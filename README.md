@@ -8,6 +8,10 @@ Rust + Slint, Linux first. Connect to an existing Spofify Go server, explicitly 
 
 Validation includes guarded used-room admission, retained paused-queue recovery, expired-device recovery, delayed media cancellation and authentication loss. Output progress was measured from the native sink and player snapshots; physical audibility was not independently measured. See [validation notes](docs/validation.md). Windows/macOS are not supported targets, and release packaging is not provided.
 
+## Visual alignment
+
+The native UI uses Spofify's current charcoal surfaces, JetBrains Mono, first-party waveform logo, pill search, flat track rows and compact local-player dock. Keyboard focus, disabled controls and error states share the web palette without adding the web's browsing/navigation features. See [visual mapping and asset provenance](docs/visual-alignment.md).
+
 ## Build and run
 
 Requires Rust >=1.92, a working Linux Wayland/X11 display, audio output, and native development libraries for fontconfig/ALSA (plus the normal C toolchain). Dependencies are pinned in `Cargo.lock`.

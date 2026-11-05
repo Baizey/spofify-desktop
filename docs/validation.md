@@ -1,5 +1,13 @@
 # MVP validation and limits
 
+## Visual-alignment acceptance
+
+The presentation-only candidate `d5ff429` passed the focused real-Go native campaign in `.tmp/web-vibe/native-06-evidence/` at **1100×760 and 900×640**. Each size has real Wayland PNGs for sign-in, validation error, empty search, results, keyboard focus, playing, paused, stopped and search error. The fixture is the same owned Go source and synthetic music described below, not a mocked UI or the user's running instance.
+
+The campaign verified checkbox Space, Tab/Return sign-in, zero catalog GETs for empty/whitespace input, real search results, stable row handles, Tab/Space Play with advancing Rodio output, Pause, keyboard Resume/Stop, disabled transport, error/retry and control bounds. All 36 existing Rust tests plus fmt/build passed offline/locked with two jobs. The subsequent dock-only correction uses explicit bounded regions rather than feeding window width into layout minima; `.tmp/web-vibe/dock-08-evidence/` confirms both sizes with live results/playback and Stop, and `dock-08.log` confirms 36 passing tests with no Slint binding-cycle warning. This removes both the old login cycle and the intermediate candidate's new dock compile-time cycle. Source changes are confined to UI, first-party logo and documentation; unchanged backend/negative-protocol evidence below is intentionally reused. See [visual mapping](visual-alignment.md).
+
+Runner failures remain preserved: early assertions incorrectly treated protobuf-omitted false/zero fields as failures, and a fixed 900ms audio observation was shorter than a publication interval. Corrected assertions normalize omitted defaults and await actual advancing publication. `native-06-evidence/result.json` is the successful campaign, with no cleanup errors and exact fixture absence. No credential-populated login capture was retained.
+
 ## Actual native evidence
 
 The owned fixture used an offline local build of `spofify-go` at `5b6be7a8f7d597575cec060613ee53617d4344df`, fresh synthetic accounts and imported MP3/FLAC tones. No working server, real account, real library or other application's screen was used. Slint 1.18.1's embedded localhost MCP inspected, clicked and captured the actual Wayland window. Rodio used the normal PipeWire-backed default ALSA output. Fixture tone files alone were attenuated to 10%; host volume/routes were unchanged.

@@ -1,0 +1,133 @@
+// Native presentation tokens mapped to the current web app; see docs/visual-alignment.md.
+export global Theme {
+    out property <color> bg: #0b0d10;
+    out property <color> panel: #12151a;
+    out property <color> raised: #181c22;
+    out property <color> line: #292f38;
+    out property <color> muted: #98a2b1;
+    out property <color> text: #f2f5f7;
+    out property <color> green: #5ce89b;
+    out property <color> green-dark: #123c29;
+    out property <color> red: #ff7884;
+    out property <color> amber: #ffc968;
+    out property <color> focus: #94f7bf;
+    out property <length> radius: 6px;
+}
+
+export component Action inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary;
+    in property <bool> round;
+    in property <bool> light;
+    callback clicked();
+    forward-focus: key;
+    accessible-role: button;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    height: 34px;
+    min-width: round ? 34px : label.preferred-width + 24px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: round ? self.height / 2 : Theme.radius;
+    border-width: key.has-focus && enabled ? 2px : 1px;
+    border-color: key.has-focus && enabled ? Theme.focus : primary ? Theme.green : Theme.line;
+    background: !enabled ? Theme.panel : pointer.pressed ? Theme.green-dark : primary ? (pointer.has-hover ? #75efab : Theme.green) : light ? (pointer.has-hover ? Theme.green : Theme.text) : pointer.has-hover ? #22272e : Theme.raised;
+    opacity: enabled ? 1 : 0.48;
+    label := Text {
+        text: root.text;
+        color: !root.enabled ? Theme.muted : root.primary || root.light ? #07130c : root.round ? Theme.green : Theme.text;
+        font-size: 13px; font-weight: 600;
+        horizontal-alignment: center; vertical-alignment: center;
+        accessible-role: none;
+    }
+    pointer := TouchArea {
+        enabled: root.enabled;
+        clicked => { key.focus(); root.clicked(); }
+    }
+    key := FocusScope {
+        width: 0px; enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                root.clicked(); return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+export component Field inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder-text;
+    in property <bool> enabled: true;
+    in property <InputType> input-type;
+    in property <bool> pill;
+    in property <string> field-label;
+    callback edited();
+    callback accepted();
+    forward-focus: input;
+    height: pill ? 44px : 38px;
+    min-width: 0px;
+    horizontal-stretch: 1; vertical-stretch: 0;
+    background: Theme.panel;
+    border-radius: pill ? 24px : Theme.radius;
+    border-width: input.has-focus ? 2px : 1px;
+    border-color: input.has-focus ? Theme.focus : Theme.line;
+    opacity: enabled ? 1 : 0.48;
+    Text {
+        x: root.pill ? 20px : 12px; width: parent.width - 40px;
+        text: root.placeholder-text; color: Theme.muted; font-size: 13px;
+        visible: input.text == ""; vertical-alignment: center;
+        overflow: elide; accessible-role: none;
+    }
+    input := TextInput {
+        x: root.pill ? 20px : 12px; width: parent.width - 2 * self.x;
+        enabled: root.enabled; input-type: root.input-type;
+        single-line: true; color: Theme.text; font-size: 13px;
+        vertical-alignment: center;
+        selection-background-color: Theme.green-dark;
+        selection-foreground-color: Theme.text;
+        accessible-label: root.field-label;
+        edited => { root.edited(); }
+        accepted => { root.accepted(); }
+    }
+}
+
+export component Consent inherits Rectangle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <string> text;
+    forward-focus: key;
+    accessible-role: checkbox;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-checkable: true;
+    accessible-checked: checked;
+    accessible-action-default => { if root.enabled { root.checked = !root.checked; } }
+    height: 30px;
+    vertical-stretch: 0;
+    opacity: enabled ? 1 : 0.48;
+    Rectangle {
+        x: 0px; y: 5px; width: 20px; height: 20px; border-radius: 4px;
+        background: root.checked ? Theme.green : Theme.raised;
+        border-width: key.has-focus ? 2px : 1px;
+        border-color: key.has-focus ? Theme.focus : Theme.line;
+        Text { text: root.checked ? "✓" : ""; color: #07130c; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+    }
+    Text { x: 30px; width: parent.width - 30px; text: root.text; color: Theme.text; font-size: 12px; vertical-alignment: center; accessible-role: none; }
+    TouchArea { enabled: root.enabled; clicked => { key.focus(); root.checked = !root.checked; } }
+    key := FocusScope {
+        width: 0px; enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space { root.checked = !root.checked; return accept; }
+            return reject;
+        }
+    }
+}
+
+export component Cover inherits Rectangle {
+    background: @linear-gradient(135deg, #3b5949, #172c28 65%, #1c242b);
+    border-width: 1px; border-color: #ffffff12;
+    Text { text: "S"; color: #dcf5de; font-size: parent.height * 0.40; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+}

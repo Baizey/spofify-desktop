@@ -1,4 +1,5 @@
-import { Button, LineEdit, CheckBox, ScrollView, Spinner } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Theme, Action, Field, Consent, Cover } from "theme.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
 export struct TrackRow { title: string, subtitle: string, detail: string, playable: bool }
 
@@ -11,7 +12,7 @@ export component AppWindow inherits Window {
     max-width: root.inspection-width > 0px ? root.inspection-width : 65535px;
     min-height: root.inspection-height > 0px ? root.inspection-height : 600px;
     max-height: root.inspection-height > 0px ? root.inspection-height : 65535px;
-    background: #101412;
+    background: Theme.bg;
     default-font-family: "JetBrains Mono";
     default-font-size: 14px;
     in-out property <string> origin;
@@ -44,94 +45,102 @@ export component AppWindow inherits Window {
     VerticalLayout {
         padding: 0px; spacing: 0px;
         Rectangle {
-            height: 82px; background: #161d19;
+            height: 58px; background: #10151b;
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
             HorizontalLayout {
-                padding-left: 28px; padding-right: 28px; spacing: 20px;
-                Text { text: "spofify"; color: #79e29d; font-size: 27px; font-weight: 800; vertical-alignment: center; }
-                Text { text: "DESKTOP / SEARCH + PLAY"; color: #9aa99f; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
-                if root.signed-in: Button { text: "Sign out"; accessible-label: "Sign out"; clicked => { root.sign-out(); } }
+                padding-left: 24px; padding-right: 24px; padding-top: 12px; padding-bottom: 12px; spacing: 12px;
+                Rectangle { width: 28px; Image { y: (parent.height - 28px) / 2; width: 28px; height: 28px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; } }
+                Text { text: "Spofify"; color: Theme.text; font-size: 17px; font-weight: 700; vertical-alignment: center; }
+                Rectangle { width: 1px; Rectangle { y: (parent.height - 20px) / 2; height: 20px; background: Theme.line; } }
+                Text { text: "Desktop"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                if root.signed-in: Action { text: "Sign out"; clicked => { root.sign-out(); } }
             }
         }
-        if !root.signed-in: HorizontalLayout {
-            padding-left: 24px; padding-right: 24px; padding-top: 20px; padding-bottom: 20px; spacing: 32px;
+        if !root.signed-in: Rectangle {
+            vertical-stretch: 1;
+            // Explicit card width and bounded content height avoid width/wrap layout cycles.
             VerticalLayout {
-                width: root.width - 486px; spacing: 18px;
-                Text { text: "Find your music.\nPress play."; color: #f0f5f1; font-size: 30px; font-weight: 700; wrap: word-wrap; }
-                Text { text: "Your Spofify server.\nA native desktop player."; color: #a9b9ae; wrap: word-wrap; }
-                Rectangle { height: 3px; width: 72px; background: #79e29d; }
-                Text { text: "01  Connect to your server\n02  Search for a track\n03  Listen on this desktop"; color: #a9b9ae; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; background: transparent; }
-                Text { text: "SEARCH FIRST\nNo catalog preload.\nNo remembered credentials."; color: #82968a; font-size: 12px; wrap: word-wrap; }
-            }
-            Rectangle {
-                width: 406px; background: #1a221d;
-                VerticalLayout {
-                    padding: 20px; spacing: 8px;
-                    Text { text: "Connect & sign in"; color: #f0f5f1; font-size: 21px; font-weight: 600; }
-                    Text { text: "Server origin"; color: #c1cec5; }
-                    origin-field := LineEdit { text <=> root.origin; placeholder-text: "https://music.example.com"; accessible-label: "Server origin"; edited => { root.server-edited(); } }
-                    Text { text: "HTTPS recommended. Origin only, no path."; color: #9aa99f; font-size: 11px; wrap: word-wrap; }
-                    Text { text: "Username"; color: #c1cec5; }
-                    user-field := LineEdit { text <=> root.username; accessible-label: "Username"; enabled: !root.busy; }
-                    Text { text: "Password"; color: #c1cec5; }
-                    password-field := LineEdit { text <=> root.password; input-type: InputType.password; accessible-label: "Password"; enabled: !root.busy; accepted => { root.sign-in(); } }
-                    CheckBox { text: "Allow trusted-LAN HTTP"; checked <=> root.lan-consent; accessible-label: "Allow trusted-LAN HTTP"; enabled: !root.busy; }
-                    Text { text: "HTTP sends credentials unencrypted. Only private, loopback or Tailscale IPs are allowed. Use a network you trust."; color: #e8c78c; font-size: 11px; wrap: word-wrap; }
-                    Button { text: root.busy ? "Signing in…" : "Sign in"; accessible-label: "Sign in"; enabled: !root.busy; primary: true; clicked => { root.sign-in(); } }
-                    if root.busy: Button { text: "Cancel sign in"; accessible-label: "Cancel sign in"; clicked => { root.sign-out(); } }
-                    Text { text: root.status; color: root.error ? #ffb7a9 : #a9b9ae; wrap: word-wrap; accessible-label: root.status; }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
+                x: (parent.width - 480px) / 2;
+                y: max(12px, (parent.height - 492px) / 2);
+                width: 480px; height: 492px;
+                padding: 0px; spacing: 7px;
+                Text { height: 32px; text: "Connect to your music"; color: Theme.text; font-size: 23px; font-weight: 700; }
+                Text { height: 22px; text: "Sign in to your Spofify server to search and play."; color: Theme.muted; font-size: 12px; }
+                Text { height: 18px; text: "Server origin"; color: Theme.muted; font-size: 12px; }
+                Field { text <=> root.origin; field-label: "Server origin"; placeholder-text: "https://music.example.com"; edited => { root.server-edited(); } }
+                Text { height: 18px; text: "HTTPS recommended. Origin only, no path."; color: Theme.muted; font-size: 11px; }
+                Text { height: 18px; text: "Username"; color: Theme.muted; font-size: 12px; }
+                Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; }
+                Text { height: 18px; text: "Password"; color: Theme.muted; font-size: 12px; }
+                Field { text <=> root.password; input-type: InputType.password; field-label: "Password"; enabled: !root.busy; accepted => { root.sign-in(); } }
+                Consent { text: "Allow trusted-LAN HTTP"; checked <=> root.lan-consent; enabled: !root.busy; }
+                Text { height: 34px; text: "HTTP sends credentials unencrypted. Only private, loopback or Tailscale IPs are allowed. Use a network you trust."; color: Theme.amber; font-size: 11px; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 12px; height: 36px;
+                    Action { text: root.busy ? "Signing in…" : "Sign in"; accessible-label: "Sign in"; enabled: !root.busy; primary: true; horizontal-stretch: 1; clicked => { root.sign-in(); } }
+                    if root.busy: Action { text: "Cancel sign in"; clicked => { root.sign-out(); } }
                 }
+                Text { height: 50px; text: root.status; color: root.error ? Theme.red : Theme.muted; font-size: 12px; wrap: word-wrap; accessible-label: root.status; }
             }
         }
         if root.signed-in: VerticalLayout {
-            padding: 28px; spacing: 16px;
-            Text { text: "What do you want to hear?"; color: #edf4ef; font-size: 26px; font-weight: 700; }
-            search-field := LineEdit { text <=> root.query; placeholder-text: "Search tracks, artists or albums"; accessible-label: "Search tracks"; edited => { root.search-edited(); } }
+            padding-left: 32px; padding-right: 32px; padding-top: 24px; padding-bottom: 20px; spacing: 16px;
+            Field { text <=> root.query; pill: true; field-label: "Search tracks"; placeholder-text: "Search tracks, artists or albums"; edited => { root.search-edited(); } }
             HorizontalLayout {
-                if root.busy: Spinner { width: 20px; height: 20px; }
-                Text { text: root.busy ? "Searching…" : root.result-label; color: #9aa99f; font-size: 12px; horizontal-stretch: 1; }
+                height: 26px;
+                Text { text: "Tracks"; color: Theme.text; font-size: 19px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                Text { text: root.busy ? "Searching…" : root.result-label; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
             }
-            if root.status != "": Text { text: root.status; color: root.error ? #ffb7a9 : #a9b9ae; wrap: word-wrap; accessible-label: root.status; }
-            if root.retry-visible && !root.busy: Button { text: "Retry search"; accessible-label: "Retry search"; clicked => { root.retry(); } }
-            ScrollView {
-                vertical-stretch: 1; content-width: self.visible-width;
-                VerticalLayout {
-                    spacing: 10px; padding: 0px;
-                    for row[index] in root.rows: Rectangle {
-                        height: 76px; background: #1c2720;
-                        HorizontalLayout {
-                            padding: 10px; spacing: 16px;
-                            Rectangle { width: 54px; height: 54px; background: #30483a; Text { text: "♪"; color: #9bdfb2; font-size: 28px; horizontal-alignment: center; vertical-alignment: center; } }
-                            VerticalLayout {
-                                spacing: 4px; horizontal-stretch: 1;
-                                Text { text: row.title; color: #edf4ef; font-size: 16px; font-weight: 600; overflow: elide; }
-                                Text { text: row.subtitle; color: #a9b9ae; font-size: 12px; overflow: elide; }
+            if root.status != "": Text { text: root.status; color: root.error ? Theme.red : Theme.muted; font-size: 12px; wrap: word-wrap; accessible-label: root.status; }
+            if root.retry-visible && !root.busy: Action { text: "Retry search"; clicked => { root.retry(); } }
+            Rectangle {
+                vertical-stretch: 1;
+                if root.rows.length == 0 && !root.busy && !root.error: VerticalLayout {
+                    padding-top: 36px; spacing: 10px; alignment: start;
+                    Text { text: root.query == "" ? "Your next listen starts here." : "No tracks found."; color: Theme.text; font-size: 16px; horizontal-alignment: center; }
+                    Text { text: root.query == "" ? "Search your library by track, artist or album." : "Try another title, artist or album."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
+                }
+                ScrollView {
+                    width: parent.width; height: parent.height; content-width: self.visible-width;
+                    VerticalLayout {
+                        spacing: 0px; padding: 0px;
+                        for row[index] in root.rows: Rectangle {
+                            height: 66px;
+                            Rectangle { y: parent.height - 1px; height: 1px; background: #ffffff0b; }
+                            HorizontalLayout {
+                                padding-top: 10px; padding-bottom: 10px; padding-left: 4px; padding-right: 8px; spacing: 14px;
+                                Rectangle { width: 34px; Action { y: 7px; text: "▶"; round: true; width: 34px; height: 32px; accessible-label: "Play " + row.title; enabled: row.playable && !root.busy; clicked => { root.play-track(index); } } }
+                                Cover { width: 46px; height: 46px; }
+                                VerticalLayout {
+                                    spacing: 4px; alignment: center; horizontal-stretch: 1;
+                                    Text { text: row.title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
+                                    Text { text: row.subtitle; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                }
+                                Text { text: row.detail; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
                             }
-                            Text { text: row.detail; color: #a9b9ae; font-size: 12px; vertical-alignment: center; }
-                            Button { text: "Play"; accessible-label: "Play " + row.title; enabled: row.playable && !root.busy; clicked => { root.play-track(index); } }
                         }
+                        Rectangle { vertical-stretch: 1; }
                     }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
                 }
             }
-            Text { text: "Search is bounded to 20 tracks. Refine your query for more specific results."; color: #82968a; font-size: 11px; wrap: word-wrap; }
+            Text { text: "Up to 20 tracks · Refine your search for more specific results"; color: Theme.muted; font-size: 11px; }
         }
         if root.signed-in: Rectangle {
-            height: 112px; background: #1b2920;
-            HorizontalLayout {
-                padding: 20px; spacing: 20px;
-                Rectangle { width: 64px; height: 64px; background: #30483a; Text { text: "♪"; color: #9bdfb2; font-size: 32px; horizontal-alignment: center; vertical-alignment: center; } }
-                VerticalLayout {
-                    spacing: 4px; horizontal-stretch: 1;
-                    Text { text: root.now-title; color: #edf4ef; font-size: 16px; font-weight: 600; overflow: elide; }
-                    Text { text: root.now-detail; color: #a9b9ae; font-size: 12px; overflow: elide; }
-                    Text { text: root.player-status; color: #a9b9ae; font-size: 11px; overflow: elide; accessible-label: root.player-status; }
-                }
-                Button { text: root.playing ? "Pause" : "Resume"; accessible-label: root.playing ? "Pause" : "Resume"; enabled: root.can-control; clicked => { root.toggle-play(); } }
-                Button { text: "Stop"; accessible-label: "Stop"; enabled: root.can-stop; clicked => { root.stop(); } }
-            }
+            height: 106px; min-width: 0px; background: #111716;
+            Rectangle { y: 0px; height: 1px; background: Theme.line; }
+            // Bounded regions keep transport centered without feeding window width into layout minima.
+            Cover { x: 24px; y: 24px; width: 58px; height: 58px; border-radius: Theme.radius; }
+            Text { x: 98px; y: 34px; width: parent.width / 2 - 159px; height: 20px; text: root.now-title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
+            Text { x: 98px; y: 59px; width: parent.width / 2 - 159px; height: 16px; text: root.now-detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+            Action { x: parent.width / 2 - 45px; y: 33px; text: root.playing ? "Ⅱ" : "▶"; round: true; light: true; width: 40px; height: 40px; accessible-label: root.playing ? "Pause" : "Resume"; enabled: root.can-control; clicked => { root.toggle-play(); } }
+            Action { x: parent.width / 2 + 11px; y: 36px; text: "■"; round: true; width: 34px; accessible-label: "Stop"; enabled: root.can-stop; clicked => { root.stop(); } }
+            Text { x: parent.width / 2 + 65px; y: 34px; width: parent.width / 2 - 89px; height: 16px; text: "THIS DESKTOP"; color: Theme.muted; font-size: 10px; horizontal-alignment: right; }
+            Text { x: parent.width / 2 + 65px; y: 56px; width: parent.width / 2 - 89px; height: 40px; text: root.player-status; color: Theme.muted; font-size: 11px; wrap: word-wrap; horizontal-alignment: right; accessible-label: root.player-status; }
         }
-        Rectangle { height: 32px; background: #0c100e; Text { x: 28px; text: "NATIVE SLINT  •  Local playback  •  No credentials saved"; color: #82968a; font-size: 11px; vertical-alignment: center; height: parent.height; } }
+        Rectangle {
+            height: 28px;
+            Text { x: 24px; height: parent.height; text: "Local playback · No credentials saved"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+        }
     }
 }
