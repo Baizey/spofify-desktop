@@ -1,6 +1,6 @@
 # PAR-002 — Control the already selected output
 
-**Status:** specified, unassigned. **Prerequisites:** none; 001/003 shared dock edits are coordination, not dependencies. Follow [delivery guide](README.md).
+**Status:** implemented; see [controller behavior and validation](../selected-output.md). **Prerequisites:** none; 001/003 shared dock edits are coordination, not dependencies. Follow [delivery guide](README.md).
 
 ## Useful delivery / existing seams
 

@@ -5,7 +5,7 @@ Applies to every lead and descendant, including tests, captures, fixture runtime
 ## Before allocating
 
 - Record run/owner, worktree/candidate, exact unique scratch/output/evidence paths, estimated peak, finite budget and cleanup responsibility **before mkdir/restore**. Check bytes/inodes on scratch, output and `/tmp`, plus visible quotas. `df` availability is not proof of user/project quota headroom; report unknown quota honestly.
-- For Rust/Slint artifact work, use a monitored **6 GiB maximum owned scratch budget only when current capacity plus safety headroom allows the estimated peak**. Otherwise stop/replan; do not allocate blindly or grow the limit to hide a failure. Max two Rust jobs; bound test concurrency, runtime, logs and captures. No hmem, package/global configuration changes or shared-cache sweeps.
+- For Rust/Slint artifact work, use a monitored **6 GiB maximum owned scratch budget only when current capacity plus safety headroom allows the estimated peak**. Otherwise stop/replan; do not allocate blindly or grow the limit to hide a failure. Max two Rust jobs; bound test concurrency, runtime, logs and captures. No package/global configuration changes or shared-cache sweeps.
 - Set `TMPDIR` and `CARGO_TARGET_DIR` to the owned run paths for processes that produce artifacts. Record any fixture/database/cache location separately; never put synthetic runtime data in a Go checkout or assume a FUSE-backed path supports every native database operation.
 - Reuse only verified, explicitly owned compatible caches/artifacts. Record source, feature set, toolchain, hash and cache origin. A target archive is an optimization, not evidence or a source backup; none is assumed active. Never overwrite retained MVP/web-vibe binaries/evidence.
 

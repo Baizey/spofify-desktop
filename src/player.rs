@@ -117,6 +117,7 @@ enum RequestKind {
     Register,
     Poll,
     Claim,
+    Command,
 }
 /// Opaque correlation metadata prevents delayed responses from reviving disposed authority.
 pub struct Request {
@@ -139,13 +140,37 @@ struct View {
     quarantine_ms: u64,
     state: Option<Value>,
     state_seq: u64,
+    #[serde(default)]
+    state_age_ms: u64,
     transfer: Option<Value>,
     directives: Vec<Directive>,
+    #[serde(default)]
+    commands: Vec<CommandOutcome>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Device {
     device_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    available: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandOutcome {
+    command_id: String,
+    status: String,
+}
+struct Operation {
+    id: String,
+    kind: String,
+    deadline: Instant,
+}
+struct QueuedCommand {
+    command: Value,
+    output: String,
+    epoch: u64,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +186,7 @@ struct Directive {
 pub struct Player {
     device_id: String,
     active: String,
+    selected: String,
     epoch: u64,
     sequence: u64,
     selection_sequence: u64,
@@ -177,12 +203,25 @@ pub struct Player {
     ack_state: Option<Value>,
     remote_state: Value,
     used_claims: HashSet<String>,
+    devices: Vec<Device>,
+    observed_at: Instant,
+    state_age_ms: u64,
+    queued: Option<QueuedCommand>,
+    operation: Option<Operation>,
+    interrupted: Option<Operation>,
+    interrupted_result: Option<String>,
+    feedback_status: String,
+    feedback_until: Option<Instant>,
+    claim_operation: Option<Operation>,
+    claim_accepted: bool,
+    feedback: String,
 }
 impl Default for Player {
     fn default() -> Self {
         Self {
             device_id: String::new(),
             active: String::new(),
+            selected: String::new(),
             epoch: 0,
             sequence: 0,
             selection_sequence: 0,
@@ -199,6 +238,18 @@ impl Default for Player {
             ack_state: None,
             remote_state: empty_snapshot(),
             used_claims: HashSet::new(),
+            devices: Vec::new(),
+            observed_at: Instant::now(),
+            state_age_ms: 0,
+            queued: None,
+            operation: None,
+            interrupted: None,
+            interrupted_result: None,
+            feedback_status: String::new(),
+            feedback_until: None,
+            claim_operation: None,
+            claim_accepted: false,
+            feedback: String::new(),
         }
     }
 }
@@ -220,6 +271,168 @@ impl Player {
     }
     pub fn active_device_id(&self) -> &str {
         &self.active
+    }
+    pub fn is_remote(&self) -> bool {
+        !self.active.is_empty() && self.active != self.device_id
+    }
+    pub fn remote_available(&self, now: Instant) -> bool {
+        self.is_remote()
+            && self.connected
+            && !self.transfer
+            && !self.quarantine
+            && now.saturating_duration_since(self.observed_at) < Duration::from_secs(5)
+            && self
+                .devices
+                .iter()
+                .any(|d| d.device_id == self.active && d.available)
+    }
+    pub fn output_name(&self) -> &str {
+        self.devices
+            .iter()
+            .find(|d| d.device_id == self.selected)
+            .map(|d| d.name.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if self.active.is_empty() {
+                "No output selected"
+            } else {
+                "Selected output"
+            })
+    }
+    pub fn observed_state(&self, now: Instant) -> Value {
+        let mut state = self.remote_state.clone();
+        if state["playing"] == true
+            && state["waiting"] == false
+            && state["loading"] != true
+            && self.remote_available(now)
+        {
+            let age = (self.state_age_ms as f64 / 1000.0
+                + now
+                    .saturating_duration_since(self.observed_at)
+                    .as_secs_f64())
+            .min(5.0);
+            let duration = state["duration"].as_f64().unwrap_or(0.0);
+            state["elapsed"] =
+                json!((state["elapsed"].as_f64().unwrap_or(0.0) + age).min(duration));
+        }
+        state
+    }
+    pub fn feedback(&self) -> &str {
+        &self.feedback
+    }
+    pub fn command_pending(&self) -> bool {
+        self.operation.is_some() || self.queued.is_some()
+    }
+    pub fn can_interrupt(&self) -> bool {
+        self.interrupted.is_none()
+            && (self.operation.as_ref().is_some_and(|op| op.kind != "pause")
+                || self
+                    .queued
+                    .as_ref()
+                    .is_some_and(|q| q.command["type"] != "pause"))
+            && self
+                .queued
+                .as_ref()
+                .is_none_or(|q| q.command["type"] != "pause")
+    }
+    pub fn selection_busy(&self) -> bool {
+        self.transfer || self.quarantine
+    }
+    pub fn claim_in_progress(&self) -> bool {
+        self.claim_operation.is_some()
+    }
+    pub fn claim_ready(&self) -> bool {
+        self.claim_accepted
+            && self.claim_operation.is_none()
+            && self.initialized
+            && !self.pending_acks()
+            && !self.transfer
+    }
+    pub fn queue_remote(&mut self, command: Value, now: Instant) -> Result<(), Error> {
+        if !self.remote_available(now) {
+            return Err(Error::OtherOutputSelected);
+        }
+        let seek = command["type"] == "seek";
+        let interrupt = command["type"] == "pause" && self.can_interrupt();
+        let valid = match command["type"].as_str() {
+            Some("pause" | "resume" | "next" | "previous") => {
+                command.as_object().is_some_and(|o| o.len() == 1)
+            }
+            Some("seek") => {
+                command.as_object().is_some_and(|o| o.len() == 2) && number(&command["value"])
+            }
+            Some("play") => {
+                command.as_object().is_some_and(|o| o.len() == 2)
+                    && crate::observation::valid_track(&command["track"], false)
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::Invalid);
+        }
+        if (self.operation.is_some() || self.queued.is_some()) && !seek && !interrupt {
+            return Err(Error::Busy);
+        }
+        if self
+            .queued
+            .as_ref()
+            .is_some_and(|q| q.command["type"] != "seek" && !interrupt)
+        {
+            return Err(Error::Busy);
+        }
+        self.queued = Some(QueuedCommand {
+            command,
+            output: self.active.clone(),
+            epoch: self.epoch,
+        });
+        self.feedback = "Waiting for output confirmation…".into();
+        self.feedback_status.clear();
+        self.feedback_until = None;
+        Ok(())
+    }
+    pub fn remote_request(&mut self, now: Instant) -> Result<Option<Request>, Error> {
+        if self.in_flight.is_some()
+            || (self.operation.is_some()
+                && !self
+                    .queued
+                    .as_ref()
+                    .is_some_and(|q| q.command["type"] == "pause" && self.interrupted.is_none()))
+        {
+            return Ok(None);
+        }
+        let Some(q) = self.queued.take() else {
+            return Ok(None);
+        };
+        if q.output != self.active || q.epoch != self.epoch || !self.remote_available(now) {
+            self.feedback =
+                "Output changed. Command cancelled; act again on the selected output.".into();
+            return Err(Error::Stale);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let kind = q.command["type"].as_str().unwrap_or("").to_owned();
+        let r = self.request(json!({"action":"command","deviceId":self.device_id,"epoch":self.epoch,"commandId":id,"command":q.command}), RequestKind::Command, now)?;
+        if self.operation.is_some() {
+            self.interrupted = self.operation.take();
+            self.interrupted_result = None;
+        }
+        self.operation = Some(Operation {
+            id,
+            kind,
+            deadline: now + Duration::from_secs(10),
+        });
+        Ok(Some(r))
+    }
+    pub fn connection_status(&self, now: Instant) -> &'static str {
+        if self.quarantine {
+            "Output lease draining; playback is paused"
+        } else if self.transfer {
+            "Switching output…"
+        } else if !self.connected {
+            "Playback connection unavailable. Retry connection."
+        } else if self.is_remote() && !self.remote_available(now) {
+            "Selected output unavailable; no local fallback"
+        } else {
+            ""
+        }
     }
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -294,6 +507,12 @@ impl Player {
         }
         self.selection_sequence += 1;
         self.used_claims.insert(command_id.to_owned());
+        self.claim_accepted = false;
+        self.claim_operation = Some(Operation {
+            id: command_id.to_owned(),
+            kind: "claim".into(),
+            deadline: now + Duration::from_secs(10),
+        });
         self.request(
             json!({"action":"transfer", "deviceId":self.device_id,
             "targetDeviceId":self.device_id, "epoch":self.epoch, "commandId":command_id,
@@ -340,9 +559,38 @@ impl Player {
     pub fn failed(&mut self, endpoint: &mut impl Endpoint) {
         self.in_flight = None;
         self.connected = false;
+        if self.operation.take().is_some() || self.interrupted.take().is_some() {
+            self.interrupted = None;
+            self.feedback =
+                "Command outcome unknown. Check the actual output, then act again.".into();
+            self.feedback_status = "unknown".into();
+            self.feedback_until = Some(Instant::now() + Duration::from_secs(8));
+        }
+        self.queued = None;
+        self.claim_operation = None;
+        self.claim_accepted = false;
         self.fence(endpoint);
         self.acks.clear();
         self.ack_state = None;
+    }
+    pub fn failed_status(&mut self, endpoint: &mut impl Endpoint, request: &Request, status: u16) {
+        let submission = request.kind == RequestKind::Command
+            && self
+                .operation
+                .as_ref()
+                .is_some_and(|op| request.body["commandId"] == op.id);
+        let previous_unknown = self.interrupted.is_some();
+        self.failed(endpoint);
+        if submission && matches!(status, 400 | 403 | 404 | 409 | 413 | 429) {
+            self.feedback = if previous_unknown {
+                "Pause refused; prior command outcome unknown. Check output."
+            } else {
+                "Command refused by server. Check output and act again."
+            }
+            .into();
+            self.feedback_status = "rejected".into();
+            self.feedback_until = Some(Instant::now() + Duration::from_secs(8));
+        }
     }
     /// Observe a bounded 409 response body (or GET view) after failure, without granting
     /// authority, replaying the failed action, or executing directives. A subsequent normal
@@ -384,6 +632,36 @@ impl Player {
     }
     /// Call independently of the network task; audio must additionally enforce Authority itself.
     pub fn tick(&mut self, endpoint: &mut impl Endpoint, now: Instant) {
+        if self.feedback_until.is_some_and(|until| now >= until) {
+            self.feedback.clear();
+            self.feedback_status.clear();
+            self.feedback_until = None;
+        }
+        if self
+            .interrupted
+            .as_ref()
+            .is_some_and(|op| now >= op.deadline)
+        {
+            self.interrupted = None;
+            self.interrupted_result = Some("unknown".into());
+        }
+        if self.operation.as_ref().is_some_and(|op| now >= op.deadline) {
+            self.operation = None;
+            self.queued = None;
+            self.feedback =
+                "Command outcome unknown. Check the actual output, then act again.".into();
+            self.feedback_status = "unknown".into();
+            self.feedback_until = Some(now + Duration::from_secs(8));
+        }
+        if self
+            .claim_operation
+            .as_ref()
+            .is_some_and(|op| now >= op.deadline)
+        {
+            self.claim_operation = None;
+            self.claim_accepted = false;
+            self.feedback = "Playback selection outcome unknown. Select the track again.".into();
+        }
         let expired = self
             .lease
             .lock()
@@ -429,7 +707,36 @@ impl Player {
             || view.quarantine_ms > 8000
             || view.devices.len() > 16
             || view.directives.len() > 16
-            || view.devices.iter().any(|d| !protocol_id(&d.device_id))
+            || view.state_age_ms > MAX_SAFE
+            || view.commands.len() > 128
+            || view.commands.iter().any(|c| {
+                !protocol_id(&c.command_id)
+                    || !matches!(
+                        c.status.as_str(),
+                        "pending"
+                            | "ok"
+                            | "blocked"
+                            | "media"
+                            | "rejected"
+                            | "timeout"
+                            | "cancelled"
+                    )
+            })
+            || view
+                .commands
+                .iter()
+                .map(|c| &c.command_id)
+                .collect::<HashSet<_>>()
+                .len()
+                != view.commands.len()
+            || view
+                .state
+                .as_ref()
+                .is_some_and(|s| !crate::observation::valid_state(s))
+            || view.transfer.as_ref().is_some_and(|t| !valid_transfer(t))
+            || view.devices.iter().any(|d| {
+                !protocol_id(&d.device_id) || !text(&d.name, 256) || d.name.chars().count() > 64
+            })
             || view
                 .devices
                 .iter()
@@ -483,13 +790,81 @@ impl Player {
         }
         self.epoch = view.epoch;
         self.active = view.active_device_id;
+        self.selected = view
+            .transfer
+            .as_ref()
+            .and_then(|t| t["targetDeviceId"].as_str())
+            .unwrap_or(&self.active)
+            .to_owned();
         self.sequence = self.sequence.max(view.state_seq);
         self.transfer = view.transfer.is_some();
         self.quarantine = view.quarantine_ms > 0;
         self.remote_state = view.state.unwrap_or_else(empty_snapshot);
+        self.devices = view.devices;
+        self.state_age_ms = view.state_age_ms.min(5000);
+        self.observed_at = now;
         self.connected = true;
-        // Transfer replies are observational: only registration/poll can grant/renew output.
-        if request.kind != RequestKind::Claim {
+        if matches!(self.feedback_status.as_str(), "blocked" | "media")
+            && self.remote_state["error"] != self.feedback_status
+        {
+            self.feedback.clear();
+            self.feedback_status.clear();
+            self.feedback_until = None;
+        }
+        for c in view.commands {
+            if self
+                .interrupted
+                .as_ref()
+                .is_some_and(|op| op.id == c.command_id)
+                && c.status != "pending"
+            {
+                self.interrupted = None;
+                self.interrupted_result = Some(c.status.clone());
+            }
+            if self
+                .operation
+                .as_ref()
+                .is_some_and(|op| op.id == c.command_id)
+                && c.status != "pending"
+            {
+                self.operation = None;
+                self.feedback = match c.status.as_str() {
+                    "ok" => "",
+                    "blocked" => "Output needs a tap. Continue playback on the actual output.",
+                    "media" => "Media failed on the output. Retry there or choose another track.",
+                    "rejected" => "Output rejected the command. Check the output and act again.",
+                    "timeout" => "Output timed out. Check the output before acting again.",
+                    _ => "Command cancelled by output change. Act again if needed.",
+                }
+                .into();
+                self.feedback_status = c.status.clone();
+                self.feedback_until = Some(now + Duration::from_secs(8));
+                if c.status != "ok"
+                    && self
+                        .queued
+                        .as_ref()
+                        .is_none_or(|q| q.command["type"] != "pause")
+                {
+                    // A deliberate Pause is cancellation intent, not a replay of
+                    // the failed operation. Keep it bound to its output/epoch.
+                    self.queued = None;
+                }
+            }
+            if self
+                .claim_operation
+                .as_ref()
+                .is_some_and(|op| op.id == c.command_id)
+                && c.status != "pending"
+            {
+                self.claim_operation = None;
+                self.claim_accepted = c.status == "ok" && self.active == self.device_id;
+                if !self.claim_accepted {
+                    self.feedback = "Local selection failed. Select the track again.".into();
+                }
+            }
+        }
+        // Command/transfer replies and GET reconciliation never grant/renew output.
+        if matches!(request.kind, RequestKind::Register | RequestKind::Poll) {
             let deadline =
                 request.sent_at + Duration::from_millis(view.lease_ms.saturating_sub(2000));
             if self.active == self.device_id && !self.released && now < deadline {
@@ -558,7 +933,10 @@ impl Player {
                             return Err(Error::Invalid);
                         }
                         let initial = endpoint.activate(&state, authority.clone());
-                        if !valid_outcome(&initial) || initial.status != Status::Ok {
+                        if !valid_outcome(&initial)
+                            || initial.status != Status::Ok
+                            || initial.state["error"] != ""
+                        {
                             return Err(Error::Invalid);
                         }
                         self.initialized = true;
@@ -566,14 +944,18 @@ impl Player {
                     if command["type"] == "toggle" {
                         command = json!({"type":if endpoint.snapshot()["playing"] == true { "pause" } else { "resume" }});
                     }
-                    if matches!(command["type"].as_str(), Some("pause" | "close" | "clear")) {
+                    if matches!(command["type"].as_str(), Some("pause" | "close")) {
                         endpoint.stop();
                     }
                     endpoint.execute(&command, authority.clone())
                 }
                 _ => unreachable!(),
             };
-            if !valid_outcome(&result) {
+            if !valid_outcome(&result)
+                || (d.kind == "activate"
+                    && result.status == Status::Ok
+                    && result.state["error"] != "")
+            {
                 return Err(Error::Invalid);
             }
             if d.kind != "release" && !authority.is_valid() {
@@ -607,7 +989,7 @@ impl Player {
         self.local_admission(endpoint, now)?;
         let authority = self.authority(now).ok_or(Error::NoAuthority)?;
         let result = endpoint.activate(&state, authority.clone());
-        self.local_result(result, authority, endpoint)
+        self.local_result(result, authority, endpoint, true)
     }
     /// Owner-local transport: execute first, publish actual snapshot in the next poll.
     pub fn local(
@@ -621,11 +1003,11 @@ impl Player {
         if !self.initialized {
             return Err(Error::NoAuthority);
         }
-        if matches!(command["type"].as_str(), Some("pause" | "close" | "clear")) {
+        if matches!(command["type"].as_str(), Some("pause" | "close")) {
             endpoint.stop();
         }
         let result = endpoint.execute(&command, authority.clone());
-        self.local_result(result, authority, endpoint)
+        self.local_result(result, authority, endpoint, false)
     }
     fn local_admission(&mut self, endpoint: &mut impl Endpoint, now: Instant) -> Result<(), Error> {
         self.tick(endpoint, now);
@@ -645,8 +1027,12 @@ impl Player {
         result: Outcome,
         authority: Authority,
         endpoint: &mut impl Endpoint,
+        activation: bool,
     ) -> Result<Status, Error> {
-        if !valid_outcome(&result) || !authority.is_valid() {
+        if !valid_outcome(&result)
+            || (activation && result.status == Status::Ok && result.state["error"] != "")
+            || !authority.is_valid()
+        {
             self.failed(endpoint);
             return Err(Error::NoAuthority);
         }
@@ -656,6 +1042,18 @@ impl Player {
     }
 }
 
+fn valid_transfer(t: &Value) -> bool {
+    t.as_object().is_some_and(|o| o.len() == 4)
+        && t["commandId"].as_str().is_some_and(protocol_id)
+        && t["sourceDeviceId"]
+            .as_str()
+            .is_some_and(|s| s.is_empty() || protocol_id(s))
+        && t["targetDeviceId"].as_str().is_some_and(protocol_id)
+        && matches!(
+            t["phase"].as_str(),
+            Some("waiting" | "preparing" | "releasing" | "activating")
+        )
+}
 pub fn empty_snapshot() -> Value {
     json!({"version":1,"queue":[],"position":-1,"context":null,"shuffle":false,"repeat":"off",
         "elapsed":0.0,"duration":0.0,"playing":false,"waiting":false,"loading":false,
@@ -815,7 +1213,7 @@ fn valid_outcome(result: &Outcome) -> bool {
             Status::Blocked | Status::Media => {
                 result.state["playing"] == false && result.state["error"] == result.status.wire()
             }
-            Status::Ok => result.state["error"] == "",
+            Status::Ok => true,
             Status::Rejected => true,
         }
 }
@@ -882,7 +1280,7 @@ mod tests {
         }
     }
     fn view(epoch: u64, active: &str, directives: Value) -> Value {
-        json!({"deviceId":"desktop","devices":[{"deviceId":"desktop"},{"deviceId":"phone"}],
+        json!({"deviceId":"desktop","devices":[{"deviceId":"desktop","name":"Desktop","available":true},{"deviceId":"phone","name":"Browser output","available":true}],
             "activeDeviceId":active,"epoch":epoch,"leaseMs":8000,"quarantineMs":0,"state":null,
             "stateSeq":0,"transfer":null,"directives":directives})
     }
@@ -898,6 +1296,224 @@ mod tests {
     fn track() -> Value {
         single_track(&json!({"id":"song","name":"Song","artists":[],"albumName":"Album","albumId":"a","duration":123.0,
             "url":"https://must-not-publish.invalid","selectionToken":"secret","libraryPath":"private"}),1).unwrap()
+    }
+    #[test]
+    fn remote_commands_wait_for_terminal_receipt_and_never_grant_output() {
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"pause"}), now).unwrap();
+        let r = p.remote_request(now).unwrap().unwrap();
+        assert_eq!(r.body["deviceId"], "desktop");
+        assert_eq!(r.body["action"], "command");
+        let command_id = r.body["commandId"].clone();
+        p.consume(&r, view(1, "phone", json!([])), &mut a, now)
+            .unwrap();
+        assert!(p.command_pending());
+        assert!(!p.is_owner(now));
+        let r = p.poll(&mut a, now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["commands"] = json!([{"commandId":command_id,"status":"blocked"}]);
+        p.consume(&r, v, &mut a, now).unwrap();
+        assert!(!p.command_pending());
+        assert!(p.feedback().contains("tap"));
+        assert_eq!(a.starts, 0);
+    }
+    #[test]
+    fn seek_coalesces_only_unsent_and_failure_does_not_replay() {
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"seek","value":10}), now)
+            .unwrap();
+        p.queue_remote(json!({"type":"seek","value":20}), now)
+            .unwrap();
+        let r = p.remote_request(now).unwrap().unwrap();
+        assert_eq!(r.body["command"]["value"], 20);
+        p.queue_remote(json!({"type":"seek","value":30}), now)
+            .unwrap();
+        assert!(p.remote_request(now).unwrap().is_none());
+        p.failed(&mut a);
+        assert!(!p.command_pending());
+        assert!(p.feedback().contains("unknown"));
+        assert!(p.remote_request(now).unwrap().is_none());
+        assert!(matches!(
+            p.consume(&r, view(1, "phone", json!([])), &mut a, now),
+            Err(Error::Stale)
+        ));
+    }
+    #[test]
+    fn remote_terminal_outcomes_and_stalled_poll_are_bounded_without_replay() {
+        for status in ["ok", "blocked", "media", "rejected", "timeout", "cancelled"] {
+            let (mut p, mut a, now) = registered("phone");
+            p.queue_remote(json!({"type":"next"}), now).unwrap();
+            let r = p.remote_request(now).unwrap().unwrap();
+            let id = r.body["commandId"].clone();
+            let mut v = view(1, "phone", json!([]));
+            v["commands"] = json!([{"commandId":id,"status":status}]);
+            p.consume(&r, v, &mut a, now).unwrap();
+            assert!(!p.command_pending());
+            assert_eq!(p.feedback().is_empty(), status == "ok");
+            assert!(p.remote_request(now).unwrap().is_none());
+            assert_eq!(a.starts, 0);
+        }
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"pause"}), now).unwrap();
+        let _r = p.remote_request(now).unwrap().unwrap();
+        p.tick(&mut a, now + Duration::from_secs(10));
+        assert!(!p.command_pending());
+        assert!(p.feedback().contains("unknown"));
+        assert!(!p.remote_available(now + Duration::from_secs(5)));
+    }
+    #[test]
+    fn pause_preempts_one_pending_play_and_accounts_for_both_receipts() {
+        let (mut p, mut a, now) = registered("phone");
+        let selected = track()["queue"][0].clone();
+        p.queue_remote(json!({"type":"play","track":selected}), now)
+            .unwrap();
+        let play = p.remote_request(now).unwrap().unwrap();
+        let play_id = play.body["commandId"].clone();
+        // Pause is deliberately retained while the serialized Play HTTP is in flight.
+        assert!(p.can_interrupt());
+        p.queue_remote(json!({"type":"pause"}), now).unwrap();
+        assert!(p.remote_request(now).unwrap().is_none());
+        p.consume(&play, view(1, "phone", json!([])), &mut a, now)
+            .unwrap();
+        let pause = p.remote_request(now).unwrap().unwrap();
+        assert_eq!(pause.body["command"]["type"], "pause");
+        assert!(!p.can_interrupt());
+        assert!(p.queue_remote(json!({"type":"pause"}), now).is_err());
+        let pause_id = pause.body["commandId"].clone();
+        let mut v = view(1, "phone", json!([]));
+        v["commands"] = json!([{"commandId":play_id,"status":"cancelled"},{"commandId":pause_id,"status":"pending"}]);
+        p.consume(&pause, v, &mut a, now).unwrap();
+        assert_eq!(p.interrupted_result.as_deref(), Some("cancelled"));
+        let poll = p.poll(&mut a, now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["commands"] = json!([{"commandId":pause_id,"status":"ok"}]);
+        p.consume(&poll, v, &mut a, now).unwrap();
+        assert!(!p.command_pending());
+        assert_eq!(a.starts, 0);
+    }
+    #[test]
+    fn definitive_refusal_differs_from_lost_reply_and_stale_feedback_recovers() {
+        for status in [0, 403, 409] {
+            let (mut p, mut a, now) = registered("phone");
+            p.queue_remote(json!({"type":"pause"}), now).unwrap();
+            let r = p.remote_request(now).unwrap().unwrap();
+            p.failed_status(&mut a, &r, status);
+            assert_eq!(p.feedback().contains("unknown"), status == 0);
+            assert_eq!(p.feedback().contains("refused"), status != 0);
+            assert!(p.remote_request(now).unwrap().is_none());
+        }
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"resume"}), now).unwrap();
+        let r = p.remote_request(now).unwrap().unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["state"] = paused(track());
+        v["state"]["error"] = json!("blocked");
+        v["commands"] = json!([{"commandId":r.body["commandId"],"status":"blocked"}]);
+        p.consume(&r, v, &mut a, now).unwrap();
+        assert!(p.feedback().contains("tap"));
+        let r = p.poll(&mut a, now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["state"] = track();
+        p.consume(&r, v, &mut a, now).unwrap();
+        assert!(p.feedback().is_empty());
+    }
+    #[test]
+    fn accepted_command_poll_refusal_is_unknown_and_queued_pause_survives_terminal_failure() {
+        for status in [403, 409] {
+            let (mut p, mut a, now) = registered("phone");
+            p.queue_remote(json!({"type":"resume"}), now).unwrap();
+            let r = p.remote_request(now).unwrap().unwrap();
+            p.consume(&r, view(1, "phone", json!([])), &mut a, now)
+                .unwrap();
+            let poll = p.poll(&mut a, now).unwrap();
+            p.failed_status(&mut a, &poll, status);
+            assert!(p.feedback().contains("unknown"));
+            assert!(!p.feedback().contains("refused"));
+        }
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"seek","value":10}), now)
+            .unwrap();
+        let r = p.remote_request(now).unwrap().unwrap();
+        let id = r.body["commandId"].clone();
+        p.consume(&r, view(1, "phone", json!([])), &mut a, now)
+            .unwrap();
+        let poll = p.poll(&mut a, now).unwrap();
+        p.queue_remote(json!({"type":"pause"}), now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["commands"] = json!([{"commandId":id,"status":"rejected"}]);
+        p.consume(&poll, v, &mut a, now).unwrap();
+        let pause = p.remote_request(now).unwrap().unwrap();
+        assert_eq!(pause.body["command"]["type"], "pause");
+    }
+    #[test]
+    fn refusing_interrupting_pause_does_not_refuse_previously_accepted_play() {
+        let (mut p, mut a, now) = registered("phone");
+        p.queue_remote(json!({"type":"resume"}), now).unwrap();
+        let r = p.remote_request(now).unwrap().unwrap();
+        p.consume(&r, view(1, "phone", json!([])), &mut a, now)
+            .unwrap();
+        p.queue_remote(json!({"type":"pause"}), now).unwrap();
+        let pause = p.remote_request(now).unwrap().unwrap();
+        p.failed_status(&mut a, &pause, 403);
+        assert!(p.feedback().contains("Pause refused"));
+        assert!(p.feedback().contains("prior command outcome unknown"));
+        assert!(!p.command_pending());
+    }
+    #[test]
+    fn unavailable_selection_never_falls_back_and_progress_is_bounded() {
+        let (mut p, mut a, now) = registered("phone");
+        let r = p.poll(&mut a, now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["state"] = track();
+        v["state"]["elapsed"] = json!(20);
+        v["stateAgeMs"] = json!(90000);
+        p.consume(&r, v, &mut a, now).unwrap();
+        assert_eq!(
+            p.observed_state(now + Duration::from_secs(1))["elapsed"],
+            25.0
+        );
+        let r = p.poll(&mut a, now).unwrap();
+        let mut v = view(1, "phone", json!([]));
+        v["devices"][1]["available"] = json!(false);
+        p.consume(&r, v, &mut a, now).unwrap();
+        assert!(p.is_remote());
+        assert_eq!(p.active_device_id(), "phone");
+        assert!(p.queue_remote(json!({"type":"resume"}), now).is_err());
+        assert!(p.claim("never-take-over", now).is_err());
+        assert_eq!(a.starts, 0);
+    }
+    #[test]
+    fn self_claim_requires_matching_terminal_acceptance_after_activation_ack() {
+        let (mut p, mut a, now) = registered("");
+        let claim = p.claim("claim", now).unwrap();
+        p.consume(&claim, view(1, "", json!([])), &mut a, now)
+            .unwrap();
+        let poll = p.poll(&mut a, now).unwrap();
+        p.consume(
+            &poll,
+            view(
+                2,
+                "desktop",
+                json!([{"deliveryId":"activate","epoch":2,"type":"activate"}]),
+            ),
+            &mut a,
+            now,
+        )
+        .unwrap();
+        assert!(!p.claim_ready());
+        let ack = p.poll(&mut a, now).unwrap();
+        assert!(!p.claim_ready());
+        assert_eq!(ack.body["acks"][0]["status"], "ok");
+        let mut v = view(2, "desktop", json!([]));
+        v["commands"] = json!([{"commandId":"other","status":"ok"}]);
+        p.consume(&ack, v, &mut a, now).unwrap();
+        assert!(!p.claim_ready());
+        let poll = p.poll(&mut a, now).unwrap();
+        let mut v = view(2, "desktop", json!([]));
+        v["commands"] = json!([{"commandId":"claim","status":"ok"}]);
+        p.consume(&poll, v, &mut a, now).unwrap();
+        assert!(p.claim_ready());
+        assert_eq!(a.starts, 0);
     }
     #[test]
     fn lease_uses_send_time_and_expires_at_boundary() {

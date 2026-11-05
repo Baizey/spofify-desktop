@@ -24,6 +24,10 @@ pub const PAGE_SIZE: u32 = 20;
 const MAX_BODY: usize = 256 * 1024;
 const LOGIN_BODY: usize = 8 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
+// Go accepts <=2MiB publications. A view can contain the room state plus up to
+// 16 directive snapshots/commands: 17*2MiB plus bounded device/outcome envelopes.
+const PLAYER_REQUEST: usize = 2 * 1024 * 1024;
+const PLAYER_RESPONSE: usize = 36 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// All messages are local constants. Never retains a transport error, URL or server body.
@@ -375,11 +379,12 @@ impl Api {
             return Err(INVALID_INPUT);
         }
         let body = serde_json::to_vec(&command).map_err(|_| INVALID_INPUT)?;
-        if body.len() > 32 * 1024 {
+        if body.len() > PLAYER_REQUEST {
             return Err(INVALID_INPUT);
         }
         let request = self
             .request(self.origin.endpoint("/api/me/player"))?
+            .timeout(Duration::from_secs(4))
             .header(header::COOKIE, session.secrets.cookie.clone())
             .header("X-CSRF-Token", session.secrets.csrf.clone())
             .header(header::CONTENT_TYPE, "application/json")
@@ -388,7 +393,7 @@ impl Api {
         if response.status() != 200 {
             return Err(INVALID_RESPONSE);
         }
-        let state = decode(response, MAX_BODY).await?;
+        let crate::observation::StrictValue(state) = decode(response, PLAYER_RESPONSE).await?;
         self.check_session(session)?;
         Ok(state)
     }
@@ -400,12 +405,13 @@ impl Api {
         self.check_session(session)?;
         let request = self
             .request_with_method(reqwest::Method::GET, self.origin.endpoint("/api/me/player"))?
+            .timeout(Duration::from_secs(4))
             .header(header::COOKIE, session.secrets.cookie.clone());
         let response = self.send(request, Some(session), false).await?;
         if response.status() != 200 {
             return Err(INVALID_RESPONSE);
         }
-        let view = decode(response, MAX_BODY).await?;
+        let crate::observation::StrictValue(view) = decode(response, PLAYER_RESPONSE).await?;
         self.check_session(session)?;
         Ok(view)
     }
@@ -900,9 +906,11 @@ mod tests {
                         .set_write_timeout(Some(Duration::from_millis(250)))
                         .unwrap();
                     let mut bytes = Vec::new();
-                    let mut chunk = [0u8; 1024];
+                    let mut chunk = [0u8; 16 * 1024];
                     let mut parsed = None;
-                    while bytes.len() <= 8192 && !stopping.load(Ordering::SeqCst) {
+                    // The fixture must accept legitimate full player publications,
+                    // while remaining finite (2MiB body + bounded HTTP headers).
+                    while bytes.len() <= PLAYER_REQUEST + 8192 && !stopping.load(Ordering::SeqCst) {
                         let size = match stream.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => n,
@@ -1396,12 +1404,39 @@ mod tests {
         );
         assert_eq!(
             failure(
-                api.player(&session, serde_json::json!({"oversized":"x".repeat(32768)}))
-                    .await
+                api.player(
+                    &session,
+                    serde_json::json!({"oversized":"x".repeat(PLAYER_REQUEST)})
+                )
+                .await
             ),
             INVALID_INPUT
         );
         assert_eq!(wire.recorded().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn player_control_failures_are_single_attempt_and_auth_loss_revokes() {
+        let wire = Wire::new(vec![
+            login_reply(),
+            reply(403, &[], "private diagnostic"),
+            reply(404, &[], "private diagnostic"),
+            reply(409, &[], "private diagnostic"),
+            reply(401, &[], "private diagnostic"),
+        ]);
+        let api = wire.api();
+        let session = api.login("listener", "password").await.unwrap();
+        for (index, status) in [403, 404, 409, 401].into_iter().enumerate() {
+            let command = serde_json::json!({"action":"command","deviceId":"controller","epoch":1,"commandId":format!("command-{index}"),"command":{"type":"pause"}});
+            let e = failure(api.player(&session, command).await);
+            assert_eq!(e.status, status);
+            assert_eq!(e.expired, status == 401);
+            assert_eq!(wire.recorded().len(), index + 2);
+            assert!(!e.message.contains("private"));
+        }
+        assert!(session.is_expired());
+        assert_eq!(failure(api.player_view(&session).await), EXPIRED);
+        assert_eq!(wire.recorded().len(), 5);
     }
 
     #[tokio::test]
@@ -1431,6 +1466,35 @@ mod tests {
             assert_eq!(request.header("x-spofify-login"), None);
             assert!(request.body.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn player_full_publication_envelopes_duplicate_keys_and_endpoint_bounds() {
+        let mut state = crate::player::empty_snapshot();
+        state["queue"]=serde_json::Value::Array((0..1000).map(|i| serde_json::json!({"id":format!("track-{i}"),"name":"n".repeat(512),"artists":[{"name":"a".repeat(512)}],"albumName":"album","albumId":"a","duration":24,"key":i+1,"order":i})).collect());
+        state["position"] = serde_json::json!(0);
+        assert!(crate::observation::valid_state(&state));
+        let publication = serde_json::json!({"action":"poll","deviceId":"desktop","epoch":1,"stateSeq":1,"state":state});
+        let bytes = publication.to_string().len();
+        assert!(bytes > MAX_BODY && bytes < PLAYER_REQUEST);
+        let view =
+            serde_json::json!({"state":state,"directives":[{"type":"prepare","state":state}]})
+                .to_string();
+        assert!(view.len() > PLAYER_REQUEST && view.len() < PLAYER_RESPONSE);
+        let too_big=format!("HTTP/1.1 200 Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",PLAYER_RESPONSE+1).into_bytes();
+        let wire = Wire::new(vec![
+            login_reply(),
+            json(&view),
+            json(r#"{"epoch":1,"epoch":2}"#),
+            too_big,
+        ]);
+        let api = wire.api();
+        let session = api.login("listener", "password").await.unwrap();
+        let got = api.player(&session, publication).await.unwrap();
+        assert_eq!(got["state"]["queue"].as_array().unwrap().len(), 1000);
+        assert_eq!(failure(api.player_view(&session).await), INVALID_RESPONSE);
+        assert_eq!(failure(api.player_view(&session).await), INVALID_RESPONSE);
+        assert_eq!(wire.recorded().len(), 4);
     }
 
     #[tokio::test]

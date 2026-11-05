@@ -1,6 +1,7 @@
 mod api;
 mod audio;
 mod engine;
+mod observation;
 mod player;
 slint::include_modules!();
 use slint::ComponentHandle;
@@ -138,11 +139,29 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    for kind in ["previous", "next", "retry"] {
+        let (weak, tx) = (ui.as_weak(), tx.clone());
+        let callback = move || {
+            if let Some(ui) = weak.upgrade() {
+                let command = if kind == "retry" {
+                    engine::Command::RetryPlayer
+                } else {
+                    engine::Command::Transport(kind)
+                };
+                send(&tx, command, &ui);
+            }
+        };
+        match kind {
+            "previous" => ui.on_previous(callback),
+            "next" => ui.on_next(callback),
+            _ => ui.on_retry_player(callback),
+        }
+    }
     {
         let (weak, tx) = (ui.as_weak(), tx.clone());
-        ui.on_stop(move || {
+        ui.on_seek(move |value| {
             if let Some(ui) = weak.upgrade() {
-                send(&tx, engine::Command::Stop, &ui);
+                send(&tx, engine::Command::Seek(value), &ui);
             }
         });
     }

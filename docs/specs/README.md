@@ -1,6 +1,6 @@
 # Desktop listening parity — delivery guide
 
-**Specs, not implemented features.** All units below are unassigned, ready for scoped lead assignment subject to their landed prerequisites. This documentation delivery runs no builds or apps and establishes no feature/native acceptance. Each future lead owns its own spec, branch/worktree, tests, one independent review, local integration and cleanup under [roles](../../AGENT_BEHAVIOUR.md) and [workflow](../worktree-review.md). No final campaign/megamerge holds finished units hostage.
+**Delivery specifications.** PAR-002 selected-output control is implemented; see [its behavior and validation](../selected-output.md). The other units remain specified/unassigned, ready for scoped lead assignment subject to their landed prerequisites. The original specification-only delivery established no feature/native acceptance. Each future lead owns its own spec, branch/worktree, tests, one independent review, local integration and cleanup under [roles](../../AGENT_BEHAVIOUR.md) and [workflow](../worktree-review.md). No final campaign/megamerge holds finished units hostage.
 
 ## TL;DR / start here
 
@@ -9,7 +9,7 @@ Assign **[PAR-001 unified header/profile](PAR-001-header-profile.md)** and **[PA
 | Spec | Complete deliverable | Genuine landed prerequisites |
 | --- | --- | --- |
 | [001](PAR-001-header-profile.md) | Unified Search header, top-right real account menu; remove reset-style dock Stop | None |
-| [002](PAR-002-selected-output.md) | Control an already selected output; authoritative bottom transport | None |
+| [002](PAR-002-selected-output.md) | **Implemented:** control an already selected output; authoritative bottom transport | None |
 | [003](PAR-003-seekable-media.md) | Bounded seekable/incremental local single-track playback, seek and local gain | None |
 | [004](PAR-004-local-context-queue.md) | Local album-context queue, progression and in-place queue editing | 003 |
 | [005](PAR-005-native-handoff.md) | Receive and return complete browser queues with asynchronous media activation | 002, 004 |

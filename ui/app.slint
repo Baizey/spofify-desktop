@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, Slider } from "std-widgets.slint";
 import { Theme, Action, Field, Consent, Cover } from "theme.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
 export struct TrackRow { title: string, subtitle: string, detail: string, playable: bool }
@@ -32,14 +32,24 @@ export component AppWindow inherits Window {
     in property <string> player-status;
     in property <bool> playing;
     in property <bool> can-control;
-    in property <bool> can-stop;
+    in property <bool> remote-controls;
+    in property <bool> can-seek;
+    in property <bool> player-retry;
+    in property <bool> player-retry-allowed;
+    in property <string> output-name;
+    in property <float> elapsed;
+    in property <float> duration;
+    in property <string> time-label;
     callback sign-in();
     callback sign-out();
     callback server-edited();
     callback search-edited();
     callback play-track(int);
     callback toggle-play();
-    callback stop();
+    callback previous();
+    callback next();
+    callback seek(float);
+    callback retry-player();
     callback retry();
 
     VerticalLayout {
@@ -127,20 +137,37 @@ export component AppWindow inherits Window {
             Text { text: "Up to 20 tracks · Refine your search for more specific results"; color: Theme.muted; font-size: 11px; }
         }
         if root.signed-in: Rectangle {
-            height: 106px; min-width: 0px; background: #111716;
+            height: 132px; min-width: 0px; background: #111716;
             Rectangle { y: 0px; height: 1px; background: Theme.line; }
             // Bounded regions keep transport centered without feeding window width into layout minima.
             Cover { x: 24px; y: 24px; width: 58px; height: 58px; border-radius: Theme.radius; }
-            Text { x: 98px; y: 34px; width: parent.width / 2 - 159px; height: 20px; text: root.now-title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
-            Text { x: 98px; y: 59px; width: parent.width / 2 - 159px; height: 16px; text: root.now-detail; color: Theme.muted; font-size: 11px; overflow: elide; }
-            Action { x: parent.width / 2 - 45px; y: 33px; text: root.playing ? "Ⅱ" : "▶"; round: true; light: true; width: 40px; height: 40px; accessible-label: root.playing ? "Pause" : "Resume"; enabled: root.can-control; clicked => { root.toggle-play(); } }
-            Action { x: parent.width / 2 + 11px; y: 36px; text: "■"; round: true; width: 34px; accessible-label: "Stop"; enabled: root.can-stop; clicked => { root.stop(); } }
-            Text { x: parent.width / 2 + 65px; y: 34px; width: parent.width / 2 - 89px; height: 16px; text: "THIS DESKTOP"; color: Theme.muted; font-size: 10px; horizontal-alignment: right; }
-            Text { x: parent.width / 2 + 65px; y: 56px; width: parent.width / 2 - 89px; height: 40px; text: root.player-status; color: Theme.muted; font-size: 11px; wrap: word-wrap; horizontal-alignment: right; accessible-label: root.player-status; }
+            Text { x: 98px; y: 34px; width: parent.width / 3 - 110px; height: 20px; text: root.now-title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; accessible-label: root.now-title; }
+            Text { x: 98px; y: 59px; width: parent.width / 3 - 110px; height: 16px; text: root.now-detail; color: Theme.muted; font-size: 11px; overflow: elide; }
+            Action { x: parent.width / 2 - 82px; y: 20px; text: "|◀"; round: true; width: 40px; height: 36px; accessible-label: "Previous"; enabled: root.remote-controls; clicked => { root.previous(); } }
+            Action { x: parent.width / 2 - 20px; y: 18px; text: root.playing ? "Ⅱ" : "▶"; round: true; light: true; width: 40px; height: 40px; accessible-label: root.playing ? "Pause" : "Resume"; enabled: root.can-control; clicked => { root.toggle-play(); } }
+            Action { x: parent.width / 2 + 42px; y: 20px; text: "▶|"; round: true; width: 40px; height: 36px; accessible-label: "Next"; enabled: root.remote-controls; clicked => { root.next(); } }
+            seek := Slider { x: parent.width / 3 + 12px; y: 64px; width: parent.width / 3 - 24px; height: 26px; minimum: 0; maximum: max(1,root.duration); value: root.elapsed; enabled: root.can-seek; accessible-label: "Seek on selected output"; changed(value) => { root.seek(value); } }
+            // Paint-only skin: the standard Slider still owns all input, focus,
+            // value and accessibility. These non-interactive rectangles only
+            // replace its stock blue paint; no hidden/duplicate input control.
+            Rectangle {
+                x: seek.x; y: seek.y; width: seek.width; height: seek.height;
+                background: #111716; accessible-role: none;
+                property <length> thumb-x: (self.width - 20px) * clamp(seek.value / seek.maximum, 0, 1);
+                Rectangle { x: 10px; y: 11px; width: parent.width - 20px; height: 4px; border-radius: 2px; background: Theme.line; accessible-role: none; }
+                Rectangle { x: 10px; y: 11px; width: parent.thumb-x; height: 4px; border-radius: 2px; background: root.can-seek ? Theme.green : Theme.muted.with-alpha(0.35); accessible-role: none; }
+                Rectangle { x: parent.thumb-x; y: 3px; width: 20px; height: 20px; border-radius: 10px; background: Theme.raised; border-width: seek.has-focus && root.can-seek ? 2px : 1px; border-color: seek.has-focus && root.can-seek ? Theme.focus : Theme.line; accessible-role: none;
+                    Rectangle { x: 4px; y: 4px; width: 12px; height: 12px; border-radius: 6px; background: root.can-seek ? Theme.green : Theme.muted.with-alpha(0.35); accessible-role: none; }
+                }
+            }
+            Text { x: parent.width / 3; y: 98px; width: parent.width / 3; height: 16px; text: root.time-label; color: Theme.muted; font-size: 11px; horizontal-alignment: center; accessible-label: root.time-label; }
+            Text { x: parent.width * 2 / 3 + 14px; y: 18px; width: parent.width / 3 - 38px; height: 18px; text: root.output-name; color: Theme.green; font-size: 11px; overflow: elide; horizontal-alignment: right; accessible-label: root.output-name; }
+            Text { x: parent.width * 2 / 3 + 14px; y: 42px; width: parent.width / 3 - 38px; height: 58px; text: root.player-status; color: Theme.muted; font-size: 11px; wrap: word-wrap; horizontal-alignment: right; accessible-label: root.player-status; }
+            if root.player-retry: Action { x: parent.width - 164px; y: 98px; height: 28px; width: 140px; text: "Retry connection"; enabled: root.player-retry-allowed; clicked => { root.retry-player(); } }
         }
         Rectangle {
             height: 28px;
-            Text { x: 24px; height: parent.height; text: "Local playback · No credentials saved"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
+            Text { x: 24px; height: parent.height; text: "Selected-output playback · No credentials saved"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
         }
     }
 }

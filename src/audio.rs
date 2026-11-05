@@ -180,7 +180,12 @@ impl Endpoint for Audio {
                 self.state["error"] = json!("");
                 self.outcome(Status::Ok)
             }
-            Some("close" | "clear") => {
+            Some("clear") => {
+                // Restricted receiver has no upcoming entries. Keep current/history,
+                // sink, elapsed and playing intent intact; this is not close/reset.
+                self.outcome(Status::Ok)
+            }
+            Some("close") => {
                 self.clear();
                 self.outcome(Status::Ok)
             }
@@ -263,6 +268,47 @@ mod tests {
             b.extend(1000i16.to_le_bytes());
         }
         b
+    }
+    #[test]
+    fn incoming_clear_preserves_current_but_close_resets() {
+        let (_, mut audio, mut player, _) = setup();
+        let now = Instant::now();
+        let mut state=player::single_track(&json!({"id":"track","name":"Current","artists":[{"name":"Manual"}],"albumName":"Album","albumId":"","duration":24}),1).unwrap();
+        state["playing"] = json!(false);
+        player.play(state, &mut audio, now).unwrap();
+        let before = audio.snapshot();
+        assert_eq!(
+            player
+                .local(json!({"type":"clear"}), &mut audio, now)
+                .unwrap(),
+            Status::Ok
+        );
+        assert_eq!(audio.snapshot(), before);
+        assert_eq!(
+            player
+                .local(json!({"type":"close"}), &mut audio, now)
+                .unwrap(),
+            Status::Ok
+        );
+        assert_eq!(audio.snapshot(), player::empty_snapshot());
+    }
+    #[test]
+    fn incoming_clear_ack_preserves_existing_blocked_and_media_errors() {
+        for error in ["blocked", "media"] {
+            let (_, mut audio, mut player, _) = setup();
+            let now = Instant::now();
+            let mut state=player::single_track(&json!({"id":"track","name":"Current","artists":[],"albumName":"Album","albumId":"","duration":24}),1).unwrap();
+            state["playing"] = json!(false);
+            player.play(state, &mut audio, now).unwrap();
+            audio.state["error"] = json!(error);
+            let before = audio.snapshot();
+            let poll = player.poll(&mut audio, now).unwrap();
+            player.consume(&poll,json!({"devices":[{"deviceId":"desktop"}],"activeDeviceId":"desktop","epoch":1,"leaseMs":8000,"state":before,"stateSeq":1,"transfer":null,"directives":[{"deliveryId":"clear","epoch":1,"type":"command","command":{"type":"clear"}}]}),&mut audio,now).unwrap();
+            assert_eq!(audio.snapshot(), before);
+            let ack = player.poll(&mut audio, now).unwrap();
+            assert_eq!(ack.body["acks"][0]["status"], "ok");
+            assert_eq!(ack.body["state"], before);
+        }
     }
     #[test]
     fn real_decode_and_sample_fences_for_epoch_lease_and_revocation() {
