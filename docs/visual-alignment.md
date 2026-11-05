@@ -1,6 +1,8 @@
 # Native visual alignment
 
-The native shell follows the current Spofify web vocabulary, not the full web feature set. Reference: read-only `spofify-go` commit `5b6be7a8f7d597575cec060613ee53617d4344df`, `internal/web/static/{app,library,player}.css`. The user's historical web screenshot informed composition only; its old logo/navigation are not restored.
+This records the shipped visual-alignment baseline, not a permanent restriction to its MVP feature set. Use [UI validation](ui-validation.md) for current affected-feature acceptance and [worktree/review](worktree-review.md) for assigned parity scope. Preserve this native vocabulary while adding authorized capabilities; do not copy the browser's separate topbar or now-playing popup.
+
+The baseline native shell follows the Spofify web vocabulary, not the full web feature set. Reference: read-only `spofify-go` commit `5b6be7a8f7d597575cec060613ee53617d4344df`, `internal/web/static/{app,library,player}.css`. The user's historical web screenshot informed composition only; its old logo/navigation are not restored.
 
 ## Mapping
 

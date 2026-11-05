@@ -1,5 +1,7 @@
 # MVP validation and limits
 
+This is historical evidence for the shipped MVP/visual-alignment sources named below, not a fresh-run recipe or a permanent feature exclusion. Current work uses [testing](testing.md), [native UI validation](ui-validation.md) and [worktree/review](worktree-review.md). Device playback, playlists, richer search and Home/unified-header/profile are now authorized as assigned parity work; this record does not claim them implemented or validated. Reuse unchanged evidence with exact-source attribution rather than replaying every past campaign for docs-only changes.
+
 ## Visual-alignment acceptance
 
 The presentation-only candidate `d5ff429` passed the focused real-Go native campaign in `.tmp/web-vibe/native-06-evidence/` at **1100×760 and 900×640**. Each size has real Wayland PNGs for sign-in, validation error, empty search, results, keyboard focus, playing, paused, stopped and search error. The fixture is the same owned Go source and synthetic music described below, not a mocked UI or the user's running instance.

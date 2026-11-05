@@ -1,6 +1,8 @@
 # Spofify Desktop — native search + local playback
 
-Rust + Slint, Linux first. Connect to an existing Spofify Go server, explicitly sign in, search for a track, and play it on this desktop. **Search-first replaces the initial album-browsing/read-only bootstrap brief.** No empty-query catalog fetch, album grid, catalog preload, web view, remembered credentials, playlists, offline cache or remote-output takeover.
+Rust + Slint, Linux first. The shipped baseline connects to an existing Spofify Go server, explicitly signs in, searches for a track, and plays it on this desktop. **Search-first replaced the initial album-browsing/read-only bootstrap brief.** It has no empty-query catalog fetch, album grid, catalog preload, web view, remembered credentials, playlists, offline cache or remote-output takeover.
+
+These are current implementation boundaries, not permanent search-only scope: the current parity request authorizes assigned device playback, playlists, search and Home/unified-header/profile work. It does not change desktop origin/TLS/privacy rules or claim those features are already implemented.
 
 ## Current status
 
@@ -10,17 +12,25 @@ Validation includes guarded used-room admission, retained paused-queue recovery,
 
 ## Visual alignment
 
-The native UI uses Spofify's current charcoal surfaces, JetBrains Mono, first-party waveform logo, pill search, flat track rows and compact local-player dock. Keyboard focus, disabled controls and error states share the web palette without adding the web's browsing/navigation features. See [visual mapping and asset provenance](docs/visual-alignment.md).
+The native UI uses Spofify's charcoal surfaces, JetBrains Mono, first-party waveform logo, pill search, flat track rows and compact local-player dock. Keyboard focus, disabled controls and error states share the web palette; the shipped baseline has not yet added browser navigation parity. See [visual mapping and asset provenance](docs/visual-alignment.md).
+
+## Development workflow
+
+Read [development rules](AGENTS.md), [role contract](AGENT_BEHAVIOUR.md), [worktree/review and local integration](docs/worktree-review.md), [storage hygiene](docs/storage-hygiene.md), [testing](docs/testing.md) and [native UI validation](docs/ui-validation.md). Each small feature has its own worktree, assigned lead and exact-source independent review. Workflow provenance pins mobile `5b2422f645bc461af3e8419cd6af3399b33fc940`; desktop product/security rules remain authoritative.
 
 ## Build and run
 
 Requires Rust >=1.92, a working Linux Wayland/X11 display, audio output, and native development libraries for fontconfig/ALSA (plus the normal C toolchain). Dependencies are pinned in `Cargo.lock`.
 
+For an already provisioned developer environment:
+
 ```sh
-cargo build --locked -j 2
-cargo run --locked -j 2
-cargo test --locked -j 2
+cargo build --offline --locked -j 2
+cargo run --offline --locked -j 2
+cargo test --offline --locked -j 2 -- --test-threads=2
 ```
+
+Agent runs must first follow the owned scratch/BUILD protocol in [testing](docs/testing.md); these commands alone are not a lifecycle supervisor. For native validation, release BUILD and launch the exact already-built binary under NATIVE rather than implicitly compiling with `cargo run`. Missing offline dependencies require explicit provisioning coordination, not global changes or silent downloads.
 
 On a Linuxbrew installation where pkg-config does not see already-installed libraries:
 
@@ -47,9 +57,12 @@ Enter an **origin**, e.g. `https://music.example.com` (no path, query, credentia
 Slint **1.18.1's published embedded MCP** is used, not an application-specific mock bridge:
 
 ```sh
-SLINT_EMIT_DEBUG_INFO=1 cargo build --locked -j 2 --features slint/mcp
-SLINT_MCP_PORT=18471 cargo run --locked -j 2 --features slint/mcp
+SLINT_EMIT_DEBUG_INFO=1 cargo build --offline --locked -j 2 --features slint/mcp
+# After releasing BUILD and acquiring NATIVE, run this exact debug artifact:
+SLINT_MCP_PORT=18471 ./target/debug/spofify-desktop
 ```
+
+If `CARGO_TARGET_DIR` is set, use the recorded binary under that target instead; preserve default and MCP artifacts separately before another build replaces the same output. These are fragments; [UI validation](docs/ui-validation.md) covers ownership, bounded supervision and cleanup.
 
 The upstream server binds **127.0.0.1** and exposes `/mcp`. No inspection feature is enabled in the default dependency features. Release builds refuse inspection environment opt-ins before creating a window. Never inspect a session containing real credentials: MCP can inspect/control the UI. Use only disposable accounts; do not retain login trees or screenshots while credentials are entered.
 
