@@ -1,6 +1,6 @@
 # MVP validation and limits
 
-This is historical evidence for the shipped MVP/visual-alignment sources named below, not a fresh-run recipe or a permanent feature exclusion. Current work uses [testing](testing.md), [native UI validation](ui-validation.md) and [worktree/review](worktree-review.md). Device playback, playlists, richer search and Home/unified-header/profile are now authorized as assigned parity work; this record does not claim them implemented or validated. Reuse unchanged evidence with exact-source attribution rather than replaying every past campaign for docs-only changes.
+This is historical evidence for the shipped MVP/visual-alignment sources named below, not a fresh-run recipe or a permanent feature exclusion. Current practices and task authority are in hmem; use [the bootstrap](../AGENTS.md). Device playback, playlists, richer search and Home/unified-header/profile are now authorized as assigned parity work; this record does not claim them implemented or validated. Reuse unchanged evidence with exact-source attribution rather than replaying every past campaign for docs-only changes.
 
 ## Visual-alignment acceptance
 

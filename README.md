@@ -16,7 +16,7 @@ The native UI uses Spofify's charcoal surfaces, JetBrains Mono, first-party wave
 
 ## Development workflow
 
-Read [development rules](AGENTS.md), [role contract](AGENT_BEHAVIOUR.md), [worktree/review and local integration](docs/worktree-review.md), [storage hygiene](docs/storage-hygiene.md), [testing](docs/testing.md) and [native UI validation](docs/ui-validation.md). Each small feature has its own worktree, assigned lead and exact-source independent review. Workflow provenance pins mobile `5b2422f645bc461af3e8419cd6af3399b33fc940`; desktop product/security rules remain authoritative.
+Use [the hmem bootstrap](AGENTS.md) for authoritative desktop practices, planning and task destinations. This README remains product/setup documentation; historical validation and visual/asset provenance remain source evidence, not current task status.
 
 ## Build and run
 
@@ -30,7 +30,7 @@ cargo run --offline --locked -j 2
 cargo test --offline --locked -j 2 -- --test-threads=2
 ```
 
-Agent runs must first follow the owned scratch/BUILD protocol in [testing](docs/testing.md); these commands alone are not a lifecycle supervisor. For native validation, release BUILD and launch the exact already-built binary under NATIVE rather than implicitly compiling with `cargo run`. Missing offline dependencies require explicit provisioning coordination, not global changes or silent downloads.
+Agent runs must first read the hmem resource-ownership and validation topics via [the bootstrap](AGENTS.md); these commands alone are not a lifecycle supervisor. For native validation, release BUILD and launch the exact already-built binary under NATIVE rather than implicitly compiling with `cargo run`. Missing offline dependencies require explicit provisioning coordination, not global changes or silent downloads.
 
 On a Linuxbrew installation where pkg-config does not see already-installed libraries:
 
@@ -65,7 +65,7 @@ SLINT_EMIT_DEBUG_INFO=1 cargo build --offline --locked -j 2 --features slint/mcp
 SLINT_MCP_PORT=18471 ./target/debug/spofify-desktop
 ```
 
-If `CARGO_TARGET_DIR` is set, use the recorded binary under that target instead; preserve default and MCP artifacts separately before another build replaces the same output. These are fragments; [UI validation](docs/ui-validation.md) covers ownership, bounded supervision and cleanup.
+If `CARGO_TARGET_DIR` is set, use the recorded binary under that target instead; preserve default and MCP artifacts separately before another build replaces the same output. These are fragments; hmem's validation and resource-ownership topics cover bounded supervision and cleanup (see [the bootstrap](AGENTS.md)).
 
 The upstream server binds **127.0.0.1** and exposes `/mcp`. No inspection feature is enabled in the default dependency features. Release builds refuse inspection environment opt-ins before creating a window. Never inspect a session containing real credentials: MCP can inspect/control the UI. Use only disposable accounts; do not retain login trees or screenshots while credentials are entered.
 

@@ -1,8 +1,10 @@
 # Native visual alignment
 
-This records the shipped visual-alignment baseline, not a permanent restriction to its MVP feature set. Use [UI validation](ui-validation.md) for current affected-feature acceptance and [worktree/review](worktree-review.md) for assigned parity scope. Preserve this native vocabulary while adding authorized capabilities; do not copy the browser's separate topbar or now-playing popup.
+## Historical source documentation
 
-The baseline native shell follows the Spofify web vocabulary, not the full web feature set. Reference: read-only `spofify-go` commit `5b6be7a8f7d597575cec060613ee53617d4344df`, `internal/web/static/{app,library,player}.css`. The user's historical web screenshot informed composition only; its old logo/navigation are not restored.
+This file retains the shipped visual baseline, technical mapping, asset provenance and acceptance context, not current scope or policy. Current UX contracts and native acceptance practices live in hmem; use [the bootstrap](../AGENTS.md). The historical descriptions below do not restrict assigned parity work or claim current-candidate validation.
+
+The baseline native shell follows the Spofify web vocabulary, not the full web feature set. Reference: spofify-server (local checkout `spofify-go`) commit `5b6be7a8f7d597575cec060613ee53617d4344df`, `internal/web/static/{app,library,player}.css`. The user's historical web screenshot informed composition only; its old logo/navigation are not restored.
 
 ## Mapping
 
@@ -25,5 +27,7 @@ The sign-in form is centered and width-bounded, with explicit field/status heigh
 `assets/spofify-logo.svg` is an unmodified byte-for-byte copy of `spofify-go/internal/web/static/spofify-logo.svg` at the pinned reference above. Its embedded provenance identifies the mobile vector (`spofify-mobile/app/src/main/res/drawable/ic_spofify.xml`, server spec `docs/specs/FEAT-021-mobile-logo-branding.md`). It is a first-party Spofify brand asset, not a third-party icon/font. Existing JetBrains Mono bytes and full SIL OFL license are unchanged; see README.
 
 ## Validation scope
+
+This is the historical visual-alignment receipt, not a fresh-run recipe.
 
 Native Wayland captures and focused real-Go synthetic interaction are retained under `.tmp/web-vibe/` outside Git. They cover 1100×760 and 900×640 sign-in/error, empty/results, playing/paused/stopped and search error/retry, keyboard focus and transport, and credential-free screenshots. Testing is separate from the user's existing MVP instance, which is never inspected or replaced. Backend/protocol recovery evidence in `docs/validation.md` remains applicable because those source files are unchanged. This is a Linux-native visual alignment, not a Windows/macOS support claim.

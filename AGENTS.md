@@ -1,19 +1,33 @@
-# Development rules
+# hmem bootstrap — spofify-desktop
 
-Read [AGENT_BEHAVIOUR.md](AGENT_BEHAVIOUR.md) for your role and [worktree/review](docs/worktree-review.md), [storage hygiene](docs/storage-hygiene.md), [testing](docs/testing.md) and [native UI validation](docs/ui-validation.md) for the relevant work. These desktop adaptations pin their mobile workflow source in [provenance](docs/worktree-review.md#provenance); mobile product/security/platform rules are not imported.
+Canonical repository and local checkout: `spofify-desktop`. The backend is **spofify-server**; `spofify-go` is its local checkout alias, not another project.
 
-- Deliver small independent features, not a waterfall mega-branch. The orchestrator delegates analysis/specs, then assigned leads implement, test, obtain independent review and integrate their own complete units. Land genuine prerequisites first; shared files need coordination, not a central integration agent.
-- Develop each feature/fix in its own branch and dedicated worktree. The assigned lead creates/manages it from the agreed clean base; do not develop product code directly on main. Use normal Git internal locks only: no custom MAIN/Git guard, flock or reservation.
-- Keep a short durable brief with scope, acceptance and exclusions. One independent reviewer checks the frozen candidate and relevant tests; the same reviewer verifies substantive fixes. Reuse unchanged evidence, not repeated full reviews.
-- UI acceptance requires actual rendered Slint screenshots and real interaction/inspection, not a no-pixel testing backend or source-only assertions. Clearly distinguish headless component tests from actual-window evidence.
-- The server and mobile repositories are read-only context. Never mutate or launch a working server, use real accounts, or change server security/configuration. Use owned synthetic fixtures.
-- Enforce exact-origin networking, normal TLS verification, bounded requests/results and redirect refusal. Preserve desktop HTTP restrictions: explicit trusted-LAN confirmation and concrete admitted private/loopback literals; no public HTTP or HTTP hostnames. Credentials/sessions remain in memory and must not appear in logs, URLs, screenshots or saved settings. No remembered credentials.
-- Enable MCP/system-testing only in explicit development/test builds, bind inspection locally, and never expose it on a LAN or silently include it in a release build.
-- Before heavy builds check actual scratch bytes/inodes and estimated peak. Quota headroom may remain unknown despite free bytes. Use recorded unique owned scratch roots; finite /dev/shm is acceptable when checked. Bound build jobs/output/runtime and await app/fixture shutdown in finally paths. Preserve first failures and separate cleanup errors. Verify exact owned absence; never sweep caches, /tmp, evidence or unrelated worktrees.
-- Rust/Slint builds are serialized, offline/locked, max two Rust jobs; use finite 6 GiB owned scratch only when capacity/estimated peak allow. Keep ephemeral /dev/shm restore/build/test/cache-save/cleanup in one invocation. BUILD and NATIVE have distinct ownership-directory plus advisory-flock safeguards; release BUILD before NATIVE, reuse exact artifacts and await children. See the resource protocol, including cross-mount lock limits, in docs/worktree-review.md.
-- Retain crossproject heavy-work coordination at /var/home/lsm/repos/spofify-go/.tmp/feature-orchestration/measurements.lock; it alone does not exclude host/nonparticipating writers. Do not run Android, server and desktop heavy builds concurrently. No global tool/harness changes.
-- Use hmem for project/task lifecycle in the existing **Desktop application** workspace (`41c2649a-9891-4b95-b600-ff69cfd13228`) and **Spofify Desktop** project (`210adbe4-9608-4778-b0bf-def61b769fea`); reuse existing PAR tasks rather than creating a duplicate tree. Active specs and tasks live in hmem; technical claims require code, review and native evidence. Do not upload transcripts or secrets. Spec migration/Markdown cleanup and general knowledge/practice migration are separately owned; do not perform those migrations as part of an unrelated feature.
-- No remote publication, deployment, force pushes, history rewriting or policy workarounds. Normal package dependency access is separate from the existing blocked server-repository remote operation; stop on an explicit denial.
-- Current parity work may include device playback, playlists, search, Home and unified header/profile as assigned; historical MVP exclusions describe implemented coverage, not permanent scope bans. Preserve the native visual vocabulary and keyboard/accessibility behavior; do not copy a separate browser topbar or now-playing popup.
-- After approval, coordinate root writes, guard source/base/tree/clean state, squash this assigned unit locally with normal Git locking, verify actual main, preserve concise source/history/evidence, then normally remove only the completed owned worktree/ref without force. Stop on unexpected changes/writers; no overwrite or cleanup of user files. Do not delete useful screenshots or touch the user's existing binaries/windows.
-- Reuse unchanged exact-source evidence and proportionate same-peer review. Docs-only updates need docs/link/diff checks, not Cargo builds or native launches. Never call mock/source-only evidence native acceptance or native output progress independently measured audibility.
+## Start in hmem
+
+1. Initialize identity with `set_workspace` using `workspace_id: null`, your assigned role and `model-id` formatted `harness:model:reasoning` (use the actual harness, model and reasoning setting).
+2. List workspaces, then select **Desktop application** (canonical repository `spofify-desktop`), workspace `41c2649a-9891-4b95-b600-ff69cfd13228`; group its Git worktrees with this repository.
+3. Read project details for **Spofify Desktop** (`210adbe4-9608-4778-b0bf-def61b769fea`), the practices root below and the topics relevant to the assignment. Browse existing projects/tasks before creating records; use full IDs and explicit workspace boundaries.
+
+## Desktop destinations
+
+**Desktop working practices** — `b626449f-38c8-4586-b4d3-44352156068b`:
+
+| Focused topic | Project ID |
+| --- | --- |
+| Build/native resource ownership and storage | `e147a114-57c7-4b19-a8bb-5ba7d9c8d5c1` |
+| Roles, review, integration and evidence | `3a71f849-7e73-4122-9424-c59e6d80d663` |
+| Product, security, playback and UX contracts | `aa15abef-6688-44cc-b289-8fccda731835` |
+| Validation commands and native acceptance | `d3fa042f-a9ba-4ab6-994e-613384717591` |
+
+## Shared destinations
+
+- **General practice**, workspace `8c030c78-4418-4a51-9981-2b00b5da39ec`: **Spofify engineering practices** (`3fc89965-22a1-406f-9523-ee53c50a1439`) and **hmem knowledge and coordination model** (`575dbbbd-c662-402a-81a7-305171f94b72`).
+- **Planning**, workspace `3f54babf-484d-492f-bf3b-ce136daa9b1c`: cross-repository information capture (`9379df08-a5ee-4b44-a687-d62053c5365e`) and architecture/product coordination (`84c6c8ef-b178-425b-977e-e49a795deaa2`). Browse project/task entity types in these nonrepository workspaces.
+
+## Authority and access
+
+hmem owns practices, planning, specifications, tasks, status, reviews and handoffs; it is not a mirror of local Markdown. Repository-manager agents own feature/bug/task migration and lifecycle. Task/spec migration and knowledge/practice migration are separately owned; neither belongs in an unrelated feature. Reuse existing PAR tasks; do not upload transcripts or secrets.
+
+Do not maintain local shadow boards, plans, status checklists or handoffs. Legacy task-spec links and compatibility pointers are provenance, not instructions to resume local planning maintenance.
+
+If hmem is inaccessible, report the access blocker; do not resurrect old local guidance as a fallback. This bootstrap grants no additional execution or integration authority. Normal README, technical/API/protocol/fixture documentation, historical evidence, assets and licenses remain source documents; source and measured evidence still ground technical claims.
