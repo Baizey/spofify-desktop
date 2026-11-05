@@ -1,6 +1,6 @@
 # Desktop listening parity — delivery guide
 
-**Delivery specifications.** PAR-002 selected-output control is implemented; see [its behavior and validation](../selected-output.md). The other units remain specified/unassigned, ready for scoped lead assignment subject to their landed prerequisites. The original specification-only delivery established no feature/native acceptance. Each future lead owns its own spec, branch/worktree, tests, one independent review, local integration and cleanup under [roles](../../AGENT_BEHAVIOUR.md) and [workflow](../worktree-review.md). No final campaign/megamerge holds finished units hostage.
+**Delivery specifications.** PAR-002 selected-output control is implemented; see [its behavior and validation](../selected-output.md). The other units remain specified/unassigned, ready for scoped lead assignment subject to their landed prerequisites. The original specification-only delivery established no feature/native acceptance. Each future lead owns its own spec, branch/worktree, tests, one independent review, local integration and cleanup under hmem's **Roles, review, integration and evidence** topic via [the hmem bootstrap](../../AGENTS.md). No final campaign/megamerge holds finished units hostage.
 
 ## TL;DR / start here
 
@@ -52,7 +52,7 @@ D currently provides in-memory sign-in, 350 ms debounced first-20-track query se
 
 ## Common implementation acceptance and completion receipt
 
-Each brief's tests below are mandatory focused cases in addition to applicable [testing](../testing.md), [native UI](../ui-validation.md), [storage](../storage-hygiene.md) and [review/integration](../worktree-review.md) procedures. Write meaningful regression/contract tests, reuse unchanged evidence, and exercise production paths rather than test-only success adapters. All personal listening routes work for listener/admin, remain per-account, and never gain admin permissions by role display.
+Each brief's tests below are mandatory focused cases in addition to the applicable hmem procedures: **Validation commands and native acceptance** for testing/native UI, **Product, security, playback and UX contracts** for UX, **Build/native resource ownership and storage** for storage/resource lifecycles, and **Roles, review, integration and evidence** for review/integration. Use [the hmem bootstrap](../../AGENTS.md) to find these topics through **Desktop working practices**. Write meaningful regression/contract tests, reuse unchanged evidence, and exercise production paths rather than test-only success adapters. All personal listening routes work for listener/admin, remain per-account, and never gain admin permissions by role display.
 
 Requests/results/metadata/media remain bounded, cancellable and session/origin/route-generation fenced. Mutation POST/PATCH/PUT/DELETE (including read-like POST) uses exact Origin + CSRF; opaque IDs are encoded once. No automatic mutation replay on timeout/conflict; distinguish initial loading, known-empty, retained refresh, forbidden/unavailable, not-found, auth loss and uncertain completion. Error text is bounded/safe, never raw server diagnostics or private paths. Known identity changes clear old account data; transient network failure alone is not revocation.
 
