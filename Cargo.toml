@@ -1,0 +1,32 @@
+[package]
+name = "spofify-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[dependencies]
+slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-18"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+cookie = "0.18"
+rodio = "=0.21.1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = true
+lto = "thin"
