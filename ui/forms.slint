@@ -1,50 +1,47 @@
 import { ScrollView, TextEdit } from "std-widgets.slint";
-import { Action, Caption, Consent, Cover, Eyebrow, Field, Notice, Theme } from "theme.slint";
+import { Action, Caption, Cover, Eyebrow, Field, Notice, Theme } from "theme.slint";
 
 export component SignInView inherits Rectangle {
     in-out property <string> origin;
     in-out property <string> username;
     in-out property <string> password;
-    in-out property <bool> consent;
     in property <string> status;
     in property <bool> error;
     in property <bool> busy;
+    property <bool> reveal-password;
+    property <bool> ready: !root.busy && root.origin != "" && root.username != "" && root.password != "";
     callback edited();
     callback sign-in();
     callback cancel();
     background: Theme.bg;
     ScrollView {
         content-width: self.visible-width;
-        content-height: max(self.visible-height, 694px);
+        content-height: max(self.visible-height, 490px);
         Rectangle {
             width: parent.width; height: parent.height;
             background: Theme.bg;
             Rectangle {
                 x: (parent.width - self.width) / 2; y: max(20px, (parent.height - self.height) / 2);
-                width: min(518px, parent.width - 34px); height: 650px;
-                border-radius: 19px; border-width: 1px; border-color: Theme.line; background: Theme.panel;
+                width: min(392px, parent.width - 40px); height: 455px;
+                background: Theme.bg;
                 VerticalLayout {
-                    padding: 25px; spacing: 7px; alignment: start;
+                    padding: 8px; spacing: 9px; alignment: start;
                     HorizontalLayout {
                         height: 35px; spacing: 10px;
                         Image { width: 31px; height: 31px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
-                        Eyebrow { text: "SPOFIFY / DESKTOP"; }
+                        Text { text: "Spofify"; color: Theme.text; font-size: 19px; font-weight: 700; vertical-alignment: center; }
                     }
-                    Text { text: "Connect to your music"; color: Theme.text; font-size: 26px; font-weight: 700; wrap: word-wrap; }
-                    Caption { text: "Sign in to the server that hosts your library."; wrap: word-wrap; }
+                    Text { text: "Sign in"; color: Theme.text; font-size: 26px; font-weight: 700; wrap: word-wrap; }
                     Rectangle { height: 11px; }
-                    Caption { text: "Server origin"; color: Theme.text; }
-                    Field { text <=> root.origin; field-label: "Server origin"; placeholder-text: "https://music.example.com"; enabled: !root.busy; edited => { root.edited(); } }
-                    Caption { text: "Use HTTPS and enter the origin without a path."; wrap: word-wrap; }
+                    Caption { text: "Server address"; color: Theme.text; }
+                    Field { text <=> root.origin; field-label: "Server address"; placeholder-text: "https://music.example.com"; enabled: !root.busy; edited => { root.edited(); } }
                     Caption { text: "Username"; color: Theme.text; }
                     Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; }
-                    Caption { text: "Password"; color: Theme.text; }
-                    Field { text <=> root.password; field-label: "Password"; input-type: InputType.password; enabled: !root.busy; accepted => { if !root.busy { root.sign-in(); } } }
-                    Consent { text: "Allow trusted-LAN HTTP"; checked <=> root.consent; enabled: !root.busy; }
-                    Caption { text: "HTTP sends credentials unencrypted. Only enable it for a private, loopback or Tailscale IP on a network you trust."; color: Theme.amber; wrap: word-wrap; }
+                    HorizontalLayout { height: 28px; Caption { text: "Password"; color: Theme.text; } Rectangle { horizontal-stretch: 1; } Action { text: root.reveal-password ? "Hide" : "Show"; accessible-label: root.reveal-password ? "Hide password" : "Show password"; quiet: true; height: 28px; clicked => { root.reveal-password = !root.reveal-password; } } }
+                    Field { text <=> root.password; field-label: "Password"; input-type: root.reveal-password ? InputType.text : InputType.password; enabled: !root.busy; accepted => { if root.ready { root.reveal-password = false; root.sign-in(); } } }
                     HorizontalLayout {
                         spacing: 8px;
-                        Action { text: root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: !root.busy; clicked => { root.sign-in(); } }
+                        Action { text: root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: root.ready; clicked => { root.reveal-password = false; root.sign-in(); } }
                         if root.busy: Action { text: "Cancel"; accessible-label: "Cancel sign in"; clicked => { root.cancel(); } }
                     }
                     if root.status != "": Notice { text: root.status; error: root.error; }

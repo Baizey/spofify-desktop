@@ -112,8 +112,9 @@ impl Desk {
     }
 }
 enum Update {
-    Read(Result<Page, ApiError>),
+    Read(Result<Page, ApiError>, bool), // true when the task will retry
     ReadGap,
+    SearchDownloads(Result<Page, ApiError>),
     Changed(Result<Option<Route>, ApiError>, bool),
     Local(Result<Command, ApiError>),
     CollectionSaved(Result<crate::collections::SaveSummary, ApiError>),
@@ -147,10 +148,8 @@ struct Browser {
 }
 fn label(route: &Route) -> &'static str {
     match route {
-        Route::Home => "Home",
-        Route::History => "Recently played",
+        Route::History => "History",
         Route::Search(_) => "Search",
-        Route::Liked => "Liked music",
         Route::Playlists => "Playlists",
         Route::Picker(_) => "Add to a playlist",
         Route::Offline => "Saved on this device",
@@ -169,10 +168,8 @@ fn label(route: &Route) -> &'static str {
 }
 fn named_route(name: &str) -> Option<Route> {
     Some(match name {
-        "home" => Route::Home,
         "history" => Route::History,
         "search" => Route::Search(String::new()),
-        "liked" => Route::Liked,
         "playlists" => Route::Playlists,
         "offline" => Route::Offline,
         "appearance" | "settings" => Route::Appearance,
@@ -183,6 +180,24 @@ fn named_route(name: &str) -> Option<Route> {
         "artists" => Route::Artists,
         _ => return None,
     })
+}
+fn context_route(kind: &str, id: String) -> Option<Route> {
+    if id.is_empty() {
+        return None;
+    }
+    // A remote player may still have a likes context, but it has no desktop page.
+    match kind {
+        "album" => Some(Route::Album(id)),
+        "artist" => Some(Route::Artist(id)),
+        "playlist" | "derived" => Some(Route::Playlist(id)),
+        _ => None,
+    }
+}
+fn repeat_navigation(current: &Route, next: &Route, reading: bool, failed: bool) -> bool {
+    current == next && (reading || (matches!(next, Route::Search(_)) && !failed))
+}
+fn saved_route(route: &Route) -> bool {
+    matches!(route, Route::Offline | Route::SavedCollection(_))
 }
 fn strings(v: Vec<&str>) -> ModelRc<slint::SharedString> {
     ModelRc::new(VecModel::from(
@@ -215,14 +230,7 @@ fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'stati
         v.push("queue");
     }
     if r.item.is_some() {
-        v.extend([
-            if r.liked == Some(true) {
-                "unlike"
-            } else {
-                "like"
-            },
-            "add",
-        ]);
+        v.push("add");
         if r.playable {
             v.push("save");
         }
@@ -330,6 +338,8 @@ impl Browser {
             .map(|a| (a.session.username.clone(), a.offline))
             .unwrap_or_default();
 
+        let local_playback =
+            saved_route(&self.route) || offline && matches!(self.route, Route::Search(_));
         let write = self.writing;
         let art = self.art.clone();
         let request = self.access.as_ref().map(|a| crate::artwork::Request {
@@ -356,15 +366,13 @@ impl Browser {
                         .iter()
                         .enumerate()
                         .map(|(i, r)| BrowseRow {
-                            section: p.section(i).into(),
+                            section: Default::default(),
                             actions: strings(row_actions(&p, r, i, offline)),
                             kind: r.kind.as_str().into(),
                             title: r.title.as_str().into(),
                             subtitle: r.subtitle.as_str().into(),
                             detail: r.detail.as_str().into(),
-                            playable: r.playable
-                                && offline
-                                    == matches!(kind.as_str(), "offline" | "saved-collection"),
+                            playable: r.playable && offline == local_playback,
                         })
                         .collect::<Vec<_>>(),
                 )));
@@ -379,14 +387,14 @@ impl Browser {
                     actions.push("play");
                 }
                 if !offline {
-                    if matches!(
-                        kind.as_str(),
-                        "album" | "artist" | "playlist-manual" | "playlist-rules" | "liked"
-                    ) {
-                        actions.push("save");
-                    }
                     if p.playback.is_some() {
                         actions.extend(["play", "queue"]);
+                    }
+                    if matches!(
+                        kind.as_str(),
+                        "album" | "artist" | "playlist-manual" | "playlist-rules"
+                    ) {
+                        actions.push("save");
                     }
                     if kind == "playlists" {
                         actions.extend(["new-manual", "new-rules"]);
@@ -404,7 +412,11 @@ impl Browser {
                         }
                     }
                 }
-                ui.set_page_actions(strings(actions));
+                let (options, primary) = actions
+                    .into_iter()
+                    .partition(|a| matches!(*a, "rename" | "rules" | "delete"));
+                ui.set_page_actions(strings(primary));
+                ui.set_page_options(strings(options));
 
                 shown.store(token, Ordering::SeqCst);
                 ui.set_page_artwork(Default::default());
@@ -419,14 +431,17 @@ impl Browser {
         self.edit_basis = None;
         self.cache = Replica::default();
         self.trail = Trail::default();
-        self.route = Route::Home;
+        self.route = Route::History;
         self.page = Arc::default();
         self.message.clear();
         self.error = false;
         self.access = access;
-        self.scoped_ui(|ui| clear_form(&ui));
+        self.scoped_ui(|ui| {
+            ui.set_query("".into());
+            clear_form(&ui);
+        });
         if self.access.is_some() {
-            self.visit(Route::Home, false, false);
+            self.visit(Route::History, false, false);
         } else {
             self.render(true);
         }
@@ -454,13 +469,17 @@ impl Browser {
         if old.offline != offline {
             self.cancel();
             self.scoped_ui(|ui| clear_form(&ui));
+            // Downloads remain the offline landing page, but don't abandon
+            // a downloaded collection or a query that can continue locally.
+            let jump_to_downloads =
+                offline && !saved_route(&self.route) && !matches!(self.route, Route::Search(_));
             self.visit(
-                if offline {
+                if jump_to_downloads {
                     Route::Offline
                 } else {
                     self.route.clone()
                 },
-                offline,
+                jump_to_downloads,
                 false,
             );
         }
@@ -469,18 +488,23 @@ impl Browser {
         self.recent_due = None;
         if self.access.as_ref().is_some_and(|a| !a.offline)
             && !self.writing
-            && !self.busy
-            && matches!(self.route, Route::Home | Route::History)
+            && self.task.is_none()
+            && matches!(self.route, Route::History)
         {
             self.cache.recent_changed();
             self.visit(self.route.clone(), false, false);
         }
     }
     fn visit(&mut self, next: Route, remember: bool, more: bool) {
-        if self.writing {
+        if self.writing
+            || remember && repeat_navigation(&self.route, &next, self.task.is_some(), self.error)
+        {
             return;
         }
         let changed = next != self.route;
+        if changed && matches!(self.route, Route::Search(_)) && !matches!(next, Route::Search(_)) {
+            self.scoped_ui(|ui| ui.set_query("".into()));
+        }
         if remember {
             self.trail.visit(&self.route, &next);
         }
@@ -491,24 +515,51 @@ impl Browser {
             self.edit_basis = None;
             self.scoped_ui(|ui| clear_form(&ui));
         }
-        let cached = self.cache.get(&next);
+        let offline_search =
+            self.access.as_ref().is_some_and(|a| a.offline) && matches!(next, Route::Search(_));
+        let cached = if offline_search {
+            None
+        } else {
+            self.cache.get(&next)
+        };
         let have = cached.is_some();
         let fresh = cached.as_ref().is_some_and(|(_, f)| *f);
-        self.page = cached.map_or_else(Arc::default, |(p, _)| p);
+        let prior_page =
+            std::mem::replace(&mut self.page, cached.map_or_else(Arc::default, |(p, _)| p));
         self.route = next.clone();
         let Some(a) = self.access.clone().filter(Access::usable) else {
             self.render(true);
             return;
         };
+        if offline_search && let Route::Search(q) = &next {
+            if q.is_empty() {
+                self.page = Arc::new(pages::search_downloads(&Page::default(), q));
+            } else if let Some((downloads, true)) = self.cache.get(&Route::Offline) {
+                self.page = Arc::new(pages::search_downloads(&downloads, q));
+            } else {
+                self.page = Arc::new(pages::search_downloads(&Page::default(), q));
+                let tx = self.results.clone();
+                let serial = self.serial;
+                self.busy = true;
+                self.task = Some(tokio::spawn(async move {
+                    // Coalesce typing before opening the bounded local indexes.
+                    tokio::time::sleep(SEARCH_DELAY).await;
+                    let result = Update::SearchDownloads(downloads_page(&a).await);
+                    let _ = tx.send(Delivery { serial, result }).await;
+                }));
+            }
+            self.render(true);
+            return;
+        }
         if matches!(
             next,
             Route::Now | Route::Queue | Route::Devices | Route::Appearance
-        ) || matches!(&next,Route::Search(q) if q.trim().is_empty())
+        ) || matches!(&next, Route::Search(q) if q.is_empty())
         {
             self.render(true);
             return;
         }
-        if a.offline && !matches!(next, Route::Offline | Route::SavedCollection(_)) {
+        if a.offline && !saved_route(&next) {
             self.message = if have {
                 "Showing the items from your last visit."
             } else {
@@ -530,10 +581,10 @@ impl Browser {
         let serial = self.serial;
         self.busy = true;
         self.silent_read = have && !more;
-        self.render(changed || !have);
+        self.render(changed || !have || !Arc::ptr_eq(&prior_page, &self.page));
         self.task = Some(tokio::spawn(async move {
             if matches!(next, Route::Search(_)) && !more {
-                tokio::time::sleep(Duration::from_millis(240)).await;
+                tokio::time::sleep(SEARCH_DELAY).await;
             }
             let mut rebuilding = false;
             for attempt in 0..=4 {
@@ -541,16 +592,7 @@ impl Browser {
                     return;
                 }
                 let mut result = match &next {
-                    Route::Offline => {
-                        async {
-                            let mut p = saved::page(&a).await?;
-                            let mut groups = crate::collections::list(&a).await?;
-                            groups.append(&mut p.rows);
-                            p.rows = groups;
-                            Ok(p)
-                        }
-                        .await
-                    }
+                    Route::Offline => downloads_page(&a).await,
                     Route::SavedCollection(id) => crate::collections::detail(&a, id).await,
                     _ if rebuilding => rebuild_for(&a, &next, depth).await,
                     _ => pages::load(&a, &next, prior.as_deref()).await,
@@ -564,12 +606,10 @@ impl Browser {
                 }
                 let retry = attempt < 4
                     && (result.as_ref().err().is_some_and(recoverable)
-                        || result
-                            .as_ref()
-                            .is_ok_and(|p| p.partial || p.pending_rules()));
+                        || result.as_ref().is_ok_and(Page::pending_rules));
                 if retry {
                     let result = match result {
-                        Ok(p) => Update::Read(Ok(p)),
+                        Ok(p) => Update::Read(Ok(p), true),
                         Err(_) => Update::ReadGap,
                     };
                     if tx.send(Delivery { serial, result }).await.is_err() {
@@ -580,7 +620,7 @@ impl Browser {
                     let _ = tx
                         .send(Delivery {
                             serial,
-                            result: Update::Read(result),
+                            result: Update::Read(result, false),
                         })
                         .await;
                     return;
@@ -610,7 +650,7 @@ impl Browser {
         if self.writing {
             return;
         }
-        let (op, idx, val) = match i.intent {
+        let (mut op, idx, val) = match i.intent {
             Intent::Navigate(s) => {
                 if s == "back" {
                     if let Some(r) = self.trail.pop() {
@@ -621,16 +661,13 @@ impl Browser {
                         self.visit(r, false, false);
                     }
                 } else if let Some(r) = named_route(&s) {
-                    if r == Route::Search(String::new()) {
-                        self.scoped_ui(|ui| ui.set_query("".into()));
-                    }
                     self.visit(r, true, false);
                 }
                 return;
             }
             Intent::Search(q) => {
                 if q.len() <= 1000 {
-                    self.visit(Route::Search(q), true, false);
+                    self.visit(Route::Search(q.trim().into()), true, false);
                 }
                 return;
             }
@@ -646,7 +683,7 @@ impl Browser {
         let route = self.route.clone();
         let page = self.page.clone();
         if op == "more" {
-            if page.more && !self.busy && !a.offline {
+            if page.more && self.task.is_none() && !a.offline {
                 self.visit(route, false, true);
             }
             return;
@@ -696,17 +733,9 @@ impl Browser {
             return;
         }
         if let Some(kind) = op.strip_prefix("context-") {
-            if val.is_empty() {
-                return;
+            if let Some(target) = context_route(kind, val) {
+                self.visit(target, true, false);
             }
-            let target = match kind {
-                "likes" => Route::Liked,
-                "album" => Route::Album(val),
-                "artist" => Route::Artist(val),
-                "playlist" | "derived" => Route::Playlist(val),
-                _ => return,
-            };
-            self.visit(target, true, false);
             return;
         }
         if matches!(op.as_str(), "album" | "artist" | "track") {
@@ -732,15 +761,26 @@ impl Browser {
             }
             return;
         }
+        let saved_page = saved_route(&route);
+        let local_results = a.offline && (saved_page || matches!(route, Route::Search(_)));
         if op == "open" && !matches!(route, Route::Picker(_)) {
             if let Some(r) = row.as_ref().and_then(|r| r.route.clone()) {
                 self.visit(r, true, false);
-            } else if let Some(r) = &row
-                && !r.id.is_empty()
-            {
-                self.visit(Route::Track(r.id.clone()), true, false);
+                return;
             }
-            return;
+            if local_results {
+                if !row.as_ref().is_some_and(|r| r.playable) {
+                    return;
+                }
+                op = "play".into(); // Saved tracks have no separate offline detail.
+            } else {
+                if let Some(r) = &row
+                    && !r.id.is_empty()
+                {
+                    self.visit(Route::Track(r.id.clone()), true, false);
+                }
+                return;
+            }
         }
         if op == "add" && !matches!(route, Route::Picker(_)) {
             if let Some(r) = row
@@ -750,8 +790,7 @@ impl Browser {
             }
             return;
         }
-        let saved_page = matches!(route, Route::Offline | Route::SavedCollection(_));
-        let local_play = saved_page && a.offline && op == "play";
+        let local_play = local_results && op == "play";
         if saved_page && !a.offline && op == "play" {
             self.message = "Choose Work offline to play the saved queue on this computer.".into();
             self.render(false);
@@ -860,28 +899,42 @@ impl Browser {
         }));
     }
     fn result(&mut self, d: Delivery) {
-        if d.serial != self.serial {
+        if d.serial != self.serial
+            || !self
+                .access
+                .as_ref()
+                .is_some_and(|a| a.epoch == self.epoch.load(Ordering::SeqCst))
+        {
             return;
+        }
+        if !matches!(&d.result, Update::Read(_, true) | Update::ReadGap) {
+            self.task = None;
         }
         self.busy = false;
         self.writing = false;
         self.error = false;
         self.message.clear();
         match d.result {
-            Update::Read(Ok(mut page)) => {
-                let partial = page.partial;
-                if partial {
-                    page.retain_home_shelves(&self.page);
-                }
+            Update::Read(Ok(page), _) => {
                 let changed = *self.page != page;
                 self.page = Arc::new(page);
                 self.cache.put(self.route.clone(), self.page.clone());
-                if partial {
-                    self.cache.recent_changed();
-                    self.message = "Some items aren't available right now.".into();
-                }
                 self.render(changed);
             }
+            Update::SearchDownloads(result) => match result {
+                Ok(downloads) => {
+                    if let Route::Search(query) = &self.route {
+                        self.page = Arc::new(pages::search_downloads(&downloads, query));
+                        self.cache.put(Route::Offline, Arc::new(downloads));
+                        self.render(true);
+                    }
+                }
+                Err(e) => {
+                    self.error = true;
+                    self.message = readable(&e);
+                    self.render(false);
+                }
+            },
             Update::ReadGap => {
                 self.message = if self.page.rows.is_empty() {
                     "Waiting for the library…"
@@ -891,7 +944,7 @@ impl Browser {
                 .into();
                 self.render(false);
             }
-            Update::Read(Err(e)) => {
+            Update::Read(Err(e), _) => {
                 self.error = true;
                 self.message = readable(&e);
                 self.render(false);
@@ -909,6 +962,9 @@ impl Browser {
                     }
                 } else {
                     self.cache.collection_changed();
+                }
+                if let Some(next) = &route {
+                    self.trail.landed(next);
                 }
                 self.visit(route.unwrap_or_else(|| self.route.clone()), false, false);
             }
@@ -959,6 +1015,17 @@ impl Browser {
         }
     }
 }
+const SEARCH_DELAY: Duration = Duration::from_millis(240);
+
+async fn downloads_page(access: &Access) -> Result<Page, ApiError> {
+    let mut page = saved::page(access).await?;
+    let mut groups = crate::collections::list(access).await?;
+    groups.append(&mut page.rows);
+    page.total = Some(groups.len() as u64);
+    page.rows = groups;
+    Ok(page)
+}
+
 /// A continuation is scoped to a point-in-time result set. If it expires, start
 /// at the first page and follow only its new cursors until the requested depth.
 async fn rebuild_for(a: &Access, r: &Route, depth: usize) -> Result<Page, ApiError> {
@@ -1021,34 +1088,37 @@ mod tests {
         );
     }
     #[test]
-    fn only_recent_entries_can_start_the_recent_shelf() {
-        use pages::{Row, RowKey};
-        let mut p = Page {
-            kind: "home".into(),
-            ..Default::default()
-        };
-        p.rows = [
-            RowKey::Playlist("p".into()),
-            RowKey::Playlist("q".into()),
-            RowKey::Track("liked".into()),
-        ]
-        .into_iter()
-        .map(|key| Row {
-            key,
-            ..Default::default()
-        })
-        .collect();
-        assert_eq!(p.section(0), "YOUR PLAYLISTS");
-        assert_eq!(p.section(1), "");
-        assert_eq!(p.section(2), "LIKED SONGS");
-        p.rows.insert(
-            0,
-            Row {
-                key: RowKey::HistoryEvent("play".into()),
-                ..Default::default()
-            },
+    fn same_query_from_edit_and_enter_is_coalesced_except_for_retry() {
+        let query = Route::Search("track".into());
+        assert!(repeat_navigation(&query, &query, true, false));
+        assert!(repeat_navigation(&query, &query, false, false));
+        assert!(!repeat_navigation(&query, &query, false, true));
+        assert!(!repeat_navigation(
+            &query,
+            &Route::Search("another".into()),
+            true,
+            false
+        ));
+        assert!(!repeat_navigation(&query, &Route::History, true, false));
+    }
+    #[test]
+    fn only_current_context_screens_are_navigable() {
+        assert_eq!(
+            context_route("album", "al".into()),
+            Some(Route::Album("al".into()))
         );
-        assert_eq!(p.section(0), "RECENTLY PLAYED");
+        assert_eq!(
+            context_route("artist", "ar".into()),
+            Some(Route::Artist("ar".into()))
+        );
+        for kind in ["playlist", "derived"] {
+            assert_eq!(
+                context_route(kind, "p".into()),
+                Some(Route::Playlist("p".into()))
+            );
+        }
+        assert_eq!(context_route("likes", "liked-songs".into()), None);
+        assert_eq!(context_route("playlist", "".into()), None);
     }
     #[test]
     fn stale_form_cannot_borrow_new_playlist_revision() {
@@ -1133,7 +1203,7 @@ pub fn start(
             .build()
             .expect("browser runtime");
         runtime.block_on(async move {
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:Route::Home,trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,recent_due:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:Route::History,trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,recent_due:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
             loop {
                 let due=b.recent_due;
                 tokio::select! { biased;

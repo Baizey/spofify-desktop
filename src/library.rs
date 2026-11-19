@@ -1,8 +1,7 @@
-//! Account-owned Home, liked tracks, recent listening, and playlists.
+//! Account-owned listening history and playlists.
 //! Declare as an `api.rs` child: `#[path = "library.rs"] pub mod library;`.
 //!
-//! Browser methods on `Api` (`&Session` first): `home()`, `recent(limit)`, `history(page)`,
-//! `likes(page)`, `like_status(track_ids)`, `set_like(track_id, liked)`,
+//! Browser methods on `Api` (`&Session` first): `history(page)`,
 //! `playlists(kind_filter, page)`, `playlist(id)`, `manual_entries(id, page)`,
 //! `derived_entries(id, limit, cursor)`, `playlist_definition(id)`,
 //! `tracked_playlist_sources(page)`, `preview_definition(definition, target, limit, cursor)`,
@@ -14,7 +13,7 @@
 //! All offsets use `catalog::PageRequest`, revisions are `u64`, and limits are `u32`.
 //! Optional arguments: `kind_filter: Option<PlaylistKind>`, `definition` on create
 //! is `Option<&RuleDefinition>` (None creates manual), `target: Option<(&str, u64)>`,
-//! rule cursors are `Option<&str>`. Batch IDs are `&[String]`.
+//! rule cursors are `Option<&str>`.
 
 use std::collections::HashSet;
 
@@ -109,35 +108,7 @@ pub type PlaylistPage = OffsetPage<PlaylistSummary>;
 pub type ManualEntriesPage = OffsetPage<ManualEntry>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LikeEntry {
-    pub track: CatalogItem,
-    pub liked_at: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LikeStatus {
-    pub track_id: String,
-    pub liked: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LikesPage {
-    pub items: Vec<LikeEntry>,
-    pub total: u64,
-    pub available_total: u64,
-    pub offset: u32,
-    pub limit: u32,
-}
-
-impl LikesPage {
-    pub fn has_more(&self) -> bool {
-        u64::from(self.offset) + (self.items.len() as u64) < self.total
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecentEntry {
+pub struct HistoryEntry {
     pub id: String,
     pub played_at: String,
     pub track: CatalogItem,
@@ -146,17 +117,7 @@ pub struct RecentEntry {
     pub metadata_missing: bool,
 }
 
-pub type RecentPage = OffsetPage<RecentEntry>;
-pub type HistoryPage = OffsetPage<RecentEntry>;
-
-/// Home has no aggregate server path. Shelves report independent errors; session
-/// revocation invalidates the whole snapshot before any shelf is returned.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Home {
-    pub recent: Result<RecentPage, ApiError>,
-    pub playlists: Result<PlaylistPage, ApiError>,
-    pub likes: Result<LikesPage, ApiError>,
-}
+pub type HistoryPage = OffsetPage<HistoryEntry>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManualEntry {
@@ -219,6 +180,7 @@ pub enum RuleSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         take: Option<RuleTake>,
     },
+    // Kept for externally authored definitions, independent of the retired UI.
     Likes {
         slot_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,51 +291,6 @@ pub enum SourceState {
 }
 
 impl Api {
-    /// Convenience initial load. Scheduling, offline gating and retention are
-    /// the account replica's responsibility. No retries are performed here.
-    pub async fn home(&self, session: &Session) -> Result<Home, ApiError> {
-        self.with_authenticated_network(session, async {
-            let (recent, playlists, likes) = tokio::join!(
-                self.recent(session, 8),
-                self.playlists(
-                    session,
-                    None,
-                    PageRequest {
-                        offset: 0,
-                        limit: 6
-                    }
-                ),
-                self.likes(
-                    session,
-                    PageRequest {
-                        offset: 0,
-                        limit: 1
-                    }
-                ),
-            );
-            self.check_session(session)?;
-            Ok(Home {
-                recent,
-                playlists,
-                likes,
-            })
-        })
-        .await
-    }
-
-    /// Recent is a bounded, server-deduplicated shelf; there is no offset query.
-    pub async fn recent(&self, session: &Session, limit: u32) -> Result<RecentPage, ApiError> {
-        if !limit_ok(limit) {
-            return Err(INVALID_INPUT);
-        }
-        let wire: OffsetPage<WireRecent> = self
-            .catalog_get(session, Route::Recent, &[("limit", &limit.to_string())])
-            .await?;
-        let page = wire.project(PageRequest { offset: 0, limit }, WireRecent::project)?;
-        unique(page.items.iter().map(|row| row.track.id.as_str()))?;
-        Ok(page)
-    }
-
     /// Paginated play events, including repeated plays and retired tracks.
     pub async fn history(
         &self,
@@ -381,116 +298,14 @@ impl Api {
         page: PageRequest,
     ) -> Result<HistoryPage, ApiError> {
         let (limit, offset) = page_params(page)?;
-        let wire: OffsetPage<WireRecent> = self
+        let wire: OffsetPage<WireHistory> = self
             .catalog_get(
                 session,
                 Route::History,
                 &[("limit", &limit), ("offset", &offset)],
             )
             .await?;
-        wire.project(page, WireRecent::project)
-    }
-
-    pub async fn likes(&self, session: &Session, page: PageRequest) -> Result<LikesPage, ApiError> {
-        let (limit, offset) = page_params(page)?;
-        let wire: WireLikes = self
-            .catalog_get(
-                session,
-                Route::Likes,
-                &[("limit", &limit), ("offset", &offset)],
-            )
-            .await?;
-        if !page_matches(page, wire.limit, wire.offset, wire.items.len(), wire.total)
-            || wire.available_total > wire.total
-            || wire.items.len() as u64 > wire.available_total
-        {
-            return Err(INVALID_RESPONSE);
-        }
-        let items = wire
-            .items
-            .into_iter()
-            .map(WireLike::project)
-            .collect::<Result<Vec<_>, _>>()?;
-        unique(items.iter().map(|row| row.track.id.as_str()))?;
-        Ok(LikesPage {
-            items,
-            total: wire.total,
-            available_total: wire.available_total,
-            offset: wire.offset,
-            limit: wire.limit,
-        })
-    }
-
-    pub async fn like_status(
-        &self,
-        session: &Session,
-        track_ids: &[String],
-    ) -> Result<Vec<LikeStatus>, ApiError> {
-        self.check_session(session)?;
-        if track_ids.len() > 100 || track_ids.iter().any(|id| !valid_id(id)) {
-            return Err(INVALID_INPUT);
-        }
-        if track_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        #[derive(Deserialize)]
-        struct Statuses {
-            items: Vec<LikeStatus>,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            track_ids: &'a [String],
-        }
-        let result: Statuses = self
-            .catalog_write(
-                session,
-                Route::LikeStatus,
-                Method::POST,
-                Request { track_ids },
-                StatusCode::OK,
-            )
-            .await?;
-        if result.items.len() != track_ids.len()
-            || result
-                .items
-                .iter()
-                .zip(track_ids)
-                .any(|(status, id)| &status.track_id != id)
-        {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(result.items)
-    }
-
-    pub async fn set_like(
-        &self,
-        session: &Session,
-        track_id: &str,
-        liked: bool,
-    ) -> Result<LikeStatus, ApiError> {
-        if !valid_id(track_id) {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            track_id: &'a str,
-            liked: bool,
-        }
-        let result: LikeStatus = self
-            .catalog_write(
-                session,
-                Route::Likes,
-                Method::PUT,
-                Request { track_id, liked },
-                StatusCode::OK,
-            )
-            .await?;
-        if result.track_id != track_id || result.liked != liked {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(result)
+        wire.project(page, WireHistory::project)
     }
 
     pub async fn playlists(
@@ -996,36 +811,7 @@ struct Revision {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WireLike {
-    track: WireItem,
-    liked_at: String,
-}
-
-impl WireLike {
-    fn project(self) -> Result<LikeEntry, ApiError> {
-        if !safe_timestamp(&self.liked_at) {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(LikeEntry {
-            track: self.track.project(Some(CatalogKind::Track), false, false)?,
-            liked_at: self.liked_at,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireLikes {
-    items: Vec<WireLike>,
-    total: u64,
-    available_total: u64,
-    offset: u32,
-    limit: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireRecent {
+struct WireHistory {
     id: String,
     played_at: String,
     track: WireItem,
@@ -1035,8 +821,8 @@ struct WireRecent {
     metadata_missing: bool,
 }
 
-impl WireRecent {
-    fn project(self) -> Result<RecentEntry, ApiError> {
+impl WireHistory {
+    fn project(self) -> Result<HistoryEntry, ApiError> {
         if !valid_id(&self.id)
             || !safe_timestamp(&self.played_at)
             || self
@@ -1050,7 +836,7 @@ impl WireRecent {
         {
             return Err(INVALID_RESPONSE);
         }
-        Ok(RecentEntry {
+        Ok(HistoryEntry {
             id: self.id,
             played_at: self.played_at,
             track: self
@@ -1364,7 +1150,7 @@ mod tests {
         let raw = json!({"id":"synthetic-play","playedAt":"2025-01-01T12:00:00Z",
             "track":{"id":"retired-track","kind":"track","hasAudio":false,
                 "coverage":{"tracks":1,"inLibrary":0,"albums":0}},"metadataMissing":true});
-        let wire: WireRecent = serde_json::from_value(raw).unwrap();
+        let wire: WireHistory = serde_json::from_value(raw).unwrap();
         let row = wire.project().unwrap();
         assert_eq!(row.track.id, "retired-track");
         assert!(row.metadata_missing);
@@ -1377,14 +1163,14 @@ mod tests {
             {"id":"event-a","playedAt":"2025-01-01T12:00:01Z","track":track()},
             {"id":"event-b","playedAt":"2025-01-01T12:00:00Z","track":track()}
         ],"total":4,"offset":2,"limit":2});
-        let wire: OffsetPage<WireRecent> = serde_json::from_value(raw).unwrap();
+        let wire: OffsetPage<WireHistory> = serde_json::from_value(raw).unwrap();
         let result = wire
             .project(
                 PageRequest {
                     offset: 2,
                     limit: 2,
                 },
-                WireRecent::project,
+                WireHistory::project,
             )
             .unwrap();
         assert_eq!(result.items[0].track.id, result.items[1].track.id);

@@ -68,9 +68,8 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-const INVALID_ORIGIN: ApiError = error(
-    "Enter an HTTPS origin, or an explicit private IP HTTP origin, without credentials, path, query or fragment.",
-);
+const INVALID_ORIGIN: ApiError =
+    error("Enter an HTTP or HTTPS server address without a path, credentials, query, or fragment.");
 const INVALID_RESPONSE: ApiError = error("The server returned an incompatible API response.");
 const INVALID_INPUT: ApiError = error("The request contains invalid or oversized input.");
 const NETWORK: ApiError =
@@ -143,9 +142,6 @@ impl Origin {
                 return Err(INVALID_ORIGIN);
             }
         }
-        if url.scheme() == "http" && !numeric.is_some_and(private_ip) {
-            return Err(INVALID_ORIGIN);
-        }
         Ok(Self(url))
     }
 
@@ -178,16 +174,6 @@ fn valid_port_suffix(suffix: &str) -> bool {
             && port.bytes().all(|c| c.is_ascii_digit())
             && port.parse::<u16>().is_ok_and(|p| p != 0)
     })
-}
-
-fn private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, _, _] = ip.octets();
-            ip.is_loopback() || ip.is_private() || (a == 100 && (64..=127).contains(&b))
-        }
-        IpAddr::V6(ip) => ip.is_loopback() || ip.segments()[0] & 0xfe00 == 0xfc00,
-    }
 }
 
 /// Safe summary plus opaque credentials. Intentionally neither Debug nor Serialize.
@@ -1957,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_origins_and_private_http_only() {
+    fn explicit_http_and_https_accept_canonical_origins() {
         assert_eq!(
             Origin::parse(" HTTPS://Example.COM:443/ ")
                 .unwrap()
@@ -1980,28 +1966,21 @@ mod tests {
             "[::1]",
             "[fc00::]",
             "[fd7a:115c:a1e0::1]",
+            "localhost",
+            "music.local",
+            "example.com",
+            "203.0.113.7",
+            "[2001:db8::1]",
         ] {
             assert!(Origin::parse(&format!("http://{host}")).is_ok(), "{host}");
         }
         for host in [
-            "localhost",
-            "music.local",
-            "example.com",
-            "8.8.8.8",
             "0.0.0.0",
-            "169.254.1.2",
-            "100.63.255.255",
-            "100.128.0.0",
-            "172.15.0.1",
-            "172.32.0.1",
             "127.1",
             "2130706433",
             "0x7f000001",
             "0177.0.0.1",
             "[::]",
-            "[fe80::1]",
-            "[::ffff:127.0.0.1]",
-            "[2001:db8::1]",
             "[fc00::1%25eth0]",
         ] {
             assert!(Origin::parse(&format!("http://{host}")).is_err(), "{host}");

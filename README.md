@@ -2,7 +2,9 @@
 
 A native Linux music player for your [Spofify server](../spofify-go). Rust owns the session, music library and playback; Slint renders the desktop window and Rodio sends audio to the default output. The server and its music library run separately.
 
-![The native desktop album view, captured through Slint MCP against the Go test library](docs/images/native-album.png)
+![Album detail and the playing mini-player, captured through Slint MCP against the Go test library](docs/images/native-album.png)
+
+[Compact Now Playing screenshot](docs/images/native-player-compact.png)
 
 ## Run
 
@@ -12,13 +14,13 @@ Install stable Rust (at least the `rust-version` in `Cargo.toml`), a C/C++ toolc
 cargo run --release --locked
 ```
 
-Use the root URL of a current Spofify server, such as `https://music.example.com`, and sign in with an existing listener or admin account. The desktop client is for listening; server administration stays in the Go dashboard. Public servers require HTTPS. For a trusted LAN you can explicitly confirm HTTP to a private IP literal such as `http://192.168.1.10:8080`. HTTP sends credentials unencrypted. Do not enter a path, credentials, query, or fragment in the server field.
+Use the root URL of a current Spofify server, such as `https://music.example.com`, and sign in with an existing listener or admin account. The desktop client is for listening; server administration stays in the Go dashboard. Both `http://` and `https://` addresses work directly, including hostnames with a port. Use HTTPS on untrusted networks; HTTP sends credentials unencrypted. Do not enter a path, credentials, query, or fragment in the server field.
 
 ## Listening
 
-- Start on **Home**, browse **Albums** or **Artists**, or use the header to search tracks, albums and artists in server-ranked order. Unified search requires a configured search index on the server; browsing does not.
-- **Liked**, **Playlists**, and **History** are scoped to the signed-in account. Play a whole collection or start at a particular occurrence. A track's `…` menu contains actions such as queueing it, liking it and saving it to a playlist.
-- The persistent player opens **Now playing**, **Queue**, and **Devices**. The selected output is shared with other connected listeners on your account. The desktop can control another output or play through its own default audio device. Linux desktop environments can use MPRIS media keys for play/pause, next and previous.
+- Start in **History**. Open **Albums**, **Artists**, or **Playlists** to browse, or type in the search field from any page (`Ctrl+F`). Results keep the server’s ranking. Unified search requires a configured search index on the server; browsing does not.
+- Play a whole collection or start from a particular occurrence. Use a track’s `…` menu to queue it, save it offline, or add it to a playlist. Open **Downloads** to see what’s saved on this computer.
+- Select the current track’s artwork or title to open **Now playing**. Queue and output controls stay at the right of the mini-player. The selected output is shared with other connected listeners on your account. The desktop can control another output or play through its own default audio device. Linux desktop environments can use MPRIS media keys for play/pause, next and previous.
 - **Work offline** is explicit. Save music while online, then switch to listen to this account’s files without server traffic. Going offline does not create an online queue or upload local button presses later. Saved music survives restarting the application, but **a fresh launch requires sign-in**; the desktop does not store a password or session cookie to unlock offline listening after a restart.
 - **Settings** separates this computer’s theme and density from the account palette. The local appearance file is `$XDG_CONFIG_HOME/spofify-desktop/appearance.json` (default `~/.config`). Private saved audio lives under `$XDG_DATA_HOME/spofify-downloads-v1` (default `~/.local/share`); saves are bounded to 32 MiB per track, 256 tracks and 1 GiB across the local store (including record headers).
 
@@ -45,7 +47,7 @@ With a provisioned Cargo cache you can add `--offline` to the build/test command
 
 The default build does not enable Slint's inspection server. For development with **disposable accounts only**, build with `SLINT_EMIT_DEBUG_INFO=1 cargo build --locked --features slint/mcp`, then launch that **debug binary** with `SLINT_MCP_PORT` on an unused unprivileged loopback port. Never expose an inspection session containing real credentials. `scripts/inspect-native.py` captures only the opt-in Slint app window and accessibility tree.
 
-For a disposable acceptance run, see the options in `python3 scripts/acceptance/run.py --help`. Point `--desktop` at that exact MCP-enabled debug binary. With `--desktop`, the default harness builds the Go checkout’s test fixture and drives a private Wayland session. Linux workers with a mediated filesystem can use `--scratch-dir /dev/shm` for the disposable fixture, including the Go linker and SQLite. `--synthetic-wire-ui` instead exercises native rendering and navigation against a synthetic HTTP fixture; it is **not** a real-Go playback test. `scripts/acceptance/audio_smoke.py` independently checks PCM output, pause/resume, natural completion, and lease loss against a synthetic v2 peer and private null sink.
+For a disposable acceptance run, see the options in `python3 scripts/acceptance/run.py --help`. Point `--desktop` at that exact MCP-enabled debug binary. With `--desktop`, the default harness builds the Go checkout’s test fixture and drives a private Cage Wayland session, using `wlr-randr` to exercise both wide and compact windows. Linux workers with a mediated filesystem can use `--scratch-dir /dev/shm` for the disposable fixture, including the Go linker and SQLite. `--synthetic-wire-ui` instead exercises native rendering and navigation against a synthetic HTTP fixture; it is **not** a real-Go playback test. `scripts/acceptance/audio_smoke.py` independently checks PCM output, pause/resume, natural completion, and lease loss against a synthetic v2 peer and private null sink.
 
 ## Credits
 

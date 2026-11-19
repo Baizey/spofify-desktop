@@ -26,15 +26,19 @@ def main():
                         help="clean spofify-go checkout with cmd/offline-fixture (default: ~/repos/spofify-go)")
     parser.add_argument("--go-module-cache", type=Path, help="prepopulated Go module cache; no network fetches")
     parser.add_argument("--fixture-binary", type=Path, help="trusted prebuilt cmd/offline-fixture, instead of Go build")
-    parser.add_argument("--desktop", type=Path, help="already-built debug desktop with slint/mcp and SLINT_EMIT_DEBUG_INFO=1; requires cage")
+    parser.add_argument("--desktop", type=Path, help="prebuilt debug desktop with Slint MCP and debug info; needs cage and wlr-randr for real Go")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--window-only", action="store_true", help="check login pixels and consent interaction without starting Go")
+    mode.add_argument("--window-only", action="store_true", help="check empty sign-in pixels and absence of a consent checkbox without starting Go")
     mode.add_argument("--synthetic-wire-ui", action="store_true", help="UI-only fallback with a Python wire stand-in; not Go integration")
     parser.add_argument("--scratch-dir", type=Path,
                         help="existing base for disposable build/cache/DB/profile state (e.g. worker-private /dev/shm)")
     parser.add_argument("--capture-dir", type=Path,
                         help="optionally retain synthetic PNGs in a new direct child of ~/repos/spofify-desktop-temporary")
+    parser.add_argument("--pcm", action="store_true",
+                        help="also verify online and offline Go fixture audio on a private PipeWire null sink")
     args = parser.parse_args()
+    if args.pcm and (not args.desktop or args.window_only or args.synthetic_wire_ui):
+        parser.error("--pcm requires --desktop with the real Go fixture")
     if (args.window_only or args.synthetic_wire_ui or args.capture_dir) and not args.desktop:
         parser.error("window-only, synthetic-wire and capture modes require --desktop")
     artifact_root = (Path.home() / "repos" / "spofify-desktop-temporary").resolve()
@@ -69,17 +73,29 @@ def main():
         else:
             binary, revision = build(args.go_source.resolve(strict=True), root, env,
                                      args.go_module_cache.resolve(strict=True) if args.go_module_cache else None)
+        failure = None
         with fixture(binary, root, env, revision) as ready:
             print(f"Go fixture source {ready['sourceRevision']}", flush=True)
             api = api_checks(ready)
             if args.desktop:
                 from native import native_checks
-                native_checks(desktop, root, env, ready, api, pixels=captures)
+                try:
+                    if args.pcm:
+                        from audio_smoke import output
+                        with output(root, env) as pcm:
+                            native_checks(desktop, root, env, ready, api, pixels=captures, pcm=pcm)
+                    else:
+                        native_checks(desktop, root, env, ready, api, pixels=captures)
+                except Failure as error:
+                    # Check the fixture's shutdown receipt even after a UI regression.
+                    failure = error
             else:
                 from playback import Peer
                 with Peer(api):
                     print("PASS real v2 WebSocket ticket, upgrade and authenticated snapshot", flush=True)
                 print("NOT RUN native desktop (provide --desktop)", flush=True)
+        if failure is not None:
+            raise failure
 
 
 if __name__ == "__main__":

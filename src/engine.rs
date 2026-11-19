@@ -30,7 +30,6 @@ pub enum Command {
         origin: String,
         username: String,
         password: String,
-        lan: bool,
     },
     Logout(u64),
     Scoped(u64, Box<Command>),
@@ -448,12 +447,11 @@ impl Engine {
                 origin,
                 username,
                 password,
-                lan,
             } if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
                 // Explicit sign-in is explicit Go Online. Retire the local
                 // queue and grant; never try to reuse its network credential.
                 self.reset(epoch);
-                match connection(&origin, lan) {
+                match connection(&origin) {
                     Ok(api) => {
                         let api = Arc::new(api);
                         let results = self.results.clone();
@@ -1124,7 +1122,12 @@ impl Engine {
                 .is_some_and(|e| e.binding.event_id == instruction.event_id)
             && let Some(audio) = &self.audio
         {
-            instruction.elapsed = instruction.elapsed.max(audio.facts().elapsed);
+            // A live pause can report the playback since the last observation.
+            // A parked execution instead takes the new absolute position, even backwards.
+            let facts = audio.facts();
+            if facts.playing {
+                instruction.elapsed = instruction.elapsed.max(facts.elapsed);
+            }
         }
         self.cancel_work();
         self.stop();
@@ -1469,6 +1472,7 @@ impl Engine {
                 p.detail = artists(track);
                 p.track = track.id.clone();
                 p.album = track.album_id.clone();
+                p.album_name = track.album_name.clone();
                 p.artist = track
                     .artists
                     .iter()
@@ -1561,6 +1565,7 @@ struct PlayerView {
     detail: String,
     track: String,
     album: String,
+    album_name: String,
     artist: String,
     context_kind: &'static str,
     context_id: String,
@@ -1597,6 +1602,7 @@ impl PlayerView {
             ui.set_now_detail(self.detail.into());
             ui.set_now_track_id(self.track.into());
             ui.set_now_album_id(self.album.into());
+            ui.set_now_album_name(self.album_name.into());
             ui.set_now_artist_id(self.artist.into());
             ui.set_now_context_kind(self.context_kind.into());
             ui.set_now_context_id(self.context_id.into());
@@ -1640,6 +1646,9 @@ impl PlayerView {
                 )
                 .into(),
             );
+            let upcoming = self.queue.iter().find(|r| r.upcoming);
+            ui.set_next_title(upcoming.map(|r| r.title.clone()).unwrap_or_default());
+            ui.set_next_subtitle(upcoming.map(|r| r.subtitle.clone()).unwrap_or_default());
             let queue = ui.get_queue_rows();
             if queue.row_count() != self.queue.len()
                 || self.queue.iter().enumerate().any(|(i, row)| {
@@ -1741,16 +1750,8 @@ fn artists(t: &socket::Track) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-fn connection(input: &str, lan: bool) -> Result<Api, ApiError> {
-    let origin = crate::api::Origin::parse(input)?;
-    if origin.as_str().starts_with("http:") && !lan {
-        return Err(ApiError {
-            message: "Confirm trusted-LAN HTTP, or use HTTPS.",
-            expired: false,
-            status: 0,
-        });
-    }
-    Api::new(origin)
+fn connection(input: &str) -> Result<Api, ApiError> {
+    Api::new(crate::api::Origin::parse(input)?)
 }
 
 pub fn start(
@@ -1887,7 +1888,7 @@ mod tests {
     #[tokio::test]
     async fn offline_mode_fences_shared_session_and_never_logs_out_on_the_wire() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account {
             api,
@@ -1907,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn cookie_expiry_keeps_local_access_but_go_online_requires_sign_in() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let deadline = Instant::now() + Duration::from_millis(100);
         let session = api.test_session_with_deadline(deadline);
         e.account = Some(Account {
@@ -1950,14 +1951,13 @@ mod tests {
             origin: "not an origin".into(),
             username: "test".into(),
             password: "test".into(),
-            lan: false,
         });
         assert!(!e.offline && e.epoch == 8 && e.socket.is_none());
     }
     #[tokio::test]
     async fn shared_fences_retire_even_if_mode_or_logout_command_never_arrives() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account {
             api,
@@ -1980,7 +1980,7 @@ mod tests {
     #[tokio::test]
     async fn latest_offline_choice_cannot_be_overridden_by_an_earlier_online_request() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account {
             api,
@@ -2007,7 +2007,7 @@ mod tests {
     #[tokio::test]
     async fn latest_online_choice_consumes_an_unapplied_offline_fence() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account {
             api,
@@ -2033,7 +2033,7 @@ mod tests {
     #[tokio::test]
     async fn failed_validation_keeps_local_queue_until_confirmed_same_account_return() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account {
             api,
@@ -2100,7 +2100,7 @@ mod tests {
     }
     #[tokio::test]
     async fn stay_offline_cancels_probe_during_retry_delay() {
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         let access = Access {
             epoch: 7,
@@ -2142,7 +2142,7 @@ mod tests {
     #[test]
     fn stale_room_token_cannot_edit_a_different_displayed_queue() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account { api, session });
         e.command(Command::Offline(true).scoped(7));
@@ -2186,7 +2186,7 @@ mod tests {
     #[test]
     fn bounded_settlement_batch_is_feedback_only_and_can_settle_a_retired_link() {
         let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         e.account = Some(Account { api, session });
         e.generation = Some(2);
@@ -2258,7 +2258,7 @@ mod tests {
             ("accepted", "superseded", "superseded", false),
         ] {
             let mut e = engine();
-            let api = Arc::new(connection("http://127.0.0.1:1", true).unwrap());
+            let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
             let session = api.test_session();
             e.account = Some(Account {
                 api,
@@ -2339,8 +2339,7 @@ mod tests {
         }
     }
     #[test]
-    fn canonical_http_requires_lan_consent() {
-        assert!(connection("HTTP://127.0.0.1:1", false).is_err());
-        assert!(connection("HTTP://127.0.0.1:1", true).is_ok());
+    fn explicit_http_needs_no_extra_state() {
+        assert!(connection("http://music.local:8080").is_ok());
     }
 }

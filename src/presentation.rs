@@ -250,7 +250,19 @@ struct Projection {
     settled: bool,
 }
 
-async fn load(account: &Account, id: &str) -> Projection {
+async fn load(account: &Account, id: &str, expanded: bool) -> Projection {
+    if !expanded {
+        let art =
+            read_with_backoff(async || media::artwork(&account.api, &account.session, id).await)
+                .await;
+        return Projection {
+            settled: art.is_ok(),
+            art: art.ok().flatten(),
+            lyrics: None,
+            waveform: None,
+            status: "",
+        };
+    }
     let (art, lyrics, waveform) = tokio::join!(
         read_with_backoff(async || media::artwork(&account.api, &account.session, id).await),
         read_with_backoff(async || media::lyrics(&account.api, &account.session, id).await),
@@ -319,22 +331,23 @@ async fn run(
 ) {
     // This key keeps the last complete/missing response for this track while
     // the pane is hidden. No catalog-wide or on-disk media cache exists here.
-    let mut satisfied: Option<(Account, String, &'static str, Arc<AtomicBool>)> = None;
+    let mut satisfied: Option<(Account, String, bool, &'static str, Arc<AtomicBool>)> = None;
     loop {
         access.mark_unchanged();
         let account = Account::current(&access);
         let request = wanted.borrow_and_update().clone();
-        if !satisfied.as_ref().is_some_and(|(a, track, _, delivered)| {
-            account.as_ref().is_some_and(|b| a.same(b))
-                && track == &request.track
-                && delivered.load(Ordering::Acquire)
-        }) {
+        if !satisfied
+            .as_ref()
+            .is_some_and(|(a, track, full, _, delivered)| {
+                account.as_ref().is_some_and(|b| a.same(b))
+                    && track == &request.track
+                    && (*full || !request.visible)
+                    && delivered.load(Ordering::Acquire)
+            })
+        {
             satisfied = None;
         }
-        if let Some(account) = account
-            .as_ref()
-            .filter(|_| request.visible && !request.track.is_empty())
-        {
+        if let Some(account) = account.as_ref().filter(|_| !request.track.is_empty()) {
             let a_fence = access.clone();
             let r_fence = wanted.clone();
             if account.offline {
@@ -355,7 +368,7 @@ async fn run(
                     biased;
                     change = scope_changed(&mut access, Some(account)) => { if !change { break } continue; }
                     change = wanted.changed() => { if change.is_err() { break } continue; }
-                    data = load(account, &request.track) => data,
+                    data = load(account, &request.track, request.visible) => data,
                 };
                 let status = projected.status;
                 let delivered = projected.settled.then(|| Arc::new(AtomicBool::new(false)));
@@ -363,6 +376,7 @@ async fn run(
                     satisfied = Some((
                         account.clone(),
                         request.track.clone(),
+                        request.visible,
                         status,
                         delivered.clone(),
                     ));
@@ -378,7 +392,7 @@ async fn run(
                     status,
                     delivered,
                 );
-            } else if let Some((_, _, status, _)) = &satisfied {
+            } else if let Some((_, _, _, status, _)) = &satisfied {
                 publish(
                     &ui,
                     a_fence,

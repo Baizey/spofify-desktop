@@ -1,12 +1,12 @@
-// Mobile's slate / mint palette and JetBrains Mono, set on a denser desktop grid.
+import { Glyph } from "icon.slint";
 export global Theme {
     in-out property <bool> light;
     in-out property <float> density: 1.0;
-    out property <color> bg: light ? #f3f6f8 : #101216;
-    out property <color> rail: light ? #e8edf2 : #14171c;
-    out property <color> panel: light ? #ffffff : #1a1e24;
-    out property <color> raised: light ? #e1e8ef : #252b34;
-    out property <color> line: light ? #bbc6d1 : #353e49;
+    out property <color> bg: light ? #fafbf9 : #131617;
+    out property <color> rail: light ? #f1f3ef : #191d1e;
+    out property <color> panel: light ? #ffffff : #1e2324;
+    out property <color> raised: light ? #e2e8e4 : #293032;
+    out property <color> line: light ? #cdd3d5 : #303638;
     out property <color> muted: light ? #41516a : #b4bdcb;
     out property <color> subtle: light ? #53657b : #9ca9ba;
     out property <color> text: light ? #142034 : #f4f6fa;
@@ -72,26 +72,14 @@ export component Action inherits Rectangle {
         : pointer.pressed ? Theme.line : selected ? Theme.accent.with-alpha(0.15) : pointer.has-hover || key.has-focus ? Theme.raised : quiet ? transparent : Theme.panel;
     opacity: enabled ? 1 : 0.48;
     property <color> ink: primary && enabled ? Theme.button-ink : danger ? Theme.red : selected ? Theme.accent : Theme.text;
-    property <length> label-width: words.preferred-width + (icon != "" && text != "" ? 8px : 0px) + mark.preferred-width;
-    mark := Text {
-        x: root.leading ? 12px : max(0px, (root.width - root.label-width) / 2);
-        text: root.icon;
-        width: self.preferred-width;
-        font-size: 16px;
-        color: root.ink;
-        vertical-alignment: center;
-        accessible-role: none;
-    }
+    property <length> glyph-size: root.icon == "" ? 0px : 18px;
+    property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
+    property <length> inset: root.leading ? 10px : max(0px, (root.width - root.glyph-size - root.gap - words.preferred-width) / 2);
+    if root.icon != "": Glyph { x: root.inset; y: (root.height - self.height) / 2; width: root.glyph-size; height: self.width; name: root.icon; ink: root.ink; }
     words := Text {
-        x: root.icon == "" ? (root.leading ? 12px : max(0px, (root.width - root.label-width) / 2)) : mark.x + mark.width + 8px;
-        width: min(self.preferred-width, max(0px, root.width - self.x - 8px));
-        text: root.text;
-        color: root.ink;
-        font-size: 12px * Theme.density;
-        font-weight: 600;
-        overflow: elide;
-        vertical-alignment: center;
-        accessible-role: none;
+        x: root.inset + root.glyph-size + root.gap; y: 0px; height: root.height;
+        width: min(self.preferred-width, max(0px, root.width - self.x - 4px)); text: root.text; color: root.ink;
+        font-size: 14px * Theme.density; font-weight: 600; overflow: elide; vertical-alignment: center; accessible-role: none;
     }
     pointer := TouchArea {
         enabled: root.enabled;
@@ -120,6 +108,8 @@ export component Field inherits Rectangle {
     in property <bool> pill;
     in property <string> prefix;
     in property <string> field-label;
+    in property <bool> clearable;
+    callback cleared();
     callback edited();
     callback accepted();
     public function take-focus() { input.focus(); }
@@ -134,7 +124,7 @@ export component Field inherits Rectangle {
     border-color: input.has-focus ? Theme.blue : Theme.line;
     opacity: enabled ? 1 : 0.55;
     clip: true;
-    Caption { x: 14px; width: 22px; text: root.prefix; color: Theme.accent; font-size: 17px; accessible-role: none; }
+    if root.prefix != "": Glyph { x: 13px; y: (parent.height - self.height)/2; width: 16px; height: 16px; name: root.prefix; ink: Theme.muted; }
     Caption {
         x: input.x; y: input.y; width: input.width; height: root.multiline ? 22px : input.height;
         text: root.placeholder-text;
@@ -144,13 +134,13 @@ export component Field inherits Rectangle {
     input := TextInput {
         x: root.prefix != "" ? 39px : 13px;
         y: root.multiline ? 9px : 0px;
-        width: parent.width - self.x - 13px;
+        width: parent.width - self.x - (root.clearable ? 39px : 13px);
         height: parent.height - 2 * self.y;
         enabled: root.enabled;
         input-type: root.input-type;
         single-line: !root.multiline;
         color: Theme.text;
-        font-size: 13px;
+        font-size: 14px * Theme.density;
         wrap: root.multiline ? word-wrap : no-wrap;
         vertical-alignment: root.multiline ? top : center;
         selection-background-color: Theme.accent.with-alpha(0.3);
@@ -159,44 +149,7 @@ export component Field inherits Rectangle {
         edited => { root.edited(); }
         accepted => { root.accepted(); }
     }
-}
-
-export component Consent inherits Rectangle {
-    in-out property <bool> checked;
-    in property <bool> enabled: true;
-    in property <string> text;
-    callback toggled(bool);
-    function toggle() { root.checked = !root.checked; root.toggled(root.checked); }
-    forward-focus: key;
-    accessible-role: checkbox;
-    accessible-label: text;
-    accessible-enabled: enabled;
-    accessible-checkable: true;
-    accessible-checked: checked;
-    accessible-action-default => { if root.enabled { root.toggle(); } }
-    height: 34px;
-    vertical-stretch: 0;
-    opacity: enabled ? 1 : 0.55;
-    Rectangle {
-        x: 0px; y: (parent.height - self.height) / 2; width: 21px; height: 21px; border-radius: 6px;
-        background: root.checked ? Theme.accent : Theme.raised;
-        border-width: key.has-focus ? 2px : 1px;
-        border-color: key.has-focus ? Theme.blue : Theme.line;
-        Text { text: root.checked ? "✓" : ""; color: Theme.on-accent; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
-    }
-    Caption { x: 31px; width: parent.width - 31px; text: root.text; color: Theme.text; accessible-role: none; }
-    TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { key.focus(); root.toggle(); } }
-    key := FocusScope {
-        enabled: root.enabled;
-        focus-on-click: false;
-        key-pressed(event) => {
-            if event.text == Key.Space || event.text == Key.Return {
-                if !event.repeat { root.toggle(); }
-                return accept;
-            }
-            return reject;
-        }
-    }
+    if root.clearable && root.text != "": Action { x: parent.width - 35px; y: (parent.height - 28px)/2; width: 28px; height: 28px; quiet: true; icon: "×"; accessible-label: "Clear search"; clicked => { root.text = ""; root.cleared(); root.take-focus(); } }
 }
 
 export component Cover inherits Rectangle {
@@ -210,15 +163,9 @@ export component Cover inherits Rectangle {
     border-color: #ffffff22;
     clip: true;
     accessible-role: none;
-    Text {
-        visible: root.artwork.width == 0;
-        text: root.mark; color: root.tint; font-size: parent.height * 0.44;
-        font-weight: 700; horizontal-alignment: center; vertical-alignment: center;
-        accessible-role: none;
-    }
+    if root.artwork.width == 0: Glyph { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: parent.height * 0.47; height: self.width; name: root.mark; ink: root.tint; }
     Image {
-        x: root.border-radius * 0.32; y: self.x;
-        width: parent.width - 2 * self.x; height: parent.height - 2 * self.y;
+        x: 0; y: 0; width: parent.width; height: parent.height;
         source: root.artwork; visible: root.artwork.width > 0; image-fit: cover; accessible-role: none;
     }
 }

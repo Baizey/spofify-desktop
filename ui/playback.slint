@@ -26,6 +26,7 @@ export component SeekBar inherits Rectangle {
     changed duration => { root.sync-position(); }
     changed enabled => { if !root.enabled { root.scrubbing = false; root.sync-position(); } }
     control := Slider {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
         minimum: 0; maximum: max(1, root.duration);
         enabled: root.enabled;
         accessible-label: "Playback position";
@@ -74,12 +75,20 @@ export component Transport inherits Rectangle {
     }
 }
 
+component Clock inherits Caption {
+    in property <float> seconds;
+    property <int> whole: floor(max(0, seconds));
+    property <int> remainder: mod(whole, 60);
+    text: floor(whole / 60) + ":" + (remainder < 10 ? "0" : "") + remainder;
+    font-family: "JetBrains Mono"; font-size: 11px; width: 41px; horizontal-alignment: center;
+}
+
 export component PlayerBar inherits Rectangle {
+    in property <bool> has-track;
     in property <string> track;
     in property <string> subtitle;
     in property <string> output;
     in property <string> status;
-    in property <string> time;
     in property <image> artwork;
     in property <float> elapsed;
     in property <float> duration;
@@ -95,48 +104,40 @@ export component PlayerBar inherits Rectangle {
     callback toggle();
     callback seek(float);
     callback navigate(string);
-    height: 108px;
-    vertical-stretch: 0;
-    background: Theme.panel;
+    property <bool> narrow: root.width < 760px;
+    property <length> pad: max(clamp(root.width * 0.04, 16px, 36px), (root.width - 1220px) / 2);
+    property <length> center-width: clamp(root.width * 0.36, 162px, 480px);
+    height: !root.has-track ? 48px : 82px;
+    vertical-stretch: 0; background: Theme.panel;
     Divider { y: 0px; }
-    VerticalLayout {
-        padding-left: root.compact ? 12px : 19px;
-        padding-right: root.compact ? 12px : 19px;
-        padding-top: 8px; padding-bottom: 8px; spacing: 3px;
-        HorizontalLayout {
-            spacing: root.compact ? 4px : 12px;
-            height: 46px;
-            Cover { width: 45px; height: 45px; artwork: root.artwork; }
-            VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 1;
-                LineNow := Action {
-                    height: 22px; min-width: 0px; horizontal-stretch: 1;
-                    text: root.track; leading: true; quiet: true; selected: root.page == "now";
-                    accessible-label: "Now playing: " + root.track;
-                    clicked => { root.navigate("now"); }
-                }
-                Caption { x: 12px; text: root.subtitle; font-size: 11px; }
-            }
-            Transport {
-                playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip;
-                previous => { root.previous(); } next => { root.next(); } toggle => { root.toggle(); }
-            }
-            Action { text: root.compact ? "" : "Queue"; icon: "≡"; quiet: true; selected: root.page == "queue"; accessible-label: "Play queue"; clicked => { root.navigate("queue"); } }
-            Action { text: root.compact ? "" : "Devices"; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; clicked => { root.navigate("devices"); } }
+    if !root.has-track: Caption { x: root.pad; width: parent.width - 2 * root.pad - 96px; text: root.status != "" ? root.status : "No song selected"; accessible-label: self.text; font-size: 13px; }
+    if root.has-track: Rectangle {
+        forward-focus: id-key;
+        x: root.pad; width: (root.width - root.center-width)/2 - root.pad - 10px;
+        height: 52px; y: (root.height - self.height)/2;
+        accessible-role: button; accessible-label: "Now playing: " + root.track; accessible-action-default => { root.navigate("now"); }
+        border-width: id-key.has-focus ? 2px : 0px; border-color: Theme.blue; border-radius: 5px;
+        background: id-touch.has-hover ? Theme.raised : transparent;
+        Cover { x: 0px; width: root.narrow ? 40px : 48px; height: self.width; y: (parent.height - self.height)/2; artwork: root.artwork; }
+        VerticalLayout { x: root.narrow ? 49px : 61px; width: parent.width - self.x; alignment: center; spacing: 3px;
+            Text { text: root.track; font-size: 15px * Theme.density; font-weight: 700; color: Theme.text; overflow: elide; }
+            if root.subtitle != "" || root.status != "": Caption { text: root.status != "" ? root.status : root.subtitle; }
         }
-        HorizontalLayout {
-            spacing: 10px;
-            SeekBar { horizontal-stretch: 1; elapsed: root.elapsed; duration: root.duration; enabled: root.can-seek; seek(v) => { root.seek(v); } }
-            if root.time != "": Caption { text: root.time; font-size: 11px; }
-            if !root.compact && (root.output != "" || root.offline): Eyebrow {
-                width: 170px; text: root.offline ? "OFFLINE PLAYBACK" : root.output; horizontal-alignment: right;
-            }
+        id-key := FocusScope { focus-on-click: false; key-pressed(event) => { if event.text == Key.Return || event.text == Key.Space { if !event.repeat {root.navigate("now");} return accept; } return reject; } }
+        id-touch := TouchArea { x: 0px; y: 0px; width: parent.width; height: parent.height; mouse-cursor: pointer; clicked => { id-key.focus(); root.navigate("now"); } }
+    }
+    if root.has-track: Rectangle {
+        width: root.center-width; x: (root.width - self.width)/2;
+        Transport { x: (parent.width - self.width)/2; y: root.duration <= 0 ? (root.height - self.height)/2 : 7px;
+            playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip; previous => {root.previous();} toggle => {root.toggle();} next => {root.next();} }
+        if root.duration > 0: HorizontalLayout { y: 52px; height: 22px; spacing: 4px;
+            if root.width >= 540px: Clock { seconds: root.elapsed; }
+            SeekBar { elapsed: root.elapsed; duration: root.duration; enabled: root.can-seek; horizontal-stretch: 1; seek(v) => { root.seek(v); } }
+            Clock { seconds: root.duration; }
         }
-        if root.compact && (root.offline || root.status != "" || root.output != ""): Caption {
-            text: root.status != "" ? root.status : root.offline ? "Offline playback" : root.output;
-            height: 14px; font-size: 10px;
-        }
-        if !root.compact && root.status != "": Caption { text: root.status; height: 12px; font-size: 10px; }
+    }
+    HorizontalLayout { x: root.width - self.width - root.pad; width: self.preferred-width; y: (root.height - self.height)/2; height: 38px; spacing: 6px;
+        Action { width: 37px; icon: "≡"; quiet: true; selected: root.page == "queue"; accessible-label: "Play queue"; clicked => { root.navigate("queue"); } }
+        Action { text: root.narrow || !root.has-track ? "" : root.offline ? "This computer" : root.output; width: self.text == "" ? 37px : 154px; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; accessible-description: root.output; clicked => { root.navigate("devices"); } }
     }
 }

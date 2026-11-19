@@ -4,7 +4,7 @@
 //!
 //! Example:
 //! ```text
-//! Source: Liked tracks
+//! Source: Saved library
 //! Source: Saved library
 //! Sort: Title
 //! Duplicates: Keep one copy
@@ -43,8 +43,8 @@ use crate::{
 };
 
 pub const DEFAULT_RULES: &str =
-    "Source: Liked tracks\nSort: Source order\nDuplicates: Keep one copy";
-pub const RULES_HELP: &str = "Use one rule per line. Try ‘Source: Liked tracks’ or ‘Source: Saved library’. Optional: ‘Sort: Title’, ‘Duplicates: Keep one copy’, and ‘Limit: First 50’. Add ‘Include:’ on its own line, then ‘  Genre: jazz’ (two spaces). Use ‘Exclude:’ to leave matches out.";
+    "Source: Saved library\nSort: Source order\nDuplicates: Keep one copy";
+pub const RULES_HELP: &str = "Use one rule per line. Try ‘Source: Saved library’ or ‘Source: Playlist’ followed by its ID. Optional: ‘Sort: Title’, ‘Duplicates: Keep one copy’, and ‘Limit: First 50’. Add ‘Include:’ on its own line, then ‘  Genre: jazz’ (two spaces). Use ‘Exclude:’ to leave matches out.";
 
 const DRAFT_MAX: usize = 32 * 1024;
 const STALE_VIEW: ApiError = ApiError {
@@ -312,7 +312,7 @@ impl<'a> RecipeParser<'a> {
         }
         if choices.is_empty() {
             return Err(error(
-                "Add at least one source, for example ‘Source: Liked tracks’.",
+                "Add at least one source, for example ‘Source: Saved library’.",
             ));
         }
         Ok(RuleDefinition {
@@ -666,10 +666,6 @@ async fn apply(
                 .await?;
             return Ok(Some(Route::Playlists));
         }
-        "like" | "unlike" | "remove" if op != "remove" || matches!(route, Route::Liked) => {
-            let (track, liked) = like_change(route, page, index, op == "like")?;
-            api.set_like(session, track, liked).await?;
-        }
         "add" => {
             let (track, playlist) = add_target(route, page, index)?;
             api.add_playlist_track(session, &playlist.id, playlist.revision, track)
@@ -787,55 +783,6 @@ fn selected(page: &Page, index: Option<usize>) -> Result<&Row, ApiError> {
     index
         .and_then(|index| page.rows.get(index))
         .ok_or(error("Select an item first."))
-}
-
-fn like_change<'a>(
-    route: &'a Route,
-    page: &'a Page,
-    index: Option<usize>,
-    like: bool,
-) -> Result<(&'a str, bool), ApiError> {
-    let (track, known) = like_target(route, page, index)?;
-    // Like is an explicit SET, even for an already-liked track or when a read
-    // has not confirmed membership. Unlike is offered only for confirmed likes.
-    require(
-        like || known == Some(true),
-        "This track isn’t marked as liked.",
-    )?;
-    Ok((track, like))
-}
-
-fn like_target<'a>(
-    route: &'a Route,
-    page: &'a Page,
-    index: Option<usize>,
-) -> Result<(&'a str, Option<bool>), ApiError> {
-    if let Some(index) = index {
-        let row = selected(page, Some(index))?;
-        let is_track = match &row.key {
-            RowKey::Track(id) => id == &row.id,
-            RowKey::HistoryEvent(_)
-            | RowKey::ManualEntry { .. }
-            | RowKey::DerivedOccurrence { .. } => true,
-            _ => false,
-        };
-        if is_track && !row.id.is_empty() {
-            return Ok((
-                &row.id,
-                row.liked.or(matches!(route, Route::Liked).then_some(true)),
-            ));
-        }
-    } else if let Route::Track(id) = route {
-        if !id.is_empty() {
-            let known = page
-                .rows
-                .iter()
-                .find(|row| matches!(&row.key, RowKey::Track(key) if key == id) && &row.id == id)
-                .and_then(|row| row.liked);
-            return Ok((id, known));
-        }
-    }
-    Err(error("Select a track first."))
 }
 
 fn add_target<'a>(
@@ -978,7 +925,7 @@ mod tests {
         assert_eq!(wire["version"], 1);
         assert_eq!(wire["duplicates"], "unique");
         assert_eq!(wire["sort"], "sourceOrder");
-        assert_eq!(wire["sources"][0]["kind"], "likes");
+        assert_eq!(wire["sources"][0]["kind"], "allSaved");
         let slot = wire["sources"][0]["slotId"].as_str().unwrap();
         assert_eq!(slot.len(), 34);
         assert!(slot.starts_with("s_"));
@@ -1113,6 +1060,10 @@ mod tests {
                 .definition,
             DEFAULT_RULES
         );
+        assert!(matches!(
+            parse(DEFAULT_RULES).unwrap().sources.as_slice(),
+            [RuleSource::AllSaved { .. }]
+        ));
     }
 
     #[test]
@@ -1160,27 +1111,6 @@ mod tests {
         assert!(add_target(&route, &page, Some(0)).is_err());
     }
 
-    #[test]
-    fn likes_resolve_track_not_playlist_entry_id() {
-        let page = Page {
-            rows: vec![Row {
-                id: "track".into(),
-                liked: Some(false),
-                key: RowKey::ManualEntry {
-                    entry_id: "entry".into(),
-                    playlist_id: "list".into(),
-                },
-                ..Row::default()
-            }],
-            ..Page::default()
-        };
-        assert_eq!(
-            like_target(&Route::Playlist("list".into()), &page, Some(0)).unwrap(),
-            ("track", Some(false))
-        );
-        assert!(like_target(&Route::Playlists, &page, Some(1)).is_err());
-    }
-
     async fn wire_fixture() -> (Access, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = Origin::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -1196,7 +1126,7 @@ mod tests {
     }
 
     // In-process, one-shot HTTP fixture: no live service or UI. Capture the
-    // actual request sent by mutate (so a status read cannot pass the Like test).
+    // actual request sent by mutate.
     async fn capture_write(
         listener: TcpListener,
         response: Value,
@@ -1279,47 +1209,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn like_put_sets_true_for_confirmed_and_unknown_states_and_unlike_sets_false() {
+    async fn retired_track_mutations_are_rejected_without_contacting_the_server() {
+        let (access, _listener) = wire_fixture().await;
         let route = Route::Track("track".into());
-        for (known, operation, liked) in [
-            (Some(true), "like", true),
-            (None, "like", true),
-            (Some(true), "unlike", false),
-        ] {
-            let page = liked_state(known);
-            let (access, listener) = wire_fixture().await;
-            let expected = json!({"trackId": "track", "liked": liked});
-            let (request, body) = capture_write(
-                listener,
-                expected.clone(),
-                mutate(&access, &route, &page, operation, Some(0), ""),
-            )
-            .await;
-            assert_eq!(request, "PUT /api/me/likes HTTP/1.1\r\n");
-            assert_eq!(body, expected);
-        }
-    }
-
-    fn liked_state(liked: Option<bool>) -> Page {
-        Page {
+        let page = Page {
             rows: vec![Row {
                 id: "track".into(),
                 key: RowKey::Track("track".into()),
-                liked,
                 ..Row::default()
             }],
             ..Page::default()
+        };
+        for operation in ["like", "unlike"] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                mutate(&access, &route, &page, operation, Some(0), ""),
+            )
+            .await
+            .expect("retired mutation must not wait for an HTTP response")
+            .unwrap_err();
+            assert_eq!(error.message, "That library action is not available here.");
         }
-    }
-
-    #[test]
-    fn unknown_like_is_set_true_without_enabling_unlike() {
-        let route = Route::Track("track".into());
-        let page = liked_state(None);
-        assert_eq!(
-            like_change(&route, &page, Some(0), true).unwrap(),
-            ("track", true)
-        );
-        assert!(like_change(&route, &page, Some(0), false).is_err());
     }
 }

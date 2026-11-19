@@ -579,9 +579,6 @@ pub(super) enum Route<'a> {
     Catalog,
     Detail(CatalogKind, &'a str),
     Search,
-    Likes,
-    LikeStatus,
-    Recent,
     History,
     Playlists,
     Playlist(&'a str),
@@ -598,13 +595,13 @@ impl Route<'_> {
     fn allows(self, method: &Method) -> bool {
         use Route::*;
         match self {
-            Catalog | Detail(..) | Search | Recent | History | Sources => *method == Method::GET,
-            Likes | Definition(_) => *method == Method::GET || *method == Method::PUT,
+            Catalog | Detail(..) | Search | History | Sources => *method == Method::GET,
+            Definition(_) => *method == Method::GET || *method == Method::PUT,
             Playlists | Entries(_) => *method == Method::GET || *method == Method::POST,
             Playlist(_) => {
                 *method == Method::GET || *method == Method::PATCH || *method == Method::DELETE
             }
-            LikeStatus | Preview | Copy(_) => *method == Method::POST,
+            Preview | Copy(_) => *method == Method::POST,
             Entry(..) => *method == Method::DELETE,
             Order(_) => *method == Method::PUT,
         }
@@ -626,15 +623,6 @@ impl Route<'_> {
                 Detail(..) => return Err(INVALID_INPUT),
                 Search => {
                     path.push("search");
-                }
-                Likes => {
-                    path.extend(["api", "me", "likes"]);
-                }
-                LikeStatus => {
-                    path.extend(["api", "me", "likes", "status"]);
-                }
-                Recent => {
-                    path.extend(["api", "me", "recent"]);
                 }
                 History => {
                     path.extend(["api", "me", "history"]);

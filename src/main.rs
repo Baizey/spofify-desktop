@@ -57,6 +57,9 @@ fn clear(ui: &AppWindow) {
     ui.set_form_description("".into());
     ui.set_now_track_id("".into());
     ui.set_now_album_id("".into());
+    ui.set_now_album_name("".into());
+    ui.set_next_title("".into());
+    ui.set_next_subtitle("".into());
     ui.set_now_artist_id("".into());
     ui.set_cover_art(Default::default());
     ui.set_waveform(Default::default());
@@ -111,7 +114,6 @@ fn main() -> Result<(), slint::PlatformError> {
                     origin: ui.get_origin().into(),
                     username: ui.get_username().into(),
                     password: ui.get_password().into(),
-                    lan: ui.get_lan_consent(),
                 };
                 ui.set_password("".into());
                 ui.set_busy(true);
@@ -129,8 +131,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_signed_in(false);
                 if logout {
                     ui.set_username("".into());
-                } else {
-                    ui.set_lan_consent(false);
                 }
                 ui.set_status("".into());
                 ui.set_busy(false);

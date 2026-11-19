@@ -23,11 +23,7 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api::{
-        ApiError, Item, PAGE_SIZE,
-        catalog::PageRequest,
-        library::{LikeEntry, PlaylistKind},
-    },
+    api::{ApiError, Item, PAGE_SIZE, library::PlaylistKind},
     desk::Access,
     offline::{self, OfflineStore},
     pages::{Page, Route, Row, RowKey},
@@ -189,8 +185,6 @@ fn detail_page(entry: StoredCollection, available: &HashMap<String, Item>) -> Pa
             String::new()
         },
         rows,
-        // `partial` on Page is a retry signal for an incomplete online Home
-        // read. Here this is a complete local read with some absent audio.
         ..Page::default()
     }
 }
@@ -324,7 +318,6 @@ enum Target<'a> {
         id: &'a str,
         expected: Option<(PlaylistKind, u64)>,
     },
-    Likes,
 }
 impl<'a> Target<'a> {
     fn new(route: &'a Route, page: &Page) -> Result<Self, ApiError> {
@@ -340,7 +333,6 @@ impl<'a> Target<'a> {
                     expected: page.playlist.as_ref().map(|p| (p.kind, p.revision)),
                 })
             }
-            Route::Liked => Ok(Self::Likes),
             _ => Err(UNSUPPORTED),
         }
     }
@@ -349,13 +341,11 @@ impl<'a> Target<'a> {
             Self::Album(_) => "albums",
             Self::Artist(_) => "artists",
             Self::Playlist { .. } => "playlists",
-            Self::Likes => "likes",
         }
     }
     fn id(self) -> &'a str {
         match self {
             Self::Album(id) | Self::Artist(id) | Self::Playlist { id, .. } => id,
-            Self::Likes => "liked-songs",
         }
     }
 }
@@ -367,6 +357,7 @@ enum Kind {
     Artist,
     Manual,
     Derived,
+    // Read legacy offline downloads without invalidating the rest of the index.
     Likes,
 }
 impl Kind {
@@ -388,38 +379,6 @@ struct Snapshot {
 }
 
 async fn snapshot(access: &Access, target: Target<'_>) -> Result<Snapshot, ApiError> {
-    if matches!(target, Target::Likes) {
-        // The Go offline manifest has no likes route. The authenticated likes
-        // endpoint has no fence: verify multi-page membership on a second pass
-        // before saving. This can detect changes but is not a server snapshot.
-        let likes = read_likes(access).await?;
-        if likes.len() > PAGE_SIZE as usize && read_likes(access).await? != likes {
-            return Err(CHANGED);
-        }
-        let tracks = likes
-            .into_iter()
-            .map(|like| {
-                let track = like.track;
-                // A non-playable item contributes only its opaque membership ID.
-                track.playable_item().unwrap_or_else(|| Item {
-                    id: track.id,
-                    name: track.name,
-                    kind: "track".into(),
-                    has_audio: false,
-                    artists: String::new(),
-                    album_name: String::new(),
-                    duration_ms: 0,
-                    track_number: 0,
-                    disc_number: 0,
-                })
-            })
-            .collect();
-        return Ok(Snapshot {
-            kind: Kind::Likes,
-            title: "Liked songs".into(),
-            tracks,
-        });
-    }
     let mut state = ManifestState::default();
     let mut cursor = None;
     loop {
@@ -435,53 +394,6 @@ async fn snapshot(access: &Access, target: Target<'_>) -> Result<Snapshot, ApiEr
         cursor = state.append(target, &wire)?;
         if cursor.is_none() {
             return state.finish();
-        }
-    }
-}
-
-async fn read_likes(access: &Access) -> Result<Vec<LikeEntry>, ApiError> {
-    let mut all = Vec::new();
-    let mut seen = HashSet::new();
-    let mut expected = None;
-    loop {
-        let offset = all.len() as u32;
-        let page = access
-            .api
-            .likes(
-                &access.session,
-                PageRequest {
-                    offset,
-                    limit: PAGE_SIZE,
-                },
-            )
-            .await?;
-        if page.total > MAX_OCCURRENCES as u64 {
-            return Err(TOO_LARGE);
-        }
-        let totals = (page.total, page.available_total);
-        if expected.is_some_and(|old| old != totals) {
-            return Err(CHANGED);
-        }
-        expected = Some(totals);
-        let remaining = page.total.checked_sub(u64::from(offset)).ok_or(CHANGED)?;
-        // If the server omits members completely, their IDs/order cannot be
-        // recovered. Require every slot rather than claim a complete save.
-        if page.offset != offset
-            || page.limit != PAGE_SIZE
-            || page.items.len() as u64 != remaining.min(u64::from(PAGE_SIZE))
-        {
-            return Err(CHANGED);
-        }
-        if page
-            .items
-            .iter()
-            .any(|like| !seen.insert(like.track.id.clone()))
-        {
-            return Err(CHANGED);
-        }
-        all.extend(page.items);
-        if all.len() as u64 == page.total {
-            return Ok(all);
         }
     }
 }

@@ -25,9 +25,9 @@ impl Replica {
         let e = self.0.remove(i)?;
         // Revalidate on a later visit, never on a periodic refresh timer.
         let ttl = match route {
-            Route::Home | Route::History => 60,
+            Route::History => 60,
             Route::Search(_) => 90,
-            Route::Playlist(_) | Route::Playlists | Route::Liked | Route::Picker(_) => 180,
+            Route::Playlist(_) | Route::Playlists | Route::Picker(_) => 180,
             _ => 600,
         };
         let fresh = !e.dirty && e.received.elapsed() < Duration::from_secs(ttl);
@@ -51,7 +51,7 @@ impl Replica {
     }
     pub fn recent_changed(&mut self) {
         for e in &mut self.0 {
-            if matches!(e.route, Route::Home | Route::History) {
+            if matches!(e.route, Route::History) {
                 e.dirty = true;
             }
         }
@@ -60,11 +60,7 @@ impl Replica {
         for e in &mut self.0 {
             if matches!(
                 e.route,
-                Route::Home
-                    | Route::Liked
-                    | Route::Playlist(_)
-                    | Route::Playlists
-                    | Route::Picker(_)
+                Route::Playlist(_) | Route::Playlists | Route::Picker(_)
             ) {
                 e.dirty = true;
             }
@@ -82,14 +78,25 @@ impl Replica {
 pub struct Trail(VecDeque<Route>);
 impl Trail {
     pub fn visit(&mut self, old: &Route, new: &Route) {
-        if old != new
-            && !matches!((old, new), (Route::Search(_), Route::Search(_)))
+        if old == new || matches!((old, new), (Route::Search(_), Route::Search(_))) {
+            return;
+        }
+        if self.0.back() == Some(new) {
+            self.0.pop_back(); // Directly returning to the previous screen.
+        } else if !matches!(old, Route::Picker(_))
+            && !matches!(old, Route::Search(q) if q.is_empty())
             && self.0.back() != Some(old)
         {
             if self.0.len() >= MAX_HISTORY {
                 self.0.pop_front();
             }
             self.0.push_back(old.clone());
+        }
+    }
+    /// When a mutation lands on the previous screen, don't leave it as Back.
+    pub fn landed(&mut self, route: &Route) {
+        if self.0.back() == Some(route) {
+            self.0.pop_back();
         }
     }
     pub fn pop(&mut self) -> Option<Route> {
@@ -109,26 +116,58 @@ mod tests {
             title: "Last good".into(),
             ..Default::default()
         });
-        r.put(Route::Home, p.clone());
-        r.put(Route::Liked, p);
+        r.put(Route::History, p.clone());
+        r.put(Route::Playlists, p);
         r.recent_changed();
-        let (old, fresh) = r.get(&Route::Home).unwrap();
+        let (old, fresh) = r.get(&Route::History).unwrap();
         assert_eq!(old.title, "Last good");
         assert!(!fresh);
-        assert!(r.get(&Route::Liked).unwrap().1);
+        assert!(r.get(&Route::Playlists).unwrap().1);
         r.collection_changed();
-        assert!(!r.get(&Route::Liked).unwrap().1);
+        assert!(!r.get(&Route::Playlists).unwrap().1);
     }
     #[test]
     fn bounded_trail_and_search_edits() {
         let mut t = Trail::default();
-        t.visit(&Route::Home, &Route::Search("a".into()));
-        t.visit(&Route::Search("a".into()), &Route::Search("ab".into()));
-        assert_eq!(t.pop(), Some(Route::Home));
+        let blank = Route::Search(String::new());
+        let first = Route::Search("a".into());
+        let query = Route::Search("ab".into());
+        t.visit(&Route::History, &blank);
+        t.visit(&blank, &first);
+        t.visit(&first, &query);
+        t.visit(&query, &Route::Track("track".into()));
+        assert_eq!(t.pop(), Some(query));
+        assert_eq!(t.pop(), Some(Route::History));
         for i in 0..100 {
-            t.visit(&Route::Album(i.to_string()), &Route::Home);
+            t.visit(&Route::Album(i.to_string()), &Route::History);
         }
         assert_eq!(t.0.len(), MAX_HISTORY);
+    }
+    #[test]
+    fn direct_returns_and_transient_screens_do_not_duplicate_back() {
+        let mut t = Trail::default();
+        t.visit(&Route::History, &Route::Playlists);
+        t.visit(&Route::Playlists, &Route::History);
+        assert!(!t.can_back());
+
+        t.visit(&Route::History, &Route::Search(String::new()));
+        t.visit(&Route::Search(String::new()), &Route::Playlists);
+        assert_eq!(t.pop(), Some(Route::History));
+        assert!(!t.can_back());
+
+        let playlist = Route::Playlist("list".into());
+        let picker = Route::Picker("track".into());
+        t.visit(&Route::Playlists, &playlist);
+        t.visit(&playlist, &picker);
+        t.landed(&playlist); // Add succeeds and returns to its destination.
+        assert_eq!(t.pop(), Some(Route::Playlists));
+        assert!(!t.can_back());
+
+        t.visit(&Route::History, &Route::Offline);
+        t.visit(&Route::Offline, &Route::Appearance);
+        t.visit(&Route::Appearance, &Route::Offline);
+        assert_eq!(t.pop(), Some(Route::History));
+        assert!(!t.can_back());
     }
     #[test]
     fn cache_evicts_least_recently_used() {
@@ -137,7 +176,7 @@ mod tests {
             r.put(Route::Album(i.to_string()), Arc::default());
         }
         r.get(&Route::Album("0".into()));
-        r.put(Route::Home, Arc::default());
+        r.put(Route::History, Arc::default());
         assert!(r.get(&Route::Album("0".into())).is_some());
         assert!(r.get(&Route::Album("1".into())).is_none());
     }

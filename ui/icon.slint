@@ -1,0 +1,25 @@
+export component Glyph inherits Image {
+    in property <string> name;
+    in property <color> ink;
+    colorize: ink; image-fit: contain; accessible-role: none;
+    source: name == "▶" ? @image-url("../assets/icons/play.svg")
+          : name == "Ⅱ" ? @image-url("../assets/icons/pause.svg")
+          : name == "|◀" ? @image-url("../assets/icons/prev.svg")
+          : name == "▶|" ? @image-url("../assets/icons/next.svg")
+          : name == "≡" ? @image-url("../assets/icons/queue.svg")
+          : name == "◫" ? @image-url("../assets/icons/devices.svg")
+          : name == "⚙" ? @image-url("../assets/icons/settings.svg")
+          : name == "⌕" ? @image-url("../assets/icons/search.svg")
+          : name == "···" ? @image-url("../assets/icons/more.svg")
+          : name == "←" ? @image-url("../assets/icons/back.svg")
+          : name == "↓" ? @image-url("../assets/icons/download.svg")
+          : name == "◎" ? @image-url("../assets/icons/album.svg")
+          : name == "◉" ? @image-url("../assets/icons/artist.svg")
+          : name == "♫" ? @image-url("../assets/icons/note.svg")
+          : name == "◷" ? @image-url("../assets/icons/history.svg")
+          : name == "×" ? @image-url("../assets/icons/close.svg")
+          : name == "+" ? @image-url("../assets/icons/plus.svg")
+          : name == "↑" ? @image-url("../assets/icons/up.svg")
+          : name == "−" ? @image-url("../assets/icons/minus.svg")
+          : name == "↗" ? @image-url("../assets/icons/out.svg") : @image-url("../assets/icons/note.svg");
+}

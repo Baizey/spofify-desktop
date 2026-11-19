@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic WS v2 executor smoke; real Slint desktop + ALSA, not Go integration.
 
-Requires a prebuilt Slint MCP debug binary, cage, PipeWire and its ALSA plugin,
+Requires a prebuilt Slint MCP debug binary, cage, wlr-randr, PipeWire and its ALSA plugin,
 pipewire-pulse, WirePlumber 0.5 (policy profile), pactl and parec. No real account,
 compositor, sound device or ambient audio server is used. All output is temporary.
 """
@@ -12,19 +12,17 @@ from queue import Empty
 import os
 import shutil
 import signal
-import socket
 import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
-from urllib.error import URLError
 
 # No checkout artifacts even if the command is run without Python's -B flag.
 sys.dont_write_bytecode = True
 from audio_smoke_wire import audio_fixture, SECONDS, TITLE, TRACK_ID
 from fixture import Failure, check, private_env
-from native import mcp_class, wait, Window
+from native import COMPACT, WIDE, desktop, verify, wait
 
 
 @contextmanager
@@ -56,6 +54,8 @@ def require_running(process, root, name):
 
 @contextmanager
 def output(root, env):
+    for name in ("pipewire", "pipewire-pulse", "wireplumber", "pactl", "parec"):
+        check(shutil.which(name), f"private PCM monitoring needs {name}")
     runtime = Path(env["XDG_RUNTIME_DIR"])
     alsa = root / "asound.conf"
     alsa.write_text('pcm.!default { type pipewire playback_node "synthetic_smoke" '
@@ -90,27 +90,6 @@ def output(root, env):
         yield pcm
 
 
-@contextmanager
-def desktop(binary, root, env):
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    env = dict(env, WLR_BACKENDS="headless", WLR_RENDERER="pixman", WLR_HEADLESS_OUTPUTS="1",
-               SLINT_BACKEND="winit-software", SLINT_MCP_PORT=str(port), SPOFIFY_DEV_SIZE="1100x760")
-    mcp = mcp_class()(port)
-    with child(["cage", "--", str(binary)], root, env) as process:
-        def discover():
-            require_running(process, root, "cage")
-            try:
-                handles = mcp.value("list_windows", {})["windowHandles"]
-            except URLError:
-                return None
-            check(len(handles) <= 1, "expected one owned Slint window")
-            return handles[0] if handles else None
-
-        yield Window(mcp, wait("Slint MCP", discover, 15), None)
-
-
 def pcm_tail(pcm, length=24000):
     with pcm.open("rb") as file:
         size = file.seek(0, os.SEEK_END)
@@ -119,11 +98,20 @@ def pcm_tail(pcm, length=24000):
     return [s for (s,) in struct.iter_unpack("<h", raw[:len(raw) & ~1])]
 
 
-def heard_tone(pcm):
-    samples = pcm_tail(pcm)
+def heard_tone(pcm, hz=480, start=None):
+    if start is None:
+        samples = pcm_tail(pcm)
+    else:
+        # Short Go fixture audio may already have finished by the time the
+        # observer sees Play. Inspect only PCM added after the click fence.
+        with pcm.open("rb") as file:
+            file.seek(start)
+            raw = file.read(6 * 48000 * 2)
+        samples = [s for (s,) in struct.iter_unpack("<h", raw[:len(raw) & ~1])]
     crossings = [i for i in range(1, len(samples)) if samples[i - 1] <= 0 < samples[i]]
-    periods = sum(98 <= b - a <= 102 for a, b in zip(crossings, crossings[1:]))
-    return periods >= 40 and max(map(abs, samples), default=0) > 500
+    period = 48000 / hz
+    return (sum(abs(b - a - period) <= 2 for a, b in zip(crossings, crossings[1:])) >= 40
+            and max(map(abs, samples), default=0) > 500)
 
 
 def silence(pcm, label):
@@ -137,9 +125,8 @@ def run(win, ready, admitted, media, requests, pcm):
     win.fill("Server( origin| URL| address)?", ready["origin"])
     win.fill("Username", ready["username"])
     win.fill("Password", ready["password"])
-    win.click(r"Allow trusted.LAN HTTP")
     win.click("Sign in")
-    win.find("Home", 15)
+    win.section("History")
     try:
         peer = admitted.get(timeout=12)
     except Empty as error:
@@ -148,8 +135,6 @@ def run(win, ready, admitted, media, requests, pcm):
         raise Failure("synthetic socket admission: " + str(peer)) from peer
     peer.state(opening=True, selected=False)
     print("PASS Slint sign-in; authenticated v2 upgrade and one-use ticket hello (canPlay=true)", flush=True)
-    win.click("Search")
-    win.section("Search")
     win.fill("Search music", TITLE)
     win.find("Open " + TITLE)
 
@@ -193,6 +178,34 @@ def run(win, ready, admitted, media, requests, pcm):
     peer.result(cmd, final=True)
     peer.report(paused, lambda m: not m["isPlaying"] and not m["ended"], "stopped report after pause")
     silence(pcm, "after pause ACK")
+    failures = []
+    # Leave enough clip after either forward target for a periodic playing
+    # report on resume, even if a backward seek fails and keeps that target.
+    for label, mode, forward in (("wide", WIDE, 0.60), ("compact", COMPACT, 0.65)):
+        if mode == COMPACT:
+            win.resize(mode)
+        for direction, fraction in (("forward", forward), ("backward", 0.25)):
+            # Real Go sends pings; keep this transport alive even if the seek
+            # never arrives. This does not renew the audio lease.
+            ping = f"before-{label}-{direction}-seek".encode()
+            peer.frame(9, ping)
+            peer.expect("pong before pointer seek", lambda m: m == {"type": "pong", "data": ping})
+            with verify(failures, f"{label} dock {direction} pointer seek"):
+                win.drag_slider(fraction)
+                cmd = peer.command("seek")
+                requested = cmd["command"]["value"]
+                check(abs(requested - fraction * SECONDS) < 0.6, f"unexpected pointer seek target: {requested:.2f}s")
+                peer.state(playing=False, elapsed=requested)
+                peer.result(cmd)
+                sought = peer.instruct("execute", elapsed=requested, duration_ms=8000, command=cmd)
+                peer.result(cmd, final=True)
+                reported = peer.report(sought, lambda m: not m["isPlaying"] and not m["ended"],
+                                       "stopped seek report")
+                elapsed = reported["elapsed"]
+                check(abs(elapsed - requested) < 0.15,
+                      f"seek sent {requested:.2f}s and was ACKed, but executor reported {elapsed:.2f}s")
+                print(f"PASS {label} {direction} pointer seek moved the executor to {elapsed:.2f}s", flush=True)
+    win.resize(WIDE)
     active = play("Play|Resume", "resume", elapsed=elapsed, source=True)
     resumed = peer.report(active, lambda m: m["isPlaying"], "resumed native playback")
     check(elapsed - 0.1 <= resumed["elapsed"] < elapsed + 3.5, "resume did not restore the position")
@@ -217,22 +230,24 @@ def run(win, ready, admitted, media, requests, pcm):
     peer.frame(9, b"synthetic-after-expiry")
     peer.expect("pong on the same socket after lease expires", lambda m: m == {"type": "pong", "data": b"synthetic-after-expiry"})
     print("PASS short lease with no renewal: tone stopped before WAV end; same WebSocket answered ping", flush=True)
+    check(not failures, "; ".join(failures))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--desktop", type=Path, default=Path.home() / "repos/spofify-desktop/target/debug/spofify-desktop")
+    parser.add_argument("--scratch-dir", type=Path, default=Path("/dev/shm"),
+                        help="existing short path for disposable profile and private sockets (default: /dev/shm)")
     args = parser.parse_args()
     try:
         binary = args.desktop.resolve(strict=True)
-        for name in ("cage", "pipewire", "pipewire-pulse", "wireplumber", "pactl", "parec"):
-            check(shutil.which(name), f"synthetic audio smoke needs {name}")
         print("SYNTHETIC WS v2 NATIVE AUDIO ONLY — not real Go integration", flush=True)
         # Short, absolute path so the private Unix sockets fit sun_path.
-        with TemporaryDirectory(prefix="aud-smoke-", dir="/tmp") as temp:
+        with TemporaryDirectory(prefix="aud-smoke-", dir=args.scratch_dir.resolve(strict=True)) as temp:
             root = Path(temp)
             env = private_env(root)
-            with audio_fixture() as (ready, admitted, media, requests), output(root, env) as pcm, desktop(binary, root, env) as win:
+            with (audio_fixture() as (ready, admitted, media, requests),
+                  output(root, env) as pcm, desktop(binary, root, env, multisize=True) as win):
                 run(win, ready, admitted, media, requests, pcm)
     except (Failure, OSError, subprocess.SubprocessError) as error:
         print(f"FAIL synthetic native audio smoke: {error}", file=sys.stderr)

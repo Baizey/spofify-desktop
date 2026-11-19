@@ -12,9 +12,7 @@
 //! `Page::kind` overrides the route kind with `playlist-manual` or `playlist-rules`
 //! on detail pages. `Row::playback` and `Page::playback` are server selection
 //! inputs, not queue keys or local audio authority. Never display signed inputs.
-//! `Row::item` is the positive `api::Item` for offline track saves. `Page::partial`
-//! marks an incomplete Home snapshot. `Page::retain_home_shelves` carries over
-//! only failed shelves from the previous snapshot of the same account.
+//! `Row::item` is the positive `api::Item` for offline track saves.
 
 use std::{collections::HashSet, fmt, sync::Arc};
 
@@ -35,7 +33,6 @@ pub const MAX_ROWS: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
-    Home,
     History,
     Search(String),
     Track(String),
@@ -43,7 +40,6 @@ pub enum Route {
     Artist(String),
     Albums,
     Artists,
-    Liked,
     Playlists,
     Playlist(String),
     Picker(String),
@@ -58,7 +54,6 @@ pub enum Route {
 impl Route {
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Home => "home",
             Self::History => "history",
             Self::Search(_) => "search",
             Self::Track(_) => "track",
@@ -66,7 +61,6 @@ impl Route {
             Self::Artist(_) => "artist",
             Self::Albums => "albums",
             Self::Artists => "artists",
-            Self::Liked => "liked",
             Self::Playlists => "playlists",
             Self::Playlist(_) => "playlist",
             Self::Picker(_) => "picker",
@@ -126,8 +120,6 @@ pub struct Row {
     pub route: Option<Route>,
     pub playlist: Option<PlaylistMetadata>,
     pub position: Option<u64>,
-    /// `Some(true)` for confirmed liked rows; `None` means not read.
-    pub liked: Option<bool>,
     pub item: Option<Item>,
     pub playback: Option<PlaybackSelection>,
 }
@@ -143,9 +135,8 @@ pub struct Page {
     pub definition: Option<RuleDefinition>,
     pub playlist: Option<PlaylistMetadata>,
     pub playback: Option<PlaybackSelection>,
-    /// Local status for partial Home, unavailable rule evaluation, or the cap.
+    /// Local status for unavailable rule evaluation or the cap.
     pub status: String,
-    pub partial: bool,
     pub total: Option<u64>,
     pub album_id: String,
     pub artist_id: String,
@@ -159,7 +150,6 @@ pub enum ContextKind {
     Album,
     Artist,
     Playlist,
-    Likes,
     Derived,
 }
 
@@ -178,7 +168,6 @@ impl ContextKind {
             Self::Album => "album",
             Self::Artist => "artist",
             Self::Playlist => "playlist",
-            Self::Likes => "likes",
             Self::Derived => "derived",
         }
     }
@@ -190,7 +179,6 @@ impl PlaybackContext {
             ContextKind::Album => Route::Album(self.id.clone()),
             ContextKind::Artist => Route::Artist(self.id.clone()),
             ContextKind::Playlist | ContextKind::Derived => Route::Playlist(self.id.clone()),
-            ContextKind::Likes => Route::Liked,
         }
     }
 
@@ -281,49 +269,7 @@ pub struct PageState {
     next: Option<Next>,
     snapshot: Option<Snapshot>,
     used_cursors: HashSet<String>,
-    home: Option<HomeFailures>,
     pending_rules: bool,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct HomeFailures {
-    recent: bool,
-    playlists: bool,
-    likes: bool,
-}
-
-impl HomeFailures {
-    fn any(self) -> bool {
-        self.recent || self.playlists || self.likes
-    }
-
-    fn contains(self, row: &Row) -> bool {
-        match HomeShelf::of(row) {
-            HomeShelf::Recent => self.recent,
-            HomeShelf::Playlists => self.playlists,
-            HomeShelf::Likes => self.likes,
-            HomeShelf::Browse => false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum HomeShelf {
-    Recent,
-    Playlists,
-    Likes,
-    Browse,
-}
-
-impl HomeShelf {
-    fn of(row: &Row) -> Self {
-        match row.key {
-            RowKey::HistoryEvent(_) => Self::Recent,
-            RowKey::Playlist(_) => Self::Playlists,
-            RowKey::Track(_) => Self::Likes,
-            _ => Self::Browse,
-        }
-    }
 }
 
 impl fmt::Debug for PageState {
@@ -431,9 +377,8 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
     };
 
     match route {
-        Route::Home => project_home(&mut page, api.home(session).await?)?,
         Route::History => {
-            page.title = "Listening history".into();
+            page.title = "History".into();
             let result = api.history(session, request).await?;
             let next = offset_next(
                 request,
@@ -444,7 +389,9 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             )?;
             let rows = result.items.into_iter().map(history_row).collect();
             page.append(rows, result.total, next, None, None)?;
-            page.subtitle = count_label(result.total, "play", "plays");
+            if result.total > 0 {
+                page.subtitle = count_label(result.total, "play", "plays");
+            }
         }
         Route::Search(query) => {
             page.title = "Search".into();
@@ -529,26 +476,6 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             page.subtitle = count_label(result.total, kind.singular(), kind.plural());
             project_catalog(&mut page, request, result, None)?;
         }
-        Route::Liked => {
-            let result = api.likes(session, request).await?;
-            page.title = "Liked songs".into();
-            page.subtitle = count_label(result.total, "song", "songs");
-            let context = context_for(ContextKind::Likes, "liked-songs", &page.title);
-            page.playback = (result.available_total > 0).then(|| collection(&context));
-            let next = offset_next(
-                request,
-                result.offset,
-                result.limit,
-                result.items.len(),
-                result.total,
-            )?;
-            let rows = result
-                .items
-                .into_iter()
-                .map(|entry| liked_row(entry, &context))
-                .collect();
-            page.append(rows, result.total, next, None, None)?;
-        }
         Route::Playlists | Route::Picker(_) => {
             let picker = if let Route::Picker(track_id) = route {
                 if !valid_id(track_id) {
@@ -614,48 +541,39 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
     Ok(page)
 }
 
-impl Page {
-    pub fn section(&self, index: usize) -> &'static str {
-        if self.kind != "home" {
-            return "";
-        }
-        let Some(row) = self.rows.get(index) else {
-            return "";
-        };
-        let shelf = HomeShelf::of(row);
-        if index > 0 && HomeShelf::of(&self.rows[index - 1]) == shelf {
-            return "";
-        }
-        match shelf {
-            HomeShelf::Recent => "RECENTLY PLAYED",
-            HomeShelf::Playlists => "YOUR PLAYLISTS",
-            HomeShelf::Likes => "LIKED SONGS",
-            HomeShelf::Browse => "",
-        }
+/// Search the current account’s Downloads projection, not the online query cache.
+/// Keep the original rows so saved collections still open and tracks play locally.
+pub fn search_downloads(downloads: &Page, query: &str) -> Page {
+    let query = query.to_lowercase();
+    let terms: Vec<_> = query.split_whitespace().collect();
+    let rows: Vec<_> = downloads
+        .rows
+        .iter()
+        .filter(|row| {
+            let text = if let Some(item) = &row.item {
+                format!("{} {} {}", row.title, item.artists, item.album_name)
+            } else {
+                row.title.clone()
+            }
+            .to_lowercase();
+            !terms.is_empty() && terms.iter().all(|term| text.contains(term))
+        })
+        .cloned()
+        .collect();
+    Page {
+        kind: "search".into(),
+        title: "Search downloads".into(),
+        subtitle: "Searching only music saved on this device.".into(),
+        total: Some(rows.len() as u64),
+        rows,
+        ..Page::default()
     }
+}
+
+impl Page {
     /// Only pending or stale evaluations warrant a bounded automatic recheck.
     pub fn pending_rules(&self) -> bool {
         self.state.pending_rules
-    }
-
-    /// Carry over failed Home shelves from the same account and epoch; a
-    /// successful empty shelf is authoritative and is never restored.
-    pub fn retain_home_shelves(&mut self, last: &Page) {
-        let Some(failed) = self.state.home else {
-            return;
-        };
-        if !self.partial
-            || last.state.home.is_none()
-            || self.state.epoch != last.state.epoch
-            || self.state.account_id != last.state.account_id
-        {
-            return;
-        }
-        self.rows.retain(|row| !failed.contains(row));
-        self.rows
-            .extend(last.rows.iter().filter(|row| failed.contains(row)).cloned());
-        self.rows.sort_by_key(HomeShelf::of);
-        self.rows.truncate(MAX_ROWS);
     }
 
     /// Commit only validated progress. Stable keys deliberately distinguish repeated
@@ -909,59 +827,6 @@ fn project_derived(
     page.append(rows, result.total, next, snapshot, cursor)
 }
 
-fn project_home(page: &mut Page, home: library::Home) -> Result<(), ApiError> {
-    // Home has independent bounded reads, not a dedicated aggregate endpoint.
-    let library::Home {
-        recent,
-        playlists,
-        likes,
-    } = home;
-    let failures = [
-        recent.as_ref().err(),
-        playlists.as_ref().err(),
-        likes.as_ref().err(),
-    ];
-    if let Some(expired) = failures.into_iter().flatten().find(|error| error.expired) {
-        return Err(*expired);
-    }
-    if let [Some(recent_error), Some(_), Some(_)] = failures {
-        return Err(*recent_error);
-    }
-    page.title = "Home".into();
-    page.subtitle = "Recent listening, playlists, and liked songs".into();
-    let failures = HomeFailures {
-        recent: failures[0].is_some(),
-        playlists: failures[1].is_some(),
-        likes: failures[2].is_some(),
-    };
-    page.partial = failures.any();
-    page.state.home = Some(failures);
-    if page.partial {
-        page.status = "Some of your music isn't available right now.".into();
-    }
-    if let Ok(recent) = recent {
-        if recent.items.is_empty() {
-            page.subtitle = "No recent plays yet. Explore your music below.".into();
-        }
-        page.rows.extend(recent.items.into_iter().map(history_row));
-    }
-    if let Ok(playlists) = playlists {
-        page.rows
-            .extend(playlists.items.into_iter().map(playlist_row));
-    }
-    if let Ok(likes) = likes {
-        let context = context_for(ContextKind::Likes, "liked-songs", "Liked songs");
-        page.rows.extend(
-            likes
-                .items
-                .into_iter()
-                .map(|entry| liked_row(entry, &context)),
-        );
-    }
-    page.rows.truncate(MAX_ROWS);
-    Ok(())
-}
-
 fn context_for(kind: ContextKind, id: &str, name: &str) -> Arc<PlaybackContext> {
     Arc::new(PlaybackContext {
         kind,
@@ -1033,7 +898,11 @@ fn catalog_row(item: CatalogItem, context: Option<&Arc<PlaybackContext>>) -> Row
             } else {
                 "Unavailable".into()
             };
-            row.detail = join_labels(&album, &availability);
+            row.detail = if context.is_some_and(|context| context.kind == ContextKind::Album) {
+                availability
+            } else {
+                join_labels(&album, &availability)
+            };
             row.playable = item.has_audio;
             row.playback = row.playable.then(|| track_selection(&id, context));
             if row.playable {
@@ -1088,7 +957,7 @@ fn catalog_row(item: CatalogItem, context: Option<&Arc<PlaybackContext>>) -> Row
     row
 }
 
-fn history_row(entry: library::RecentEntry) -> Row {
+fn history_row(entry: library::HistoryEntry) -> Row {
     let mut row = catalog_row(entry.track, None);
     let origin = if entry.origin.as_deref() == Some("offline") {
         "offline"
@@ -1115,12 +984,6 @@ fn history_row(entry: library::RecentEntry) -> Row {
     {
         row.detail = join_labels(date, &row.detail);
     }
-    row
-}
-
-fn liked_row(entry: library::LikeEntry, context: &Arc<PlaybackContext>) -> Row {
-    let mut row = catalog_row(entry.track, Some(context));
-    row.liked = Some(true);
     row
 }
 
@@ -1342,8 +1205,8 @@ mod tests {
         serde_json::to_value(player::Selection::from(row.playback.clone().unwrap())).unwrap()
     }
 
-    fn recent(id: &str, metadata_missing: bool) -> library::RecentEntry {
-        library::RecentEntry {
+    fn history_entry(id: &str, metadata_missing: bool) -> library::HistoryEntry {
+        library::HistoryEntry {
             id: id.into(),
             played_at: "2026-05-01T00:00:00Z".into(),
             track: track(),
@@ -1371,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_in_album_and_liked_views_keep_their_collection_context() {
+    fn rows_in_album_keep_their_collection_context() {
         let album = context_for(ContextKind::Album, "album/1", "Album");
         let row = catalog_row(track(), Some(&album));
         assert_eq!(
@@ -1384,16 +1247,8 @@ mod tests {
             Route::Album("album/1".into())
         );
         assert_eq!(selection(&row)["context"]["kind"], "album");
-        let likes = context_for(ContextKind::Likes, "liked-songs", "Liked songs");
-        let row = liked_row(
-            library::LikeEntry {
-                track: track(),
-                liked_at: "2026-05-01T00:00:00Z".into(),
-            },
-            &likes,
-        );
-        assert_eq!(row.liked, Some(true));
-        assert_eq!(selection(&row)["context"]["id"], "liked-songs");
+        assert_eq!(row.detail, "1:01");
+        assert_eq!(row.item.as_ref().unwrap().album_name, "Album");
     }
 
     #[test]
@@ -1571,104 +1426,43 @@ mod tests {
     }
 
     #[test]
-    fn home_reports_partial_reads_but_never_discards_successful_shelves() {
-        let mut page = Page::default();
-        let row = recent("event", false);
-        project_home(
-            &mut page,
-            library::Home {
-                recent: Ok(library::OffsetPage {
-                    items: vec![row],
-                    total: 1,
-                    offset: 0,
-                    limit: 8,
-                }),
-                playlists: Err(CHANGED),
-                likes: Err(CHANGED),
-            },
-        )
-        .unwrap();
-        assert!(page.partial);
-        assert_eq!(
-            page.rows[0].key,
-            RowKey::HistoryEvent("online:event".into())
-        );
-        assert!(selection(&page.rows[0]).get("context").is_none());
-        let mut offline = recent("event", false);
-        offline.origin = Some("offline".into());
-        assert_ne!(history_row(offline).key, page.rows[0].key);
-        let missing = history_row(recent("old-event", true));
-        assert!(!missing.playable && missing.item.is_none() && missing.route.is_none());
-        assert_eq!(
-            project_home(
-                &mut Page::default(),
-                library::Home {
-                    recent: Err(CHANGED),
-                    playlists: Err(EXPIRED),
-                    likes: Err(CHANGED),
-                }
-            ),
-            Err(EXPIRED)
-        );
+    fn offline_search_matches_download_metadata_and_collects_only_local_rows() {
+        let mut row = catalog_row(track(), None);
+        row.route = None;
+        row.playback = None;
+        let group = Row {
+            title: "Road trip".into(),
+            route: Some(Route::SavedCollection("local".into())),
+            ..Row::default()
+        };
+        let downloads = Page {
+            rows: vec![group.clone(), row.clone()],
+            ..Page::default()
+        };
+        let matches = search_downloads(&downloads, "ALBUM artist");
+        assert_eq!(matches.rows, [row]);
+        assert_eq!(matches.total, Some(1));
+        assert!(!matches.more);
+        assert_eq!(search_downloads(&downloads, "TRIP").rows, [group]);
+        assert!(search_downloads(&downloads, "not present").rows.is_empty());
+        assert!(search_downloads(&downloads, " ").rows.is_empty());
     }
 
     #[test]
-    fn partial_home_retains_only_failed_shelves_and_only_for_the_same_scope() {
-        fn shelf<T>(items: Vec<T>) -> library::OffsetPage<T> {
-            library::OffsetPage {
-                total: items.len() as u64,
-                items,
-                offset: 0,
-                limit: 8,
-            }
-        }
-        fn likes(items: Vec<library::LikeEntry>) -> library::LikesPage {
-            let count = items.len() as u64;
-            library::LikesPage {
-                items,
-                total: count,
-                available_total: count,
-                offset: 0,
-                limit: 8,
-            }
-        }
-        let mut previous = Page::default();
-        project_home(
-            &mut previous,
-            library::Home {
-                recent: Ok(shelf(vec![recent("retained-event", false)])),
-                playlists: Ok(shelf(vec![])),
-                likes: Ok(likes(vec![library::LikeEntry {
-                    track: track(),
-                    liked_at: "2026-05-01T00:00:00Z".into(),
-                }])),
-            },
-        )
-        .unwrap();
-        previous.state.account_id = "first".into();
-        let mut next = Page::default();
-        project_home(
-            &mut next,
-            library::Home {
-                recent: Err(CHANGED),
-                playlists: Ok(shelf(vec![])),
-                likes: Ok(likes(vec![])),
-            },
-        )
-        .unwrap();
-        assert!(next.partial);
-        next.state.account_id = "second".into();
-        next.retain_home_shelves(&previous);
-        assert!(next.rows.is_empty());
-        next.state.account_id = "first".into();
-        next.retain_home_shelves(&previous);
-        next.retain_home_shelves(&previous);
-        assert_eq!(next.rows.len(), 1); // Only a real listening event, no fabricated shelf entries.
-        assert_eq!(
-            next.rows[0].key,
-            RowKey::HistoryEvent("online:retained-event".into())
-        );
-        assert!(next.rows.iter().all(|r| r.liked.is_none()));
+    fn history_distinguishes_repeated_plays_and_never_opens_missing_tracks() {
+        let online = history_row(history_entry("event", false));
+        assert_eq!(online.key, RowKey::HistoryEvent("online:event".into()));
+        assert!(selection(&online).get("context").is_none());
+        let mut offline = history_entry("event", false);
+        offline.origin = Some("offline".into());
+        let offline = history_row(offline);
+        let repeated = history_row(history_entry("another-event", false));
+        assert_eq!(offline.id, online.id);
+        assert_eq!(repeated.id, online.id);
+        assert_ne!(offline.key, online.key);
+        assert_ne!(repeated.key, online.key);
+        let missing = history_row(history_entry("old-event", true));
+        assert!(!missing.playable && missing.item.is_none() && missing.route.is_none());
     }
 
     #[test]

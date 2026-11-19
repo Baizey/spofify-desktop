@@ -5,16 +5,14 @@ export struct PaletteRow { id: string, title: string, primary: color, on-primary
 export component SettingCard inherits Rectangle {
     in property <string> title;
     in property <string> detail;
-    border-radius: 12px;
-    border-width: 1px;
-    border-color: Theme.line;
-    background: Theme.panel;
+    background: transparent;
     min-height: layout.preferred-height;
     vertical-stretch: 0;
+    Divider { y: parent.height - 1px; }
     layout := VerticalLayout {
-        padding: 15px;
+        padding-top: 12px; padding-bottom: 12px;
         spacing: 9px;
-        Text { text: root.title; color: Theme.text; font-size: 15px * Theme.density; font-weight: 700; }
+        if root.title != "": Text { text: root.title; color: Theme.text; font-size: 15px * Theme.density; font-weight: 700; }
         if root.detail != "": Caption { text: root.detail; wrap: word-wrap; }
         @children
     }
@@ -47,7 +45,7 @@ export component Settings inherits VerticalLayout {
     }
     SettingCard {
         title: "Display on this computer";
-        detail: "Choose a light or dark background and change the size of text and list rows.";
+        detail: "";
         HorizontalLayout {
             spacing: 7px;
             Action { text: "Dark"; selected: root.mode == 0; clicked => { root.appearance(0, root.scale); } }
@@ -68,7 +66,7 @@ export component Settings inherits VerticalLayout {
     }
     SettingCard {
         title: "Account colors";
-        detail: root.reconnecting ? "Account colors will be available once you’re connected." : root.offline ? "Go online to choose an account palette." : "Palettes are provided by your music server.";
+        detail: root.reconnecting ? "Account colors will be available once you’re connected." : root.offline ? "Go online to choose an account palette." : "";
         if root.palette-status != "": Notice { text: root.palette-status; }
         for palette in root.palettes: HorizontalLayout {
             spacing: 9px;
