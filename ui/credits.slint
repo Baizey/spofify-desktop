@@ -1,0 +1,200 @@
+import { Caption, Theme } from "theme.slint";
+
+export struct ArtistCredit { id: string, name: string }
+
+component CreditName inherits Rectangle {
+    in property <ArtistCredit> credit;
+    in property <bool> interactive;
+    in property <length> font-size;
+    out property <length> text-width: label.preferred-width;
+    callback activated(string);
+    callback focused();
+
+    property <bool> linked: root.interactive && root.credit.id != "";
+    if root.linked: Rectangle {
+        width: parent.width; height: parent.height;
+        // Slint 1.18 has no accessibility link role. Use its navigation button
+        // semantics, and instantiate no actionable node for unlinked text.
+        accessible-role: button;
+        accessible-label: "Open artist: " + label.text;
+        accessible-action-default => { if root.linked { root.activated(root.credit.id); } }
+        forward-focus: key;
+        border-width: key.has-focus ? 1px : 0px;
+        border-color: Theme.blue;
+        border-radius: 4px;
+        background: pointer.has-hover ? Theme.raised : transparent;
+
+        pointer := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { key.focus(); root.activated(root.credit.id); }
+        }
+        key := FocusScope {
+            focus-on-click: false;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            key-pressed(event) => {
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { root.activated(root.credit.id); }
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+
+    label := Caption {
+        x: 2px; width: max(0px, parent.width - 4px); height: parent.height;
+        text: root.credit.name == "" ? "Unknown artist" : root.credit.name;
+        font-size: root.font-size;
+        color: root.linked ? Theme.blue : Theme.muted;
+        accessible-role: none;
+    }
+    if !root.linked: Rectangle {
+        width: parent.width; height: parent.height;
+        accessible-role: text;
+        accessible-label: label.text;
+    }
+}
+
+export component CreditLine inherits Rectangle {
+    in property <[ArtistCredit]> credits;
+    // A display-only line used when there are no structured credits.
+    in property <string> fallback;
+    in property <bool> centered;
+    in property <bool> interactive: true;
+    in property <length> font-size: 13px * Theme.density;
+    callback activated(string /* id */);
+    callback focused();
+
+    min-width: 0px;
+    horizontal-stretch: 1;
+    preferred-height: max(20px, root.font-size + 6px);
+
+    if root.credits.length == 0: Caption {
+        width: parent.width; height: parent.height;
+        text: root.fallback;
+        font-size: root.font-size;
+        horizontal-alignment: root.centered ? center : left;
+    }
+
+    // Keep one compact line. Overlong names elide; long lists pan with a
+    // horizontal gesture or drag. Focusing a credit always brings it into view.
+    viewport := Flickable {
+        visible: root.credits.length > 0;
+        width: parent.width; height: parent.height;
+        content-width: max(self.width, strip.width);
+        content-height: self.height;
+        mouse-drag-pan-enabled: self.content-width > self.width;
+
+        strip := HorizontalLayout {
+            x: root.centered ? max(0px, (viewport.width - self.width) / 2) : 0px;
+            width: self.preferred-width;
+            height: viewport.height;
+            for credit[index] in root.credits: slot := Rectangle {
+                property <length> inset: index == 0 ? 0px : 12px;
+                width: min(viewport.width, item.text-width + 4px + self.inset);
+                // Draw the separator rather than eliding a glyph in a narrow slot.
+                if index != 0: Rectangle {
+                    x: (slot.inset - self.width) / 2; y: (parent.height - self.height) / 2;
+                    width: 3px; height: self.width; border-radius: self.width / 2;
+                    background: Theme.muted;
+                    accessible-role: none;
+                }
+                item := CreditName {
+                    x: slot.inset; width: max(0px, slot.width - self.x); height: slot.height;
+                    credit: credit; interactive: root.interactive; font-size: root.font-size;
+                    activated(id) => { root.activated(id); }
+                    focused => {
+                        let start = strip.x + slot.x;
+                        let end = start + slot.width;
+                        viewport.content-x = clamp(min(-start, max(viewport.width - end, viewport.content-x)),
+                            viewport.width - viewport.content-width, 0px);
+                        root.focused();
+                    }
+                }
+            }
+        }
+    }
+    changed credits => { viewport.content-x = 0px; }
+}
+
+// Use the visible text itself as the flex item so Slint measures the whole
+// name, including the height of a long name wrapped within one item.
+component DetailCredit inherits Text {
+    in property <ArtistCredit> credit;
+    in property <bool> interactive;
+    callback activated(string);
+    callback focused();
+
+    property <bool> linked: root.interactive && root.credit.id != "";
+    text: root.credit.name == "" ? "Unknown artist" : root.credit.name;
+    color: root.linked ? Theme.blue : Theme.muted;
+    wrap: char-wrap;
+    overflow: clip;
+    vertical-alignment: center;
+    accessible-role: none;
+
+    if root.linked: Rectangle {
+        width: parent.width; height: parent.height;
+        accessible-role: button;
+        accessible-label: "Open artist: " + root.text;
+        accessible-action-default => { key.focus(); root.activated(root.credit.id); }
+        forward-focus: key;
+        border-radius: 4px;
+        border-width: key.has-focus ? 2px : pointer.has-hover ? 1px : 0px;
+        border-color: Theme.blue;
+        pointer := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { key.focus(); root.activated(root.credit.id); }
+        }
+        key := FocusScope {
+            focus-on-click: false;
+            focus-gained(_) => { root.focused(); }
+            key-pressed(event) => {
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { root.activated(root.credit.id); }
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+    if !root.linked: Rectangle {
+        width: parent.width; height: parent.height;
+        accessible-role: text;
+        accessible-label: root.text;
+    }
+}
+
+// Detail views can grow vertically; don't hide credits behind a sideways pan.
+export component WrappingCredits inherits FlexboxLayout {
+    in property <[ArtistCredit]> credits;
+    in property <string> fallback;
+    in property <bool> centered;
+    in property <bool> interactive: true;
+    in property <length> font-size: 13px * Theme.density;
+    callback activated(string);
+    callback focused(length, length);
+
+    min-width: 0px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    flex-wrap: wrap;
+    alignment: root.centered ? center : start;
+    cross-axis-alignment: center;
+    spacing-horizontal: 14px;
+    spacing-vertical: 6px;
+    padding-top: 3px;
+    padding-bottom: 3px;
+
+    for credit in root.credits: DetailCredit {
+        credit: credit; interactive: root.interactive; font-size: root.font-size;
+        activated(id) => { root.activated(id); }
+        focused => { root.focused(self.y, self.height); }
+    }
+    if root.credits.length == 0 && root.fallback != "": Caption {
+        text: root.fallback;
+        font-size: root.font-size;
+        wrap: char-wrap; overflow: clip;
+        horizontal-alignment: root.centered ? center : left;
+    }
+}

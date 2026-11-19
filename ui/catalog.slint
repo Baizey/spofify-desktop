@@ -1,4 +1,6 @@
-import { Action, Caption, Cover, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, TextTarget, Theme } from "theme.slint";
+import { ArtistCredit, CreditLine, WrappingCredits } from "credits.slint";
+import { ActionCopy, OverflowMenu } from "overflow-menu.slint";
 
 export global Copy {
     public pure function title(kind: string) -> string {
@@ -23,16 +25,10 @@ export global Copy {
             : kind == "artist" || kind == "artists" ? Theme.amber : Theme.accent;
     }
     public pure function action-label(action: string) -> string {
-        return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
-            : action == "save" ? "Save offline"
-            : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
-            : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
-            : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
-            : action == "new-rules" ? "New rules playlist" : action;
+        return ActionCopy.label(action);
     }
     public pure function action-mark(action: string) -> string {
-        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" ? "↓" : action == "remove" ? "−" : action == "up" ? "↑"
-            : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+        return ActionCopy.mark(action);
     }
 }
 
@@ -46,7 +42,15 @@ export component Hero inherits Rectangle {
     in property <bool> compact;
     in property <bool> show-art: true;
     in property <bool> large;
-    height: large ? (compact ? 155px : 216px) : show-art ? (compact ? 108px : 134px) : subtitle == "" ? 61px : 77px;
+    in property <[ArtistCredit]> credits;
+    in property <string> album-id;
+    in property <string> album-name;
+    in property <bool> metadata-enabled: true;
+    callback page-action(string, string);
+    callback focused(length, length);
+    min-width: 0px;
+    min-height: max(copy.preferred-height + 12px,
+        large ? (compact ? 155px : 216px) : show-art ? (compact ? 108px : 134px) : subtitle == "" ? 61px : 77px);
     vertical-stretch: 0;
     HorizontalLayout {
         spacing: root.compact ? 16px : 22px;
@@ -58,16 +62,27 @@ export component Hero inherits Rectangle {
                 artwork: root.artwork; mark: root.glyph; tint: root.tint;
             }
         }
-        VerticalLayout {
+        copy := VerticalLayout {
+            min-width: 0px;
             horizontal-stretch: 1;
             alignment: center;
-            spacing: 7px;
+            spacing: 4px;
             if root.section != "": Eyebrow { text: root.section; color: root.tint; }
             Text {
                 text: root.title; color: Theme.text; font-size: (root.compact ? 28px : 37px) * Theme.density;
                 font-weight: 700; letter-spacing: -1px; overflow: elide; wrap: word-wrap; max-height: root.compact ? 61px : 86px;
             }
             if root.subtitle != "": Caption { text: root.subtitle; wrap: word-wrap; max-height: 40px; }
+            if root.credits.length > 0: hero-credits := WrappingCredits {
+                credits: root.credits; interactive: root.metadata-enabled;
+                activated(id) => { root.page-action("artist", id); }
+                focused(y, h) => { root.focused(copy.y + hero-credits.y + y, h); }
+            }
+            if root.album-name != "": AlbumLine {
+                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
+                activated => { root.page-action("album", root.album-id); }
+                focused => { root.focused(copy.y + self.y, self.height); }
+            }
         }
     }
 }
@@ -89,60 +104,12 @@ export component EmptyState inherits Rectangle {
     }
 }
 
-export component LineButton inherits Rectangle {
+export component LineButton inherits TextTarget {
     in property <string> title;
-    in property <string> subtitle;
-    in property <string> kind;
-    in property <image> artwork;
-    in property <bool> enabled: true;
     in property <bool> selected;
-    in property <bool> compact;
-    in property <int> sequence;
-    in property <string> action-name: "Open";
-    callback activated();
-    callback focused();
-    forward-focus: key;
-    accessible-role: button;
-    accessible-label: action-name + " " + title;
-    accessible-description: subtitle;
-    accessible-enabled: enabled;
-    accessible-action-default => { if root.enabled { root.activated(); } }
-    min-width: 0px;
-    horizontal-stretch: 1;
-    border-radius: 8px;
-    border-width: key.has-focus ? 2px : 0px;
-    border-color: Theme.blue;
-    background: (pointer.has-hover && enabled) || key.has-focus ? Theme.raised : transparent;
-    HorizontalLayout {
-        spacing: 10px;
-        padding-left: 0px;
-        padding-right: 8px;
-        if root.sequence > 0: Caption { width: 33px; text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono"; }
-        if root.sequence == 0 && !root.compact: Rectangle {
-            width: 39px;
-            Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px; artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist"; }
-        }
-        VerticalLayout {
-            alignment: center;
-            horizontal-stretch: 1;
-            spacing: 3px;
-            Text { text: root.title; color: root.selected ? Theme.accent : Theme.text; font-size: 15px * Theme.density; font-weight: 600; overflow: elide; accessible-role: none; }
-            if root.subtitle != "": Caption { text: root.subtitle; font-size: 12px * Theme.density; accessible-role: none; }
-        }
-    }
-    pointer := TouchArea { enabled: root.enabled; mouse-cursor: MouseCursor.pointer; clicked => { key.focus(); root.activated(); } }
-    key := FocusScope {
-        enabled: root.enabled;
-        focus-on-click: false;
-        focus-gained(_) => { root.focused(); }
-        key-pressed(event) => {
-            if event.text == Key.Return || event.text == Key.Space {
-                if !event.repeat { root.activated(); }
-                return accept;
-            }
-            return reject;
-        }
-    }
+    text: title;
+    label: "Open " + title;
+    ink: selected ? Theme.accent : Theme.text;
 }
 
 export component MediaLine inherits Rectangle {
@@ -155,56 +122,84 @@ export component MediaLine inherits Rectangle {
     in property <bool> can-open: true;
     in property <int> sequence;
     in property <bool> compact;
-    in property <bool> expanded;
+    in property <bool> search-result;
     in property <bool> selected;
     in property <[string]> actions;
+    in property <[ArtistCredit]> credits;
+    in property <string> album-id;
+    in property <string> album-name;
+    in property <bool> metadata-enabled: true;
+    in property <length> window-height;
+    in property <string> menu-key;
+    callback page-action(string, string);
     callback action(string);
-    callback toggle-options();
     callback focused();
-    height: line-height + (expanded && actions.length > 0 ? ceil(actions.length / option-columns) * 41px + 4px : 0px);
+    property <string> result-type: !search-result ? ""
+        : kind == "artist" ? "Artist" : kind == "album" ? "Album" : kind == "track" ? "Track" : "";
+    min-width: 0px;
+    min-height: max(max(48px, 56px * Theme.density), words.min-height + 12px);
     vertical-stretch: 0;
-    property <length> line-height: max(48px, 56px * Theme.density);
-    property <int> option-columns: self.width > 810px ? 4 : self.width > 575px ? 3 : 2;
-    property <length> option-width: (self.width - 18px - (option-columns - 1) * 6px) / option-columns;
     border-radius: 10px;
-    background: expanded || selected ? Theme.panel : transparent;
+    background: selected ? Theme.panel : transparent;
     HorizontalLayout {
-        height: root.line-height;
-        padding-top: (root.line-height - 38px)/2; padding-bottom: (root.line-height - 38px)/2; spacing: 8px;
-        LineButton {
-            title: root.title; subtitle: root.subtitle; kind: root.kind; artwork: root.artwork; sequence: root.sequence;
-            enabled: root.can-open; selected: root.selected;
-            activated => { root.action("open"); }
-            focused => { root.focused(); }
+        padding-top: 6px; padding-bottom: 6px; spacing: 8px;
+        if root.sequence > 0: Caption {
+            width: 33px; text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
         }
-        if (!root.compact || root.sequence > 0) && root.detail != "": Caption { width: root.sequence > 0 ? 44px : 208px; text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left; }
-        if root.playable: Action {
-            width: 37px; icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.action("play"); }
+        if root.sequence == 0 && !root.compact: Rectangle {
+            width: 39px;
+            Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
+                artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist";
+            }
         }
-        if root.actions.length > 0: Action {
-            width: 37px; icon: root.expanded ? "×" : "···"; quiet: true; selected: root.expanded;
-            accessible-label: (root.expanded ? "Hide actions for " : "Show actions for ") + root.title;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.toggle-options(); }
+        words := VerticalLayout {
+            min-width: 0px; horizontal-stretch: 1; alignment: center;
+            LineButton {
+                title: root.title; interactive: root.can-open; selected: root.selected;
+                activated => { root.action("open"); }
+                focused => { root.focused(); }
+            }
+            if root.result-type != "": Rectangle {
+                height: max(18px, 16px * Theme.density);
+                Caption {
+                    x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
+                    text: root.result-type + (root.detail == "" ? "" : " · " + root.detail);
+                }
+            }
+            if root.credits.length > 0 || root.subtitle != "": CreditLine {
+                credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                height: max(20px, self.font-size + 6px);
+                activated(id) => { root.page-action("artist", id); }
+                focused => { root.focused(); }
+            }
+            if root.album-name != "": AlbumLine {
+                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
+                activated => { root.page-action("album", root.album-id); }
+                focused => { root.focused(); }
+            }
         }
-    }
-    if root.expanded && root.actions.length > 0: Rectangle {
-        y: root.line-height; height: parent.height - root.line-height;
-        for item-action[i] in root.actions: Action {
-            x: 9px + mod(i, root.option-columns) * (root.option-width + 6px);
-            y: floor(i / root.option-columns) * 41px;
-            width: root.option-width;
-            min-width: 0px;
-            height: 37px;
-            icon: Copy.action-mark(item-action);
-            text: Copy.action-label(item-action);
-            accessible-label: Copy.action-label(item-action) + " · " + root.title;
-            leading: true;
-            danger: item-action == "remove";
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.action(item-action); }
+        if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
+            width: root.sequence > 0 ? 64px : 126px;
+            text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
+        }
+        if root.playable: Rectangle {
+            width: 37px;
+            Action {
+                y: (parent.height - self.height) / 2; width: parent.width;
+                icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
+                changed has-focus => { if self.has-focus { root.focused(); } }
+                clicked => { root.action("play"); }
+            }
+        }
+        if root.actions.length > 0: Rectangle {
+            width: 37px;
+            OverflowMenu {
+                y: (parent.height - self.height) / 2;
+                actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
+                item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+                action(op) => { root.action(op); }
+                focused => { root.focused(); }
+            }
         }
     }
     Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: 0.5; }

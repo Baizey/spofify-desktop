@@ -1,16 +1,18 @@
 //! Desktop browsing controller. A single owner accepts navigation and writes;
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
-    AppWindow, BrowseRow, actions,
+    AppWindow, ArtistCredit, BrowseRow, actions,
     api::{Api, ApiError, Session},
     engine::Command,
     pages::{self, Page, Route},
+    personal_bridge::{Effect, Link, Mutation, PersonalAccess, Status},
     player,
     replica::{Replica, Trail},
     saved,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
+    hash::{BuildHasher, RandomState},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -29,7 +31,7 @@ pub struct Access {
     pub api: Arc<Api>,
     pub session: Session,
     pub offline: bool,
-    pub recent_change: u64,
+    pub personal: PersonalAccess,
 }
 impl Access {
     fn usable(&self) -> bool {
@@ -115,7 +117,7 @@ enum Update {
     Read(Result<Page, ApiError>, bool), // true when the task will retry
     ReadGap,
     SearchDownloads(Result<Page, ApiError>),
-    Changed(Result<Option<Route>, ApiError>, bool),
+    Changed(Result<Option<Route>, ApiError>),
     Local(Result<Command, ApiError>),
     CollectionSaved(Result<crate::collections::SaveSummary, ApiError>),
 }
@@ -123,6 +125,13 @@ struct Delivery {
     serial: u64,
     result: Update,
 }
+struct Pending {
+    effect: Effect,
+    before: Status,
+    due: tokio::time::Instant,
+}
+const PERSONAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const PERSONAL_WRITE_TIMEOUT: Duration = Duration::from_secs(12);
 struct Browser {
     ui: slint::Weak<AppWindow>,
     epoch: Arc<AtomicU64>,
@@ -130,6 +139,7 @@ struct Browser {
     engine: mpsc::Sender<Command>,
     access: Option<Access>,
     route: Route,
+    page_keys: RandomState,
     trail: Trail,
     cache: Replica,
     page: Arc<Page>,
@@ -137,7 +147,10 @@ struct Browser {
     serial: u64,
     busy: bool,
     silent_read: bool,
-    recent_due: Option<tokio::time::Instant>,
+    personal_ready: bool,
+    personal_due: Option<tokio::time::Instant>,
+    personal_view: Option<Status>,
+    pending: Option<Pending>,
     edit_basis: Option<(String, String, u64)>, // form, playlist, original revision
     writing: bool,
     message: String,
@@ -146,6 +159,15 @@ struct Browser {
     results: mpsc::Sender<Delivery>,
     art: watch::Sender<Option<crate::artwork::Request>>,
 }
+/// Opaque, account-session-local identity for the shell's scroll position.
+/// Hash the exact typed route, not its display title or refresh generation, and
+/// never serialize the raw query or server entity ID into the scroll key.
+fn page_key(route: &Route, keys: Option<&RandomState>) -> String {
+    keys.map_or_else(String::new, |keys| {
+        format!("p-{:016x}", keys.hash_one(route))
+    })
+}
+
 fn label(route: &Route) -> &'static str {
     match route {
         Route::History => "History",
@@ -157,8 +179,6 @@ fn label(route: &Route) -> &'static str {
         Route::Now => "Now playing",
         Route::Queue => "Queue",
         Route::Devices => "Devices",
-        Route::Albums => "Albums",
-        Route::Artists => "Artists",
         Route::Album(_) => "Album",
         Route::Artist(_) => "Artist",
         Route::Playlist(_) => "Playlist",
@@ -176,22 +196,54 @@ fn named_route(name: &str) -> Option<Route> {
         "now" => Route::Now,
         "queue" => Route::Queue,
         "devices" => Route::Devices,
-        "albums" => Route::Albums,
-        "artists" => Route::Artists,
         _ => return None,
     })
 }
-fn context_route(kind: &str, id: String) -> Option<Route> {
-    if id.is_empty() {
-        return None;
-    }
+fn context_route(kind: &str, id: &str) -> Option<Route> {
     // A remote player may still have a likes context, but it has no desktop page.
     match kind {
-        "album" => Some(Route::Album(id)),
-        "artist" => Some(Route::Artist(id)),
-        "playlist" | "derived" => Some(Route::Playlist(id)),
+        "album" | "artist" => pages::music_route(kind, id),
+        "playlist" | "derived"
+            if crate::api::catalog::segment_id(id) && !matches!(id, "sources" | "preview") =>
+        {
+            Some(Route::Playlist(id.into()))
+        }
         _ => None,
     }
+}
+
+fn metadata_route(kind: &str, id: &str, offline: bool) -> Option<Route> {
+    if offline || !matches!(kind, "album" | "artist") {
+        return None;
+    }
+    pages::music_route(kind, id)
+}
+
+fn projected_music(credit: Option<&pages::Credit>, offline: bool, artist: bool) -> (&str, &str) {
+    let Some(credit) = credit else {
+        return ("", "");
+    };
+    let id = match (&credit.target, offline, artist) {
+        (Some(Route::Artist(id)), false, true) | (Some(Route::Album(id)), false, false) => id,
+        _ => "",
+    };
+    (id, &credit.name)
+}
+
+fn artist_credits(music: &pages::MusicMetadata, offline: bool) -> ModelRc<ArtistCredit> {
+    ModelRc::new(VecModel::from(
+        music
+            .credits
+            .iter()
+            .map(|credit| {
+                let (id, name) = projected_music(Some(credit), offline, true);
+                ArtistCredit {
+                    id: id.into(),
+                    name: name.into(),
+                }
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 fn repeat_navigation(current: &Route, next: &Route, reading: bool, failed: bool) -> bool {
     current == next && (reading || (matches!(next, Route::Search(_)) && !failed))
@@ -217,12 +269,6 @@ fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'stati
         }
         return v;
     }
-    if !r.album_id.is_empty() {
-        v.push("album");
-    }
-    if !r.artist_id.is_empty() {
-        v.push("artist");
-    }
     if offline {
         return v;
     }
@@ -244,7 +290,7 @@ fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'stati
         if i > 0 {
             v.push("up");
         }
-        if i + 1 < p.rows.len() || p.more {
+        if i + 1 < p.rows.len() {
             v.push("down");
         }
     }
@@ -317,6 +363,7 @@ impl Browser {
         } else {
             p.kind.clone()
         };
+        let key = page_key(&self.route, self.access.as_ref().map(|_| &self.page_keys));
         let title = if p.title.is_empty() {
             label(&self.route).into()
         } else {
@@ -340,6 +387,7 @@ impl Browser {
 
         let local_playback =
             saved_route(&self.route) || offline && matches!(self.route, Route::Search(_));
+        let personal_actions = !self.route.personal() || self.personal_ready;
         let write = self.writing;
         let art = self.art.clone();
         let request = self.access.as_ref().map(|a| crate::artwork::Request {
@@ -352,6 +400,7 @@ impl Browser {
             ui.set_account_label(account.into());
             ui.set_manual_offline(offline);
             ui.set_page_kind(kind.clone().into());
+            ui.set_page_key(key.into());
             ui.set_page_title(title.into());
             ui.set_page_subtitle(p.subtitle.clone().into());
             ui.set_page_status(message.into());
@@ -361,18 +410,36 @@ impl Browser {
             ui.set_has_more(p.more && !offline);
             ui.set_form_busy(write);
             if models {
+                let (album_id, album_name) =
+                    projected_music(p.music.album.as_ref(), offline, false);
+                ui.set_page_credits(artist_credits(&p.music, offline));
+                ui.set_page_album_id(album_id.into());
+                ui.set_page_album_name(album_name.into());
                 ui.set_browse_rows(ModelRc::new(VecModel::from(
                     p.rows
                         .iter()
                         .enumerate()
-                        .map(|(i, r)| BrowseRow {
-                            section: Default::default(),
-                            actions: strings(row_actions(&p, r, i, offline)),
-                            kind: r.kind.as_str().into(),
-                            title: r.title.as_str().into(),
-                            subtitle: r.subtitle.as_str().into(),
-                            detail: r.detail.as_str().into(),
-                            playable: r.playable && offline == local_playback,
+                        .map(|(i, r)| {
+                            let (album_id, album_name) =
+                                projected_music(r.music.album.as_ref(), offline, false);
+                            BrowseRow {
+                                section: Default::default(),
+                                actions: if personal_actions {
+                                    strings(row_actions(&p, r, i, offline))
+                                } else {
+                                    strings(Vec::new())
+                                },
+                                kind: r.kind.as_str().into(),
+                                title: r.title.as_str().into(),
+                                subtitle: r.subtitle.as_str().into(),
+                                detail: r.detail.as_str().into(),
+                                playable: r.playable
+                                    && personal_actions
+                                    && offline == local_playback,
+                                credits: artist_credits(&r.music, offline),
+                                album_id: album_id.into(),
+                                album_name: album_name.into(),
+                            }
                         })
                         .collect::<Vec<_>>(),
                 )));
@@ -386,7 +453,7 @@ impl Browser {
                 {
                     actions.push("play");
                 }
-                if !offline {
+                if !offline && personal_actions {
                     if p.playback.is_some() {
                         actions.extend(["play", "queue"]);
                     }
@@ -396,8 +463,10 @@ impl Browser {
                     ) {
                         actions.push("save");
                     }
-                    if kind == "playlists" {
-                        actions.extend(["new-manual", "new-rules"]);
+                    match kind.as_str() {
+                        "playlists" => actions.extend(["new-manual", "new-rules"]),
+                        "picker" => actions.push("new-manual"),
+                        _ => {}
                     }
                     if let Some(m) = &p.playlist {
                         let c = &m.capabilities;
@@ -427,10 +496,14 @@ impl Browser {
     }
     fn reset(&mut self, access: Option<Access>) {
         self.cancel();
-        self.recent_due = None;
+        self.personal_due = None;
+        self.personal_ready = false;
+        self.personal_view = None;
+        self.pending = None;
         self.edit_basis = None;
         self.cache = Replica::default();
         self.trail = Trail::default();
+        self.page_keys = RandomState::new();
         self.route = Route::History;
         self.page = Arc::default();
         self.message.clear();
@@ -459,15 +532,11 @@ impl Browser {
         let old = self.access.replace(next.unwrap()).unwrap();
         let a = self.access.as_ref().unwrap();
         let offline = a.offline;
-        let recent = a.recent_change != old.recent_change;
-        if recent {
-            // Playback progress is a hint, never a committed history record. Let
-            // the server settle and combine nearby hints into one background read.
-            self.cache.recent_changed();
-            self.recent_due = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-        }
         if old.offline != offline {
+            let interrupted = self.pending.take().is_some();
             self.cancel();
+            self.personal_due = None;
+            self.personal_view = None;
             self.scoped_ui(|ui| clear_form(&ui));
             // Downloads remain the offline landing page, but don't abandon
             // a downloaded collection or a query that can continue locally.
@@ -482,19 +551,222 @@ impl Browser {
                 jump_to_downloads,
                 false,
             );
+            if interrupted {
+                self.message =
+                    "You went offline before the playlist change could be confirmed.".into();
+                self.error = true;
+                self.render(false);
+            }
         }
     }
-    fn recent_hint(&mut self) {
-        self.recent_due = None;
-        if self.access.as_ref().is_some_and(|a| !a.offline)
-            && !self.writing
-            && self.task.is_none()
-            && matches!(self.route, Route::History)
+    fn personal_write_error(&mut self, message: String) {
+        self.pending = None;
+        self.writing = false;
+        self.busy = false;
+        self.error = true;
+        self.message = message.clone();
+        self.scoped_ui(move |ui| ui.set_form_error(message.into()));
+        self.render(false);
+    }
+
+    fn personal_mutation(&mut self, access: &Access, mutation: Mutation) {
+        let before = access.personal.read(|status, _| status);
+        if access.offline
+            || access.session.is_offline()
+            || before.epoch != access.epoch
+            || before.link != Link::Ready
         {
-            self.cache.recent_changed();
-            self.visit(self.route.clone(), false, false);
+            self.personal_write_error("You're not connected to your account library.".into());
+            return;
+        }
+        if self
+            .engine
+            .try_send(Command::Personal {
+                epoch: access.epoch,
+                generation: before.generation,
+                command: mutation.command,
+            })
+            .is_err()
+        {
+            self.personal_write_error("The change was not sent. Please try again.".into());
+            return;
+        }
+        self.pending = Some(Pending {
+            effect: mutation.effect,
+            before,
+            due: tokio::time::Instant::now() + PERSONAL_WRITE_TIMEOUT,
+        });
+        self.writing = true;
+        self.busy = true;
+        self.error = false;
+        self.message = "Waiting to see the change in your account library…".into();
+        self.scoped_ui(|ui| ui.set_form_error("".into()));
+        self.render(false);
+    }
+
+    fn personal_changed(&mut self, visiting: bool) {
+        if !self.route.personal() {
+            return;
+        }
+        let Some(a) = self.access.clone().filter(Access::usable) else {
+            self.render(visiting);
+            return;
+        };
+        let route = self.route.clone();
+        let (status, next, detail_live, unavailable, limited) =
+            a.personal.read(|status, replica| {
+                let detail_live = replica.playlist().is_some_and(|p| !p.stale);
+                let page = (status.epoch == a.epoch)
+                    .then(|| pages::personal_projection(&route, replica))
+                    .flatten();
+                (
+                    status,
+                    page,
+                    detail_live,
+                    matches!(route, Route::Playlist(_)) && replica.playlist_unavailable(),
+                    matches!(route, Route::Playlist(_)) && replica.playlist_limited(),
+                )
+            });
+        let prior = self.personal_view.replace(status);
+        let online = !a.offline && !a.session.is_offline();
+        let prior_ready = self.personal_ready;
+        self.personal_ready = online
+            && status.epoch == a.epoch
+            && status.link == Link::Ready
+            && next.is_some()
+            && (!matches!(route, Route::Playlist(_)) || detail_live);
+        let models_changed = if let Some(next) = next {
+            if *self.page == next {
+                false
+            } else {
+                self.page = Arc::new(next);
+                true
+            }
+        } else if unavailable && self.page.playlist.is_some() {
+            self.page = Arc::default();
+            true
+        } else {
+            false
+        };
+        let render_models = visiting || models_changed || prior_ready != self.personal_ready;
+        if let Some(pending) = self.pending.as_ref() {
+            let before = pending.before;
+            if !online
+                || status.epoch != before.epoch
+                || status.generation != before.generation
+                || status.interruption != before.interruption
+                || status.link != Link::Ready
+            {
+                self.personal_write_error("The connection was interrupted. The change was not confirmed; check the current library before retrying.".into());
+                self.render(render_models);
+                return;
+            }
+            if status.refused != before.refused {
+                self.personal_write_error("The connection could not take the change. Check the current library before retrying.".into());
+                self.render(render_models);
+                return;
+            }
+            if let Some(observed) = a.personal.observed(before, &pending.effect) {
+                self.pending = None;
+                self.writing = false;
+                self.busy = false;
+                self.edit_basis = None;
+                self.scoped_ui(clear_form_owned);
+                if let Some(next) = observed {
+                    self.trail.landed(&next);
+                    self.visit(next, false, false);
+                }
+                self.error = false;
+                self.message = "The matching change is now visible in your account library.".into();
+                self.render(true);
+                return;
+            }
+            self.render(render_models);
+            return;
+        }
+        // Do not overwrite a local download's separate progress or completion.
+        if self.writing || (!visiting && self.personal_ready && self.error && prior_ready) {
+            self.render(render_models);
+            return;
+        }
+        let refused = prior.is_some_and(|old| {
+            old.generation == status.generation && old.refused != status.refused
+        });
+        let transitioned = prior.is_none_or(|old| {
+            old.link != status.link
+                || old.generation != status.generation
+                || old.interruption != status.interruption
+        }) || prior_ready;
+        let waiting = online
+            && matches!(status.link, Link::Waiting | Link::Ready)
+            && !self.personal_ready
+            && !unavailable
+            && !limited;
+        if !waiting || refused || (visiting && self.error) {
+            self.personal_due = None;
+        } else if transitioned || visiting {
+            self.personal_due = Some(tokio::time::Instant::now() + PERSONAL_READ_TIMEOUT);
+        }
+        self.busy = self.personal_due.is_some() && self.page.rows.is_empty();
+        if !(visiting && self.error) {
+            let (message, error) = if !online {
+                ("Work online to refresh your account library.", false)
+            } else if limited {
+                (
+                    "This playlist is too large to load here. Previously loaded songs may still be shown.",
+                    true,
+                )
+            } else if unavailable {
+                (
+                    "This playlist could not be opened. It may have been removed.",
+                    true,
+                )
+            } else if refused && !self.personal_ready {
+                (
+                    "The playlist request was not sent. Open it again to retry.",
+                    true,
+                )
+            } else if self.personal_ready {
+                ("", false)
+            } else if status.link == Link::Gap {
+                (
+                    "The account update was interrupted. Waiting for a fresh snapshot.",
+                    true,
+                )
+            } else if status.link == Link::Disconnected {
+                (
+                    "The account library is disconnected. Reconnect to refresh it.",
+                    true,
+                )
+            } else if self.personal_due.is_some() {
+                ("Waiting for the account library…", false)
+            } else {
+                (
+                    "The account library did not finish loading. Open this page again to retry.",
+                    true,
+                )
+            };
+            self.message = message.into();
+            self.error = error;
+        }
+        self.render(render_models);
+    }
+
+    fn personal_timeout(&mut self) {
+        let now = tokio::time::Instant::now();
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.due <= now)
+        {
+            self.personal_write_error("The server did not confirm this change. Check the current library before retrying.".into());
+        }
+        if self.personal_due.is_some_and(|due| due <= now) {
+            self.personal_due = None;
+            self.personal_changed(false);
         }
     }
+
     fn visit(&mut self, next: Route, remember: bool, more: bool) {
         if self.writing
             || remember && repeat_navigation(&self.route, &next, self.task.is_some(), self.error)
@@ -502,6 +774,7 @@ impl Browser {
             return;
         }
         let changed = next != self.route;
+        let retry_personal = !changed && self.error && matches!(next, Route::Playlist(_));
         if changed && matches!(self.route, Route::Search(_)) && !matches!(next, Route::Search(_)) {
             self.scoped_ui(|ui| ui.set_query("".into()));
         }
@@ -514,6 +787,41 @@ impl Browser {
         if changed {
             self.edit_basis = None;
             self.scoped_ui(|ui| clear_form(&ui));
+        }
+        if let Some(a) = self.access.clone().filter(Access::usable) {
+            let wanted = match &next {
+                Route::Playlist(id) => Some(id.clone()),
+                _ => None,
+            };
+            if retry_personal {
+                a.personal.watch_playlist(a.epoch, None);
+            }
+            if let Some((generation, command)) = a.personal.watch_playlist(a.epoch, wanted)
+                && !a.offline
+                && !a.session.is_offline()
+                && self
+                    .engine
+                    .try_send(Command::Personal {
+                        epoch: a.epoch,
+                        generation,
+                        command,
+                    })
+                    .is_err()
+            {
+                self.error = true;
+                self.message = "The playlist request was not sent. Open it again to retry.".into();
+            }
+        }
+        self.personal_due = None;
+        self.personal_ready = false;
+        self.personal_view = None;
+        if next.personal() {
+            let previous = std::mem::replace(&mut self.route, next);
+            if previous != self.route {
+                self.page = Arc::default();
+            }
+            self.personal_changed(true);
+            return;
         }
         let offline_search =
             self.access.as_ref().is_some_and(|a| a.offline) && matches!(next, Route::Search(_));
@@ -604,9 +912,7 @@ impl Browser {
                     rebuilding = true;
                     result = rebuild_for(&a, &next, depth).await;
                 }
-                let retry = attempt < 4
-                    && (result.as_ref().err().is_some_and(recoverable)
-                        || result.as_ref().is_ok_and(Page::pending_rules));
+                let retry = attempt < 4 && result.as_ref().err().is_some_and(recoverable);
                 if retry {
                     let result = match result {
                         Ok(p) => Update::Read(Ok(p), true),
@@ -732,55 +1038,62 @@ impl Browser {
             });
             return;
         }
+        // Explicit Work offline closes the session gate immediately, before
+        // the access watch necessarily reports the mode change to the browser.
+        let offline = a.offline || a.session.is_offline();
+        if route.personal()
+            && !self.personal_ready
+            && !matches!(op.as_str(), "open" | "album" | "artist" | "track")
+        {
+            self.message = "Wait for the current account library before making changes.".into();
+            self.render(false);
+            return;
+        }
         if let Some(kind) = op.strip_prefix("context-") {
-            if let Some(target) = context_route(kind, val) {
+            if !offline && let Some(target) = context_route(kind, &val) {
                 self.visit(target, true, false);
             }
             return;
         }
         if matches!(op.as_str(), "album" | "artist" | "track") {
-            let id = row.as_ref().map_or(val, |r| {
-                if op == "artist" {
-                    r.artist_id.clone()
-                } else if op == "album" {
-                    r.album_id.clone()
-                } else {
-                    r.id.clone()
-                }
-            });
-            if !id.is_empty() {
-                self.visit(
-                    match op.as_str() {
-                        "artist" => Route::Artist(id),
-                        "album" => Route::Album(id),
-                        _ => Route::Track(id),
-                    },
-                    true,
-                    false,
-                );
+            let target = if op == "track" && !offline && idx.is_none() {
+                pages::music_route("track", &val) // Now Playing's explicit track link.
+            } else {
+                metadata_route(&op, &val, offline)
+            };
+            if let Some(target) = target.filter(|target| *target != route) {
+                self.visit(target, true, false);
             }
             return;
         }
         let saved_page = saved_route(&route);
         let local_results = a.offline && (saved_page || matches!(route, Route::Search(_)));
         if op == "open" && !matches!(route, Route::Picker(_)) {
-            if let Some(r) = row.as_ref().and_then(|r| r.route.clone()) {
-                self.visit(r, true, false);
+            let target = row.as_ref().and_then(|r| {
+                r.route.clone().or_else(|| {
+                    // Download rows have local playback, not a local Track
+                    // detail. While online they can still open their stored
+                    // track identity on this account's server.
+                    if saved_page
+                        && !offline
+                        && let pages::RowKey::Track(id) = &r.key
+                    {
+                        pages::music_route("track", id)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(target) = target {
+                if (!offline || saved_route(&target)) && target != route {
+                    self.visit(target, true, false);
+                }
                 return;
             }
-            if local_results {
-                if !row.as_ref().is_some_and(|r| r.playable) {
-                    return;
-                }
-                op = "play".into(); // Saved tracks have no separate offline detail.
-            } else {
-                if let Some(r) = &row
-                    && !r.id.is_empty()
-                {
-                    self.visit(Route::Track(r.id.clone()), true, false);
-                }
+            if !local_results || !row.as_ref().is_some_and(|r| r.playable) {
                 return;
             }
+            op = "play".into(); // Saved tracks have no separate offline detail.
         }
         if op == "add" && !matches!(route, Route::Picker(_)) {
             if let Some(r) = row
@@ -834,6 +1147,18 @@ impl Browser {
             self.render(false);
             return;
         }
+        if !local_play && !save && !remove_saved {
+            let op = if op == "open" && matches!(route, Route::Picker(_)) {
+                "add"
+            } else {
+                &op
+            };
+            match actions::mutation(&route, &page, op, idx, &val) {
+                Ok(mutation) => self.personal_mutation(&a, mutation),
+                Err(e) => self.personal_write_error(readable(&e)),
+            }
+            return;
+        }
         self.cancel();
         self.writing = true;
         self.busy = true;
@@ -866,7 +1191,6 @@ impl Browser {
                         crate::collections::remove(&a, id)
                             .await
                             .map(|_| Some(Route::Offline)),
-                        true,
                     )
                 } else {
                     let res = if let Some(r) = row.as_ref() {
@@ -882,18 +1206,10 @@ impl Browser {
                     } else {
                         Err(unavailable("Choose a track to save or remove."))
                     };
-                    Update::Changed(res.map(|_| None), true)
+                    Update::Changed(res.map(|_| None))
                 }
             } else {
-                let op = if op == "open" && matches!(route, Route::Picker(_)) {
-                    "add"
-                } else {
-                    &op
-                };
-                Update::Changed(
-                    actions::mutate(&a, &route, &page, op, idx, &val).await,
-                    false,
-                )
+                unreachable!("personal mutations are sent through the account socket")
             };
             let _ = tx.send(Delivery { serial, result }).await;
         }));
@@ -949,19 +1265,15 @@ impl Browser {
                 self.message = readable(&e);
                 self.render(false);
             }
-            Update::Changed(Ok(route), saved) => {
+            Update::Changed(Ok(route)) => {
                 self.scoped_ui(|ui| clear_form(&ui));
-                if saved {
-                    self.cache.saved_changed();
-                    if route.is_none()
-                        && !matches!(self.route, Route::Offline | Route::SavedCollection(_))
-                    {
-                        self.message = "Saved on this device.".into();
-                        self.render(false);
-                        return;
-                    }
-                } else {
-                    self.cache.collection_changed();
+                self.cache.saved_changed();
+                if route.is_none()
+                    && !matches!(self.route, Route::Offline | Route::SavedCollection(_))
+                {
+                    self.message = "Saved on this device.".into();
+                    self.render(false);
+                    return;
                 }
                 if let Some(next) = &route {
                     self.trail.landed(next);
@@ -988,17 +1300,12 @@ impl Browser {
                 }
                 self.render(false);
             }
-            Update::Changed(Err(e), _) => {
+            Update::Changed(Err(e)) => {
                 let msg = readable(&e);
                 self.scoped_ui({
                     let m = msg.clone();
                     move |ui| ui.set_form_error(m.into())
                 });
-                if matches!(e.status, 409 | 410 | 412) || recoverable(&e) {
-                    // Outcome may be unknown after a lost response. Re-read; never resubmit the write.
-                    self.cache.collection_changed();
-                    self.visit(self.route.clone(), false, false);
-                }
                 self.error = true;
                 self.message = msg;
                 self.render(false);
@@ -1104,21 +1411,70 @@ mod tests {
     #[test]
     fn only_current_context_screens_are_navigable() {
         assert_eq!(
-            context_route("album", "al".into()),
+            context_route("album", "al"),
             Some(Route::Album("al".into()))
         );
         assert_eq!(
-            context_route("artist", "ar".into()),
+            context_route("artist", "ar"),
             Some(Route::Artist("ar".into()))
         );
         for kind in ["playlist", "derived"] {
-            assert_eq!(
-                context_route(kind, "p".into()),
-                Some(Route::Playlist("p".into()))
-            );
+            assert_eq!(context_route(kind, "p"), Some(Route::Playlist("p".into())));
         }
-        assert_eq!(context_route("likes", "liked-songs".into()), None);
-        assert_eq!(context_route("playlist", "".into()), None);
+        assert_eq!(context_route("likes", "liked-songs"), None);
+        assert_eq!(context_route("playlist", ""), None);
+    }
+    #[test]
+    fn metadata_targets_are_explicit_online_routes_only() {
+        assert_eq!(
+            metadata_route("artist", "ar%2F", false),
+            Some(Route::Artist("ar%2F".into()))
+        );
+        assert_eq!(
+            metadata_route("album", "al", false),
+            Some(Route::Album("al".into()))
+        );
+        for bad in ["", " ", "a/b", "a\\b", ".."] {
+            assert_eq!(metadata_route("artist", bad, false), None);
+            assert_eq!(metadata_route("album", bad, false), None);
+        }
+        assert_eq!(metadata_route("artist", "ar", true), None);
+        let credit = pages::Credit {
+            name: "Artist".into(),
+            target: Some(Route::Artist("ar".into())),
+        };
+        assert_eq!(
+            projected_music(Some(&credit), false, true),
+            ("ar", "Artist")
+        );
+        assert_eq!(projected_music(Some(&credit), true, true), ("", "Artist"));
+    }
+    #[test]
+    fn page_keys_match_back_routes_without_exposing_query_or_entity_identity() {
+        let keys = RandomState::new();
+        let private = "synthetic private query/id";
+        let query = Route::Search(private.into());
+        let key = page_key(&query, Some(&keys));
+        assert!(key.starts_with("p-"));
+        assert_eq!(key.len(), 18);
+        assert!(!key.contains(private));
+        assert_ne!(
+            key,
+            page_key(&Route::Search(private.to_uppercase()), Some(&keys))
+        );
+        assert_ne!(key, page_key(&Route::Playlist(private.into()), Some(&keys)));
+
+        let mut trail = Trail::default();
+        trail.visit(&query, &Route::Artist("synthetic".into()));
+        assert_eq!(page_key(&trail.pop().unwrap(), Some(&keys)), key);
+        assert_ne!(page_key(&query, Some(&RandomState::new())), key);
+        assert!(page_key(&Route::History, None).is_empty());
+    }
+    #[test]
+    fn catalog_indexes_are_not_named_destinations() {
+        assert_eq!(named_route("albums"), None);
+        assert_eq!(named_route("artists"), None);
+        assert_eq!(named_route("search"), Some(Route::Search(String::new())));
     }
     #[test]
     fn stale_form_cannot_borrow_new_playlist_revision() {
@@ -1159,16 +1515,18 @@ mod tests {
         let r = pages::Row {
             id: "t".into(),
             playable: true,
-            album_id: "a".into(),
             ..Default::default()
         };
-        assert_eq!(row_actions(&p, &r, 0, true), ["album"]);
+        assert!(row_actions(&p, &r, 0, true).is_empty());
     }
 }
 fn draft_matches(b: &Option<(String, String, u64)>, p: &Page, mode: &str) -> bool {
     b.as_ref()
         .zip(p.playlist.as_ref())
         .is_some_and(|((op, id, rev), m)| op == mode && id == &m.id && *rev == m.revision)
+}
+fn clear_form_owned(ui: AppWindow) {
+    clear_form(&ui);
 }
 fn clear_form(ui: &AppWindow) {
     ui.set_form_mode("".into());
@@ -1203,14 +1561,25 @@ pub fn start(
             .build()
             .expect("browser runtime");
         runtime.block_on(async move {
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:Route::History,trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,recent_due:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:Route::History,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
+            let initial = access.borrow_and_update().clone();
+            let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
+            b.access_changed(initial);
             loop {
-                let due=b.recent_due;
+                let due=b.personal_due.into_iter().chain(b.pending.as_ref().map(|p| p.due)).min();
                 tokio::select! { biased;
-                    change=access.changed()=>{if change.is_err(){break;}let next=access.borrow_and_update().clone();b.access_changed(next);},
+                    change=access.changed()=>{
+                        if change.is_err(){break;}
+                        let next=access.borrow_and_update().clone();
+                        if b.access.as_ref().map(|a| a.epoch) != next.as_ref().map(|a| a.epoch) {
+                            personal_updates = next.as_ref().map(|a| a.personal.changes());
+                        }
+                        b.access_changed(next);
+                    },
+                    _=async {match due{Some(t)=>tokio::time::sleep_until(t).await,None=>std::future::pending().await}}=>b.personal_timeout(),
+                    _=async { match &mut personal_updates { Some(w) => { let _ = w.changed().await; }, None => std::future::pending().await } }=>b.personal_changed(false),
                     Some(u)=updates.recv()=>b.result(u),
                     input=inputs.recv()=>{let Some(i)=input else{break;};b.input(i);},
-                    _=async {match due{Some(t)=>tokio::time::sleep_until(t).await,None=>std::future::pending().await}}=>b.recent_hint(),
                 }
             }
             b.cancel();

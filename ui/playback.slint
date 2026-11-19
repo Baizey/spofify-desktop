@@ -1,5 +1,6 @@
 import { Slider } from "std-widgets.slint";
-import { Action, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
+import { Action, AlbumLine, Caption, Cover, Divider, TextTarget, Theme } from "theme.slint";
+import { ArtistCredit, CreditLine } from "credits.slint";
 
 export component SeekBar inherits Rectangle {
     in property <float> elapsed;
@@ -99,32 +100,53 @@ export component PlayerBar inherits Rectangle {
     in property <bool> offline;
     in property <bool> compact;
     in property <string> page;
+    in property <bool> queue-open;
+    in property <[ArtistCredit]> credits;
+    in property <string> album-id;
+    in property <string> album-name;
+    in property <bool> metadata-enabled: true;
+    callback page-action(string, string);
     callback previous();
     callback next();
     callback toggle();
     callback seek(float);
     callback navigate(string);
+    public function focus-queue() { queue-trigger.take-focus(); }
     property <bool> narrow: root.width < 760px;
     property <length> pad: max(clamp(root.width * 0.04, 16px, 36px), (root.width - 1220px) / 2);
     property <length> center-width: clamp(root.width * 0.36, 162px, 480px);
-    height: !root.has-track ? 48px : 82px;
+    height: !root.has-track ? 48px : (root.status == "" ? 82px : 96px);
     vertical-stretch: 0; background: Theme.panel;
     Divider { y: 0px; }
     if !root.has-track: Caption { x: root.pad; width: parent.width - 2 * root.pad - 96px; text: root.status != "" ? root.status : "No song selected"; accessible-label: self.text; font-size: 13px; }
     if root.has-track: Rectangle {
-        forward-focus: id-key;
-        x: root.pad; width: (root.width - root.center-width)/2 - root.pad - 10px;
-        height: 52px; y: (root.height - self.height)/2;
-        accessible-role: button; accessible-label: "Now playing: " + root.track; accessible-action-default => { root.navigate("now"); }
-        border-width: id-key.has-focus ? 2px : 0px; border-color: Theme.blue; border-radius: 5px;
-        background: id-touch.has-hover ? Theme.raised : transparent;
-        Cover { x: 0px; width: root.narrow ? 40px : 48px; height: self.width; y: (parent.height - self.height)/2; artwork: root.artwork; }
-        VerticalLayout { x: root.narrow ? 49px : 61px; width: parent.width - self.x; alignment: center; spacing: 3px;
-            Text { text: root.track; font-size: 15px * Theme.density; font-weight: 700; color: Theme.text; overflow: elide; }
-            if root.subtitle != "" || root.status != "": Caption { text: root.status != "" ? root.status : root.subtitle; }
+        x: root.pad; width: max(0px, (root.width - root.center-width)/2 - root.pad - 10px);
+        height: root.height;
+        property <bool> show-cover: self.width >= 150px;
+        Cover {
+            visible: parent.show-cover;
+            x: 0px; width: root.narrow ? 40px : 48px; height: self.width;
+            y: (parent.height - self.height)/2; artwork: root.artwork;
         }
-        id-key := FocusScope { focus-on-click: false; key-pressed(event) => { if event.text == Key.Return || event.text == Key.Space { if !event.repeat {root.navigate("now");} return accept; } return reject; } }
-        id-touch := TouchArea { x: 0px; y: 0px; width: parent.width; height: parent.height; mouse-cursor: pointer; clicked => { id-key.focus(); root.navigate("now"); } }
+        VerticalLayout {
+            x: parent.show-cover ? (root.narrow ? 49px : 61px) : 0px;
+            width: max(0px, parent.width - self.x); height: parent.height;
+            alignment: center;
+            TextTarget {
+                text: root.track; label: "Now playing: " + root.track; font-weight: 700;
+                activated => { root.navigate("now"); }
+            }
+            if root.credits.length > 0 || root.subtitle != "": CreditLine {
+                credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                height: max(20px, self.font-size + 6px);
+                activated(id) => { root.page-action("artist", id); }
+            }
+            if root.album-name != "": AlbumLine {
+                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
+                activated => { root.page-action("album", root.album-id); }
+            }
+            if root.status != "": Caption { text: root.status; color: Theme.amber; }
+        }
     }
     if root.has-track: Rectangle {
         width: root.center-width; x: (root.width - self.width)/2;
@@ -137,7 +159,11 @@ export component PlayerBar inherits Rectangle {
         }
     }
     HorizontalLayout { x: root.width - self.width - root.pad; width: self.preferred-width; y: (root.height - self.height)/2; height: 38px; spacing: 6px;
-        Action { width: 37px; icon: "≡"; quiet: true; selected: root.page == "queue"; accessible-label: "Play queue"; clicked => { root.navigate("queue"); } }
+        queue-trigger := Action {
+            width: 37px; icon: "≡"; quiet: true; selected: root.queue-open || root.page == "queue";
+            accessible-label: "Play queue"; accessible-expanded: root.queue-open;
+            clicked => { root.navigate("queue"); }
+        }
         Action { text: root.narrow || !root.has-track ? "" : root.offline ? "This computer" : root.output; width: self.text == "" ? 37px : 154px; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; accessible-description: root.output; clicked => { root.navigate("devices"); } }
     }
 }

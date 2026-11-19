@@ -37,14 +37,16 @@ export component Settings inherits VerticalLayout {
     alignment: start;
     SettingCard {
         title: "Connection";
-        detail: root.reconnecting ? "Connecting… You can still play saved music." : root.offline ? "You’re working offline. You can play music saved on this computer." : "Go offline to pause all network activity and listen to saved music.";
+        detail: root.reconnecting ? "Reconnecting. You can keep listening to music in Saved offline."
+            : root.offline ? "Offline mode is on. Only music saved on this device is available for playback."
+            : "You’re online. Work offline to disconnect and listen to music saved on this device.";
         HorizontalLayout {
             Action { text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline"; primary: root.offline; clicked => { root.toggle-offline(); } }
             Rectangle { horizontal-stretch: 1; }
         }
     }
     SettingCard {
-        title: "Display on this computer";
+        title: "Appearance on this device";
         detail: "";
         HorizontalLayout {
             spacing: 7px;

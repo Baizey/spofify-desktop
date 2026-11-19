@@ -1,16 +1,22 @@
-//! Account-scoped actor: canonical v2 queue online, independent verified queue offline.
+//! Account-state.v1 controller, output executor, and independent saved queue.
+#[path = "engine_online.rs"]
+mod online;
+#[path = "engine_output.rs"]
+mod output;
+
 use crate::{
-    AppWindow, DeviceRow, QueueRow,
+    AppWindow, ArtistCredit, DeviceRow, QueueRow,
     api::{Api, ApiError, Item, Session},
     audio::Audio,
     desk::Access,
     mode::ModeControl,
     offline::{self, OfflineStore, PlaybackInput},
-    player::{Action, Authority, Change, LocalQueue, LocalTrack, Repeat, Status},
-    socket::{
-        self, Binding, EventKind, Generation, Instruction, InstructionKind, Link, MediaError,
-    },
+    personal::Command as PersonalCommand,
+    personal_bridge::PersonalHub,
+    player::{Action, Authority, Change, LocalQueue, LocalTrack, Status},
+    socket::{self, Link},
 };
+use online::Online;
 use slint::{Model, ModelRc, VecModel};
 use std::{
     sync::{
@@ -36,6 +42,11 @@ pub enum Command {
     Toggle,
     Transport(&'static str),
     Playback(Action),
+    Personal {
+        epoch: u64,
+        generation: u64,
+        command: PersonalCommand,
+    },
     Guarded(String, Action),
     #[cfg(test)]
     Offline(bool),
@@ -56,7 +67,6 @@ impl Command {
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
 const LOAD_BUDGET: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(25);
-const SETTLEMENT_BATCH: usize = 64;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
 const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -64,30 +74,6 @@ const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
 struct Account {
     api: Arc<Api>,
     session: Session,
-}
-struct Work {
-    generation: Generation,
-    instruction: Instruction,
-    grant: Option<Authority>,
-}
-struct Execution {
-    generation: Generation,
-    binding: Binding,
-    grant: Option<Authority>,
-    status: Status,
-    sent_at: Option<Instant>,
-    ended: bool,
-}
-struct PauseFence {
-    generation: Option<Generation>,
-    binding: Option<Binding>,
-    buffered: usize,
-}
-struct Recent {
-    event: String,
-    amount: f64,
-    emitted: bool,
-    observed: Option<(Instant, f64)>,
 }
 struct Reconnect {
     serial: u64,
@@ -130,22 +116,12 @@ struct Engine {
     local_read_slot: Arc<Semaphore>,
     local_status: Status,
     socket: Option<socket::Socket>,
-    generation: Option<Generation>,
-    snapshot: Option<Arc<socket::Snapshot>>,
-    anchor: Option<(socket::Playback, Instant)>,
-    connection_id: String,
-    execution: Option<Execution>,
-    pending: Option<Work>,
+    online: Online,
+    personal: PersonalHub,
     media: Option<JoinHandle<()>>,
     operation: u64,
-    request_id: u64,
     room_incarnation: u64,
     local_revision: u64,
-    // A physical stop retires its exact binding and the authority prefix
-    // already buffered locally. It is not a veto on later coordinator intent.
-    pause_fence: Option<PauseFence>,
-    recent: Option<Recent>,
-    recent_change: u64,
     action_status: &'static str,
 }
 impl Engine {
@@ -163,13 +139,11 @@ impl Engine {
                 .filter(|a| a.session.is_offline())
                 .map(|_| format!("local:{}:{}", self.room_incarnation, self.local_revision));
         }
-        let generation = self.generation?;
-        if !self.network_allowed() || self.link() != Link::Connected(generation) {
-            return None;
-        }
-        self.snapshot
+        self.online_generation()?;
+        self.online
+            .state
             .as_ref()
-            .map(|s| format!("{}:{}", self.room_incarnation, s.state_version))
+            .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
     }
     fn network_allowed(&self) -> bool {
         self.current()
@@ -186,7 +160,7 @@ impl Engine {
                 api: a.api.clone(),
                 session: a.session.clone(),
                 offline: self.offline,
-                recent_change: self.recent_change,
+                personal: self.personal.access(),
             }));
     }
     fn login_view(&self, busy: bool, error: bool, status: &'static str) {
@@ -229,7 +203,7 @@ impl Engine {
         self.logouts.retain(|task| !task.is_finished());
         self.epoch = epoch;
         self.offline = false;
-        self.recent_change = 0;
+        self.personal.reset(epoch);
         self.publish_access();
     }
     fn clear_output(&mut self) {
@@ -238,13 +212,9 @@ impl Engine {
         self.cancel_work();
         self.stop();
         self.audio = None;
+        self.disconnect_personal();
         self.socket = None;
-        self.generation = None;
-        self.snapshot = None;
-        self.anchor = None;
-        self.connection_id.clear();
-        self.pause_fence = None;
-        self.recent = None;
+        self.online = Online::default();
         self.local = LocalQueue::default();
         self.local_store = None;
         self.local_status = Status::Ok;
@@ -297,7 +267,7 @@ impl Engine {
         // Closing a native stream can join its backend thread. Never do that
         // under the shared mode lock, which the UI uses for immediate fencing.
         drop(retired);
-        // The lease and API consult this same immediate transport fence.
+        // The native source and API consult this same immediate mode fence.
         // An offline request that lands just after apply is also safe here.
         if !self.offline
             && self
@@ -465,6 +435,14 @@ impl Engine {
                     Err(e) => self.login_view(false, true, e.message),
                 }
             }
+            Command::Personal {
+                epoch,
+                generation,
+                command,
+            } => {
+                self.apply_mode();
+                self.send_personal(epoch, generation, &command);
+            }
             Command::Scoped(epoch, command) if epoch == self.epoch && self.current() => {
                 self.apply_mode();
                 self.scoped(*command)
@@ -474,6 +452,11 @@ impl Engine {
         true
     }
     fn scoped(&mut self, command: Command) {
+        if !self.offline {
+            // Resolve buffered canonical changes before comparing a displayed
+            // queue token or deciding whether the transport button is Pause.
+            self.drain_online_events(None);
+        }
         match command {
             #[cfg(test)]
             Command::Offline(true) => self.set_offline(true),
@@ -500,8 +483,7 @@ impl Engine {
                         id: item.id,
                         title: item.name,
                         subtitle: item.artists,
-                        album_id: String::new(),
-                        artist_id: String::new(),
+                        album_name: item.album_name,
                         duration: item.duration_ms as f64 / 1000.0,
                     })
                     .collect();
@@ -515,7 +497,7 @@ impl Engine {
             }
             Command::Guarded(token, action) => {
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
-                    self.apply_action(action, true);
+                    self.action(action);
                 }
             }
             Command::Playback(action) if !action.depends_on_visible_queue() => self.action(action),
@@ -523,9 +505,7 @@ impl Engine {
                 let desired = if self.offline {
                     self.local.desired
                 } else {
-                    self.snapshot
-                        .as_ref()
-                        .is_some_and(|s| s.state.desired_playing)
+                    self.online.wants_pause()
                 };
                 self.action(if desired {
                     Action::Pause
@@ -542,9 +522,6 @@ impl Engine {
         }
     }
     fn action(&mut self, action: Action) {
-        self.apply_action(action, false);
-    }
-    fn apply_action(&mut self, action: Action, displayed_version: bool) {
         if self.offline {
             if self.local.desired
                 && self.local.current().is_some()
@@ -556,68 +533,7 @@ impl Engine {
             self.local_change(change);
             return;
         }
-        if !self.network_allowed() {
-            return;
-        }
-        let Some((command, guarded)) = action.wire() else {
-            return;
-        };
-        let local_stop = matches!(command, socket::Command::Pause | socket::Command::Close)
-            && (self.execution.is_some()
-                || self.pending.as_ref().is_some_and(|w| w.grant.is_some())
-                || self.snapshot.as_ref().is_some_and(|s| {
-                    !self.connection_id.is_empty() && s.selected_connection_id == self.connection_id
-                }));
-        if local_stop {
-            self.pause_local();
-        }
-        let Some(snapshot) = &self.snapshot else {
-            self.action_status = "No output is available yet.";
-            return;
-        };
-        let Some(generation) = self
-            .generation
-            .filter(|g| self.link() == Link::Connected(*g))
-        else {
-            self.action_status = "No output is available yet.";
-            return;
-        };
-        self.request_id = self.request_id.wrapping_add(1);
-        let request = self.request_id;
-        let submitted = self.socket.as_ref().is_some_and(|s| {
-            s.command(
-                generation,
-                request,
-                command,
-                (guarded || displayed_version).then_some(snapshot.state_version),
-            )
-            .is_ok()
-        });
-        if submitted {
-            self.action_status = "";
-        } else {
-            self.action_status = "The playback action was not sent.";
-        }
-    }
-    fn pause_local(&mut self) {
-        let binding = self
-            .pending
-            .as_ref()
-            .filter(|work| work.grant.is_some())
-            .map(|work| work.instruction.binding())
-            .or_else(|| self.execution.as_ref().map(|e| e.binding.clone()));
-        let buffered = self.socket.as_ref().map_or(0, |s| s.events.len());
-        if let Some(audio) = &mut self.audio {
-            audio.stop();
-        }
-        self.sample(true, false);
-        self.cancel_work();
-        self.stop();
-        self.pause_fence = Some(PauseFence {
-            generation: self.generation,
-            binding,
-            buffered,
-        });
+        self.online_action(action);
     }
     fn local_change(&mut self, change: Change) {
         if change != Change::Invalid {
@@ -775,13 +691,7 @@ impl Engine {
                 result,
             } if self.epoch == epoch && self.operation == operation && !self.offline => {
                 self.media = None;
-                if let Some(work) = self.pending.take() {
-                    match result {
-                        Ok(bytes) => self.complete(work, Some(bytes.into()), Status::Ok),
-                        Err(e) if e.expired => self.expire(),
-                        Err(_) => self.complete(work, None, Status::Media),
-                    }
-                }
+                self.complete_online(result);
             }
             _ => {}
         }
@@ -800,530 +710,18 @@ impl Engine {
         if let Some(task) = self.media.take() {
             task.abort();
         }
-        if let Some(work) = self.pending.take()
-            && let Some(g) = work.grant
-        {
-            g.revoke();
-        }
+        self.online.work = None;
     }
     fn stop(&mut self) {
-        if let Some(e) = self.execution.take()
-            && let Some(g) = e.grant
-        {
-            g.revoke();
-        }
+        self.online.execution = None;
         if let Some(audio) = &mut self.audio {
             audio.stop();
         }
     }
-    fn events(&mut self) {
-        if self.link() == Link::Expired {
-            self.expire();
-            return;
-        }
-        if !matches!(self.link(), Link::Connected(g) if self.generation == Some(g)) {
-            if self.pending.is_some() {
-                self.cancel_work();
-            }
-            if self.execution.is_some() {
-                self.stop();
-            }
-            // Keep the observed room for read-only presentation, not authority.
-        }
-        for _ in 0..32 {
-            if !self.network_allowed() {
-                break;
-            }
-            let Some(event) = self.socket.as_mut().and_then(|s| s.events.try_recv().ok()) else {
-                break;
-            };
-            let before_stop = self.pause_fence.as_mut().is_some_and(|fence| {
-                if fence.buffered == 0 {
-                    return false;
-                }
-                fence.buffered -= 1;
-                fence.generation == Some(event.generation)
-            });
-            if event.generation == 0 || self.link() != Link::Connected(event.generation) {
-                continue;
-            }
-            self.event(event, before_stop);
-        }
-    }
-    fn event(&mut self, event: socket::Event, before_stop: bool) {
-        let generation = event.generation;
-        if let EventKind::Snapshot {
-            connection_id,
-            snapshot,
-            ..
-        } = event.kind
-        {
-            if self.generation != Some(generation) {
-                self.cancel_work();
-                self.stop();
-                self.pause_fence = None;
-                self.snapshot = None;
-                self.anchor = None;
-                self.room_incarnation = self.room_incarnation.wrapping_add(1);
-                self.generation = Some(generation);
-                self.connection_id = connection_id;
-            }
-            self.state(snapshot);
-            return;
-        }
-        if self.generation != Some(generation) {
-            return;
-        }
-        match event.kind {
-            EventKind::Snapshot { .. } => unreachable!(),
-            EventKind::State(snapshot) => self.state(snapshot),
-            EventKind::Playback(playback) => self.anchor(playback),
-            EventKind::Instruction {
-                instruction,
-                deadline,
-            } => self.instruction(generation, instruction, deadline, before_stop),
-            EventKind::Lease { binding, deadline } => {
-                let grant = self
-                    .execution
-                    .as_ref()
-                    .filter(|e| e.binding == binding)
-                    .and_then(|e| e.grant.as_ref());
-                if let Some(g) = grant {
-                    g.renew_until(deadline);
-                }
-            }
-            EventKind::LeaseExpired(binding) => {
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|w| w.instruction.binding() == binding)
-                {
-                    self.cancel_work();
-                }
-                if self
-                    .execution
-                    .as_ref()
-                    .is_some_and(|e| e.binding == binding)
-                {
-                    self.stop();
-                }
-            }
-            // Only the independent settlement queue may affect command feedback.
-            EventKind::Result { .. }
-            | EventKind::CommandNotSent { .. }
-            | EventKind::CommandUncertain { .. } => {}
-            // This engine never attaches a PlanID to an ended report. V2 will
-            // advance canonically and send a normal absolute execute instead.
-            EventKind::NextAdmitted { .. } => {
-                self.cancel_work();
-                self.stop();
-            }
-        }
-    }
-    fn drain_settlements(&mut self) {
-        if let Some(socket) = &mut self.socket {
-            for event in settlement_batch(&mut socket.settlements) {
-                self.settlement(event);
-            }
-        }
-    }
-    fn settlement(&mut self, event: socket::Event) {
-        if !self.current() || self.offline || self.account.is_none() || event.generation == 0 {
-            return;
-        }
-        // Request IDs are actor-lifetime unique. A receipt for an old socket
-        // generation can still settle its matching action, but this path
-        // cannot admit instructions, leases, snapshots or native work.
-        match event.kind {
-            EventKind::Result { request_id, result } => {
-                if !result.is_final {
-                    return;
-                }
-                if request_id != self.request_id {
-                    return;
-                }
-                self.action_status = match (result.outcome, result.execution) {
-                    (socket::Outcome::Rejected, _) => {
-                        "This playback action is no longer available."
-                    }
-                    (_, socket::Execution::Blocked) => {
-                        "This output needs permission to play audio."
-                    }
-                    (_, socket::Execution::Media) => "This output could not play the audio.",
-                    (_, socket::Execution::Uncertain) => "Playback action unconfirmed.",
-                    _ => "",
-                };
-            }
-            EventKind::CommandNotSent { request_id, .. } if request_id == self.request_id => {
-                self.action_status = "The playback action was not sent.";
-            }
-            EventKind::CommandUncertain { request_id } if request_id == self.request_id => {
-                self.action_status = "Playback action unconfirmed.";
-            }
-            _ => {}
-        }
-    }
-    fn state(&mut self, snapshot: Arc<socket::Snapshot>) {
-        if self
-            .snapshot
-            .as_ref()
-            .is_some_and(|previous| previous.state_version > snapshot.state_version)
-        {
-            return;
-        }
-        // The source may continue during a different target's prepare, but it
-        // must stop if this connection is neither selected nor a handoff target.
-        let mine = snapshot.selected_connection_id == self.connection_id
-            || snapshot
-                .transfer
-                .as_ref()
-                .is_some_and(|t| t.target_connection_id == self.connection_id);
-        if !mine
-            || self
-                .execution
-                .as_ref()
-                .is_some_and(|e| e.binding.output_version < snapshot.output_version)
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|w| w.instruction.output_version < snapshot.output_version)
-        {
-            self.cancel_work();
-            self.stop();
-        }
-        if let Some(o) = &snapshot.state.occurrence {
-            if self.recent.as_ref().is_none_or(|r| r.event != o.event_id) {
-                self.recent = Some(Recent {
-                    event: o.event_id.clone(),
-                    amount: o.progress,
-                    // First observation can be an already reported retained account snapshot.
-                    emitted: o.reported && self.snapshot.is_none(),
-                    observed: None,
-                });
-            }
-            if let Some(r) = &mut self.recent {
-                r.amount = r.amount.max(o.progress);
-            }
-            if o.reported {
-                self.notify_recent();
-            }
-        } else {
-            self.recent = None;
-        }
-        let playback = snapshot.playback.clone();
-        self.snapshot = Some(snapshot);
-        self.anchor(playback);
-    }
-    fn anchor(&mut self, playback: socket::Playback) {
-        let Some(s) = &self.snapshot else {
-            return;
-        };
-        if s.output_version != playback.output_version
-            || s.state_version != playback.state_version
-            || s.state.event_id() != playback.event_id
-        {
-            return;
-        }
-        if self.anchor.as_ref().is_some_and(|(p, _)| {
-            p.output_version == playback.output_version
-                && p.state_version == playback.state_version
-                && p.playback_sequence >= playback.playback_sequence
-        }) {
-            return;
-        }
-        let now = Instant::now();
-        if playback.has_reported_playback
-            && let Some(r) = &mut self.recent
-            && r.event == playback.event_id
-        {
-            if let Some((before, pos)) = r.observed {
-                let heard = playback.elapsed - pos;
-                if heard >= 0.0
-                    && heard <= now.saturating_duration_since(before).as_secs_f64() + 1.0
-                {
-                    r.amount += heard;
-                }
-            }
-            r.observed = (playback.is_playing
-                && !playback.is_buffering
-                && !playback.is_loading
-                && playback.error == MediaError::None)
-                .then_some((now, playback.elapsed));
-            // History is qualified only after more than thirty seconds of
-            // contiguous reported media advance. Catalog still reads it via REST.
-            if r.amount > 30.0 {
-                self.notify_recent();
-            }
-        }
-        self.anchor = Some((playback, now));
-    }
-    fn notify_recent(&mut self) {
-        if let Some(r) = &mut self.recent
-            && !r.emitted
-        {
-            r.emitted = true;
-            self.recent_change = self.recent_change.wrapping_add(1);
-            self.publish_access();
-        }
-    }
-    fn instruction(
-        &mut self,
-        generation: Generation,
-        instruction: Instruction,
-        deadline: Option<Instant>,
-        before_stop: bool,
-    ) {
-        let link = self.socket.as_ref().map(|s| s.link.clone());
-        self.admit_instruction(generation, instruction, deadline, before_stop, link);
-    }
-    /// The socket has already checked ordering, binding, and the lease's send
-    /// basis. Only this exact grant may authorize the native continuation.
-    fn admit_instruction(
-        &mut self,
-        generation: Generation,
-        mut instruction: Instruction,
-        deadline: Option<Instant>,
-        before_stop: bool,
-        link: Option<watch::Receiver<Link>>,
-    ) {
-        let binding = instruction.binding();
-        match instruction.kind {
-            // Staging is optional. Publish an exact real end and allow the
-            // coordinator to choose the next occurrence non-speculatively.
-            InstructionKind::StageNext | InstructionKind::CancelNext => return,
-            InstructionKind::Release => {
-                if let Some(audio) = &mut self.audio {
-                    audio.stop();
-                }
-                self.sample(true, false);
-                self.cancel_work();
-                self.stop();
-                self.ack(generation, binding, Status::Ok);
-                return;
-            }
-            _ => {}
-        }
-        let starting = instruction.desired_playing && instruction.kind != InstructionKind::Prepare;
-        if starting
-            && (before_stop
-                || self.pause_fence.as_ref().is_some_and(|fence| {
-                    fence.generation == Some(generation) && fence.binding.as_ref() == Some(&binding)
-                }))
-        {
-            // This operation was interrupted before native admission. Do not
-            // ACK an unstarted execution or ack-reject a newer server binding.
-            return;
-        }
-        if instruction.kind == InstructionKind::Execute
-            && !instruction.desired_playing
-            && self
-                .execution
-                .as_ref()
-                .is_some_and(|e| e.binding.event_id == instruction.event_id)
-            && let Some(audio) = &self.audio
-        {
-            // A live pause can report the playback since the last observation.
-            // A parked execution instead takes the new absolute position, even backwards.
-            let facts = audio.facts();
-            if facts.playing {
-                instruction.elapsed = instruction.elapsed.max(facts.elapsed);
-            }
-        }
-        self.cancel_work();
-        self.stop();
-        let grant = deadline
-            .zip(link)
-            .map(|(deadline, link)| Authority::online(deadline, link, generation));
-        if instruction.kind != InstructionKind::Prepare
-            && grant.as_ref().is_none_or(|g| !g.is_valid())
-        {
-            self.ack(generation, binding, Status::Rejected);
-            return;
-        }
-        if starting {
-            self.pause_fence = None;
-        }
-        let work = Work {
-            generation,
-            instruction,
-            grant,
-        };
-        let id = work
-            .instruction
-            .track
-            .as_ref()
-            .map(|track| track.id.clone());
-        if let Some(id) = id.filter(|_| {
-            work.instruction.desired_playing || work.instruction.kind == InstructionKind::Prepare
-        }) {
-            if let Some(bytes) = self.audio.as_ref().and_then(|audio| audio.cached(&id)) {
-                self.complete(work, Some(bytes), Status::Ok);
-            } else if let Some(a) = &self.account {
-                let deadline = deadline.map_or(LOAD_BUDGET, |d| {
-                    d.saturating_duration_since(Instant::now()).min(LOAD_BUDGET)
-                });
-                let (api, session, results, epoch, operation) = (
-                    a.api.clone(),
-                    a.session.clone(),
-                    self.results.clone(),
-                    self.epoch,
-                    self.operation,
-                );
-                self.pending = Some(work);
-                self.media = Some(tokio::spawn(async move {
-                    let result = tokio::time::timeout(deadline, api.media(&session, &id))
-                        .await
-                        .unwrap_or(Err(ApiError {
-                            message: "Media could not be loaded in time.",
-                            expired: false,
-                            status: 0,
-                        }));
-                    let _ = results
-                        .send(Reply::Media {
-                            epoch,
-                            operation,
-                            result,
-                        })
-                        .await;
-                }));
-            }
-        } else {
-            self.complete(work, None, Status::Ok);
-        }
-    }
-    fn complete(&mut self, work: Work, bytes: Option<Arc<[u8]>>, mut status: Status) {
-        if !self.network_allowed() || self.link() != Link::Connected(work.generation) {
-            return;
-        }
-        let instruction = work.instruction;
-        let binding = instruction.binding();
-        let Some(audio) = &mut self.audio else {
-            return;
-        };
-        let prepare = instruction.kind == InstructionKind::Prepare;
-        let mut grant = work.grant;
-        if !prepare && grant.as_ref().is_none_or(|g| !g.is_valid()) {
-            status = Status::Rejected;
-        }
-        if !prepare {
-            let duration = instruction.track.as_ref().map_or(0.0, |t| t.duration);
-            audio.anchor(instruction.elapsed, duration);
-        }
-        if status == Status::Ok {
-            match (
-                prepare,
-                instruction.desired_playing,
-                instruction.track,
-                bytes,
-            ) {
-                (true, _, Some(track), Some(bytes)) => {
-                    status = audio.prepare(track.id, bytes, instruction.elapsed)
-                }
-                (false, true, Some(track), Some(bytes)) => {
-                    status = audio.play(
-                        track.id,
-                        bytes,
-                        instruction.elapsed,
-                        track.duration,
-                        grant.as_ref().unwrap().clone(),
-                    );
-                }
-                (true, _, None, _) | (false, false, _, _) => {}
-                _ => status = Status::Media,
-            }
-        }
-        if !instruction.desired_playing || status != Status::Ok {
-            audio.stop();
-            if let Some(g) = grant.take() {
-                g.revoke();
-            }
-        }
-        if !self.ack(work.generation, binding.clone(), status) {
-            self.stop();
-            return;
-        }
-        if !prepare && status != Status::Rejected {
-            self.execution = Some(Execution {
-                generation: work.generation,
-                binding,
-                grant,
-                status,
-                sent_at: None,
-                ended: false,
-            });
-            self.sample(true, true);
-        }
-    }
-    fn ack(&self, generation: Generation, binding: Binding, status: Status) -> bool {
-        if !self.network_allowed() {
-            return false;
-        }
-        self.socket.as_ref().is_some_and(|s| {
-            s.ack(
-                generation,
-                binding,
-                match status {
-                    Status::Ok => socket::AckStatus::Ok,
-                    Status::Blocked => socket::AckStatus::Blocked,
-                    Status::Media => socket::AckStatus::Media,
-                    Status::Rejected => socket::AckStatus::Rejected,
-                },
-            )
-            .is_ok()
-        })
-    }
-    fn sample(&mut self, force: bool, allow_end: bool) {
-        if !self.network_allowed() {
-            return;
-        }
-        let now = Instant::now();
-        let Some(e) = &mut self.execution else {
-            return;
-        };
-        let (Some(socket), Some(audio)) = (&self.socket, &self.audio) else {
-            return;
-        };
-        if *socket.link.borrow() != Link::Connected(e.generation) || e.ended {
-            return;
-        }
-        if !force && e.grant.is_none() {
-            return;
-        }
-        let facts = audio.facts();
-        let ended = allow_end
-            && facts.ended
-            && self.snapshot.as_ref().is_some_and(|s| s.transfer.is_none());
-        if force
-            || ended
-            || e.sent_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= REPORT_INTERVAL)
-        {
-            let report = socket::Report {
-                elapsed: facts.elapsed,
-                duration: facts.duration,
-                is_playing: facts.playing && !ended,
-                is_buffering: false,
-                is_loading: facts.loading,
-                ended,
-                error: match e.status {
-                    Status::Blocked => MediaError::Blocked,
-                    Status::Media => MediaError::Media,
-                    _ => MediaError::None,
-                },
-                plan_id: None,
-            };
-            if socket
-                .report(e.generation, e.binding.clone(), report)
-                .is_ok()
-            {
-                e.sent_at = Some(now);
-                e.ended = ended;
-            } else {
-                self.stop();
-            }
-        }
-    }
     fn tick(&mut self) {
+        self.tick_with_event(None);
+    }
+    fn tick_with_event(&mut self, event: Option<socket::Event>) {
         let requested_epoch = self.shared_epoch.load(Ordering::SeqCst);
         if self.epoch != requested_epoch {
             let offline = self.offline
@@ -1375,19 +773,7 @@ impl Engine {
             self.socket = None;
             return;
         }
-        self.events();
-        // Settlement has its own credit/buffer and must drain even while the
-        // link is disconnected or a new generation is connecting.
-        self.drain_settlements();
-        if self
-            .execution
-            .as_ref()
-            .and_then(|e| e.grant.as_ref())
-            .is_some_and(|g| !g.is_valid())
-        {
-            self.stop();
-        }
-        self.sample(false, true);
+        self.tick_online(event);
     }
     fn publish(&self) {
         let mut p = PlayerView {
@@ -1406,8 +792,7 @@ impl Engine {
                 p.title = entry.track.title.clone();
                 p.detail = entry.track.subtitle.clone();
                 p.track = entry.track.id.clone();
-                p.album = entry.track.album_id.clone();
-                p.artist = entry.track.artist_id.clone();
+                p.album_name = entry.track.album_name.clone();
                 p.context_kind = "offline";
                 p.context_name = "Saved music".into();
                 p.duration = entry.track.duration;
@@ -1435,117 +820,92 @@ impl Engine {
                 .entries
                 .iter()
                 .enumerate()
-                .map(|(i, e)| QueueRow {
-                    key: e.key.to_string().into(),
-                    title: e.track.title.clone().into(),
-                    subtitle: e.track.subtitle.clone().into(),
+                .map(|(i, e)| QueueEntryView {
+                    key: e.key.to_string(),
+                    title: e.track.title.clone(),
+                    subtitle: e.track.subtitle.clone(),
+                    album_name: e.track.album_name.clone(),
                     current: self.local.position == Some(i),
                     upcoming: self.local.position.is_some_and(|pos| i > pos),
+                    ..QueueEntryView::default()
                 })
                 .collect();
-        } else if let Some(s) = &self.snapshot {
-            let live = self
-                .generation
-                .is_some_and(|g| self.link() == Link::Connected(g));
-            p.shuffle = s.state.shuffle;
-            p.repeat = match s.state.repeat {
-                socket::Repeat::Off => Repeat::Off,
-                socket::Repeat::All => Repeat::All,
-                socket::Repeat::One => Repeat::One,
-            }
-            .wire();
-            p.transport = live && s.state.current().is_some();
-            p.control = p.transport
-                || self
-                    .execution
-                    .as_ref()
-                    .and_then(|e| e.grant.as_ref())
-                    .is_some_and(Authority::is_valid);
-            p.output = s
-                .devices
-                .iter()
-                .find(|d| d.device_id == s.selected_device_id)
-                .map(|d| d.name.clone())
-                .unwrap_or_else(|| "No output selected".into());
-            if let Some(track) = s.state.current() {
-                p.title = track.name.clone();
-                p.detail = artists(track);
-                p.track = track.id.clone();
-                p.album = track.album_id.clone();
-                p.album_name = track.album_name.clone();
-                p.artist = track
-                    .artists
-                    .iter()
-                    .find_map(|a| a.id.clone())
-                    .unwrap_or_default();
-                if let Some(context) = track.playback_context.as_ref().or(s.state.context.as_ref())
-                {
-                    p.context_kind = context_kind(context.kind);
-                    p.context_id = context.id.clone();
-                    p.context_name = context.name.clone();
-                }
-            }
-            p.elapsed = s.state.elapsed;
-            p.duration = s.state.duration;
-            if let Some((a, at)) = &self.anchor
-                && a.state_version == s.state_version
-                && a.output_version == s.output_version
-                && a.event_id == s.state.event_id()
-                && a.has_reported_playback
-            {
-                p.duration = a.duration;
-                p.elapsed = a.elapsed;
-                p.playing = live && a.is_playing && s.selected_connection_id != self.connection_id;
-                p.error = a.error;
-                if p.playing && !a.is_loading && !a.is_buffering && p.duration > 0.0 {
-                    p.elapsed = (a.elapsed + at.elapsed().as_secs_f64().min(3.0)).min(p.duration);
-                }
-            }
-            if self.execution.is_some()
-                && let Some(audio) = &self.audio
-            {
-                let facts = audio.facts();
-                p.playing = facts.playing;
-                p.elapsed = facts.elapsed;
-                if facts.duration > 0.0 {
-                    p.duration = facts.duration;
-                }
-            }
-            p.queue = s
-                .state
-                .queue
-                .iter()
-                .enumerate()
-                .map(|(i, t)| QueueRow {
-                    key: t.key.to_string().into(),
-                    title: t.name.clone().into(),
-                    subtitle: artists(t).into(),
-                    current: i as i64 == s.state.position,
-                    upcoming: i as i64 > s.state.position,
-                })
-                .collect();
-            p.devices = s
-                .devices
-                .iter()
-                .map(|d| DeviceRow {
-                    id: d.device_id.clone().into(),
-                    name: d.name.clone().into(),
-                    selected: d.device_id == s.selected_device_id,
-                    available: live && d.available,
-                    can_play: d.can_play,
-                })
-                .collect();
-            if p.status.is_empty() && s.transfer.is_some() && live {
-                p.status = "Switching output…";
-            }
-            if p.status.is_empty() && self.pending.as_ref().is_some_and(|w| w.grant.is_some()) {
-                p.status = "Loading audio…";
-            }
+        } else {
+            self.project_online(&mut p);
         }
         p.publish(self.window.clone(), self.shared_epoch.clone(), self.epoch);
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CreditView {
+    id: String,
+    name: String,
+}
+
+fn credits_match(credits: &[CreditView], model: &ModelRc<ArtistCredit>) -> bool {
+    model.row_count() == credits.len()
+        && credits
+            .iter()
+            .zip(model.iter())
+            .all(|(credit, row)| credit.id == row.id.as_str() && credit.name == row.name.as_str())
+}
+
+fn credit_model(credits: Vec<CreditView>) -> ModelRc<ArtistCredit> {
+    if credits.is_empty() {
+        return ModelRc::default();
+    }
+    ModelRc::new(VecModel::from(
+        credits
+            .into_iter()
+            .map(|a| ArtistCredit {
+                id: a.id.into(),
+                name: a.name.into(),
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[derive(Default)]
+struct QueueEntryView {
+    key: String,
+    title: String,
+    subtitle: String,
+    credits: Vec<CreditView>,
+    album_id: String,
+    album_name: String,
+    current: bool,
+    upcoming: bool,
+}
+
+impl QueueEntryView {
+    fn matches(&self, row: &QueueRow) -> bool {
+        self.key == row.key.as_str()
+            && self.title == row.title.as_str()
+            && self.subtitle == row.subtitle.as_str()
+            && self.album_id == row.album_id.as_str()
+            && self.album_name == row.album_name.as_str()
+            && self.current == row.current
+            && self.upcoming == row.upcoming
+            && credits_match(&self.credits, &row.credits)
+    }
+
+    fn into_row(self) -> QueueRow {
+        QueueRow {
+            key: self.key.into(),
+            title: self.title.into(),
+            subtitle: self.subtitle.into(),
+            credits: credit_model(self.credits),
+            album_id: self.album_id.into(),
+            album_name: self.album_name.into(),
+            current: self.current,
+            upcoming: self.upcoming,
+        }
+    }
+}
+
+// Only owned, Send data is captured for the event-loop hop. Construct the
+// nested Slint models on the UI thread, and only if their content changed.
 #[derive(Default)]
 struct PlayerView {
     offline: bool,
@@ -1554,7 +914,6 @@ struct PlayerView {
     repeat: &'static str,
     status: &'static str,
     room_token: String,
-    error: MediaError,
     playing: bool,
     control: bool,
     transport: bool,
@@ -1566,11 +925,11 @@ struct PlayerView {
     track: String,
     album: String,
     album_name: String,
-    artist: String,
+    credits: Vec<CreditView>,
     context_kind: &'static str,
     context_id: String,
     context_name: String,
-    queue: Vec<QueueRow>,
+    queue: Vec<QueueEntryView>,
     devices: Vec<DeviceRow>,
 }
 impl PlayerView {
@@ -1603,7 +962,9 @@ impl PlayerView {
             ui.set_now_track_id(self.track.into());
             ui.set_now_album_id(self.album.into());
             ui.set_now_album_name(self.album_name.into());
-            ui.set_now_artist_id(self.artist.into());
+            if !credits_match(&self.credits, &ui.get_now_credits()) {
+                ui.set_now_credits(credit_model(self.credits));
+            }
             ui.set_now_context_kind(self.context_kind.into());
             ui.set_now_context_id(self.context_id.into());
             ui.set_now_context_name(self.context_name.into());
@@ -1614,16 +975,7 @@ impl PlayerView {
             ui.set_can_seek(self.transport && self.duration > 0.0);
             ui.set_elapsed(self.elapsed as f32);
             ui.set_duration(self.duration as f32);
-            let status = if !self.status.is_empty() {
-                self.status
-            } else {
-                match self.error {
-                    MediaError::Blocked => "This output needs permission to play audio.",
-                    MediaError::Media => "This output could not play the audio.",
-                    MediaError::None => "",
-                }
-            };
-            ui.set_player_status(status.into());
+            ui.set_player_status(self.status.into());
             ui.set_queue_status(if self.queue.is_empty() {
                 "Nothing in the queue".into()
             } else {
@@ -1647,21 +999,30 @@ impl PlayerView {
                 .into(),
             );
             let upcoming = self.queue.iter().find(|r| r.upcoming);
-            ui.set_next_title(upcoming.map(|r| r.title.clone()).unwrap_or_default());
-            ui.set_next_subtitle(upcoming.map(|r| r.subtitle.clone()).unwrap_or_default());
+            ui.set_next_title(
+                upcoming
+                    .map(|r| r.title.as_str().into())
+                    .unwrap_or_default(),
+            );
+            ui.set_next_subtitle(
+                upcoming
+                    .map(|r| r.subtitle.as_str().into())
+                    .unwrap_or_default(),
+            );
             let queue = ui.get_queue_rows();
             if queue.row_count() != self.queue.len()
-                || self.queue.iter().enumerate().any(|(i, row)| {
-                    queue.row_data(i).is_none_or(|old| {
-                        old.key != row.key
-                            || old.title != row.title
-                            || old.subtitle != row.subtitle
-                            || old.current != row.current
-                            || old.upcoming != row.upcoming
-                    })
-                })
+                || !self
+                    .queue
+                    .iter()
+                    .zip(queue.iter())
+                    .all(|(entry, row)| entry.matches(&row))
             {
-                ui.set_queue_rows(ModelRc::new(VecModel::from(self.queue)));
+                ui.set_queue_rows(ModelRc::new(VecModel::from(
+                    self.queue
+                        .into_iter()
+                        .map(QueueEntryView::into_row)
+                        .collect::<Vec<_>>(),
+                )));
             }
             let devices = ui.get_device_rows();
             if devices.row_count() != self.devices.len()
@@ -1721,18 +1082,16 @@ where
 fn next_probe_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(PROBE_MAX_DELAY)
 }
-fn settlement_batch(receiver: &mut mpsc::Receiver<socket::Event>) -> Vec<socket::Event> {
-    (0..SETTLEMENT_BATCH)
-        .map_while(|_| receiver.try_recv().ok())
-        .collect()
-}
-async fn socket_signal(socket: Option<&mut socket::Socket>) {
-    if let Some(socket) = socket
-        && socket.link.changed().await.is_ok()
-    {
-        return;
+async fn socket_signal(socket: Option<&mut socket::Socket>) -> Option<socket::Event> {
+    if let Some(socket) = socket {
+        tokio::select! {
+            Ok(_) = socket.link.changed() => return None,
+            Ok(_) = socket.authority.changed() => return None,
+            Some(event) = socket.events.recv() => return Some(event),
+            else => {}
+        }
     }
-    std::future::pending::<()>().await;
+    std::future::pending().await
 }
 fn context_kind(kind: socket::ContextKind) -> &'static str {
     match kind {
@@ -1743,10 +1102,32 @@ fn context_kind(kind: socket::ContextKind) -> &'static str {
         socket::ContextKind::Likes => "likes",
     }
 }
-fn artists(t: &socket::Track) -> String {
-    t.artists
+fn metadata_id(id: &str) -> &str {
+    // The socket allows blank metadata. Only expose IDs the catalog can open.
+    if id.trim() != id || matches!(id, "." | "..") {
+        ""
+    } else {
+        id
+    }
+}
+fn credit_views(artists: &[socket::Artist]) -> Vec<CreditView> {
+    artists
+        .iter()
+        .filter_map(|a| {
+            let id = metadata_id(a.id.as_deref().unwrap_or_default());
+            let name = a.name.trim();
+            (!id.is_empty() || !name.is_empty()).then(|| CreditView {
+                id: id.into(),
+                name: name.into(),
+            })
+        })
+        .collect()
+}
+fn artist_subtitle(credits: &[CreditView]) -> String {
+    credits
         .iter()
         .map(|a| a.name.as_str())
+        .filter(|name| !name.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1787,20 +1168,12 @@ pub fn start(
                 local_store: None,
                 local_read_slot: Arc::new(Semaphore::new(1)),
                 socket: None,
-                generation: None,
-                snapshot: None,
-                anchor: None,
-                connection_id: String::new(),
-                execution: None,
-                pending: None,
+                online: Online::default(),
+                personal: PersonalHub::default(),
                 media: None,
                 operation: 0,
-                request_id: 0,
                 room_incarnation: 0,
                 local_revision: 0,
-                pause_fence: None,
-                recent: None,
-                recent_change: 0,
                 action_status: "",
             };
             let mut cadence = tokio::time::interval(TICK);
@@ -1813,7 +1186,7 @@ pub fn start(
                         e.publish();
                     }
                     Some(reply) = replies.recv() => { e.reply(reply); e.publish(); },
-                    _ = socket_signal(e.socket.as_mut()) => { e.tick(); e.publish(); },
+                    event = socket_signal(e.socket.as_mut()) => { e.tick_with_event(event); e.publish(); },
                     _ = cadence.tick() => {
                         e.tick();
                         refresh = (refresh + 1) % 5;
@@ -1833,6 +1206,65 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_projection_keeps_order_and_never_invents_ids() {
+        let credits = credit_views(&[
+            socket::Artist {
+                id: Some("artist/1".into()),
+                name: "First".into(),
+            },
+            socket::Artist {
+                id: None,
+                name: "Name only".into(),
+            },
+            socket::Artist {
+                id: Some(" ".into()),
+                name: "Also name only".into(),
+            },
+            socket::Artist {
+                id: Some("artist/2".into()),
+                name: "Last".into(),
+            },
+        ]);
+        assert_eq!(
+            credits.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["artist/1", "", "", "artist/2"],
+        );
+        assert_eq!(
+            artist_subtitle(&credits),
+            "First, Name only, Also name only, Last"
+        );
+    }
+
+    #[test]
+    fn queue_projection_detects_album_and_credit_only_changes() {
+        let entry = || QueueEntryView {
+            key: "7".into(),
+            title: "Track".into(),
+            subtitle: "Artist".into(),
+            credits: vec![CreditView {
+                id: "artist/1".into(),
+                name: "Artist".into(),
+            }],
+            album_id: "album/1".into(),
+            album_name: "Album".into(),
+            upcoming: true,
+            ..QueueEntryView::default()
+        };
+        let row = entry().into_row();
+        let mut next = entry();
+        assert!(next.matches(&row));
+        next.credits[0].id = "artist/2".into();
+        assert!(!next.matches(&row));
+        let mut next = entry();
+        next.album_id = "album/2".into();
+        assert!(!next.matches(&row));
+        let mut next = entry();
+        next.album_name = "New album name".into();
+        assert!(!next.matches(&row));
+    }
+
     fn engine() -> Engine {
         let (results, _) = mpsc::channel(2);
         let (access, _) = watch::channel(None);
@@ -1855,20 +1287,12 @@ mod tests {
             socket: None,
             local_store: None,
             local_read_slot: Arc::new(Semaphore::new(1)),
-            generation: None,
-            snapshot: None,
-            anchor: None,
-            connection_id: String::new(),
-            execution: None,
-            pending: None,
+            online: Online::default(),
+            personal: PersonalHub::default(),
             media: None,
             operation: 0,
-            request_id: 0,
             room_incarnation: 0,
             local_revision: 0,
-            pause_fence: None,
-            recent: None,
-            recent_change: 0,
             action_status: "",
         }
     }
@@ -2045,8 +1469,7 @@ mod tests {
                 id: "saved".into(),
                 title: "Saved".into(),
                 subtitle: String::new(),
-                album_id: String::new(),
-                artist_id: String::new(),
+                album_name: String::new(),
                 duration: 20.0,
             }],
             0,
@@ -2107,7 +1530,7 @@ mod tests {
             api,
             session,
             offline: true,
-            recent_change: 0,
+            personal: PersonalHub::default().access(),
         };
         let mode = ModeControl::default();
         mode.request(&access, false);
@@ -2138,208 +1561,5 @@ mod tests {
         };
         let (result, ()) = tokio::join!(probe, work_offline);
         assert!(result.is_none());
-    }
-    #[test]
-    fn stale_room_token_cannot_edit_a_different_displayed_queue() {
-        let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
-        let session = api.test_session();
-        e.account = Some(Account { api, session });
-        e.command(Command::Offline(true).scoped(7));
-        let tracks = ["a", "b", "c"]
-            .into_iter()
-            .map(|id| LocalTrack {
-                id: id.into(),
-                title: id.into(),
-                subtitle: String::new(),
-                album_id: String::new(),
-                artist_id: String::new(),
-                duration: 100.0,
-            })
-            .collect();
-        assert_eq!(e.local.replace(tracks, 0, false), Change::Start);
-        let shown = e.room_token().unwrap();
-        let remove = e.local.entries[1].key;
-        let move_key = e.local.entries[2].key;
-        e.command(
-            Command::Guarded(
-                shown.clone(),
-                Action::Move {
-                    key: move_key,
-                    after: None,
-                },
-            )
-            .scoped(7),
-        );
-        assert_eq!(e.local.entries[1].key, move_key);
-        e.command(Command::Guarded(shown.clone(), Action::Remove(remove)).scoped(7));
-        assert_eq!(e.local.entries.len(), 3);
-        e.command(Command::Guarded(e.room_token().unwrap(), Action::Remove(remove)).scoped(7));
-        assert_eq!(e.local.entries.len(), 2);
-        e.local.desired = false;
-        e.command(Command::Guarded(shown, Action::Seek(35.0)).scoped(7));
-        e.command(Command::Playback(Action::Seek(35.0)).scoped(7));
-        assert_eq!(e.local.elapsed, 0.0);
-        e.command(Command::Guarded(e.room_token().unwrap(), Action::Seek(35.0)).scoped(7));
-        assert_eq!(e.local.elapsed, 35.0);
-    }
-    #[test]
-    fn bounded_settlement_batch_is_feedback_only_and_can_settle_a_retired_link() {
-        let mut e = engine();
-        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
-        let session = api.test_session();
-        e.account = Some(Account { api, session });
-        e.generation = Some(2);
-        e.request_id = SETTLEMENT_BATCH as u64;
-        let binding = Binding {
-            instruction_id: "old-execution".into(),
-            output_version: 2,
-            event_id: "song".into(),
-        };
-        let grant = Authority::new(Instant::now() + Duration::from_secs(4));
-        e.execution = Some(Execution {
-            generation: 2,
-            binding: binding.clone(),
-            grant: Some(grant.clone()),
-            status: Status::Ok,
-            sent_at: None,
-            ended: false,
-        });
-        let (tx, mut rx) = mpsc::channel(SETTLEMENT_BATCH + 1);
-        for i in 1..=SETTLEMENT_BATCH {
-            tx.try_send(socket::Event {
-                generation: 1,
-                kind: EventKind::CommandUncertain {
-                    request_id: i as u64,
-                },
-            })
-            .ok()
-            .unwrap();
-        }
-        tx.try_send(socket::Event {
-            generation: 2,
-            kind: EventKind::LeaseExpired(binding),
-        })
-        .ok()
-        .unwrap();
-        let batch = settlement_batch(&mut rx);
-        assert_eq!(batch.len(), SETTLEMENT_BATCH);
-        for event in batch {
-            e.settlement(event);
-        }
-        assert_eq!(e.action_status, "Playback action unconfirmed.");
-        assert_eq!(rx.len(), 1);
-        for event in settlement_batch(&mut rx) {
-            e.settlement(event);
-        }
-        assert!(grant.is_valid() && e.execution.is_some());
-        e.shared_epoch.store(8, Ordering::SeqCst);
-        e.settlement(socket::Event {
-            generation: 2,
-            kind: EventKind::CommandNotSent {
-                request_id: e.request_id,
-                error: socket::SocketError::NotConnected,
-            },
-        });
-        assert_eq!(e.action_status, "Playback action unconfirmed.");
-    }
-    #[tokio::test]
-    async fn fresh_same_output_resume_admits_media_despite_older_local_pause_settlement() {
-        use serde_json::{from_value, json};
-        fn instruction(id: &str, wants_play: bool, sequence: u64) -> Instruction {
-            from_value(json!({"id":id,"type":"execute","outputVersion":3,"eventId":"song-event",
-                "elapsed":2.0,"desiredPlaying":wants_play,"lease":{"clientSequence":sequence,"durationMs":8000},
-                "track":{"id":"song","name":"Song","artists":[],"albumName":"","albumId":"",
-                    "duration":30.0,"key":1,"order":1,"intent":"now"}})).unwrap()
-        }
-        for (outcome, execution, code, receipt_first) in [
-            ("accepted", "confirmed", "", true),
-            ("rejected", "unchanged", "invalid", true),
-            ("accepted", "superseded", "superseded", false),
-        ] {
-            let mut e = engine();
-            let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
-            let session = api.test_session();
-            e.account = Some(Account {
-                api,
-                session: session.clone(),
-            });
-            e.audio = Some(Audio::new(
-                Some(session),
-                false,
-                e.shared_epoch.clone(),
-                e.epoch,
-            ));
-            e.generation = Some(2);
-            e.request_id = 7;
-            // Inject a test output link at the already-validated socket boundary:
-            // the frame, matching generation, and live grant are all required.
-            let (_link, rx) = watch::channel(Link::Connected(2));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            e.admit_instruction(
-                2,
-                instruction("interrupted", true, 4),
-                Some(deadline),
-                false,
-                Some(rx.clone()),
-            );
-            let old_operation = e.operation;
-            let old_grant = e.pending.as_ref().unwrap().grant.as_ref().unwrap().clone();
-            e.pause_local();
-            assert!(!old_grant.is_valid() && e.pending.is_none());
-            e.admit_instruction(
-                2,
-                instruction("buffered-before-pause", true, 4),
-                Some(deadline),
-                true,
-                Some(rx.clone()),
-            );
-            e.admit_instruction(
-                2,
-                instruction("interrupted", true, 4),
-                Some(deadline),
-                false,
-                Some(rx.clone()),
-            );
-            assert!(e.pending.is_none());
-            let receipt = socket::Event {
-                generation: 2,
-                kind: EventKind::Result {
-                    request_id: 7,
-                    result: from_value(
-                        json!({"id":"7","outcome":outcome,"execution":execution,"code":code,
-                    "stateVersion":9,"acceptedCount":0,"placement":"none","final":true}),
-                    )
-                    .unwrap(),
-                },
-            };
-            let mut receipt = Some(receipt);
-            if receipt_first {
-                e.settlement(receipt.take().unwrap());
-            }
-            e.admit_instruction(
-                2,
-                instruction("other-controller-resume", true, 5),
-                Some(deadline),
-                false,
-                Some(rx),
-            );
-            if let Some(receipt) = receipt {
-                e.settlement(receipt);
-            }
-            e.reply(Reply::Media {
-                epoch: 7,
-                operation: old_operation,
-                result: Ok(vec![1]),
-            });
-            let pending = e.pending.as_ref().unwrap();
-            assert_eq!(pending.instruction.id, "other-controller-resume");
-            assert!(pending.grant.as_ref().unwrap().is_valid() && e.pause_fence.is_none());
-            e.cancel_work();
-        }
-    }
-    #[test]
-    fn explicit_http_needs_no_extra_state() {
-        assert!(connection("http://music.local:8080").is_ok());
     }
 }

@@ -11,6 +11,8 @@ mod mode;
 mod mpris;
 mod offline;
 mod pages;
+mod personal;
+mod personal_bridge;
 mod player;
 use api::preferences;
 mod presentation;
@@ -60,7 +62,7 @@ fn clear(ui: &AppWindow) {
     ui.set_now_album_name("".into());
     ui.set_next_title("".into());
     ui.set_next_subtitle("".into());
-    ui.set_now_artist_id("".into());
+    ui.set_now_credits(Default::default());
     ui.set_cover_art(Default::default());
     ui.set_waveform(Default::default());
     ui.set_lyrics_text("".into());

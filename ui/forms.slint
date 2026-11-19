@@ -1,5 +1,5 @@
 import { ScrollView, TextEdit } from "std-widgets.slint";
-import { Action, Caption, Cover, Eyebrow, Field, Notice, Theme } from "theme.slint";
+import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 
 export component SignInView inherits Rectangle {
     in-out property <string> origin;
@@ -56,14 +56,11 @@ export component Editor inherits Rectangle {
     in property <string> help;
     in property <string> error;
     in property <bool> busy;
-    in property <bool> offline;
-    in property <bool> reconnecting;
     in-out property <string> name;
     in-out property <string> description;
     in-out property <string> definition;
     callback save();
     callback cancel();
-    callback toggle-offline();
     property <bool> deleting: mode == "delete" || mode == "remove-saved";
     property <bool> editing-rules: mode == "rules" || mode == "new-rules";
     property <bool> editing-name: mode == "new-manual" || mode == "new-rules" || mode == "rename" || mode == "device-rename";
@@ -81,22 +78,15 @@ export component Editor inherits Rectangle {
         ScrollView {
             content-width: self.visible-width;
             VerticalLayout {
-                padding-top: 30px; padding-bottom: 30px;
-                alignment: start;
+                padding: 14px; alignment: start;
                 Rectangle {
-                    width: min(656px, max(300px, root.width - 52px));
-                    x: (root.width - self.width) / 2;
+                    max-width: 660px;
                     min-height: editor-form.preferred-height;
                     vertical-stretch: 0;
-                    background: Theme.panel; border-radius: 14px; border-width: 1px; border-color: Theme.line;
+                    background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.line;
                     editor-form := VerticalLayout {
-                        padding: 24px; spacing: 10px;
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Eyebrow { text: root.mode == "device-rename" ? "PLAYBACK DEVICES" : root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
-                            Rectangle { horizontal-stretch: 1; }
-                            Action { text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline"; quiet: true; clicked => { root.toggle-offline(); } }
-                        }
+                        padding: 15px; spacing: 10px;
+                        Eyebrow { text: root.mode == "device-rename" ? "PLAYBACK DEVICES" : root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
                         Text {
                             text: root.mode == "remove-saved" ? "Remove this download?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
                                 : root.mode == "rules" ? "Edit playlist rules" : root.mode == "new-rules" ? "New rules playlist"
@@ -120,9 +110,12 @@ export component Editor inherits Rectangle {
                             text <=> root.definition; accessible-label: "Playlist rules definition";
                             font-family: "JetBrains Mono"; font-size: 13px * Theme.density;
                             height: 178px; enabled: !root.busy; wrap: word-wrap;
+                            init => { if !root.editing-name { self.focus(); } }
                         }
                         if root.error != "": Notice { text: root.error; error: true; }
-                        HorizontalLayout {
+                        Divider { }
+                        FlexboxLayout {
+                            flex-wrap: wrap;
                             spacing: 8px;
                             Action {
                                 text: "Cancel"; enabled: !root.busy;
@@ -130,7 +123,11 @@ export component Editor inherits Rectangle {
                                 clicked => { root.cancel(); }
                             }
                             Rectangle { horizontal-stretch: 1; }
-                            Action { text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove download" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes"; enabled: root.ready; primary: !root.deleting; danger: root.deleting; clicked => { root.save(); } }
+                            Action {
+                                text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove download" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
+                                enabled: root.ready; primary: !root.deleting; danger: root.deleting;
+                                clicked => { root.save(); }
+                            }
                         }
                     }
                 }

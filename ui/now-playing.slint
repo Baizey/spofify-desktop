@@ -1,4 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
+import { ArtistCredit, WrappingCredits } from "credits.slint";
 import { Action, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
 import { SeekBar, Transport } from "playback.slint";
 
@@ -100,7 +101,8 @@ export component NowPlaying inherits Rectangle {
     in property <string> subtitle;
     in property <string> album-id;
     in property <string> album-name;
-    in property <string> artist-id;
+    in property <[ArtistCredit]> credits;
+    in property <bool> metadata-interactive: true;
     in property <string> context-kind;
     in property <string> context-id;
     in property <string> context-name;
@@ -147,9 +149,9 @@ export component NowPlaying inherits Rectangle {
     property <bool> has-context: root.context-id != "" && root.context-name != "" &&
         (root.context-kind == "album" || root.context-kind == "artist" || root.context-kind == "playlist" || root.context-kind == "derived");
     property <bool> context-is-album: root.has-context && root.context-kind == "album" && root.context-id == root.album-id;
-    property <bool> context-is-artist: root.has-context && root.context-kind == "artist" && root.context-id == root.artist-id;
-    property <bool> show-album: root.album-id != "";
-    property <bool> show-context: root.has-context && !root.context-is-artist && !root.context-is-album;
+    property <bool> link-album: root.metadata-interactive && root.album-id != "";
+    property <bool> show-album: root.link-album || root.album-label != "";
+    property <bool> show-context: root.metadata-interactive && root.has-context && !root.context-is-album;
     property <string> album-label: root.album-name != "" ? root.album-name : root.context-is-album ? root.context-name : "";
     property <bool> repeats: root.repeat-mode == "one" || root.repeat-mode == "all";
 
@@ -225,17 +227,12 @@ export component NowPlaying inherits Rectangle {
                     overflow: elide;
                     accessible-label: root.track;
                 }
-                if root.subtitle != "" || root.artist-id != "": artist-line := Rectangle {
-                    height: 30px;
-                    if root.artist-id == "": Caption { text: root.subtitle; horizontal-alignment: center; font-size: 15px * Theme.density; }
-                    if root.artist-id != "": Action {
-                        x: (parent.width - self.width) / 2; width: min(parent.width, self.min-width); height: parent.height;
-                        text: root.subtitle == "" ? "Artist" : root.subtitle;
-                        accessible-label: root.subtitle == "" ? "Open artist" : "Open artist: " + root.subtitle;
-                        quiet: true;
-                        changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + artist-line.y, artist-line.height); } }
-                        clicked => { root.page-action("artist", root.artist-id); }
-                    }
+                if root.subtitle != "" || root.credits.length > 0: artist-line := WrappingCredits {
+                    credits: root.credits; fallback: root.subtitle; centered: true;
+                    interactive: root.metadata-interactive;
+                    font-size: 15px * Theme.density;
+                    focused(y, h) => { root.reveal(stage.y + deck.y + artist-line.y + y, h); }
+                    activated(id) => { root.page-action("artist", id); }
                 }
                 Rectangle { height: root.short ? 4px : 10px; }
                 if root.duration > 0: SeekBar {
@@ -291,7 +288,7 @@ export component NowPlaying inherits Rectangle {
                 if root.show-album || root.show-context: Rectangle { height: root.short ? 4px : 11px; }
                 if root.show-album || root.show-context: source-line := HorizontalLayout {
                     height: 34px; spacing: 8px;
-                    if root.show-album: Rectangle {
+                    if root.link-album: Rectangle {
                         width: min(album.min-width, parent.width * (root.show-context ? 0.49 : 1));
                         album := Action {
                             width: parent.width; height: parent.height;
@@ -301,6 +298,11 @@ export component NowPlaying inherits Rectangle {
                             changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + source-line.y, source-line.height); } }
                             clicked => { root.page-action("album", root.album-id); }
                         }
+                    }
+                    if root.show-album && !root.link-album: Caption {
+                        min-width: 0px;
+                        max-width: root.show-context ? parent.width * 0.49 : parent.width;
+                        text: root.album-label;
                     }
                     if root.show-context: Action {
                         min-width: 0px; height: 34px; horizontal-stretch: 1;

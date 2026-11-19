@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthetic WS v2 executor smoke; real Slint desktop + ALSA, not Go integration.
+"""Synthetic account-state executor smoke; real Slint desktop + ALSA, not Go integration.
 
 Requires a prebuilt Slint MCP debug binary, cage, wlr-randr, PipeWire and its ALSA plugin,
 pipewire-pulse, WirePlumber 0.5 (policy profile), pactl and parec. No real account,
@@ -7,6 +7,7 @@ compositor, sound device or ambient audio server is used. All output is temporar
 """
 import argparse
 from contextlib import contextmanager, ExitStack
+from math import cos, pi
 from pathlib import Path
 from queue import Empty
 import os
@@ -105,13 +106,33 @@ def heard_tone(pcm, hz=480, start=None):
         # Short Go fixture audio may already have finished by the time the
         # observer sees Play. Inspect only PCM added after the click fence.
         with pcm.open("rb") as file:
-            file.seek(start)
+            file.seek(start & ~1)
             raw = file.read(6 * 48000 * 2)
         samples = [s for (s,) in struct.iter_unpack("<h", raw[:len(raw) & ~1])]
-    crossings = [i for i in range(1, len(samples)) if samples[i - 1] <= 0 < samples[i]]
-    period = 48000 / hz
-    return (sum(abs(b - a - period) <= 2 for a, b in zip(crossings, crossings[1:])) >= 40
-            and max(map(abs, samples), default=0) > 500)
+    # Narrowband power over windowed 250 ms slices. A monitor discontinuity
+    # (e.g. a quantum filled with zeros) is not a different pitch. Compare
+    # neighboring bins too: Go's next fixture track is only 7 Hz higher.
+    rate, size = 8000, 2000
+    decimated = samples[::6]
+    window = tuple(0.5 - 0.5 * cos(2 * pi * i / size) for i in range(size))
+
+    def power(weighted, frequency):
+        coeff = 2 * cos(2 * pi * frequency / rate)
+        prev = previous = 0.0
+        for sample in weighted:
+            prev, previous = sample + coeff * prev - previous, prev
+        return prev * prev + previous * previous - coeff * prev * previous
+
+    for start in range(0, len(decimated) - size + 1, size // 2):
+        chunk = decimated[start:start + size]
+        if max(map(abs, chunk)) < 500:
+            continue
+        weighted = [sample * weight for sample, weight in zip(chunk, window)]
+        energy = sum(sample * value for sample, value in zip(chunk, weighted)) * size / 2
+        target = power(weighted, hz)
+        if 2 * target >= 0.45 * energy and target > 1.6 * max(power(weighted, hz - 7), power(weighted, hz + 7)):
+            return True
+    return False
 
 
 def silence(pcm, label):
@@ -121,115 +142,148 @@ def silence(pcm, label):
     check(max(map(abs, pcm_tail(pcm)), default=0) <= 8, label + ": monitor was not silent")
 
 
+def admission(admitted, requests, label):
+    try:
+        peer = admitted.get(timeout=12)
+    except Empty as error:
+        raise Failure(f"no authenticated account hello ({label}); loopback routes/status: {list(requests)}") from error
+    if isinstance(peer, Exception):
+        raise Failure(f"synthetic account admission ({label}): {peer}") from peer
+    return peer
+
+
 def run(win, ready, admitted, media, requests, pcm):
     win.fill("Server( origin| URL| address)?", ready["origin"])
     win.fill("Username", ready["username"])
     win.fill("Password", ready["password"])
     win.click("Sign in")
+    peer = admission(admitted, requests, "sign-in")
+    peer.open()
+    peer.expect("presence to the selected connection", lambda m: m["type"] == "presence")
     win.section("History")
-    try:
-        peer = admitted.get(timeout=12)
-    except Empty as error:
-        raise Failure(f"no authenticated v2 WebSocket hello; loopback routes/status: {list(requests)}") from error
-    if isinstance(peer, Exception):
-        raise Failure("synthetic socket admission: " + str(peer)) from peer
-    peer.state(opening=True, selected=False)
-    print("PASS Slint sign-in; authenticated v2 upgrade and one-use ticket hello (canPlay=true)", flush=True)
-    win.fill("Search music", TITLE)
+    print("PASS Slint sign-in; account v1 upgrade, one-use ticket, selected output and presence/grant", flush=True)
+    win.fill("Search tracks, albums or artists", TITLE)
     win.find("Open " + TITLE)
 
-    def play(click, kind="queueIntent", *, elapsed=0, lease=8000, source=False):
-        win.click(click)
-        command = peer.command(kind)
-        if kind == "queueIntent":
-            cmd = command["command"]
-            check(cmd["intent"] == "now" and cmd["selection"] == {"kind": "track", "track": {"id": TRACK_ID}},
-                  "clicked search result sent unexpected selection")
-            peer.select_track()
-        peer.state(playing=True, elapsed=elapsed, selected=source, phase="preparing", source=source)
-        peer.result(command)
-        peer.instruct("prepare", elapsed=elapsed, command=command)
-        if source:
-            peer.instruct("release", command=command, after_send=lambda: peer.state(
-                playing=True, elapsed=elapsed, phase="releasing", source=True))
-        peer.version += 1
-        i = peer.instruct("activate", playing=True, elapsed=elapsed, duration_ms=lease, command=command,
-                          after_send=lambda: peer.state(playing=True, elapsed=elapsed, phase="activating", source=source))
-        peer.state(playing=True, elapsed=elapsed)
-        peer.result(command, final=True)
-        return i
+    def play():
+        win.click("Play " + TITLE)
+        return peer.play(peer.command("play"))
+
+    def audible(m):
+        return m["playing"] and not m["buffering"] and not m["ended"]
 
     silence(pcm, "before play")
-    active = play("Play " + TITLE)
-    initial = peer.report(active, lambda m: m["isPlaying"], "playing report")
-    wait("480 Hz fixture tone at the ALSA sink monitor", lambda: heard_tone(pcm), 3)
-    advanced = peer.report(active, lambda m: m["isPlaying"] and m["elapsed"] >= initial["elapsed"] + 0.5,
-                           "advancing native elapsed")
-    check(media and advanced["duration"] == SECONDS, "missing WAV delivery or incorrect decoded duration")
-    print(f"PASS queueIntent(now) → prepare → activate; WAV {media[0]} bytes; native elapsed "
-          f"{initial['elapsed']:.2f} → {advanced['elapsed']:.2f}s; captured 480 Hz", flush=True)
+    baseline = pcm.stat().st_size
+    active = play()
+    initial = peer.fact(active, audible, "bound playing fact")
+    wait("480 Hz fixture tone at the private ALSA sink monitor", lambda: heard_tone(pcm, start=baseline), 3)
+    advanced = peer.fact(active, lambda m: audible(m) and m["elapsed"] >= initial["elapsed"] + 0.5,
+                         "advancing native account fact")
+    check(media and media[0] == 44 + 2 * 48000 * SECONDS, "missing complete WAV delivery")
+    print(f"PASS canonical Play; native elapsed {initial['elapsed']:.2f} → {advanced['elapsed']:.2f}s; 480 Hz PCM",
+          flush=True)
 
+    # Go's Pause increments Run and marks the cursor stopped. No native
+    # decoder remains to report on that paused run; verify sink silence and
+    # that no advancing fact follows, rather than inventing a receipt.
     win.click("Pause")
-    cmd = peer.command("pause")
-    elapsed = advanced["elapsed"]
-    peer.state(playing=False, elapsed=elapsed)
-    peer.result(cmd)
-    paused = peer.instruct("execute", elapsed=elapsed, duration_ms=8000, command=cmd)
-    peer.result(cmd, final=True)
-    peer.report(paused, lambda m: not m["isPlaying"] and not m["ended"], "stopped report after pause")
-    silence(pcm, "after pause ACK")
+    paused = peer.control(peer.command("pause", before=lambda msg: peer.observe(active, msg)))
+    elapsed = paused["elapsed"]
+    check(advanced["elapsed"] - 0.2 <= elapsed < SECONDS - 0.5 and not paused["desired"] and
+          not paused["playing"] and paused["run"] == active["run"] + 1, "incorrect pause cursor")
+    win.find("Play|Resume", roles=("Button",))
+    silence(pcm, "after pause")
+    peer.frame(9, b"paused-connection")
+    peer.no_replay(0.6, pong=b"paused-connection", label="paused run")
+
+    baseline = pcm.stat().st_size
+    win.click("Play|Resume")
+    active = peer.control(peer.command("resume"))
+    resumed = peer.fact(active, audible, "resumed native playing fact")
+    check(elapsed - 0.15 <= resumed["elapsed"] < elapsed + 2.5, "resume did not restore the position")
+    marker = 480 if elapsed < 2 else 360 if elapsed < 6 else 600
+    wait("PCM from resumed position", lambda: heard_tone(pcm, hz=marker, start=baseline), 3)
+    print("PASS canonical Pause, silent monitor, no advancing fact, and Resume from observed position", flush=True)
+
     failures = []
-    # Leave enough clip after either forward target for a periodic playing
-    # report on resume, even if a backward seek fails and keeps that target.
     for label, mode, forward in (("wide", WIDE, 0.60), ("compact", COMPACT, 0.65)):
-        if mode == COMPACT:
+        if mode == COMPACT:  # Cage already starts in WIDE.
             win.resize(mode)
-        for direction, fraction in (("forward", forward), ("backward", 0.25)):
-            # Real Go sends pings; keep this transport alive even if the seek
-            # never arrives. This does not renew the audio lease.
-            ping = f"before-{label}-{direction}-seek".encode()
-            peer.frame(9, ping)
-            peer.expect("pong before pointer seek", lambda m: m == {"type": "pong", "data": ping})
+        for direction, fraction, marker in (("forward", forward, 600), ("backward", 0.25, 360)):
+            peer.ping(f"before-{label}-{direction}-seek")
             with verify(failures, f"{label} dock {direction} pointer seek"):
+                baseline = pcm.stat().st_size
                 win.drag_slider(fraction)
                 cmd = peer.command("seek")
-                requested = cmd["command"]["value"]
+                requested = cmd["value"]
+                started = monotonic()
+                active = peer.control(cmd)
+                report = peer.fact(active, audible, "playing fact for new seek run")
                 check(abs(requested - fraction * SECONDS) < 0.6, f"unexpected pointer seek target: {requested:.2f}s")
-                peer.state(playing=False, elapsed=requested)
-                peer.result(cmd)
-                sought = peer.instruct("execute", elapsed=requested, duration_ms=8000, command=cmd)
-                peer.result(cmd, final=True)
-                reported = peer.report(sought, lambda m: not m["isPlaying"] and not m["ended"],
-                                       "stopped seek report")
-                elapsed = reported["elapsed"]
-                check(abs(elapsed - requested) < 0.15,
-                      f"seek sent {requested:.2f}s and was ACKed, but executor reported {elapsed:.2f}s")
-                print(f"PASS {label} {direction} pointer seek moved the executor to {elapsed:.2f}s", flush=True)
+                check(requested - 0.15 <= report["elapsed"] <= requested + monotonic() - started + 0.25,
+                      f"seek sent {requested:.2f}s but executor reported {report['elapsed']:.2f}s")
+                wait(f"{marker} Hz PCM from the {direction} seek target", lambda: heard_tone(pcm, hz=marker, start=baseline), 3)
+                print(f"PASS {label} {direction} seek to {requested:.2f}s: native fact {report['elapsed']:.2f}s and {marker} Hz PCM",
+                      flush=True)
     win.resize(WIDE)
-    active = play("Play|Resume", "resume", elapsed=elapsed, source=True)
-    resumed = peer.report(active, lambda m: m["isPlaying"], "resumed native playback")
-    check(elapsed - 0.1 <= resumed["elapsed"] < elapsed + 3.5, "resume did not restore the position")
-    wait("resumed fixture tone", lambda: heard_tone(pcm), 3)
-    ended = peer.report(active, lambda m: m["ended"], "native ended report")
-    check(not ended["isPlaying"] and ended["elapsed"] == ended["duration"] == SECONDS, "incorrect natural end facts")
-    # Repeat off: Go parks the final occurrence by issuing one stopped execute.
-    parked = peer.instruct("execute", elapsed=SECONDS, duration_ms=8000,
-                           after_send=lambda: peer.state(playing=False, elapsed=SECONDS))
-    peer.report(parked, lambda m: not m["isPlaying"] and not m["ended"], "stopped report after natural end")
-    print("PASS Pause command/ACK + silent monitor; Resume command + tone; bound natural ended report", flush=True)
+    ended = peer.fact(active, lambda m: m["ended"], "bound native EOF fact", timeout=SECONDS + 2)
+    check(not ended["playing"] and not ended["buffering"] and ended["landed"] == 0 and
+          abs(ended["elapsed"] - SECONDS) < 0.05, "incorrect repeat-off EOF fact")
     silence(pcm, "after natural end")
+    print("PASS natural EOF (landed=0), stopped cursor and silent monitor", flush=True)
 
-    before_replay = monotonic()
-    short = play("Play " + TITLE, source=True, lease=3500)
-    peer.report(short, lambda m: m["isPlaying"] and not m["ended"], "short-lease playback", renew=False)
-    wait("tone with short lease", lambda: heard_tone(pcm), 2)
-    # Withhold renewals while keeping this exact socket alive and desiredPlaying=true.
-    sleep(3)
-    silence(pcm, "after lease expiration")
-    check(monotonic() - before_replay < SECONDS - 0.5, "silence was not verified before natural end")
-    peer.frame(9, b"synthetic-after-expiry")
-    peer.expect("pong on the same socket after lease expires", lambda m: m == {"type": "pong", "data": b"synthetic-after-expiry"})
-    print("PASS short lease with no renewal: tone stopped before WAV end; same WebSocket answered ping", flush=True)
+    # Withhold renewals without sending a pause, a new cursor, or an owner change.
+    peer.grant_ms = 3500
+    peer.expect("fresh short grant basis", lambda m: m["type"] == "presence")
+    deadline = peer.last_grant + peer.grant_ms / 1000
+    peer.grant_ms = None
+    baseline = pcm.stat().st_size
+    started = monotonic()
+    short = play()
+    peer.fact(short, audible, "playing under the short grant", timeout=3)
+    wait("short-grant 480 Hz tone", lambda: heard_tone(pcm, start=baseline), 2)
+    check(monotonic() < deadline, "did not verify audible playback within the short grant")
+    sleep(max(0, deadline - monotonic()))
+    silence(pcm, "after unrenewed grant expires")
+    check(monotonic() - started < SECONDS - 0.5, "expiry silence was not verified before natural end")
+    peer.ping("same-connection-after-expiry")
+    print("PASS local grant expiry stopped tone before EOF without dropping the account socket", flush=True)
+
+    peer.drop_output()
+    peer.expect("release after loss of ownership", lambda m: m["type"] == "release")
+    # After release, a new user Play claims an unowned output, as on Go.
+    peer.grant_ms = 4500
+    baseline = pcm.stat().st_size
+    started = monotonic()
+    win.click("Play " + TITLE)
+    cmd = peer.command("play")
+    peer.claim_output()
+    active = peer.play(cmd)
+    fact = peer.fact(active, audible, "playing before disconnect", timeout=4)
+    wait("480 Hz tone before disconnect", lambda: heard_tone(pcm, start=baseline), 2)
+    deadline = peer.last_grant + peer.grant_ms / 1000
+    check(monotonic() < deadline - 0.4, "transport was not cut during a live grant")
+    peer.disconnect()
+    # Hold the replacement snapshot until we have PCM that could only be
+    # rendered under the already-accepted grant on the disconnected run. Fence
+    # after the new hello so prior monitor/backend buffers already had time to drain.
+    rejoined = admission(admitted, requests, "reconnect")
+    check(peer.hello["deviceId"] == rejoined.hello["deviceId"] and peer.id != rejoined.id,
+          "reconnect did not retain logical device identity with a new connection")
+    baseline = pcm.stat().st_size
+    check(0 <= fact["elapsed"] < 5, "disconnect did not exercise the early/middle PCM markers")
+    wait("360 Hz PCM under the detached run's existing grant",
+         lambda: heard_tone(pcm, hz=360, start=baseline), min(2, max(0, deadline - monotonic())))
+    check(monotonic() < deadline, "detached tone was not observed within the old grant")
+    # Drop grace by publishing still-desired state with no owner and no new
+    # grant. No new connection may replay choices, facts, or ungranted audio.
+    rejoined.open(selected=False, prior=peer)
+    rejoined.no_replay(4)
+    silence(pcm, "after account reconnect without ownership")
+    check(monotonic() - started < SECONDS - 0.5, "disconnect silence was not verified before natural EOF")
+    rejoined.frame(9, b"account-no-replay")
+    rejoined.no_replay(2, pong=b"account-no-replay")
+    print("PASS disconnect/rejoin did not replay account choices, stale facts, or ungranted audio", flush=True)
     check(not failures, "; ".join(failures))
 
 
@@ -241,7 +295,7 @@ def main():
     args = parser.parse_args()
     try:
         binary = args.desktop.resolve(strict=True)
-        print("SYNTHETIC WS v2 NATIVE AUDIO ONLY — not real Go integration", flush=True)
+        print("SYNTHETIC ACCOUNT-STATE NATIVE AUDIO ONLY — not real Go integration", flush=True)
         # Short, absolute path so the private Unix sockets fit sun_path.
         with TemporaryDirectory(prefix="aud-smoke-", dir=args.scratch_dir.resolve(strict=True)) as temp:
             root = Path(temp)
@@ -249,7 +303,7 @@ def main():
             with (audio_fixture() as (ready, admitted, media, requests),
                   output(root, env) as pcm, desktop(binary, root, env, multisize=True) as win):
                 run(win, ready, admitted, media, requests, pcm)
-    except (Failure, OSError, subprocess.SubprocessError) as error:
+    except (Failure, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"FAIL synthetic native audio smoke: {error}", file=sys.stderr)
         return 1
     return 0

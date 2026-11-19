@@ -1,6 +1,6 @@
-//! Session-owned read models, independent of the wire protocol. Today collection
-//! changes invalidate snapshots backed by personal REST reads; the playback room
-//! uses a separate live replica. No cached objects survive a change of identity.
+//! Session-owned presentation cache and navigation trail. The account's v3
+//! personal playlist and Recent authority lives in `crate::personal`; caching
+//! a rendered page here does not establish or repair that account state.
 use crate::pages::{Page, Route};
 use std::{
     collections::VecDeque,
@@ -24,11 +24,10 @@ impl Replica {
         let i = self.0.iter().position(|e| &e.route == route)?;
         let e = self.0.remove(i)?;
         // Revalidate on a later visit, never on a periodic refresh timer.
-        let ttl = match route {
-            Route::History => 60,
-            Route::Search(_) => 90,
-            Route::Playlist(_) | Route::Playlists | Route::Picker(_) => 180,
-            _ => 600,
+        let ttl = if matches!(route, Route::Search(_)) {
+            90
+        } else {
+            600
         };
         let fresh = !e.dirty && e.received.elapsed() < Duration::from_secs(ttl);
         let page = e.value.clone();
@@ -47,23 +46,6 @@ impl Replica {
             || self.0.iter().map(|e| e.value.rows.len()).sum::<usize>() > MAX_ROWS
         {
             self.0.pop_front();
-        }
-    }
-    pub fn recent_changed(&mut self) {
-        for e in &mut self.0 {
-            if matches!(e.route, Route::History) {
-                e.dirty = true;
-            }
-        }
-    }
-    pub fn collection_changed(&mut self) {
-        for e in &mut self.0 {
-            if matches!(
-                e.route,
-                Route::Playlist(_) | Route::Playlists | Route::Picker(_)
-            ) {
-                e.dirty = true;
-            }
         }
     }
     pub fn saved_changed(&mut self) {
@@ -116,15 +98,13 @@ mod tests {
             title: "Last good".into(),
             ..Default::default()
         });
-        r.put(Route::History, p.clone());
-        r.put(Route::Playlists, p);
-        r.recent_changed();
-        let (old, fresh) = r.get(&Route::History).unwrap();
+        r.put(Route::Offline, p.clone());
+        r.put(Route::Album("a".into()), p);
+        r.saved_changed();
+        let (old, fresh) = r.get(&Route::Offline).unwrap();
         assert_eq!(old.title, "Last good");
         assert!(!fresh);
-        assert!(r.get(&Route::Playlists).unwrap().1);
-        r.collection_changed();
-        assert!(!r.get(&Route::Playlists).unwrap().1);
+        assert!(r.get(&Route::Album("a".into())).unwrap().1);
     }
     #[test]
     fn bounded_trail_and_search_edits() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Go fixture and API assertions. No service discovery, production state or proxies."""
+"""Real Go account-state fixture with a synthetic catalog and disposable accounts."""
 
 from contextlib import contextmanager
 import hashlib
@@ -49,6 +49,9 @@ def stop(process, graceful=False):
 
 def build(source, root, env, module_cache=None):
     """Overlay only composition/lifecycle, not any endpoint, store or wire logic."""
+    # The overlay key must match Go's physical checkout path (e.g. /var/home,
+    # not a /home alias), or Go can silently compile the unmodified fixture.
+    source = source.resolve(strict=True)
     fixture_source = "cmd/offline-fixture/main.go"
     git = ["git", "--no-optional-locks", "-C", str(source)]
     try:
@@ -59,6 +62,9 @@ def build(source, root, env, module_cache=None):
     check(not clean, "use a clean Go checkout to give the fixture an exact revision")
     original = source / fixture_source
     contents = original.read_text()
+    # Match cmd/spofify's AuthConfig: this store supplies both the canonical
+    # playback resolver and the personal socket worker. Keep the source checkout
+    # read-only, and join the hijacked sockets before closing the fixture DBs.
     for old, new in (
         ("BaseURL: origin, PersonalLibrary: web.NewPersonalWithOffline(db, libraryRoot),",
          "BaseURL: origin, PersonalLibrary: web.NewPersonalWithOffline(db, libraryRoot), PlaybackCatalog: db,"),
@@ -153,7 +159,10 @@ def fixture(binary, root, env, expected_revision=None):
 class Api:
     def __init__(self, ready, account=None):
         self.origin = ready["origin"]
-        self.port = urlsplit(self.origin).port
+        parsed_origin = urlsplit(self.origin)
+        self.port = parsed_origin.port
+        check(self.port and self.origin == f"http://127.0.0.1:{self.port}",
+              "fixture API requires its disposable IPv4 loopback origin")
         self.cookie = self.csrf = ""
         if account:
             _, headers, body = self.request("/api/auth/login", method="POST",
@@ -192,21 +201,96 @@ class Api:
         return json.loads(self.request(path, **kwargs)[2])
 
 
+def account_checks(ready, api, other):
+    from playback import Peer
+
+    playlists = [t for t in ready["targets"] if t["kind"] == "playlist"]
+    expected = {p["id"] for p in playlists}
+
+    def scoped_ids(peer):
+        return {p["id"] for p in peer.personal_snapshot["playlists"]}
+
+    with Peer(api, name="Acceptance writer") as writer, Peer(api) as observer:
+        check(scoped_ids(writer) == scoped_ids(observer) == expected, "primary playlist snapshot scope")
+        check(writer.personal_snapshot["recent"] == observer.personal_snapshot["recent"] == [], "fresh fixture history")
+        written = {}
+        for target in playlists:
+            listing = observer.playlist(target["id"])
+            summary, rows = listing["summary"], listing["rows"]
+            check(summary["kind"] == target["playlistKind"] and summary["name"] == target["name"] and
+                  len(rows) == target["total"], "complete scoped playlist rows")
+            check(sum(r["track"]["id"] == ready["duplicateTrackId"] for r in rows) == 3,
+                  "playlist lost duplicate occurrences")
+            if summary["kind"] == "manual":
+                manual, manual_rows = target, rows
+            else:
+                check(listing["definition"]["duplicates"] == "keep", "derived rules missing from scoped read")
+
+        # Real commands run on the store's account lane. Match committed deltas
+        # from another connection, then ask a fresh connection to read the DB.
+        name = "Disposable acceptance edits"
+        track = ready["duplicateTrackId"]
+        writer.personal("createPlaylist", name=name, description="Socket round trip", trackId=track)
+        created = observer.personal_change(lambda ch: ch.get("playlist", {}).get("name") == name)["playlist"]
+        pid = created["id"]
+        first = observer.playlist(pid)["rows"]
+        check(created["trackCount"] == len(first) == 1 and first[0]["track"]["id"] == track,
+              "playlist creation did not commit its initial entry")
+        writer.personal("addEntry", playlistId=pid, trackId=track)
+        added = observer.personal_change(lambda ch: ch.get("playlist", {}).get("id") == pid
+                                         and "added" in ch.get("entries", {}))["entries"]["added"]
+        check(added["track"]["id"] == track and added["id"] != first[0]["id"], "duplicate write lost identity")
+        writer.personal("moveEntry", playlistId=pid, entryId=added["id"], after="")
+        observer.personal_change(lambda ch: ch.get("entries", {}).get("moved") == added["id"])
+        with Peer(api, name="Acceptance reconnect") as readback, Peer(other) as foreign:
+            check(scoped_ids(readback) == expected | {pid}, "fresh account socket missed committed playlist")
+            rows = readback.playlist(pid)["rows"]
+            check([r["id"] for r in rows] == [added["id"], first[0]["id"]] and
+                  all(r["track"]["id"] == track for r in rows), "fresh readback lost duplicate move")
+            check(scoped_ids(foreign) == {ready["otherPlaylistId"]} and
+                  not foreign.snapshot["player"]["queue"], "foreign account socket leaked personal or player state")
+        writer.personal("deletePlaylist", playlistId=pid)
+        observer.personal_change(lambda ch: ch.get("deleted") == pid)
+
+        # Play selects the exact duplicate occurrence. This is real canonical
+        # state, not evidence of rendering: all these observers have canPlay=false.
+        chosen = manual_rows[1]
+        writer.send(dict(type="play", selection=dict(kind="track", track=dict(id=track, entryId=chosen["id"]),
+                                                      context=dict(kind="playlist", id=manual["id"]))))
+        replace = observer.wait_frame(lambda f: f.get("player", {}).get("queue", {}).get("kind") == "replace")["player"]
+        player = observer.snapshot["player"]
+        queue, cursor = player["queue"], player["cursor"]
+        check(replace["source"] == writer.connection_id and len(queue) == manual["total"] and
+              queue[0]["key"] == cursor["key"] and queue[0]["entryId"] == chosen["id"] and
+              {r["entryId"] for r in queue if r["id"] == track} == {r["id"] for r in manual_rows[:3]} and
+              cursor["desired"] and not cursor["playing"] and not observer.snapshot["owner"],
+              "canonical Play lost selection, occurrence keys, or desired/observed distinction")
+        writer.send(dict(type="add", placement="next", selection=dict(kind="track", track=dict(id=track))))
+        insert = observer.wait_frame(lambda f: f.get("player", {}).get("queue", {}).get("kind") == "insert")["player"]
+        now = observer.snapshot["player"]
+        check(insert["source"] == writer.connection_id and now["cursor"] == cursor and
+              [r["key"] for r in now["queue"]] == [queue[0]["key"], insert["queue"]["rows"][0]["key"],
+                                                     *(r["key"] for r in queue[1:])] and
+              now["queue"][1]["id"] == track and now["queue"][1]["intent"] == "next",
+              "canonical Add did not insert a new next occurrence")
+        with Peer(api, name="Acceptance reconnect") as readback:
+            check(readback.snapshot["player"]["queue"] == now["queue"] and
+                  readback.snapshot["player"]["cursor"] == cursor and scoped_ids(readback) == expected,
+                  "fresh socket did not read back canonical player/playlist state")
+        writer.send(dict(type="close"))
+        observer.wait(lambda snapshot: not snapshot["player"]["queue"] and not snapshot["player"]["cursor"]["key"])
+    print("PASS real account socket: scoped personal snapshots/rows; committed create, add, move, delete; "
+          "canonical Play/Add and reconnect readback (no audio executor)", flush=True)
+
+
 def api_checks(ready):
-    Api(ready).request("/api/me/playlists", status=401)
+    from playback import CONNECT
+
+    Api(ready).request(CONNECT, method="POST", body={}, status=401)
     api = Api(ready, ready)
     other = Api(ready, ready["otherAccount"])
     targets = ready["targets"]
-    playlists = [t for t in targets if t["kind"] == "playlist"]
-    listed = api.json("/api/me/playlists")["items"]
-    check({p["id"] for p in listed} == {p["id"] for p in playlists}, "primary playlist scope")
-    check([p["id"] for p in other.json("/api/me/playlists")["items"]] == [ready["otherPlaylistId"]],
-          "second account playlist scope")
-    other.request(f"/api/me/playlists/{playlists[0]['id']}", status=404)
-    entries = api.json(f"/api/me/playlists/{playlists[0]['id']}/entries?limit=3")["items"]
-    check(len({e["id"] for e in entries}) == 3 and
-          all(e["track"]["id"] == ready["duplicateTrackId"] for e in entries), "manual duplicate identities")
-    print("PASS real login, playlist isolation and duplicate entries", flush=True)
+    account_checks(ready, api, other)
 
     search = api.json("/api/library?" + urlencode({"kind": "tracks", "scope": "all", "q": "Synthetic Tone", "limit": 10}))
     check(search["total"] == 47 and len(search["items"]) == 10 and

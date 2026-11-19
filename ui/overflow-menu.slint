@@ -1,0 +1,129 @@
+import { Action, Theme } from "theme.slint";
+
+export global ActionCopy {
+    public pure function label(action: string) -> string {
+        return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
+            : action == "save" ? "Save offline"
+            : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
+            : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
+            : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
+            : action == "new-rules" ? "New rules playlist" : action;
+    }
+    public pure function mark(action: string) -> string {
+        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" ? "↓" : action == "remove" ? "−" : action == "up" ? "↑"
+            : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+    }
+}
+
+export component OverflowMenu inherits Rectangle {
+    in property <[string]> actions;
+    in property <string> text;
+    in property <string> label: "More actions";
+    in property <string> open-label: label;
+    in property <string> item-context;
+    in property <string> context-key;
+    in property <length> window-height;
+    callback action(string);
+    callback focused();
+    public function take-focus() { if root.visible && root.actions.length > 0 { trigger.take-focus(); } }
+
+    width: text == "" ? 37px : trigger.min-width;
+    height: 38px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    forward-focus: trigger;
+    property <length> menu-width: 244px + max(0, Theme.density - 1) * 80px;
+    property <length> item-height: max(37px, 34px * Theme.density);
+    property <length> menu-height: 12px + actions.length * item-height;
+    property <length> anchor-y: self.absolute-position.y;
+    property <bool> open-above: window-height > 0px && anchor-y + self.height + 4px + menu-height > window-height
+        && anchor-y > window-height - anchor-y - self.height;
+
+    changed actions => { if menu.is-open { menu.close(); } }
+    changed context-key => { if menu.is-open { menu.close(); } }
+
+    trigger := Action {
+        width: parent.width; height: parent.height;
+        visible: root.actions.length > 0;
+        enabled: self.visible;
+        text: root.text; icon: menu.is-open ? "×" : "···";
+        quiet: root.text == ""; selected: menu.is-open;
+        accessible-label: menu.is-open ? root.open-label : root.label;
+        accessible-expanded: menu.is-open;
+        changed has-focus => { if self.has-focus { root.focused(); } }
+        clicked => {
+            if menu.is-open {
+                menu.close();
+            } else if root.actions.length > 0 {
+                // For assistive activation as well as pointer/keyboard activation:
+                // Slint restores the focus it saved immediately before showing the popup.
+                self.take-focus();
+                menu.show();
+            }
+        }
+    }
+
+    menu := PopupWindow {
+        x: root.width - root.menu-width;
+        y: root.open-above ? -root.menu-height - 4px : root.height + 4px;
+        width: root.menu-width;
+        height: root.menu-height;
+        close-policy: close-on-click-outside;
+        forward-focus: keys;
+        property <int> highlighted: 0;
+        function choose(op: string) {
+            self.close();
+            root.action(op);
+        }
+        init => { keys.focus(); }
+
+        Rectangle {
+            width: 100%; height: 100%;
+            background: Theme.panel;
+            border-color: Theme.line; border-width: 1px; border-radius: 10px;
+            VerticalLayout {
+                padding: 6px;
+                for op[i] in root.actions: Action {
+                    height: root.item-height; min-width: 0px;
+                    text: ActionCopy.label(op); icon: ActionCopy.mark(op);
+                    leading: true; quiet: true; danger: op == "delete" || op == "remove";
+                    keyboard-focusable: false;
+                    selected: menu.highlighted == i;
+                    border-width: self.selected && keys.has-focus ? 2px : 0px;
+                    border-color: Theme.blue;
+                    accessible-label: self.text + (root.item-context == "" ? "" : " · " + root.item-context);
+                    changed has-hover => { if self.has-hover { menu.highlighted = i; } }
+                    clicked => { menu.choose(op); }
+                }
+            }
+        }
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    menu.close();
+                    return accept;
+                }
+                if event.text == Key.Tab || event.text == Key.Backtab {
+                    // Let normal Tab traversal continue from the restored trigger.
+                    menu.close();
+                    return reject;
+                }
+                if root.actions.length == 0 { return reject; }
+                if event.text == Key.UpArrow || event.text == Key.DownArrow {
+                    menu.highlighted = mod(menu.highlighted + root.actions.length + (event.text == Key.DownArrow ? 1 : -1), root.actions.length);
+                    return accept;
+                }
+                if event.text == Key.Home || event.text == Key.End {
+                    menu.highlighted = event.text == Key.Home ? 0 : root.actions.length - 1;
+                    return accept;
+                }
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { menu.choose(root.actions[menu.highlighted]); }
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+}

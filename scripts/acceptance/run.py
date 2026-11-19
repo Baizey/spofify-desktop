@@ -26,10 +26,12 @@ def main():
                         help="clean spofify-go checkout with cmd/offline-fixture (default: ~/repos/spofify-go)")
     parser.add_argument("--go-module-cache", type=Path, help="prepopulated Go module cache; no network fetches")
     parser.add_argument("--fixture-binary", type=Path, help="trusted prebuilt cmd/offline-fixture, instead of Go build")
-    parser.add_argument("--desktop", type=Path, help="prebuilt debug desktop with Slint MCP and debug info; needs cage and wlr-randr for real Go")
+    parser.add_argument("--desktop", type=Path,
+                        help="prebuilt debug desktop with Slint MCP and debug info; needs cage and wlr-randr for multisize checks")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--window-only", action="store_true", help="check empty sign-in pixels and absence of a consent checkbox without starting Go")
-    mode.add_argument("--synthetic-wire-ui", action="store_true", help="UI-only fallback with a Python wire stand-in; not Go integration")
+    mode.add_argument("--synthetic-wire-ui", action="store_true",
+                      help="native typed-search and navigation checks against a Go-shaped Python wire fixture; not Go integration")
     parser.add_argument("--scratch-dir", type=Path,
                         help="existing base for disposable build/cache/DB/profile state (e.g. worker-private /dev/shm)")
     parser.add_argument("--capture-dir", type=Path,
@@ -92,7 +94,7 @@ def main():
             else:
                 from playback import Peer
                 with Peer(api):
-                    print("PASS real v2 WebSocket ticket, upgrade and authenticated snapshot", flush=True)
+                    print("PASS real account v1 ticket, upgrade and initial player/personal snapshots", flush=True)
                 print("NOT RUN native desktop (provide --desktop)", flush=True)
         if failure is not None:
             raise failure

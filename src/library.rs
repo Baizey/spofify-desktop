@@ -1,19 +1,4 @@
-//! Account-owned listening history and playlists.
-//! Declare as an `api.rs` child: `#[path = "library.rs"] pub mod library;`.
-//!
-//! Browser methods on `Api` (`&Session` first): `history(page)`,
-//! `playlists(kind_filter, page)`, `playlist(id)`, `manual_entries(id, page)`,
-//! `derived_entries(id, limit, cursor)`, `playlist_definition(id)`,
-//! `tracked_playlist_sources(page)`, `preview_definition(definition, target, limit, cursor)`,
-//! `create_playlist(name, description, definition)`,
-//! `update_playlist(id, revision, name, description)`, `delete_playlist(id, revision)`,
-//! `update_playlist_definition(id, revision, definition)`,
-//! `add_playlist_track(id, revision, track_id)`, `remove_playlist_entry(id, revision, entry_id)`,
-//! `reorder_playlist(id, revision, entry_ids)`, `copy_derived_playlist(id, revision, fence, name, description)`.
-//! All offsets use `catalog::PageRequest`, revisions are `u64`, and limits are `u32`.
-//! Optional arguments: `kind_filter: Option<PlaylistKind>`, `definition` on create
-//! is `Option<&RuleDefinition>` (None creates manual), `target: Option<(&str, u64)>`,
-//! rule cursors are `Option<&str>`.
+//! Account personal wire projections and the retained HTTP rule-source/preview routes.
 
 use std::collections::HashSet;
 
@@ -31,15 +16,6 @@ use super::{Api, ApiError, INVALID_INPUT, INVALID_RESPONSE, Session, valid_id};
 pub enum PlaylistKind {
     Manual,
     Derived,
-}
-
-impl PlaylistKind {
-    fn wire(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Derived => "derived",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -104,9 +80,6 @@ impl<T> OffsetPage<T> {
     }
 }
 
-pub type PlaylistPage = OffsetPage<PlaylistSummary>;
-pub type ManualEntriesPage = OffsetPage<ManualEntry>;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub id: String,
@@ -116,8 +89,6 @@ pub struct HistoryEntry {
     pub received_at: Option<String>,
     pub metadata_missing: bool,
 }
-
-pub type HistoryPage = OffsetPage<HistoryEntry>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManualEntry {
@@ -268,12 +239,6 @@ pub enum RuleMembership {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct PlaylistDefinition {
-    pub definition: RuleDefinition,
-    pub revision: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackedPlaylistSource {
     pub id: String,
@@ -291,105 +256,6 @@ pub enum SourceState {
 }
 
 impl Api {
-    /// Paginated play events, including repeated plays and retired tracks.
-    pub async fn history(
-        &self,
-        session: &Session,
-        page: PageRequest,
-    ) -> Result<HistoryPage, ApiError> {
-        let (limit, offset) = page_params(page)?;
-        let wire: OffsetPage<WireHistory> = self
-            .catalog_get(
-                session,
-                Route::History,
-                &[("limit", &limit), ("offset", &offset)],
-            )
-            .await?;
-        wire.project(page, WireHistory::project)
-    }
-
-    pub async fn playlists(
-        &self,
-        session: &Session,
-        kind_filter: Option<PlaylistKind>,
-        page: PageRequest,
-    ) -> Result<PlaylistPage, ApiError> {
-        let (limit, offset) = page_params(page)?;
-        let mut query = vec![("limit", limit.as_str()), ("offset", offset.as_str())];
-        if let Some(kind) = kind_filter {
-            query.push(("kind", kind.wire()));
-        }
-        let wire: PlaylistPage = self.catalog_get(session, Route::Playlists, &query).await?;
-        let result = wire.project(page, |row| row.checked(None, kind_filter, None))?;
-        unique(result.items.iter().map(|row| row.id.as_str()))?;
-        Ok(result)
-    }
-
-    pub async fn playlist(&self, session: &Session, id: &str) -> Result<PlaylistSummary, ApiError> {
-        let wire: PlaylistSummary = self.catalog_get(session, Route::Playlist(id), &[]).await?;
-        wire.checked(Some(id), None, None)
-    }
-
-    pub async fn manual_entries(
-        &self,
-        session: &Session,
-        id: &str,
-        page: PageRequest,
-    ) -> Result<ManualEntriesPage, ApiError> {
-        let (limit, offset) = page_params(page)?;
-        let wire: OffsetPage<WireManualEntry> = self
-            .catalog_get(
-                session,
-                Route::Entries(id),
-                &[("limit", &limit), ("offset", &offset)],
-            )
-            .await?;
-        let result = wire.project(page, WireManualEntry::project)?;
-        // Tracks may repeat; only the occurrence IDs/positions must be unique.
-        unique(result.items.iter().map(|row| row.id.as_str()))?;
-        if !result
-            .items
-            .windows(2)
-            .all(|w| w[0].position < w[1].position)
-        {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(result)
-    }
-
-    pub async fn derived_entries(
-        &self,
-        session: &Session,
-        id: &str,
-        limit: u32,
-        cursor: Option<&str>,
-    ) -> Result<DerivedPage, ApiError> {
-        check_rule_paging(limit, cursor)?;
-        let limit_param = limit.to_string();
-        let mut query = vec![("limit", limit_param.as_str())];
-        if let Some(cursor) = cursor {
-            query.push(("cursor", cursor));
-        }
-        let wire: WireDerivedPage = self
-            .catalog_get(session, Route::Entries(id), &query)
-            .await?;
-        wire.project(limit, cursor, DerivedMode::Saved)
-    }
-
-    pub async fn playlist_definition(
-        &self,
-        session: &Session,
-        id: &str,
-    ) -> Result<PlaylistDefinition, ApiError> {
-        let result: PlaylistDefinition = self
-            .catalog_get(session, Route::Definition(id), &[])
-            .await?;
-        if !revision_ok(result.revision) || !result.definition.is_valid() {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(result)
-    }
-
     pub async fn tracked_playlist_sources(
         &self,
         session: &Session,
@@ -469,284 +335,6 @@ impl Api {
             .await?;
         wire.project(limit, cursor, DerivedMode::Preview(expected_revision))
     }
-
-    pub async fn create_playlist(
-        &self,
-        session: &Session,
-        name: &str,
-        description: &str,
-        definition: Option<&RuleDefinition>,
-    ) -> Result<PlaylistSummary, ApiError> {
-        let name = metadata(name, description)?;
-        if definition.is_some_and(|definition| !definition.is_valid()) {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        struct Request<'a> {
-            name: &'a str,
-            description: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            kind: Option<&'static str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            definition: Option<&'a RuleDefinition>,
-        }
-        let kind = if definition.is_some() {
-            PlaylistKind::Derived
-        } else {
-            PlaylistKind::Manual
-        };
-        let request = Request {
-            name,
-            description,
-            kind: definition.map(|_| kind.wire()),
-            definition,
-        };
-        let wire: PlaylistSummary = self
-            .catalog_write(
-                session,
-                Route::Playlists,
-                Method::POST,
-                request,
-                StatusCode::CREATED,
-            )
-            .await?;
-        wire.checked(None, Some(kind), None)
-    }
-
-    pub async fn update_playlist(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        name: &str,
-        description: &str,
-    ) -> Result<PlaylistSummary, ApiError> {
-        let name = metadata(name, description)?;
-        check_revision(revision)?;
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            name: &'a str,
-            description: &'a str,
-            expected_revision: u64,
-        }
-        let request = Request {
-            name,
-            description,
-            expected_revision: revision,
-        };
-        self.playlist_write(
-            session,
-            Route::Playlist(id),
-            Method::PATCH,
-            request,
-            id,
-            None,
-            revision,
-        )
-        .await
-    }
-
-    pub async fn delete_playlist(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-    ) -> Result<(), ApiError> {
-        check_revision(revision)?;
-        self.catalog_delete(
-            session,
-            Route::Playlist(id),
-            Revision {
-                expected_revision: revision,
-            },
-        )
-        .await
-    }
-
-    pub async fn update_playlist_definition(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        definition: &RuleDefinition,
-    ) -> Result<PlaylistSummary, ApiError> {
-        check_revision(revision)?;
-        if !definition.is_valid() {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            definition: &'a RuleDefinition,
-            expected_revision: u64,
-        }
-        let request = Request {
-            definition,
-            expected_revision: revision,
-        };
-        self.playlist_write(
-            session,
-            Route::Definition(id),
-            Method::PUT,
-            request,
-            id,
-            Some(PlaylistKind::Derived),
-            revision,
-        )
-        .await
-    }
-
-    pub async fn add_playlist_track(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        track_id: &str,
-    ) -> Result<PlaylistSummary, ApiError> {
-        check_revision(revision)?;
-        if !valid_id(track_id) {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            track_id: &'a str,
-            expected_revision: u64,
-        }
-        let request = Request {
-            track_id,
-            expected_revision: revision,
-        };
-        self.playlist_write(
-            session,
-            Route::Entries(id),
-            Method::POST,
-            request,
-            id,
-            Some(PlaylistKind::Manual),
-            revision,
-        )
-        .await
-    }
-
-    pub async fn remove_playlist_entry(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        entry_id: &str,
-    ) -> Result<PlaylistSummary, ApiError> {
-        check_revision(revision)?;
-        let request = Revision {
-            expected_revision: revision,
-        };
-        self.playlist_write(
-            session,
-            Route::Entry(id, entry_id),
-            Method::DELETE,
-            request,
-            id,
-            Some(PlaylistKind::Manual),
-            revision,
-        )
-        .await
-    }
-
-    /// Full published membership permutation, not just the current page.
-    pub async fn reorder_playlist(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        entry_ids: &[String],
-    ) -> Result<PlaylistSummary, ApiError> {
-        check_revision(revision)?;
-        let mut seen = HashSet::new();
-        if entry_ids.len() > 32_768
-            || entry_ids
-                .iter()
-                .any(|id| !valid_id(id) || !seen.insert(id.as_str()))
-        {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            entry_ids: &'a [String],
-            expected_revision: u64,
-        }
-        let request = Request {
-            entry_ids,
-            expected_revision: revision,
-        };
-        self.playlist_write(
-            session,
-            Route::Order(id),
-            Method::PUT,
-            request,
-            id,
-            Some(PlaylistKind::Manual),
-            revision,
-        )
-        .await
-    }
-
-    pub async fn copy_derived_playlist(
-        &self,
-        session: &Session,
-        id: &str,
-        revision: u64,
-        fence: &str,
-        name: &str,
-        description: &str,
-    ) -> Result<PlaylistSummary, ApiError> {
-        check_revision(revision)?;
-        let name = metadata(name, description)?;
-        if !opaque_token(fence, 4096) {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            name: &'a str,
-            description: &'a str,
-            expected_revision: u64,
-            fence: &'a str,
-        }
-        let request = Request {
-            name,
-            description,
-            expected_revision: revision,
-            fence,
-        };
-        let wire: PlaylistSummary = self
-            .catalog_write(
-                session,
-                Route::Copy(id),
-                Method::POST,
-                request,
-                StatusCode::CREATED,
-            )
-            .await?;
-        wire.checked(None, Some(PlaylistKind::Manual), None)
-    }
-
-    async fn playlist_write(
-        &self,
-        session: &Session,
-        route: Route<'_>,
-        method: Method,
-        body: impl Serialize,
-        id: &str,
-        kind: Option<PlaylistKind>,
-        revision: u64,
-    ) -> Result<PlaylistSummary, ApiError> {
-        let wire: PlaylistSummary = self
-            .catalog_write(session, route, method, body, StatusCode::OK)
-            .await?;
-        wire.checked(Some(id), kind, Some(revision))
-    }
 }
 
 impl<T> OffsetPage<T> {
@@ -772,7 +360,7 @@ impl<T> OffsetPage<T> {
 }
 
 impl PlaylistSummary {
-    fn checked(
+    pub(crate) fn checked(
         self,
         id: Option<&str>,
         kind: Option<PlaylistKind>,
@@ -803,15 +391,9 @@ impl PlaylistSummary {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Revision {
-    expected_revision: u64,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WireHistory {
+pub(crate) struct WireHistory {
     id: String,
     played_at: String,
     track: WireItem,
@@ -822,7 +404,7 @@ struct WireHistory {
 }
 
 impl WireHistory {
-    fn project(self) -> Result<HistoryEntry, ApiError> {
+    pub(crate) fn project(self) -> Result<HistoryEntry, ApiError> {
         if !valid_id(&self.id)
             || !safe_timestamp(&self.played_at)
             || self
@@ -850,15 +432,23 @@ impl WireHistory {
 }
 
 #[derive(Deserialize)]
-struct WireManualEntry {
+pub(crate) struct WireManualEntry {
     id: String,
     position: u64,
     track: WireItem,
 }
 
 impl WireManualEntry {
-    fn project(self) -> Result<ManualEntry, ApiError> {
-        if !valid_id(&self.id) || self.position > i64::MAX as u64 {
+    pub(crate) fn project(self) -> Result<ManualEntry, ApiError> {
+        self.project_scoped(PlaylistKind::Manual)
+    }
+
+    pub(crate) fn project_scoped(self, kind: PlaylistKind) -> Result<ManualEntry, ApiError> {
+        let valid = match kind {
+            PlaylistKind::Manual => valid_id(&self.id),
+            PlaylistKind::Derived => self.id.starts_with("o1_") && opaque_token(&self.id, 4096),
+        };
+        if !valid || self.position > i64::MAX as u64 {
             return Err(INVALID_RESPONSE);
         }
         Ok(ManualEntry {
@@ -1077,14 +667,6 @@ fn take_ok(take: Option<RuleTake>) -> bool {
 fn revision_ok(revision: u64) -> bool {
     (1..=i64::MAX as u64).contains(&revision)
 }
-fn check_revision(revision: u64) -> Result<(), ApiError> {
-    if revision_ok(revision) {
-        Ok(())
-    } else {
-        Err(INVALID_INPUT)
-    }
-}
-
 fn valid_error_code(code: Option<&str>) -> bool {
     code.is_none_or(|code| {
         !code.is_empty()
@@ -1155,51 +737,6 @@ mod tests {
         assert_eq!(row.track.id, "retired-track");
         assert!(row.metadata_missing);
         assert!(row.track.playable_item().is_none());
-    }
-
-    #[test]
-    fn history_offset_preserves_repeated_plays() {
-        let raw = json!({"items":[
-            {"id":"event-a","playedAt":"2025-01-01T12:00:01Z","track":track()},
-            {"id":"event-b","playedAt":"2025-01-01T12:00:00Z","track":track()}
-        ],"total":4,"offset":2,"limit":2});
-        let wire: OffsetPage<WireHistory> = serde_json::from_value(raw).unwrap();
-        let result = wire
-            .project(
-                PageRequest {
-                    offset: 2,
-                    limit: 2,
-                },
-                WireHistory::project,
-            )
-            .unwrap();
-        assert_eq!(result.items[0].track.id, result.items[1].track.id);
-        assert_ne!(result.items[0].id, result.items[1].id);
-        assert!(!result.has_more());
-    }
-
-    #[test]
-    fn manual_order_is_by_occurrence_not_track() {
-        let raw = json!({"items":[{"id":"entry-a","position":2,"track":track()},
-            {"id":"entry-b","position":4,"track":track()}],"total":2,"offset":0,"limit":2});
-        let wire: OffsetPage<WireManualEntry> = serde_json::from_value(raw).unwrap();
-        let result = wire
-            .project(
-                PageRequest {
-                    offset: 0,
-                    limit: 2,
-                },
-                WireManualEntry::project,
-            )
-            .unwrap();
-        assert_eq!(result.items[0].track.id, result.items[1].track.id);
-        assert_ne!(result.items[0].id, result.items[1].id);
-        assert_eq!(result.items[1].position, 4);
-        let body = serde_json::to_value(Revision {
-            expected_revision: 9,
-        })
-        .unwrap();
-        assert_eq!(body, json!({"expectedRevision":9}));
     }
 
     #[test]

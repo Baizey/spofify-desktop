@@ -52,7 +52,10 @@ export component Action inherits Rectangle {
     in property <bool> danger;
     in property <bool> leading;
     in property <bool> round;
+    // Composite controls such as a popup menu can own keyboard focus themselves.
+    in property <bool> keyboard-focusable: true;
     out property <bool> has-focus: key.has-focus;
+    out property <bool> has-hover: pointer.has-hover;
     callback clicked();
     public function take-focus() { key.focus(); }
     forward-focus: key;
@@ -84,10 +87,10 @@ export component Action inherits Rectangle {
     pointer := TouchArea {
         enabled: root.enabled;
         mouse-cursor: MouseCursor.pointer;
-        clicked => { key.focus(); root.clicked(); }
+        clicked => { if root.keyboard-focusable { key.focus(); } root.clicked(); }
     }
     key := FocusScope {
-        enabled: root.enabled;
+        enabled: root.enabled && root.keyboard-focusable;
         focus-on-click: false;
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
@@ -97,6 +100,74 @@ export component Action inherits Rectangle {
             return reject;
         }
     }
+}
+
+// A text-sized target with its own hit area, separate from the containing row.
+// Slint 1.18 has no accessible link role; navigation is exposed as a named button.
+export component TextTarget inherits Rectangle {
+    in property <string> text;
+    in property <string> label: text;
+    in property <bool> interactive: true;
+    in property <bool> accent;
+    in property <color> ink: Theme.text;
+    in property <length> font-size: 15px * Theme.density;
+    in property <int> font-weight: 600;
+    callback activated();
+    callback focused();
+    min-width: 0px;
+    horizontal-stretch: 1;
+    height: max(20px, font-size + 7px);
+
+    if root.interactive: Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        forward-focus: key;
+        accessible-role: button;
+        accessible-label: root.label;
+        accessible-action-default => { key.focus(); root.activated(); }
+        border-radius: 5px;
+        border-width: key.has-focus ? 2px : 0px;
+        border-color: Theme.blue;
+        background: pointer.has-hover || key.has-focus ? Theme.raised : transparent;
+        Text {
+            x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
+            text: root.text; color: root.accent ? Theme.blue : root.ink;
+            font-size: root.font-size; font-weight: root.font-weight;
+            vertical-alignment: center; overflow: elide; accessible-role: none;
+        }
+        pointer := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { key.focus(); root.activated(); }
+        }
+        key := FocusScope {
+            focus-on-click: false;
+            focus-gained(_) => { root.focused(); }
+            key-pressed(event) => {
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { root.activated(); }
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+    if !root.interactive: Text {
+        x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
+        text: root.text; color: root.ink;
+        font-size: root.font-size; font-weight: root.font-weight;
+        vertical-alignment: center; overflow: elide;
+        accessible-role: AccessibleRole.text; accessible-label: root.text;
+    }
+}
+
+export component AlbumLine inherits TextTarget {
+    in property <string> album-id;
+    in property <bool> links-enabled: true;
+    label: "Open album: " + self.text;
+    interactive: links-enabled && album-id != "" && self.text != "";
+    accent: true;
+    ink: Theme.muted;
+    font-size: 12px * Theme.density;
+    font-weight: 500;
 }
 
 export component Field inherits Rectangle {

@@ -465,12 +465,12 @@ impl Api {
         .await
     }
 
-    /// Opens the configured origin's v2 playback socket. The caller owns framing and must
-    /// fence every use of the returned connection against session expiry and network changes.
-    pub(crate) async fn playback_upgrade(
+    /// Opens the configured origin's account socket. The framing worker must
+    /// fence every use against session expiry and network changes.
+    pub(crate) async fn account_upgrade(
         &self,
         session: &Session,
-    ) -> Result<crate::socket::PlaybackUpgrade, ApiError> {
+    ) -> Result<crate::socket::AccountUpgrade, ApiError> {
         use tokio_tungstenite::tungstenite::handshake::{client::generate_key, derive_accept_key};
 
         self.with_authenticated_network(session, async {
@@ -541,7 +541,7 @@ impl Api {
                 .await
                 .map_err(|_| NETWORK)?
                 .map_err(|_| INVALID_RESPONSE)?;
-            Ok(crate::socket::PlaybackUpgrade { upgraded, ticket })
+            Ok(crate::socket::AccountUpgrade { upgraded, ticket })
         })
         .await
     }
@@ -1467,6 +1467,165 @@ mod tests {
         )
     }
 
+    // Follow the Go web test artist/album identities (libraryHandlerFixture) and both
+    // role projections (listening.go / library.go). The search item is the
+    // positive ListeningItem projection: no self credit, no albumId, no audio.
+    // Extend the fixture with an ID-only guest, which catalog.go's upsertArtist
+    // and replaceArtists persist and library.go projects without filling a name.
+    #[tokio::test]
+    async fn go_indexed_artist_opens_role_specific_detail_and_bounded_releases() {
+        use crate::{
+            desk::Access,
+            pages::{self, Route},
+            replica::{Replica, Trail},
+        };
+        use serde_json::json;
+
+        let artist = json!({"kind":"artist","id":"root","name":"Björk","hasAudio":false,
+            "coverage":{"tracks":2,"inLibrary":1,"albums":1}});
+        let coverage = json!({"tracks":2,"inLibrary":1,"albums":1});
+        for role in ["user", "admin"] {
+            let mut detail = artist.clone();
+            // Library's artist coverage includes the additional unsaved
+            // summary release; indexed coverage counts only actual memberships.
+            detail["coverage"]["albums"] = json!(2);
+            let mut album = json!({"kind":"album","id":"album","name":"Vespertine",
+                "artists":[{"id":"root","name":"Björk"},{"id":"guest-record","name":""}],
+                "albumType":"album","releaseDate":"2001-08-27","relation":"release",
+                "hasAudio":false,"coverage":coverage.clone()});
+            let mut track = json!({"kind":"track","id":"one","name":"Hidden Place",
+                "artists":[{"id":"root","name":"Björk"}],"albumId":"album","albumName":"Vespertine",
+                "durationMs":180000,"discNumber":1,"trackNumber":1,"hasAudio":true,
+                "coverage":{"tracks":1,"inLibrary":1,"albums":0}});
+            if role == "admin" {
+                for (item, status, incomplete, complete) in [
+                    (&mut detail, "partial", 2, false),
+                    (&mut album, "partial", 1, true),
+                    (&mut track, "complete", 0, true),
+                ] {
+                    item.as_object_mut().unwrap().remove("hasAudio");
+                    item["tracked"] = json!(true);
+                    item["coverage"]["status"] = json!(status);
+                    item["coverage"]["completeAlbums"] = json!(0);
+                    item["coverage"]["incompleteAlbums"] = json!(incomplete);
+                    item["coverage"]["metadataComplete"] = json!(complete);
+                }
+                track["libraryPath"] = json!("/recorded/synthetic-track.flac");
+            }
+            let wire = Wire::new(vec![
+                json(
+                    &json!({"items":[artist.clone()],"resultCount":1,
+                    "expiresAt":"2026-05-01T12:00:00.123456789Z"})
+                    .to_string(),
+                ),
+                json(&json!({"item":detail,"revision":42}).to_string()),
+                // Detail and child listing legitimately read separate revisions.
+                json(
+                    &json!({"items":[album.clone()],"limit":20,"offset":0,"total":1,
+                    "revision":43})
+                    .to_string(),
+                ),
+                json(&json!({"item":album,"revision":43}).to_string()),
+                json(
+                    &json!({"items":[track],"limit":20,"offset":0,"total":1,"revision":43})
+                        .to_string(),
+                ),
+            ]);
+            let api = Arc::new(wire.api());
+            let mut session = api.test_session();
+            session.role = role.into();
+            let access = Access {
+                epoch: 1,
+                api,
+                session,
+                offline: false,
+                personal: Default::default(),
+            };
+            let history = Route::History;
+            let history_page = Arc::new(pages::load(&access, &history, None).await.unwrap());
+            assert!(history_page.rows.is_empty());
+            assert!(!history_page.status.is_empty());
+            let query = Route::Search("Björk".into());
+            let search = Arc::new(pages::load(&access, &query, None).await.unwrap());
+            let hit = &search.rows[0];
+            assert!(hit.music.credits.is_empty());
+            assert_eq!(hit.title, "Björk");
+            let target = hit.route.clone().unwrap();
+            assert_eq!(target, Route::Artist("root".into()));
+            let page = pages::load(&access, &target, None).await.unwrap();
+            assert_eq!(page.title, "Björk");
+            assert_eq!(page.subtitle, "1 available song");
+            assert_eq!(page.rows.len(), 1);
+            assert!(!page.more);
+            assert_eq!(page.rows[0].music.credits[1].name, "Unknown artist");
+            assert_eq!(
+                page.rows[0].music.credits[1].target,
+                Some(Route::Artist("guest-record".into()))
+            );
+            let release = page.rows[0].route.clone().unwrap();
+            assert_eq!(release, Route::Album("album".into()));
+            let album = pages::load(&access, &release, None).await.unwrap();
+            assert_eq!(album.title, "Vespertine");
+            assert_eq!(album.music.credits[0].target, Some(target.clone()));
+            assert!(
+                album.music.album.is_none(),
+                "album has no redundant self link"
+            );
+            let recording = &album.rows[0];
+            assert_eq!(recording.route, Some(Route::Track("one".into())));
+            assert_eq!(
+                recording.music.album.as_ref().unwrap().target,
+                Some(release.clone())
+            );
+            assert_eq!(
+                recording
+                    .playback
+                    .as_ref()
+                    .unwrap()
+                    .context()
+                    .unwrap()
+                    .info_route(),
+                release
+            );
+            assert!(!format!("{recording:?}").contains("/recorded/"));
+
+            let mut trail = Trail::default();
+            let mut replica = Replica::default();
+            replica.put(history.clone(), history_page.clone());
+            replica.put(query.clone(), search.clone());
+            trail.visit(&history, &query);
+            trail.visit(&query, &target);
+            trail.visit(&target, &release);
+            assert_eq!(trail.pop(), Some(target));
+            let restored_query = trail.pop().unwrap();
+            assert_eq!(restored_query, query);
+            assert!(Arc::ptr_eq(
+                &replica.get(&restored_query).unwrap().0,
+                &search
+            ));
+            assert_eq!(trail.pop(), Some(history.clone()));
+            assert!(Arc::ptr_eq(
+                &replica.get(&history).unwrap().0,
+                &history_page
+            ));
+
+            let reads = wire.recorded();
+            assert_eq!(
+                reads
+                    .iter()
+                    .map(|r| r.first_line.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "GET /search?query=Bj%C3%B6rk&limit=20 HTTP/1.1",
+                    "GET /api/library/artists/root HTTP/1.1",
+                    "GET /api/library?kind=albums&scope=all&availability=in-library&limit=20&offset=0&artistId=root&releaseGroup=all HTTP/1.1",
+                    "GET /api/library/albums/album HTTP/1.1",
+                    "GET /api/library?kind=tracks&scope=all&availability=in-library&limit=20&offset=0&albumId=album HTTP/1.1",
+                ]
+            );
+        }
+    }
+
     // Avoid requiring Debug on the intentionally opaque Session type.
     fn failure<T>(result: Result<T, ApiError>) -> ApiError {
         match result {
@@ -1494,7 +1653,7 @@ mod tests {
         );
         assert_eq!(failure(api.search(&session, "track").await), OFFLINE);
         assert_eq!(failure(api.media(&session, "track").await), OFFLINE);
-        assert_eq!(failure(api.playback_upgrade(&session).await), OFFLINE);
+        assert_eq!(failure(api.account_upgrade(&session).await), OFFLINE);
         assert_eq!(failure(api.logout(&clone).await), OFFLINE);
         assert!(session.is_expired());
         assert!(wire.recorded().is_empty());
@@ -1526,7 +1685,7 @@ mod tests {
         assert!(!session.can_access_local());
         assert_eq!(failure(api.authenticated_account(&session)), EXPIRED);
         assert_eq!(failure(api.search(&session, "track").await), EXPIRED);
-        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
 
         session.set_offline(true);
         assert!(session.can_access_local());
@@ -1860,7 +2019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_upgrade_uses_csrf_ticket_and_exact_credentialed_handshake() {
+    async fn account_upgrade_uses_csrf_ticket_and_exact_credentialed_handshake() {
         let wire = Wire::with_responder(
             vec![
                 json(&format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#)),
@@ -1876,7 +2035,7 @@ mod tests {
         );
         let api = wire.api();
         let session = api.test_session();
-        let upgrade = api.playback_upgrade(&session).await.unwrap();
+        let upgrade = api.account_upgrade(&session).await.unwrap();
         assert_eq!(upgrade.ticket, SOCKET_TICKET);
         let requests = wire.recorded();
         let [ticket, socket] = requests.as_slice() else {
@@ -1889,7 +2048,7 @@ mod tests {
         assert_eq!(socket.first_line, "GET /api/me/player/socket HTTP/1.1");
         assert_eq!(
             socket.header("sec-websocket-protocol"),
-            Some(crate::socket::SUBPROTOCOL)
+            Some("spofify.account-state.v1")
         );
         assert_eq!(socket.header("sec-websocket-version"), Some("13"));
         assert!(socket.body.is_empty());
@@ -1907,12 +2066,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_upgrade_rejects_bad_ticket_and_bad_handshake_and_revokes_on_401() {
+    async fn account_upgrade_rejects_bad_ticket_and_bad_handshake_and_revokes_on_401() {
         let wire = Wire::new(vec![json(r#"{"ticket":"short"}"#)]);
         let api = wire.api();
         let session = api.test_session();
         assert_eq!(
-            failure(api.playback_upgrade(&session).await),
+            failure(api.account_upgrade(&session).await),
             INVALID_RESPONSE
         );
         assert_eq!(wire.recorded().len(), 1);
@@ -1928,7 +2087,25 @@ mod tests {
         let api = wire.api();
         let session = api.test_session();
         assert_eq!(
-            failure(api.playback_upgrade(&session).await),
+            failure(api.account_upgrade(&session).await),
+            INVALID_RESPONSE
+        );
+        assert_eq!(wire.recorded().len(), 2);
+
+        let wire = Wire::with_responder(vec![ticket.clone(), Vec::new()], |request, response| {
+            if response.is_empty() {
+                String::from_utf8(socket_reply(request, ""))
+                    .unwrap()
+                    .replace("spofify.account-state.v1", "spofify.library-playback.v2")
+                    .into_bytes()
+            } else {
+                response
+            }
+        });
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(
+            failure(api.account_upgrade(&session).await),
             INVALID_RESPONSE
         );
         assert_eq!(wire.recorded().len(), 2);
@@ -1936,9 +2113,9 @@ mod tests {
         let wire = Wire::new(vec![ticket, reply(401, &[], "synthetic error")]);
         let api = wire.api();
         let session = api.test_session();
-        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
         assert!(session.is_expired());
-        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
         assert_eq!(wire.recorded().len(), 2);
     }
 
@@ -2280,7 +2457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_ticket_failures_are_bounded_redacted_and_never_retried() {
+    async fn account_ticket_failures_are_bounded_redacted_and_never_retried() {
         let ticket = format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#);
         let wire = Wire::new(vec![
             json(&format!("{ticket}{}", " ".repeat(TICKET_BODY))),
@@ -2294,18 +2471,18 @@ mod tests {
         let session = api.test_session();
         for index in 0..2 {
             assert_eq!(
-                failure(api.playback_upgrade(&session).await),
+                failure(api.account_upgrade(&session).await),
                 INVALID_RESPONSE
             );
             assert_eq!(wire.recorded().len(), index + 1);
         }
-        let err = failure(api.playback_upgrade(&session).await);
+        let err = failure(api.account_upgrade(&session).await);
         assert_eq!(err.status, 409);
         assert!(!err.expired);
         assert!(!format!("{err:?}").contains("secret"));
         assert_eq!(wire.recorded().len(), 3);
-        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
-        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
         assert_eq!(wire.recorded().len(), 4);
     }
 

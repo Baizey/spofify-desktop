@@ -325,12 +325,16 @@ impl<'a> Target<'a> {
             Route::Album(id) if valid_id(id) => Ok(Self::Album(id)),
             Route::Artist(id) if valid_id(id) => Ok(Self::Artist(id)),
             Route::Playlist(id) if valid_id(id) => {
-                if page.playlist.as_ref().is_some_and(|p| p.id != *id) {
-                    return Err(CHANGED);
-                }
+                // The account socket supplies the accepted basis; only the
+                // genuine offline manifest grants a consistent download view.
+                let playlist = page
+                    .playlist
+                    .as_ref()
+                    .filter(|p| p.id == *id)
+                    .ok_or(CHANGED)?;
                 Ok(Self::Playlist {
                     id,
-                    expected: page.playlist.as_ref().map(|p| (p.kind, p.revision)),
+                    expected: Some((playlist.kind, playlist.revision)),
                 })
             }
             _ => Err(UNSUPPORTED),
@@ -1066,7 +1070,7 @@ mod tests {
             api,
             session,
             offline: false,
-            recent_change: 0,
+            personal: crate::personal_bridge::PersonalAccess::default(),
         }
     }
 

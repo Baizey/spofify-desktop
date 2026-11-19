@@ -560,7 +560,7 @@ mod tests {
             session: api.test_session(),
             api,
             offline: false,
-            recent_change: 0,
+            personal: Default::default(),
         }
     }
 
@@ -710,7 +710,7 @@ mod tests {
             tx.send_replace(Some(request(
                 1,
                 2,
-                Route::Albums,
+                Route::Search("album".into()),
                 vec![
                     Row {
                         key: RowKey::Album("absent".into()),

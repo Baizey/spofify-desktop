@@ -75,7 +75,7 @@ mod tests {
             session,
             epoch: 4,
             offline: true,
-            recent_change: 0,
+            personal: Default::default(),
         };
         let m = ModeControl::default();
         m.request(&a, false);

@@ -31,7 +31,10 @@ pub struct Audio {
     cached: Option<(String, Arc<[u8]>)>,
     authority: Option<Authority>,
     started: Option<Arc<AtomicBool>>,
+    exhausted: Option<Arc<AtomicBool>>,
+    fenced_out: Option<Arc<AtomicBool>>,
     session: Option<Session>,
+    network: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
     offline: bool,
     epoch: Arc<AtomicU64>,
     expected: u64,
@@ -45,13 +48,21 @@ impl Audio {
         epoch: Arc<AtomicU64>,
         expected: u64,
     ) -> Self {
+        let network = session.as_ref().map(|s| {
+            let changes = s.network_changes();
+            let stamp = *changes.borrow();
+            (changes, stamp)
+        });
         Self {
             stream: None,
             sink: None,
             cached: None,
             authority: None,
             started: None,
+            exhausted: None,
+            fenced_out: None,
             session,
+            network,
             offline,
             epoch,
             expected,
@@ -77,18 +88,6 @@ impl Audio {
         }
         Ok(())
     }
-    /// Decode enough to validate the media and open the output without appending
-    /// or starting any samples. Keep only one bounded encoded file in memory.
-    pub fn prepare(&mut self, id: String, bytes: Arc<[u8]>, elapsed: f64) -> Status {
-        if !self.current() {
-            return Status::Rejected;
-        }
-        let status = decoder(bytes.clone(), elapsed).and_then(|_| self.output());
-        if status.is_ok() {
-            self.cached = Some((id, bytes));
-        }
-        status.err().unwrap_or(Status::Ok)
-    }
     pub fn play(
         &mut self,
         id: String,
@@ -99,7 +98,7 @@ impl Audio {
     ) -> Status {
         self.stop();
         self.anchor(elapsed, duration);
-        if !self.current() || !authority.is_valid() {
+        if !self.current() || !authority.may_start() {
             return Status::Rejected;
         }
         let source = match decoder(bytes.clone(), self.elapsed) {
@@ -114,23 +113,30 @@ impl Audio {
         if let Err(e) = self.output() {
             return e;
         }
-        if !self.current() || !authority.is_valid() {
+        if !self.current() || !authority.may_start() {
             return Status::Rejected;
         }
         let sink = Sink::connect_new(self.stream.as_ref().expect("output initialized").mixer());
         sink.pause();
         let started = Arc::new(AtomicBool::new(false));
+        let exhausted = Arc::new(AtomicBool::new(false));
+        let fenced_out = Arc::new(AtomicBool::new(false));
         sink.append(Fenced {
             inner: source,
             started: started.clone(),
+            exhausted: exhausted.clone(),
+            fenced_out: fenced_out.clone(),
             authority: authority.clone(),
             session: self.session.clone(),
+            network: self.network.clone(),
             offline: self.offline,
             epoch: self.epoch.clone(),
             expected: self.expected,
         });
         self.authority = Some(authority);
         self.started = Some(started);
+        self.exhausted = Some(exhausted);
+        self.fenced_out = Some(fenced_out);
         self.sink = Some(sink);
         if self.allowed() {
             self.sink.as_ref().unwrap().play();
@@ -157,6 +163,8 @@ impl Audio {
             sink.stop();
         }
         self.started = None;
+        self.exhausted = None;
+        self.fenced_out = None;
         self.elapsed = elapsed;
     }
     pub fn clear(&mut self) {
@@ -167,6 +175,7 @@ impl Audio {
     }
     fn current(&self) -> bool {
         self.epoch.load(Ordering::SeqCst) == self.expected
+            && network_current(&self.network)
             && self
                 .session
                 .as_ref()
@@ -175,17 +184,29 @@ impl Audio {
     fn allowed(&self) -> bool {
         self.current() && self.authority.as_ref().is_some_and(Authority::is_valid)
     }
-    pub fn facts(&self) -> Facts {
-        let allowed = self.allowed();
-        let started = self
-            .started
+    pub fn has_started(&self) -> bool {
+        self.started
             .as_ref()
-            .is_some_and(|started| started.load(Ordering::Acquire));
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+    pub fn was_fenced(&self) -> bool {
+        self.fenced_out
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+    pub fn facts(&self) -> Facts {
+        let allowed = self.allowed() && !self.was_fenced();
+        let started = self.has_started();
         let (elapsed, playing, ended) =
             self.sink
                 .as_ref()
                 .map_or((self.elapsed, false, false), |sink| {
-                    let ended = allowed && sink.empty();
+                    let ended = allowed
+                        && sink.empty()
+                        && self
+                            .exhausted
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire));
                     let elapsed = (self.elapsed + sink.get_pos().as_secs_f64()).min(MAX_SECONDS);
                     let elapsed = if self.duration > 0.0 {
                         if ended {
@@ -215,6 +236,12 @@ impl Drop for Audio {
     fn drop(&mut self) {
         self.clear();
     }
+}
+
+fn network_current(network: &Option<(tokio::sync::watch::Receiver<u64>, u64)>) -> bool {
+    network
+        .as_ref()
+        .is_none_or(|(changes, stamp)| *changes.borrow() == *stamp)
 }
 
 fn session_allows_output(session: &Session, offline: bool) -> bool {
@@ -248,8 +275,11 @@ fn decoder(bytes: Arc<[u8]>, elapsed: f64) -> Result<Decoder<Cursor<Arc<[u8]>>>,
 struct Fenced<S> {
     inner: S,
     started: Arc<AtomicBool>,
+    exhausted: Arc<AtomicBool>,
+    fenced_out: Arc<AtomicBool>,
     authority: Authority,
     session: Option<Session>,
+    network: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
     offline: bool,
     epoch: Arc<AtomicU64>,
     expected: u64,
@@ -257,17 +287,25 @@ struct Fenced<S> {
 impl<S: Source<Item = f32>> Iterator for Fenced<S> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
+        if self.fenced_out.load(Ordering::Acquire) || self.exhausted.load(Ordering::Acquire) {
+            return None;
+        }
         if self.epoch.load(Ordering::SeqCst) != self.expected
             || !self.authority.is_valid()
+            || (!self.started.load(Ordering::Acquire) && !self.authority.may_start())
+            || !network_current(&self.network)
             || self
                 .session
                 .as_ref()
                 .is_some_and(|s| !session_allows_output(s, self.offline))
         {
+            self.fenced_out.store(true, Ordering::Release);
             None
         } else {
             let sample = self.inner.next();
-            if sample.is_some() && !self.started.load(Ordering::Relaxed) {
+            if sample.is_none() {
+                self.exhausted.store(true, Ordering::Release);
+            } else if !self.started.load(Ordering::Relaxed) {
                 self.started.store(true, Ordering::Release);
             }
             sample
@@ -320,15 +358,19 @@ mod tests {
         for online in [false, true] {
             let epoch = Arc::new(AtomicU64::new(1));
             let grant = if online {
-                Authority::new(Instant::now() + Duration::from_secs(1))
+                let deadline = Instant::now() + Duration::from_secs(1);
+                Authority::online(move || Instant::now() < deadline, || true)
             } else {
                 Authority::offline()
             };
             let mut source = Fenced {
                 inner: decoder(wav(), 0.004).unwrap(),
                 started: Arc::new(AtomicBool::new(false)),
+                exhausted: Arc::new(AtomicBool::new(false)),
+                fenced_out: Arc::new(AtomicBool::new(false)),
                 authority: grant.clone(),
                 session: None,
+                network: None,
                 offline: !online,
                 epoch: epoch.clone(),
                 expected: 1,
@@ -343,10 +385,42 @@ mod tests {
         }
     }
     #[test]
+    fn an_unstarted_decoder_cannot_use_grace_and_fencing_is_not_natural_end() {
+        let attached = Arc::new(AtomicBool::new(false));
+        let start = attached.clone();
+        let grant = Authority::online(|| true, move || start.load(Ordering::Acquire));
+        let mut source = Fenced {
+            inner: decoder(wav(), 0.0).unwrap(),
+            started: Arc::default(),
+            exhausted: Arc::default(),
+            fenced_out: Arc::default(),
+            authority: grant,
+            session: None,
+            network: None,
+            offline: false,
+            epoch: Arc::new(AtomicU64::new(1)),
+            expected: 1,
+        };
+        assert!(source.next().is_none());
+        assert!(source.fenced_out.load(Ordering::Acquire));
+        assert!(!source.exhausted.load(Ordering::Acquire));
+        attached.store(true, Ordering::Release);
+        assert!(
+            source.next().is_none(),
+            "a retired source must not revive after reattach"
+        );
+    }
+    #[test]
     fn malformed_media_never_opens_an_output() {
         let mut a = Audio::new(None, false, Arc::new(AtomicU64::new(1)), 1);
         assert_eq!(
-            a.prepare("bad".into(), Arc::from([1u8]), 0.0),
+            a.play(
+                "bad".into(),
+                Arc::from([1u8]),
+                0.0,
+                0.0,
+                Authority::offline()
+            ),
             Status::Media
         );
         assert!(a.stream.is_none());

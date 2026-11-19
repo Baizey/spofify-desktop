@@ -1,23 +1,31 @@
 import { ScrollView } from "std-widgets.slint";
-import { Action, Caption, Cover, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
-import { Copy, EmptyState, Hero, LineButton, MediaLine } from "catalog.slint";
+import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
+import { Copy, EmptyState, Hero, MediaLine } from "catalog.slint";
+import { OverflowMenu } from "overflow-menu.slint";
+import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
-import { LibraryCard } from "library-grid.slint";
 import { PlayerBar } from "playback.slint";
 import { NowPlaying } from "now-playing.slint";
 import { PaletteRow, Settings, SettingCard } from "settings.slint";
+import { WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { PaletteRow }
+export { ArtistCredit, PaletteRow }
 
-export struct BrowseRow { kind: string, title: string, subtitle: string, detail: string, playable: bool, actions: [string], section: string }
-export struct QueueRow { key: string, title: string, subtitle: string, current: bool, upcoming: bool }
+export struct BrowseRow {
+    kind: string, title: string, subtitle: string, detail: string, playable: bool, actions: [string], section: string,
+    credits: [ArtistCredit], album-id: string, album-name: string,
+}
+export struct QueueRow {
+    key: string, title: string, subtitle: string, current: bool, upcoming: bool,
+    credits: [ArtistCredit], album-id: string, album-name: string,
+}
 export struct DeviceRow { id: string, name: string, selected: bool, available: bool, can-play: bool }
 
 export component AppWindow inherits Window {
     title: "Spofify Desktop";
     in property <length> inspection-width: 0px;
     in property <length> inspection-height: 0px;
-    preferred-width: 1180px;
+    preferred-width: 1280px;
     preferred-height: 790px;
     min-width: root.inspection-width > 0px ? root.inspection-width : 480px;
     max-width: root.inspection-width > 0px ? root.inspection-width : 65535px;
@@ -56,7 +64,11 @@ export component AppWindow inherits Window {
     in property <[BrowseRow]> browse-rows;
     in property <[image]> browse-artwork;
     in property <image> page-artwork;
+    in property <[ArtistCredit]> page-credits;
+    in property <string> page-album-id;
+    in property <string> page-album-name;
     in property <string> page-title;
+    in property <string> page-key;
     in property <string> page-subtitle;
     in property <string> page-kind: "search";
     in property <string> page-status;
@@ -81,6 +93,7 @@ export component AppWindow inherits Window {
     in property <string> now-track-id;
     in property <string> now-album-id;
     in property <string> now-album-name;
+    in property <[ArtistCredit]> now-credits;
     in property <string> next-title;
     in property <string> next-subtitle;
     in property <string> now-artist-id;
@@ -145,44 +158,51 @@ export component AppWindow inherits Window {
         property <color> active-primary: preset.primary;
         changed active-primary => { self.apply(); }
     }
-    property <bool> compact: self.width < 806px;
-    property <bool> dense: self.width < 950px;
+
+    property <bool> compact: self.width < 820px;
+    property <bool> wide: self.width >= 1136px;
+    property <length> rail-width: self.width >= 1480px ? 224px : root.compact ? 150px : 194px;
+    property <length> queue-width: clamp(self.width * 0.229, 304px, 390px);
+    property <length> toolbar-height: root.compact ? 57px : 65px;
+    property <string> dock-status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
+    property <length> player-height: root.is-now || root.editor-open ? 0px : root.now-track-id == "" ? 48px : root.dock-status == "" ? 82px : 96px;
+    property <bool> wide-queue-open: true;
+    property <bool> compact-queue-open;
+    property <bool> queue-shown: root.wide ? root.wide-queue-open : root.compact-queue-open;
     property <bool> editor-open: form-mode != "" && form-mode != "closed";
     property <bool> is-search: page-kind == "search";
     property <bool> is-history: page-kind == "history" || page-kind == "recent";
     property <bool> is-playlist: page-kind == "playlist" || page-kind == "playlist-manual" || page-kind == "playlist-rules";
-    property <bool> has-now-context: now-context-name != "" && now-context-id != "" &&
-        (now-context-kind == "album" || now-context-kind == "artist" || now-context-kind == "playlist" || now-context-kind == "derived");
     property <bool> is-settings: page-kind == "appearance" || page-kind == "settings" || page-kind == "account";
-    property <bool> is-playback-page: page-kind == "now" || page-kind == "queue" || page-kind == "devices";
-    property <string> displayed-kind: page-kind;
-    property <bool> is-grid: displayed-kind == "albums" || displayed-kind == "artists";
-    property <bool> saved-view: displayed-kind == "offline" || displayed-kind == "saved-collection";
+    property <bool> is-now: page-kind == "now";
+    property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
     property <bool> local-mode: manual-offline || reconnecting;
-    property <bool> can-play-saved: saved-view && local-mode;
+    property <bool> can-play-local: manual-offline && (root.saved-view || root.is-search);
     property <bool> queue-controls: local-mode ? offline-playback && can-control : !offline-playback && remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
-    property <string> catalog-title: page-title != "" ? page-title : Copy.title(displayed-kind);
-    property <int> expanded-row: -1;
-    property <bool> more-page-actions;
-    property <string> expanded-queue-key;
-    property <[string]> sections: ["history", "playlists", "albums", "artists", "offline"];
-    property <length> gutter: max(clamp(root.width * 0.04, 16px, 36px), (root.width - 1220px) / 2);
-    changed page-kind => { root.more-page-actions = false; root.expanded-row = -1; root.expanded-queue-key = ""; }
-    changed page-title => { root.more-page-actions = false; root.expanded-row = -1; }
-    changed browse-rows => { root.expanded-row = -1; }
+    property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
+    property <string> form-return;
+    property <int> form-focus-serial;
+    changed wide => { root.compact-queue-open = false; }
+    changed signed-in => {
+        if !root.signed-in {
+            root.compact-queue-open = false;
+            root.wide-queue-open = true;
+            root.form-return = "";
+        }
+    }
 
-    function back() { if root.can-back { root.navigate("back"); } }
     function flip-offline() { root.page-action("offline", root.reconnecting || !root.manual-offline ? "on" : "off"); }
     function edit-form(mode: string) {
+        root.form-return = mode;
         root.form-name = "";
         root.form-description = "";
         root.form-value = "";
         root.form-mode = mode;
-        root.page-action("prepare-" + mode, "");
+        if mode != "remove-saved" { root.page-action("prepare-" + mode, ""); }
     }
     function cancel-form() {
-        if root.form-mode != "device-rename" { root.page-action("cancel-form", root.form-mode); }
+        if root.form-mode != "device-rename" && root.form-mode != "remove-saved" { root.page-action("cancel-form", root.form-mode); }
         root.form-mode = "";
         root.form-name = "";
         root.form-description = "";
@@ -195,123 +215,283 @@ export component AppWindow inherits Window {
     }
     function catalog-action(action: string) {
         if action == "new-manual" || action == "new-rules" || action == "rename" || action == "rules" || action == "delete" { root.edit-form(action); }
-        else if action == "remove" { root.form-mode = "remove-saved"; }
+        else if action == "remove" { root.edit-form("remove-saved"); }
         else { root.page-action(action, ""); }
-    }
-    pure function section-label(kind: string) -> string {
-        return kind == "history" ? "History" : kind == "offline" ? "Downloads" : Copy.title(kind);
-    }
-    pure function is-current(section: string) -> bool {
-        return root.displayed-kind == section || (section == "albums" && root.displayed-kind == "album") || (section == "artists" && root.displayed-kind == "artist") || (section == "offline" && root.displayed-kind == "saved-collection") || (section == "history" && root.displayed-kind == "recent")
-            || (section == "playlists" && (root.displayed-kind == "playlist-manual" || root.displayed-kind == "playlist-rules" || root.displayed-kind == "picker"));
     }
 
     if !root.signed-in: SignInView {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
         origin <=> root.origin; username <=> root.username; password <=> root.password;
         status: root.status; error: root.error; busy: root.busy;
         edited => { root.server-edited(); } sign-in => { root.sign-in(); } cancel => { root.sign-out(); }
     }
-    if root.signed-in && root.editor-open: Editor {
-        mode: root.form-mode; name <=> root.form-name; description <=> root.form-description; definition <=> root.form-value;
-        error: root.form-error; help: root.form-help; busy: root.form-busy; offline: root.local-mode; reconnecting: root.reconnecting;
-        cancel => { root.cancel-form(); } save => { root.submit-form(); }
-        toggle-offline => { root.flip-offline(); }
-    }
-    if root.signed-in && !root.editor-open: shell := FocusScope {
-        // A clicked result may disappear with its model. Keep shortcut capture alive
-        // across that transition without moving the caret while a query is edited.
-        property <string> destination: root.displayed-kind;
+    if root.signed-in: shell := FocusScope {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        focus-on-tab-navigation: false; focus-on-click: false;
+        property <string> destination: root.page-kind;
+        property <bool> editing: root.editor-open;
+        property <string> account-scope: root.account-label;
+        // Two account-local return slots, owned by the signed-in shell.
+        property <string> search-return-key;
+        property <length> search-return-y;
+        property <string> playlist-return-key;
+        property <length> playlist-return-y;
+        property <bool> returning;
+        property <string> restoring-key;
+        property <length> restoring-y;
         init => { self.focus(); }
-        changed destination => { if root.is-search { search.take-focus(); } else { self.focus(); } }
-        focus-on-tab-navigation: false;
-        focus-on-click: false;
+        changed account-scope => {
+            self.search-return-key = "";
+            self.playlist-return-key = "";
+            self.restoring-key = "";
+            self.returning = false;
+        }
+        function remember-scroll() {
+            if root.is-search && root.query != "" {
+                self.search-return-key = catalog-scroll.scroll-key;
+                self.search-return-y = catalog-scroll.content-y;
+            } else if root.is-playlist {
+                self.playlist-return-key = catalog-scroll.scroll-key;
+                self.playlist-return-y = catalog-scroll.content-y;
+            }
+        }
+        function browse(op: string, index: int) {
+            if op == "open" || op == "add" { self.remember-scroll(); }
+            root.row-action(op, index);
+        }
+        function edited-search() {
+            root.compact-queue-open = false;
+            self.returning = false;
+            self.restoring-key = "";
+            root.search-edited();
+        }
+        function apply-return-scroll() {
+            if self.restoring-key != "" && self.restoring-key == catalog-scroll.scroll-key {
+                catalog-scroll.content-y = clamp(self.restoring-y, min(0px, catalog-scroll.visible-height - catalog-scroll.content-height), 0px);
+                if catalog-scroll.content-y == self.restoring-y { self.restoring-key = ""; }
+            }
+        }
+        function destination-scrolled() {
+            self.restoring-key = "";
+            catalog-scroll.content-y = 0px;
+            if self.returning {
+                self.returning = false;
+                if root.is-search && catalog-scroll.scroll-key == self.search-return-key {
+                    self.restoring-key = self.search-return-key;
+                    self.restoring-y = self.search-return-y;
+                } else if root.is-playlist && catalog-scroll.scroll-key == self.playlist-return-key {
+                    self.restoring-key = self.playlist-return-key;
+                    self.restoring-y = self.playlist-return-y;
+                }
+                self.apply-return-scroll();
+            }
+        }
+        changed destination => {
+            if !root.editor-open && !root.compact-queue-open {
+                if root.is-search { search.take-focus(); }
+                else if !history-pane.has-focus { self.focus(); }
+            }
+        }
+        changed editing => {
+            if !self.editing {
+                // The browse view is still mounted. Focus the action that opened the editor if it survived.
+                if root.is-playlist && root.page-options.length > 0 && !root.local-mode { playlist-menu.take-focus(); }
+                else if root.can-back { back-button.take-focus(); }
+                else { rail.restore-focus(); }
+                root.form-focus-serial += 1;
+            }
+        }
+        function show-queue() {
+            if root.wide { root.wide-queue-open = true; }
+            else { root.compact-queue-open = true; }
+            queue-close.take-focus();
+        }
+        function hide-queue() {
+            if root.wide { root.wide-queue-open = false; }
+            else { root.compact-queue-open = false; }
+            if root.is-now { now-queue.take-focus(); }
+            else { player.focus-queue(); }
+        }
+        function route(target: string) {
+            if root.editor-open { return; }
+            if target == "queue" {
+                if root.queue-shown { self.hide-queue(); } else { self.show-queue(); }
+            } else {
+                self.remember-scroll();
+                self.returning = target == "back";
+                self.restoring-key = "";
+                root.compact-queue-open = false;
+                root.navigate(target);
+            }
+        }
+        function entity(kind: string, id: string) {
+            if !root.local-mode && !root.editor-open && id != "" {
+                self.remember-scroll();
+                if root.compact-queue-open { root.compact-queue-open = false; self.focus(); }
+                root.page-action(kind, id);
+            }
+        }
         capture-key-pressed(event) => {
+            if root.editor-open { return reject; }
             if event.modifiers.control && (event.text == "f" || event.text == "l" || event.text == "F" || event.text == "L") {
+                root.compact-queue-open = false;
                 search.take-focus(); return accept;
             }
-            if root.can-back && (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
-                if !event.repeat { root.back(); }
-                return accept;
+            if event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow) {
+                if root.compact-queue-open {
+                    if !event.repeat { self.hide-queue(); }
+                    return accept;
+                }
+                if root.can-back {
+                    if !event.repeat { self.route("back"); }
+                    return accept;
+                }
             }
             return reject;
         }
-        VerticalLayout {
-            Rectangle {
-                height: root.compact ? 58px : 68px; background: Theme.rail;
-                HorizontalLayout {
-                    padding-left: root.gutter; padding-right: root.gutter; spacing: root.compact ? 8px : 16px;
-                    Rectangle { width: root.compact ? 30px : 146px;
-                        Image { x: 0px; y: (parent.height - self.height) / 2; width: 27px; height: 27px; source: @image-url("../assets/spofify-logo.svg"); }
-                        if !root.compact: Text { x: 37px; text: "Spofify"; vertical-alignment: center; color: Theme.text; font-size: 24px; font-weight: 750; letter-spacing: -1px; }
-                    }
-                    Rectangle { horizontal-stretch: 1; max-width: 512px; min-width: 100px;
-                        search := Field { y: (parent.height - self.height) / 2; width: parent.width; height: 38px; text <=> root.query; prefix: "⌕"; clearable: true; cleared => { root.search-edited(); } pill: true; field-label: "Search music"; placeholder-text: root.compact ? "Search music" : "Search tracks, albums or artists"; edited => { root.search-edited(); } accepted => { root.search-edited(); } }
-                    }
-                    Rectangle { horizontal-stretch: 1; max-width: root.compact ? 0px : 10000px; }
-                    Rectangle { width: root.compact ? 38px : 146px;
-                        account-button := Action { y: (parent.height - self.height)/2; width: parent.width; text: root.compact ? "" : root.account-label; icon: "⚙"; quiet: true; accessible-label: "Settings"; selected: root.is-settings; clicked => { root.navigate("settings"); } }
+        work := Rectangle {
+            x: 0px; y: 0px; width: parent.width; height: parent.height - root.player-height;
+            rail := WorkspaceRail {
+                x: 0px; y: 0px; width: root.rail-width; height: parent.height;
+                kind: root.page-kind; account: root.account-label; compact: root.compact;
+                offline: root.manual-offline; reconnecting: root.reconnecting; locked: root.editor-open;
+                navigate(target) => { shell.route(target); }
+            }
+            main := Rectangle {
+                x: root.rail-width; y: 0px; height: parent.height;
+                width: parent.width - self.x - (root.wide && root.queue-shown ? root.queue-width : 0px);
+                property <length> inset: clamp(self.width * 0.038, 13px, 38px);
+                property <bool> narrow: self.width < 640px;
+                toolbar := Rectangle {
+                    x: 0px; y: 0px; width: parent.width; height: root.toolbar-height;
+                    background: Theme.rail;
+                    Divider { x: 0px; y: parent.height - 1px; }
+                    HorizontalLayout {
+                        padding-left: main.inset; padding-right: main.inset; spacing: 0px;
+                        Rectangle {
+                            width: root.can-back ? 37px : 0px;
+                            visible: root.can-back;
+                            back-button := Action {
+                                y: (parent.height - self.height) / 2; width: parent.width;
+                                icon: "←"; quiet: true; accessible-label: "Back";
+                                enabled: root.can-back && !root.editor-open;
+                                clicked => { shell.route("back"); }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1; max-width: 560px; min-width: 0px;
+                            search := Field {
+                                y: (parent.height - self.height) / 2; width: parent.width; height: 39px;
+                                text <=> root.query; prefix: "⌕"; clearable: true; enabled: !root.editor-open;
+                                field-label: root.local-mode ? "Search downloads" : "Search tracks, albums or artists";
+                                placeholder-text: root.local-mode ? "Search downloads" : main.width < 420px ? "Search music" : "Search tracks, albums or artists";
+                                cleared => { shell.edited-search(); }
+                                edited => { shell.edited-search(); }
+                                accepted => { shell.edited-search(); }
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; max-width: main.narrow ? 0px : 65535px; }
+                        now-queue-wrapper := Rectangle {
+                            width: root.is-now ? 39px : 0px; visible: root.is-now;
+                            now-queue := Action {
+                                y: (parent.height - self.height) / 2; width: parent.width;
+                                icon: "≡"; quiet: true; selected: root.queue-shown;
+                                accessible-label: root.queue-shown ? "Close play queue" : "Open play queue";
+                                enabled: root.is-now && !root.editor-open; clicked => { shell.route("queue"); }
+                            }
+                        }
                     }
                 }
-            }
-            Rectangle {
-                height: 44px; background: Theme.rail;
-                HorizontalLayout { padding-left: root.gutter; padding-right: root.gutter; spacing: root.compact ? 2px : 12px;
-                    for section in root.sections: Rectangle {
-                        width: nav.min-width; horizontal-stretch: 0;
-                        nav := Action { y: (parent.height - self.height)/2; text: root.section-label(section); quiet: true; accessible-description: root.is-current(section) ? "Current section" : ""; clicked => { root.navigate(section); } }
-                        if root.is-current(section): Rectangle { x: 9px; y: parent.height - 2px; width: parent.width - 18px; height: 2px; background: Theme.accent; }
+                history-pane := FocusScope {
+                    x: 0px; y: root.toolbar-height; width: parent.width; height: parent.height - self.y;
+                    visible: !root.editor-open && !root.compact-queue-open;
+                    focus-on-click: false; focus-on-tab-navigation: false;
+                    if root.is-now: NowPlaying {
+                        x: 0px; y: 0px; width: parent.width; height: parent.height;
+                        track-id: root.now-track-id; track: root.now-title; subtitle: root.now-detail;
+                        credits: root.now-credits; metadata-interactive: !root.local-mode;
+                        album-name: root.now-album-name; album-id: root.now-album-id;
+                        next-title: root.next-title; next-subtitle: root.next-subtitle;
+                        context-kind: root.now-context-kind; context-id: root.local-mode ? "" : root.now-context-id;
+                        context-name: root.local-mode ? "" : root.now-context-name;
+                        artwork: root.cover-art; lyrics-text: root.lyrics-text; waveform: root.waveform; elapsed: root.elapsed; duration: root.duration;
+                        playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.offline-playback); can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
+                        can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
+                        shuffle: root.shuffle; repeat-mode: root.repeat-mode; can-change-modes: root.queue-controls;
+                        previous => { root.previous(); } toggle => { root.toggle-play(); } next => { root.next(); } seek(v) => { root.seek(v); }
+                        navigate(page) => { shell.route(page); } page-action(op, id) => { shell.entity(op, id); } queue-action(op, key) => { root.queue-action(op, key); }
                     }
-                    Rectangle { horizontal-stretch: 1; }
-                    if root.local-mode: Rectangle { width: 12px; Rectangle { y: (parent.height - 7px)/2; width: 7px; height: 7px; border-radius: 4px; background: Theme.amber; accessible-role: text; accessible-label: "Offline"; } }
-                }
-                Divider { y: parent.height - 1px; }
-            }
-            if root.displayed-kind == "now": VerticalLayout {
-                padding-left: root.gutter; padding-right: root.gutter; padding-top: 8px; spacing: 4px;
-                HorizontalLayout { Action { icon: "←"; text: "Back"; quiet: true; accessible-label: "Back"; clicked => { root.back(); } } Rectangle { horizontal-stretch: 1; } Action { icon: "◫"; quiet: true; accessible-label: "Playback devices"; clicked => {root.navigate("devices");} } }
-                NowPlaying {
-                    track-id: root.now-track-id; track: root.now-title; subtitle: root.now-detail; album-name: root.now-album-name; next-title: root.next-title; next-subtitle: root.next-subtitle; album-id: root.now-album-id; artist-id: root.now-artist-id;
-                    context-kind: root.now-context-kind; context-id: root.has-now-context ? root.now-context-id : ""; context-name: root.has-now-context ? root.now-context-name : "";
-                    artwork: root.cover-art; lyrics-text: root.lyrics-text; waveform: root.waveform; elapsed: root.elapsed; duration: root.duration;
-                    playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.offline-playback); can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
-                    can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls; shuffle: root.shuffle; repeat-mode: root.repeat-mode; can-change-modes: root.queue-controls;
-                    previous => {root.previous();} toggle => {root.toggle-play();} next => {root.next();} seek(v) => {root.seek(v);}
-                    navigate(page) => {root.navigate(page);} page-action(op,id) => {root.page-action(op,id);} queue-action(op,key) => {root.queue-action(op,key);}
-                }
-            }
-            if root.displayed-kind != "now": catalog-scroll := ScrollView {
-                        min-height: 0px; vertical-stretch: 1;
-                        content-width: self.visible-width;
-                        property <string> scroll-key: root.displayed-kind + "|" + root.catalog-title;
-                        changed scroll-key => { self.content-y = 0px; }
+                    catalog-scroll := ScrollView {
+                        visible: !root.is-now;
+                        x: 0px; y: 0px; width: parent.width; height: parent.height;
+                        horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
+                        property <string> scroll-key: root.is-search ? "search|" + root.query
+                            : root.page-key != "" ? root.page-key : root.page-kind + "|" + root.catalog-title;
+                        changed scroll-key => { shell.destination-scrolled(); }
+                        changed content-height => { shell.apply-return-scroll(); }
                         function reveal(y: length, h: length) {
                             if y < -self.content-y { self.content-y = -y; }
                             else if y + h > -self.content-y + self.visible-height { self.content-y = min(0px, self.visible-height - y - h); }
                         }
-                        VerticalLayout {
-                            padding-left: root.gutter; padding-right: root.gutter; padding-top: root.compact ? 16px : 26px; padding-bottom: 22px; spacing: 5px; alignment: start;
-                            if root.can-back: Action { icon: "←"; text: "Back"; accessible-label: "Back"; quiet: true; leading: true; width: 80px; height: 30px; clicked => { root.back(); } }
-                            Hero {
-                                title: root.is-settings ? "Settings" : root.catalog-title;
-                                subtitle: root.page-subtitle;
-                                section: root.saved-view ? "ON THIS COMPUTER" : "";
-                                glyph: Copy.mark(root.displayed-kind); tint: Copy.tint(root.displayed-kind);
-                                artwork: root.page-artwork;
-                                compact: root.compact; show-art: root.is-playlist || root.displayed-kind == "album" || root.displayed-kind == "artist" || root.displayed-kind == "track";
-                            }
-                            if root.saved-view: HorizontalLayout { Action { text: root.reconnecting ? "Stay offline" : root.local-mode ? "Go online" : "Work offline"; clicked => { root.flip-offline(); } } Rectangle { horizontal-stretch: 1; } }
-                            if root.page-actions.length > 0 || root.page-options.length > 0: FlexboxLayout {
-                                flex-wrap: wrap; spacing: 6px;
-                                for action in root.page-actions: Action {
-                                    text: Copy.action-label(action); icon: Copy.action-mark(action); primary: action == "play" || action == "new-manual";
-                                    enabled: action != "play" || !root.saved-view || root.can-play-saved;
-                                    clicked => { root.catalog-action(action); }
+                        catalog := VerticalLayout {
+                            x: 0px; y: 0px; width: min(catalog-scroll.visible-width, 1160px);
+                            padding-left: main.inset; padding-right: main.inset;
+                            padding-top: main.narrow ? 14px : 23px; padding-bottom: 24px;
+                            spacing: 8px; alignment: start;
+                            detail-hero := Rectangle {
+                                property <bool> with-art: root.is-playlist || root.page-kind == "album" || root.page-kind == "artist" || root.page-kind == "track";
+                                property <color> tint: Copy.tint(root.page-kind);
+                                border-radius: 12px;
+                                background: self.with-art ? @linear-gradient(120deg, self.tint.with-alpha(0.16) 0%, Theme.panel 85%) : transparent;
+                                min-height: hero-layout.preferred-height; vertical-stretch: 0;
+                                hero-layout := VerticalLayout {
+                                    padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;
+                                    Hero {
+                                        title: root.is-settings ? "Settings" : root.catalog-title;
+                                        subtitle: root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
+                                        section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : root.page-kind == "track" ? "TRACK" : root.is-playlist ? "PLAYLIST" : "";
+                                        glyph: Copy.mark(root.page-kind); tint: detail-hero.tint;
+                                        artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
+                                        credits: root.page-credits; metadata-enabled: !root.local-mode;
+                                        album-id: root.page-album-id; album-name: root.page-kind == "album" ? "" : root.page-album-name;
+                                        focused(y, h) => { catalog-scroll.reveal(catalog.y + detail-hero.y + self.y + y, h); }
+                                        page-action(op, id) => { shell.entity(op, id); }
+                                    }
                                 }
-                                if root.is-playlist && root.page-options.length > 0: Action { icon: "···"; quiet: true; accessible-label: "Playlist options"; selected: root.more-page-actions; clicked => { root.more-page-actions = !root.more-page-actions; } }
                             }
-                            if root.more-page-actions && root.is-playlist: HorizontalLayout { spacing: 6px;
-                                for action in root.page-options: Action { text: Copy.action-label(action); quiet: true; danger: action == "delete"; clicked => { root.more-page-actions = false; root.catalog-action(action); } }
-                                Rectangle { horizontal-stretch: 1; }
+                            page-tools := HorizontalLayout {
+                                property <bool> has-primary: root.page-actions.length > 0 && (!root.local-mode || root.saved-view);
+                                property <bool> has-menu: !root.local-mode && ((root.is-playlist && root.page-options.length > 0)
+                                    || (root.page-kind == "track" && root.browse-rows.length > 0 && root.browse-rows[0].actions.length > 0));
+                                visible: self.has-primary || self.has-menu;
+                                spacing: self.has-menu ? 8px : 0px;
+                                FlexboxLayout {
+                                    flex-wrap: wrap; spacing: 6px; horizontal-stretch: 1;
+                                    for action in !root.local-mode || root.saved-view ? root.page-actions : []: Action {
+                                        text: Copy.action-label(action); icon: Copy.action-mark(action); primary: action == "play" || action == "new-manual";
+                                        enabled: action != "play" || !root.saved-view || root.can-play-local;
+                                        property <int> resume: root.form-focus-serial;
+                                        changed resume => { if root.form-return == action || (action == "remove" && root.form-return == "remove-saved") { self.take-focus(); } }
+                                        clicked => { root.catalog-action(action); }
+                                    }
+                                }
+                                playlist-menu := OverflowMenu {
+                                    actions: root.is-playlist && !root.local-mode ? root.page-options : [];
+                                    width: self.actions.length > 0 ? 37px : 0px;
+                                    height: self.actions.length > 0 ? 38px : 0px;
+                                    visible: self.actions.length > 0;
+                                    label: "Manage playlist"; open-label: "Hide playlist options";
+                                    context-key: root.page-key + "|" + root.catalog-title;
+                                    window-height: root.height;
+                                    action(op) => { root.catalog-action(op); }
+                                }
+                                for row in root.page-kind == "track" && !root.local-mode ? root.browse-rows : []: OverflowMenu {
+                                    actions: row.actions; label: "Show actions for " + row.title; open-label: "Hide actions for " + row.title;
+                                    visible: self.actions.length > 0;
+                                    width: self.visible ? 37px : 0px; height: self.visible ? 38px : 0px;
+                                    context-key: root.page-key + "|" + row.title; item-context: row.title; window-height: root.height;
+                                    action(op) => { shell.browse(op, 0); }
+                                }
                             }
                             if root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
                             if root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
@@ -324,94 +504,90 @@ export component AppWindow inherits Window {
                                 appearance(mode, scale) => { root.appearance-changed(mode, scale, root.appearance-accent); }
                                 select-palette(id) => { root.palette-selected(id); } reset => { root.reset-appearance(); }
                             }
-                            if root.displayed-kind == "queue": FlexboxLayout {
-                                flex-wrap: wrap; spacing: 7px;
-                                Action { text: "Shuffle"; selected: root.shuffle; enabled: root.queue-controls; accessible-description: root.shuffle ? "On" : "Off"; clicked => { root.queue-action("shuffle", ""); } }
-                                Action { text: root.repeat-mode == "one" ? "Repeat: one" : root.repeat-mode == "all" ? "Repeat: all" : "Repeat: off"; selected: root.repeat-mode != "off"; enabled: root.queue-controls; clicked => { root.queue-action("repeat", ""); } }
-                                if root.queue-has-upcoming: Action { text: "Clear upcoming"; enabled: root.queue-controls; clicked => { root.queue-action("clear", ""); } }
-                            }
-                            if root.displayed-kind == "queue" && root.queue-rows.length > 0 && root.queue-status != "": Notice { text: root.queue-status; }
-                            if root.displayed-kind == "queue" && root.queue-rows.length == 0: EmptyState { title: "The queue is empty"; subtitle: "Play or queue tracks from your library."; glyph: "≡"; }
-                            if root.displayed-kind == "queue": queue-list := VerticalLayout {
-                                spacing: 3px;
-                                for row[i] in root.queue-rows: MediaLine {
-                                    title: row.title; subtitle: row.current ? "Playing now · " + row.subtitle : row.subtitle;
-                                    detail: row.upcoming ? "UP NEXT" : row.current ? "NOW PLAYING" : "PLAYED"; kind: "track";
-                                    property <bool> can-up: i > 0 && root.queue-rows[i - 1].upcoming;
-                                    property <bool> can-down: i + 1 < root.queue-rows.length && root.queue-rows[i + 1].upcoming;
-                                    selected: row.current; can-open: false; playable: row.upcoming && root.queue-controls;
-                                    actions: !self.playable ? [] : self.can-up && self.can-down ? ["up", "down", "remove"]
-                                        : self.can-up ? ["up", "remove"] : self.can-down ? ["down", "remove"] : ["remove"];
-                                    compact: root.compact; expanded: root.expanded-queue-key == row.key;
-                                    toggle-options => { root.expanded-queue-key = self.expanded ? "" : row.key; }
-                                    focused => { catalog-scroll.reveal(queue-list.y + self.y, self.height); }
-                                    action(op) => { if op != "open" { root.queue-action(op, row.key); } }
-                                }
-                            }
-                            if root.displayed-kind == "devices" && root.device-status != "" && (root.local-mode || root.device-rows.length > 0): Notice { text: root.device-status; }
-                            if root.displayed-kind == "devices" && root.device-rows.length == 0: EmptyState { title: "No playback devices yet"; subtitle: "Available outputs will appear here."; glyph: "◫"; }
-                            if root.displayed-kind == "devices": VerticalLayout {
+                            if root.page-kind == "devices" && root.device-status != "" && (root.local-mode || root.device-rows.length > 0): Notice { text: root.device-status; }
+                            if root.page-kind == "devices" && root.device-rows.length == 0: EmptyState { title: "No playback devices yet"; subtitle: "Available outputs will appear here."; glyph: "◫"; }
+                            if root.page-kind == "devices": VerticalLayout {
                                 spacing: 6px;
                                 for device in root.device-rows: SettingCard {
                                     title: device.name;
                                     detail: device.selected ? "Selected output" : !device.available ? "Not available" : device.can-play ? "Available for playback" : "Cannot play audio";
-                                    HorizontalLayout {
-                                        spacing: 6px;
+                                    FlexboxLayout {
+                                        flex-wrap: wrap; spacing: 6px;
                                         Action {
                                             text: device.selected ? "Deselect" : "Select output"; enabled: !root.local-mode && (device.selected || (device.available && device.can-play));
                                             primary: !device.selected; clicked => { root.device-action(device.selected ? "deselect" : "select", device.id); }
                                         }
                                         if device.selected: Action {
-                                            text: "Rename"; enabled: !root.local-mode;
-                                            clicked => { root.form-name = device.name; root.form-mode = "device-rename"; root.device-action("prepare-rename", device.id); }
+                                            text: "Rename device"; enabled: !root.local-mode;
+                                            property <int> resume: root.form-focus-serial;
+                                            changed resume => { if root.form-return == "device-rename" { self.take-focus(); } }
+                                            clicked => { root.form-return = "device-rename"; root.form-name = device.name; root.form-mode = "device-rename"; root.device-action("prepare-rename", device.id); }
                                         }
-                                        Rectangle { horizontal-stretch: 1; }
                                     }
                                 }
                             }
                             if root.is-history && root.browse-rows.length == 0 && !root.page-busy && !root.page-error: VerticalLayout {
                                 spacing: 12px;
-                                Caption { text: "Nothing played yet."; font-size: 15px; }
-                                HorizontalLayout { Action { text: root.local-mode ? "Browse downloads" : "Browse albums"; clicked => { root.navigate(root.local-mode ? "offline" : "albums"); } } Rectangle { horizontal-stretch: 1; } }
+                                Caption { text: root.local-mode ? "Listening history isn’t available offline." : "Tracks you play will appear here."; font-size: 14px * Theme.density; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    Action {
+                                        text: root.local-mode ? "Open saved offline" : "Search music"; icon: root.local-mode ? "↓" : "⌕";
+                                        clicked => { if root.local-mode { shell.route("offline"); } else { search.take-focus(); } }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
                             }
-                            if !root.is-history && !root.is-settings && !root.is-playback-page && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
+                            if !root.is-history && !root.is-settings && root.page-kind != "devices" && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
                                 EmptyState {
-                                    glyph: Copy.mark(root.displayed-kind);
-                                    title: root.is-history ? "No listening history yet" : root.is-search && root.query == "" ? "What would you like to hear?" : root.is-search ? "No matching results" : root.displayed-kind == "picker" ? "No manual playlists" : root.displayed-kind == "offline" ? "Nothing saved yet" : "No items here yet";
-                                    subtitle: root.is-history ? (root.reconnecting ? "Connecting…" : root.local-mode ? "Go online to see listening history for this account." : "Play a song to start your history.") : root.is-search && root.query == "" ? "Use the search field above to explore your library." : root.is-search ? "Try a different title, artist or album." : root.displayed-kind == "picker" ? "Create a manual playlist before adding tracks." : root.displayed-kind == "offline" ? "Use Save offline on a track while you’re online." : "";
+                                    glyph: Copy.mark(root.page-kind);
+                                    title: root.is-search && root.query == "" ? (root.local-mode ? "Search your downloads" : "What would you like to hear?")
+                                        : root.is-search ? "No matching results" : root.page-kind == "picker" ? "No manual playlists"
+                                        : root.page-kind == "offline" ? "Nothing saved yet" : root.page-kind == "playlists" ? "No playlists yet"
+                                        : root.page-kind == "artist" ? "No releases found" : root.page-kind == "album" ? "No tracks found" : "No items here yet";
+                                    subtitle: root.is-search && root.query == "" ? (root.local-mode ? "Find music saved on this device." : "Search by track, album or artist.")
+                                        : root.is-search ? "Try a different title, artist or album." : root.page-kind == "picker" ? "Create a manual playlist before adding tracks."
+                                        : root.page-kind == "offline" ? "Choose Save offline on music you want to keep on this device."
+                                        : root.page-kind == "playlists" && !root.local-mode ? "Create a playlist to keep tracks together."
+                                        : root.page-kind == "artist" ? "There are no releases listed here. Tracks and appearances may still be indexed in search." : "";
                                 }
-                            if root.browse-rows.length > 0 && (root.is-search || root.is-playlist || root.displayed-kind == "picker"): Eyebrow {
-                                height: 35px; text: root.is-search ? "Search results" : root.is-playlist ? "Tracks" : "Manual playlists"; color: Theme.muted; letter-spacing: 0px; font-size: 13px * Theme.density;
-                            }
-                            if root.is-grid: grid := Rectangle {
-                                property <length> gap: 12px;
-                                property <int> columns: max(2, floor((self.width + self.gap) / (156px * Theme.density + self.gap)));
-                                property <length> tile: (self.width - (self.columns - 1) * self.gap) / self.columns;
-                                property <length> cell-height: self.tile + 48px * Theme.density;
-                                height: ceil(root.browse-rows.length / self.columns) * (self.cell-height + self.gap);
-                                for row[i] in root.browse-rows: LibraryCard {
-                                    x: mod(i, grid.columns) * (grid.tile + grid.gap); y: floor(i / grid.columns) * (grid.cell-height + grid.gap);
-                                    width: grid.tile; title: row.title; secondary: row.subtitle; is-artist: root.displayed-kind == "artists";
-                                    artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
-                                    activated => { root.row-action("open", i); } focused => { catalog-scroll.reveal(grid.y + self.y, self.height); }
+                            if root.page-kind == "artist" && root.browse-rows.length == 0 && !root.page-busy && !root.page-error && !root.local-mode: HorizontalLayout {
+                                alignment: center;
+                                Action {
+                                    text: "Search for this artist"; icon: "⌕";
+                                    clicked => { root.query = root.catalog-title; shell.edited-search(); search.take-focus(); }
                                 }
                             }
-                            if !root.is-grid && !root.is-settings && !root.is-playback-page: catalog-list := VerticalLayout {
-                            spacing: 2px;
-                            for row[i] in root.browse-rows: shelf-row := VerticalLayout {
-                                spacing: 4px;
-                                if row.section != "": Eyebrow { text: row.section; height: 28px; }
-                                MediaLine {
-                                    title: row.title; subtitle: row.subtitle; detail: row.detail; kind: row.kind; sequence: root.displayed-kind == "album" ? i + 1 : 0;
-                                    artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
-                                    playable: row.playable && (root.saved-view ? root.can-play-saved : !root.local-mode) && root.displayed-kind != "picker";
-                                    compact: root.compact; expanded: root.expanded-row == i;
-                                    actions: root.displayed-kind == "picker" ? [] : row.actions;
-                                    toggle-options => { root.expanded-row = root.expanded-row == i ? -1 : i; }
-                                    focused => { catalog-scroll.reveal(catalog-list.y + shelf-row.y + self.y, self.height); }
-                                    action(op) => { root.row-action(op, i); }
-                                }
+                            if root.browse-rows.length > 0 && root.page-kind != "track" && root.page-kind != "playlists": Eyebrow {
+                                height: 30px; color: Theme.muted;
+                                text: root.is-search ? "RESULTS" : root.is-history ? "RECENTLY PLAYED" : root.page-kind == "artist" ? "DISCOGRAPHY"
+                                    : root.page-kind == "album" || root.is-playlist ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
+                                    : root.saved-view ? "DOWNLOADED MUSIC" : "";
                             }
+                            catalog-list := VerticalLayout {
+                                spacing: 2px;
+                                for row[i] in root.page-kind == "track" ? [] : root.browse-rows: shelf-row := VerticalLayout {
+                                    spacing: 4px;
+                                    if row.section != "": Eyebrow { text: row.section; height: 27px; }
+                                    MediaLine {
+                                        title: row.title; subtitle: row.subtitle; detail: row.detail; kind: row.kind;
+                                        search-result: root.is-search;
+                                        sequence: root.page-kind == "album" || root.is-playlist ? i + 1 : 0;
+                                        artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
+                                        credits: row.credits; metadata-enabled: !root.local-mode && root.page-kind != "picker";
+                                        album-id: row.album-id;
+                                        album-name: root.page-kind == "album" || root.page-kind == "picker" || row.kind != "track" ? "" : row.album-name;
+                                        playable: row.playable && (root.local-mode ? root.can-play-local : !root.saved-view) && root.page-kind != "picker";
+                                        can-open: !root.local-mode || root.saved-view || (root.is-search && self.playable);
+                                        compact: main.width < 435px;
+                                        window-height: root.height;
+                                        menu-key: root.page-key + "|" + root.page-kind + "|" + i + "|" + row.title + "|" + row.subtitle;
+                                        actions: root.page-kind == "picker" ? [] : !root.local-mode ? row.actions
+                                            : root.page-kind == "offline" && row.actions.length > 0 ? ["remove"] : [];
+                                        focused => { catalog-scroll.reveal(catalog.y + catalog-list.y + shelf-row.y + self.y, self.height); }
+                                        action(op) => { shell.browse(op, i); }
+                                        page-action(op, id) => { shell.entity(op, id); }
+                                    }
+                                }
                             }
                             if root.has-more: HorizontalLayout {
                                 Action { text: "Load more"; enabled: !root.page-busy; clicked => { root.page-action("more", ""); } }
@@ -419,19 +595,104 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-            if root.displayed-kind != "now": PlayerBar {
-                has-track: root.now-track-id != "";
-                track: root.now-title; subtitle: root.now-detail; output: root.output-name;
-                status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
-                artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
-                can-seek: root.can-seek && (!root.local-mode || root.offline-playback);
-                playing: root.playing;
-                can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
-                can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
-                page: root.displayed-kind; compact: root.compact; offline: root.local-mode || root.offline-playback;
-                previous => { root.previous(); } next => { root.next(); } toggle => { root.toggle-play(); }
-                seek(v) => { root.seek(v); } navigate(page) => { root.navigate(page); }
+                }
+                if root.editor-open: Editor {
+                    x: 0px; y: root.toolbar-height; width: parent.width; height: parent.height - self.y;
+                    mode: root.form-mode; name <=> root.form-name; description <=> root.form-description; definition <=> root.form-value;
+                    error: root.form-error; help: root.form-help; busy: root.form-busy;
+                    cancel => { root.cancel-form(); } save => { root.submit-form(); }
+                }
             }
+            queue-pane := Rectangle {
+                visible: root.queue-shown;
+                x: root.wide ? work.width - root.queue-width : root.rail-width;
+                y: root.wide ? 0px : root.toolbar-height;
+                width: root.wide ? root.queue-width : work.width - root.rail-width;
+                height: work.height - self.y;
+                background: Theme.rail;
+                Divider { x: 0px; y: 0px; width: 1px; height: parent.height; }
+                VerticalLayout {
+                    padding-left: root.compact ? 12px : 17px; padding-right: root.compact ? 12px : 16px;
+                    padding-top: 10px; padding-bottom: 5px; spacing: 8px;
+                    HorizontalLayout {
+                        height: 41px; spacing: 8px;
+                        Text { text: "Queue"; color: Theme.text; font-size: 22px * Theme.density; font-weight: 750; vertical-alignment: center; horizontal-stretch: 1; }
+                        queue-close := Action {
+                            width: 36px; quiet: true; icon: "×"; enabled: root.queue-shown && !root.editor-open;
+                            accessible-label: "Close play queue"; clicked => { shell.hide-queue(); }
+                        }
+                    }
+                    if root.queue-rows.length > 0: FlexboxLayout {
+                        flex-wrap: wrap; spacing: 6px;
+                        Action { text: "Shuffle"; height: 32px; selected: root.shuffle; enabled: root.queue-controls && !root.editor-open; accessible-description: root.shuffle ? "On" : "Off"; clicked => { root.queue-action("shuffle", ""); } }
+                        Action { text: root.repeat-mode == "one" ? "Repeat: one" : root.repeat-mode == "all" ? "Repeat: all" : "Repeat: off"; height: 32px; selected: root.repeat-mode != "off"; enabled: root.queue-controls && !root.editor-open; clicked => { root.queue-action("repeat", ""); } }
+                        if root.queue-has-upcoming: Action { text: "Clear upcoming"; height: 32px; quiet: true; enabled: root.queue-controls && !root.editor-open; clicked => { root.queue-action("clear", ""); } }
+                    }
+                    Divider { }
+                    queue-scroll := ScrollView {
+                        min-height: 0px; vertical-stretch: 1;
+                        horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
+                        function reveal(y: length, h: length) {
+                            if y < -self.content-y { self.content-y = -y; }
+                            else if y + h > -self.content-y + self.visible-height { self.content-y = min(0px, self.visible-height - y - h); }
+                        }
+                        queue-list := VerticalLayout {
+                            x: 0px; y: 0px; width: queue-scroll.visible-width;
+                            spacing: 3px; alignment: start; padding-bottom: 8px;
+                            if root.queue-rows.length > 0 && root.queue-status != "": Notice { text: root.queue-status; }
+                            if root.queue-rows.length == 0: Caption {
+                                text: "The queue is empty. Play a track or choose Add to queue.";
+                                wrap: word-wrap;
+                            }
+                            for phase in ["current", "upcoming", "played"]: phase-list := VerticalLayout {
+                                spacing: 0px;
+                                for row[i] in root.queue-rows: queue-group := VerticalLayout {
+                                    property <bool> member: phase == "current" ? row.current : phase == "upcoming" ? row.upcoming && !row.current : !row.current && !row.upcoming;
+                                    property <bool> first-upcoming: i == 0 || !root.queue-rows[i - 1].upcoming;
+                                    property <bool> first-played: i == 0 || root.queue-rows[i - 1].current || root.queue-rows[i - 1].upcoming;
+                                    if self.member && (row.current || (row.upcoming ? self.first-upcoming : self.first-played)): Eyebrow {
+                                        text: phase == "current" ? "NOW PLAYING" : phase == "upcoming" ? "UP NEXT" : "PLAYED";
+                                        height: 27px; color: phase == "current" ? Theme.accent : Theme.muted;
+                                    }
+                                    if self.member: MediaLine {
+                                        title: row.title; subtitle: row.subtitle; kind: "track"; selected: row.current;
+                                        credits: row.credits; metadata-enabled: !root.local-mode && !root.editor-open;
+                                        album-id: row.album-id; album-name: row.album-name;
+                                        artwork: row.current ? root.cover-art : root.no-artwork;
+                                        property <bool> can-up: i > 0 && root.queue-rows[i - 1].upcoming;
+                                        property <bool> can-down: i + 1 < root.queue-rows.length && root.queue-rows[i + 1].upcoming;
+                                        can-open: false; compact: !row.current;
+                                        playable: row.upcoming && root.queue-controls && !root.editor-open;
+                                        actions: !root.queue-shown || !self.playable ? [] : self.can-up && self.can-down ? ["up", "down", "remove"]
+                                            : self.can-up ? ["up", "remove"] : self.can-down ? ["down", "remove"] : ["remove"];
+                                        window-height: root.height; menu-key: row.key;
+                                        focused => { queue-scroll.reveal(queue-list.y + phase-list.y + queue-group.y + self.y, self.height); }
+                                        action(op) => { if op != "open" { root.queue-action(op, row.key); } }
+                                        page-action(op, id) => { shell.entity(op, id); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        player := PlayerBar {
+            x: 0px; y: parent.height - root.player-height; width: parent.width; height: root.player-height;
+            visible: !root.is-now && !root.editor-open;
+            has-track: root.now-track-id != "";
+            track: root.now-title; subtitle: root.now-detail; output: root.output-name;
+            credits: root.now-credits; metadata-enabled: !root.local-mode;
+            album-id: root.now-album-id; album-name: root.now-album-name;
+            status: root.dock-status;
+            artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
+            can-seek: root.can-seek && (!root.local-mode || root.offline-playback);
+            playing: root.playing; can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
+            can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
+            page: root.page-kind; queue-open: root.queue-shown; compact: root.compact; offline: root.local-mode || root.offline-playback;
+            previous => { root.previous(); } next => { root.next(); } toggle => { root.toggle-play(); }
+            seek(v) => { root.seek(v); } navigate(page) => { shell.route(page); }
+            page-action(op, id) => { shell.entity(op, id); }
         }
     }
 }

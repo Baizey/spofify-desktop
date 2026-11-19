@@ -18,10 +18,16 @@ from fixture import Failure, check, stop
 from playback import Peer
 
 
+DESKTOP = (1910, 1537)  # Cage's 35px client decoration leaves 1910×1502 content.
 WIDE = (1280, 720)
 COMPACT = (640, 640)
 DOCK_TITLE = r"Now playing: Synthetic Tone \d{3}"
-ESCAPE, CONTROL, ALT, LEFT = "\x1b", "\x11", "\x12", "\uf702"
+TRACK = "Synthetic Tone 001"
+PLAYLIST = "Synthetic Manual Duplicates"
+OFFLINE_SWITCH = r"Work offline|Go online|Stay offline"
+OLD_NAV = r"Liked|Like|Unlike|Home|Search|Albums|Artists|Downloads"
+SAVED = "Saved offline"
+ESCAPE, CONTROL, ALT, LEFT, DOWN, RETURN = "\x1b", "\x11", "\x12", "\uf702", "\uf701", "\n"
 
 
 def mcp_class():
@@ -65,8 +71,19 @@ class Window:
         tree = self.mcp.value("get_element_tree", {
             "elementHandle": self.properties["rootElementHandle"], "maxElements": 1000})
         check(not tree.get("debugInfoMissing"), "desktop requires SLINT_EMIT_DEBUG_INFO=1 at build time")
-        # A long page may be truncated; the visible header and first visible rows come first.
-        return tree["elements"]
+        elements = tree["elements"]
+        # With a populated catalog and queue, MCP's tree limit can precede the
+        # dock. Query that named subtree rather than mistaking truncation for
+        # an absent transport. Header and initial rows precede the limit.
+        if tree["truncated"] and not element_id(elements, "player"):
+            handles = self.mcp.value("find_elements_by_id", {"windowHandle": self.handle,
+                                      "elementsId": "AppWindow::player"})["elementHandles"]
+            check(len(handles) <= 1, "unexpected duplicate playback dock")
+            for handle in handles:
+                dock = self.mcp.value("get_element_tree", {"elementHandle": handle, "maxElements": 256})
+                check(not dock["truncated"], "truncated playback dock inspection")
+                elements.extend(dock["elements"])
+        return elements
 
     @staticmethod
     def matches(element, pattern):
@@ -78,26 +95,47 @@ class Window:
                          and (roles is None or element.get("accessibleRole") in roles)), None)
         return wait(pattern, matches, timeout)
 
-    def section(self, label, retry_navigation=False):
+    def absent(self, pattern, roles=None):
+        check(not any(self.matches(e, pattern) and (roles is None or e.get("accessibleRole") in roles)
+                      for e in self.elements()), f"unexpected native element: {pattern}")
+
+    def section(self, label):
         def current():
-            element = next((node for node in self.elements() if self.matches(node, label)
-                            and node.get("accessibleRole") == "Button"), None)
-            if element and element.get("accessibleDescription") == "Current section":
-                return element
-            if retry_navigation and element:
-                # A write may temporarily defer route changes. Retry only navigation,
-                # never the underlying mutation.
-                self.click_element(element)
-            return None
+            return next((e for e in self.elements() if self.matches(e, label)
+                         and e.get("accessibleRole") == "Button"
+                         and (e.get("accessibleDescription") or "").split(",")[0] == "Current section"), None)
         return wait(f"current section {label}", current)
 
+    def dimensions(self):
+        props = self.window_properties()
+        return tuple(props["size"][key] / props["scaleFactor"] for key in ("width", "height"))
+
     def click_element(self, element):
+        # MCP synthesizes a left press/release at the item's center in this
+        # window, including popup offsets. Never invoke accessible default.
+        x, y, x2, y2 = bounds(element)
+        check(x2 > x and y2 > y, f"empty pointer target: {element.get('accessibleLabel')}")
         self.mcp.call("click_element", {"elementHandle": element["handle"]})
 
     def click(self, pattern):
         element = self.find(pattern, roles=("Button", "Checkbox"))
         check(element.get("accessibleEnabled", True), f"native control disabled: {pattern}")
         self.click_element(element)
+
+    def pointer_position_for_click(self, label):
+        # Popup items have popup-local bounds in the Slint tree. Recording the
+        # actual dispatched press gives the client-window coordinates instead.
+        self.mcp.call("start_event_recording", {})
+        try:
+            self.click(label)
+        finally:
+            events = self.mcp.value("stop_event_recording", {})
+        check(not events.get("droppedCount") and not events.get("unknownEventCount"),
+              "incomplete native pointer event recording")
+        presses = [item["event"]["pointerPressed"]["position"] for item in events["events"]
+                   if "pointerPressed" in item["event"] and item["windowHandle"] == self.handle]
+        check(len(presses) == 1, f"expected one native pointer press for {label}")
+        return presses[0]["x"], presses[0]["y"]
 
     def key(self, text, event="PressAndRelease"):
         self.mcp.call("dispatch_key_event", {"windowHandle": self.handle, "text": text, "eventType": event})
@@ -113,6 +151,9 @@ class Window:
         self.click_element(self.find(pattern, roles=("TextInput",)))
         # Type through the real input rather than assigning a model property.
         self.key(value)
+
+    def title(self, name):
+        return self.find(re.escape(name), roles=("Text",))
 
     def scroll_catalog(self, delta):
         width = self.window_properties()["size"]["width"] / self.properties["scaleFactor"]
@@ -158,6 +199,11 @@ def element_type(elements, name):
     return next((e for e in elements if any(t.get("typeName") == name for t in e.get("typeNamesAndIds", []))), None)
 
 
+def element_id(elements, name):
+    return next((e for e in elements if any(t.get("id", "").split("::")[-1] == name
+                for t in e.get("typeNamesAndIds", []))), None)
+
+
 def bounds(element):
     pos, size = element.get("absolutePosition", {}), element.get("size", {})
     x, y = pos.get("x", 0), pos.get("y", 0)
@@ -179,12 +225,10 @@ def assert_dock_layout(window):
     def named(pattern):
         return next((e for e in elements if window.matches(e, pattern) and e.get("accessibleRole") == "Button"), None)
     dock = element_type(elements, "PlayerBar")
-    catalog = next((e for e in elements if any(t.get("id", "").split("::")[-1] == "catalog-scroll"
-                   for t in e.get("typeNamesAndIds", []))), None)
+    catalog = element_id(elements, "catalog-scroll")
     check(dock and catalog, "missing catalog viewport or dock in the Slint tree")
     left, top, right, bottom = bounds(dock)
-    props = window.window_properties()
-    width, height = (props["size"][key] / props["scaleFactor"] for key in ("width", "height"))
+    width, height = window.dimensions()
     check(abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
     check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= 100,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
@@ -211,7 +255,7 @@ def assert_dock_layout(window):
 def full_player(window, title, name, width, failures):
     window.click(title)  # Strict pointer activation: no keyboard or accessibility fallback.
     try:
-        window.find("NOW PLAYING", timeout=3, roles=("Text",))
+        wait("full-player page", lambda: element_type(window.elements(), "NowPlaying"), timeout=3)
     except Failure:
         window.pixels(name + "-pointer-failed", width)
         raise
@@ -303,8 +347,15 @@ def desktop(binary, root, env, pixels=None, *, multisize=False):
 
 
 def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None):
+    from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
+                                  compact_queue, keyboard_playlist_menu, manual_options, open_manual, open_playlists,
+                                  pane_layout, playlist_row_menu, rules_editor, typed_catalog,
+                                  wide_queue_toggle)
+
     failures = []
-    with desktop(binary, root, env, pixels, multisize=api is not None) as window:
+    with desktop(binary, root, env, pixels, multisize=ready is not None) as window:
+        if ready is not None:
+            window.resize(DESKTOP)
         window.find("Sign in")
         check(not any(e.get("accessibleRole") == "Checkbox" for e in window.elements()), "unexpected sign-in gate")
         window.pixels("01-login-empty")
@@ -316,78 +367,45 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.fill("Password", ready["password"])
         window.click("Sign in")
         window.section("History")
-        check(not any(window.matches(e, "Liked|Like|Unlike|Home|Search") and e.get("accessibleRole") == "Button" for e in window.elements()), "obsolete navigation entry")
-        window.pixels("02-signed-in")
+        check_navigation(window)
+        pane_layout(window, wide=True)
+        window.pixels("02-signed-in", DESKTOP[0])
 
-        window.click("Playlists")
-        window.section("Playlists")
-        window.click("Open Synthetic Manual Duplicates")
-        wait("distinct visible duplicate playlist rows", lambda: sum(window.matches(element, "Open Synthetic Tone 001")
-             for element in window.elements()) >= 2)
-        window.pixels("03-manual-playlist")
-        print("PASS native sign-in, playlist navigation and duplicate rows", flush=True)
+        open_playlists(window)
         if api is None:
-            with verify(failures, "Ctrl+F focuses the live search field"):
-                window.shortcut(CONTROL, "f")
-                window.key("Synthetic Tone")
-                window.find("Clear search", timeout=2, roles=("Button",))
-            if failures:
-                window.fill("Search music", "Synthetic Tone")
-            window.find("SEARCH RESULTS", roles=("Text",))
-            window.find("Open Synthetic Tone 001")
-            before_back = len(failures)
-            with verify(failures, "Escape returns from Search to the playlist"):
-                window.key(ESCAPE)
-                window.find("TRACKS", timeout=2, roles=("Text",))
-            if len(failures) != before_back:
-                window.click("Back")
-            window.find("Open Synthetic Tone 001")
-            before_back = len(failures)
-            with verify(failures, "Alt+Left returns from the playlist to the listing"):
-                window.shortcut(ALT, LEFT)
-                window.find("Open Synthetic Manual Duplicates", timeout=2)
-            if len(failures) != before_back:
-                window.click("Back")
-            window.find("Open Synthetic Manual Duplicates")
-            window.click("Open Synthetic Manual Duplicates")
-            window.find("Open Synthetic Tone 001")
-            print("PASS typed search and repeated playlist open (synthetic wire only)", flush=True)
-            window.click("Show actions for Synthetic Tone 001")
-            window.find("Hide actions for Synthetic Tone 001")
-            window.click("Play queue")
-            window.find("The queue is empty")
-            window.pixels("04-empty-queue")
+            rules_editor(window, "03-rules-editor")
+            typed_catalog(window, DESKTOP[0], capture=True, via_shortcut=True)
+            check_shortcut_back(window)
+            open_manual(window)
+            manual_options(window, capture="04-playlist-menu-1910")
+            keyboard_playlist_menu(window)
+            playlist_row_menu(window)
+            window.pixels("04-manual-playlist", DESKTOP[0])
+            wide_queue_toggle(window, lambda: window.title(PLAYLIST))
+            window.resize(COMPACT)
+            pane_layout(window, wide=False, can_go_back=True)
+            compact_queue(window, lambda: window.title(PLAYLIST), capture="05-queue-empty-compact")
+            manual_options(window, capture="05-playlist-menu-640")
             window.click("Back")
-            window.find("Open Synthetic Tone 001")
-            check(not any(window.matches(node, "Hide actions for Synthetic Tone 001") for node in window.elements()),
-                  "playlist row actions stayed open after navigating away and back")
-            check(not any(window.matches(e,"Now playing: Nothing playing") for e in window.elements()), "idle dock offers an empty player")
+            window.find(f"Open {PLAYLIST}", roles=("Button",))
+            typed_catalog(window, COMPACT[0], capture=True)
+            window.absent("Now playing: Nothing playing", roles=("Button",))
             window.click("Settings")
-            window.find("Reset display defaults")
-            window.pixels("05-appearance")
-            print("PASS closed row actions after Back, empty queue, idle dock and appearance (UI only)", flush=True)
-            check(not failures, "; ".join(failures))
+            window.find("Work offline", roles=("Button",))
+            window.find("Reset display defaults", roles=("Button",))
+            window.pixels("06-settings-compact", COMPACT[0])
+            print("PASS workspace interaction against Go-shaped wire data (no Go playback)", flush=True)
             return
-        with verify(failures, "playlist menu partition"):
-            options = r"Rename|Delete|Edit rules"
-            check(not any(window.matches(e, options) for e in window.elements()),
-                  "playlist management is visible before opening Playlist options")
-            window.click("Playlist options")
-            for option in ("Rename", "Delete"):
-                window.find(option, timeout=3, roles=("Button",))
-            window.click("Playlist options")
-            check(not any(window.matches(e, options) for e in window.elements()),
-                  "playlist management stayed open after toggling Playlist options")
-            print("PASS playlist management is behind Playlist options", flush=True)
+        open_manual(window)
+        manual_options(window)
+        window.pixels("03-manual-playlist", DESKTOP[0])
         # Join only after the desktop: an observer must not become the initial
         # selected logical output or change how the desktop is admitted.
         with Peer(api) as observer:
-            def selected_desktop(envelope):
-                snapshot = envelope.get("snapshot", {})
-                return snapshot.get("transfer") is None and any(
-                    device.get("name") == "Spofify Desktop" and device.get("canPlay")
-                    and device.get("deviceId") == snapshot.get("selectedDeviceId")
-                    for device in snapshot.get("devices", []))
+            def selected_desktop(snapshot):
+                return any(device.get("name") == "Spofify Desktop" and device.get("canPlay")
+                           and device.get("id") == snapshot.get("owner")
+                           for device in snapshot.get("devices", []))
 
             # The initial output transfer can still be draining while the
             # catalog is already interactive. This case exercises Play on a
@@ -395,19 +413,28 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             if not selected_desktop(observer.snapshot):
                 observer.wait(selected_desktop, timeout=20)
             window.click("Playback devices")
-            window.find("Deselect")
+            window.find("Deselect", roles=("Button",))
+            window.title("Acceptance observer")
+            peer_button = window.find("Select output", roles=("Button",))
+            check(not peer_button.get("accessibleEnabled"), "read-only remote peer was selectable for audio")
+            window.pixels("03-devices")
+            print("PASS device panel shows the real Go observer without selecting it for audio", flush=True)
             window.click("Back")
-            window.find("Open Synthetic Tone 001")
+            window.title(PLAYLIST)
 
-            def canonical_track(envelope):
-                state = envelope.get("snapshot", {}).get("state", {})
-                queue, position = state.get("queue", []), state.get("position", -1)
-                return (0 <= position < len(queue) and queue[position].get("id") == ready["duplicateTrackId"])
+            def canonical_track(snapshot):
+                state = snapshot.get("player", {})
+                queue, cursor = state.get("queue", []), state.get("cursor", {})
+                return (len(queue) > 1 and cursor.get("desired") and any(
+                    track.get("key") == cursor.get("key") and track.get("id") == ready["duplicateTrackId"]
+                    for track in queue))
 
             if pcm is not None:
                 from audio_smoke import heard_tone
                 baseline = pcm.stat().st_size
-            window.click("Play Synthetic Tone 001")
+            # The actual Go fixture clips last one second. Start the full
+            # playlist to keep media and upcoming rows present during resize.
+            window.click("Play")
             try:
                 observer.wait(canonical_track, timeout=20)
             except TimeoutError as error:
@@ -416,68 +443,83 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 with verify(failures, "real Go online PCM"):
                     wait("220 Hz Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                     print("PASS real Go online track rendered 220 Hz PCM", flush=True)
-            window.find(DOCK_TITLE)
+            window.find(DOCK_TITLE, roles=("Button",))
+            window.find("Pause", roles=("Button",))
             print("PASS native Play updated canonical online queue and dock", flush=True)
-            window.pixels("04-dock-wide", WIDE[0])
-            with verify(failures, "wide geometry"):
-                assert_dock_layout(window)
+            for mode in (DESKTOP, WIDE):
+                if mode != DESKTOP:
+                    window.resize(mode)
+                window.title(PLAYLIST)
+                pane_layout(window, wide=True, populated=True, can_go_back=True)
+                window.find("Pause", roles=("Button",))
+                window.pixels(f"04-playing-{mode[0]}", mode[0])
+                with verify(failures, f"dock geometry at {mode[0]}"):
+                    assert_dock_layout(window)
             window.resize(COMPACT)
-            window.find(DOCK_TITLE)
+            window.find(DOCK_TITLE, roles=("Button",))
+            pane_layout(window, wide=False, can_go_back=True)
+            window.find("Pause", roles=("Button",))
             window.pixels("05-dock-compact", COMPACT[0])
-            with verify(failures, "compact geometry"):
+            with verify(failures, "compact dock geometry"):
                 assert_dock_layout(window)
-            with verify(failures, "compact full player"):
-                full_player(window, DOCK_TITLE, "06-player-compact", COMPACT[0], failures)
-                window.click("Open play queue")
-                window.find("Shuffle", roles=("Button",))
-                window.find("Repeat: (off|one|all)", roles=("Button",))
-                window.click("Back")
-                window.find("Open play queue", roles=("Button",))
-            if not any(window.matches(e, "Open Synthetic Tone 001") for e in window.elements()):
-                window.click("Back")
-                window.find("Open Synthetic Tone 001")
+            compact_queue(window, lambda: window.title(PLAYLIST), populated=True, capture="06-queue-playing-compact")
+            full_player(window, DOCK_TITLE, "07-player-compact", COMPACT[0], failures)
+            window.click("Back")
+            window.title(PLAYLIST)
             window.resize(WIDE)
 
-            window.click("Playback devices")
-            window.find("Acceptance observer")
-            peer_button = window.find("Select output")
-            check(not peer_button.get("accessibleEnabled"), "read-only remote peer was selectable for audio")
-            window.pixels("07-devices")
-            print("PASS native device panel shows another connection without selecting an incapable peer", flush=True)
-
-        window.click("Albums")
-        window.section("Albums")
-        window.find("Open Synthetic Paging Album", roles=("Button",))
-        window.pixels("08-album-grid", WIDE[0])
-        window.click("Open Synthetic Paging Album")
-        window.find("Open Synthetic Tone 001")
+        album = next(target["name"] for target in ready["targets"] if target["kind"] == "album")
+        window.click(f"Open album: {re.escape(album)}")
+        window.title(album)
+        window.find(f"Open {TRACK}", roles=("Button",))
         window.pixels("09-album-detail", WIDE[0])
-        print("PASS native album browsing through the real Go catalog", flush=True)
+        print("PASS native album metadata link opens the real Go catalog detail", flush=True)
 
-        window.click("Show actions for Synthetic Tone 001")
-        for option in ("Album", "Artist", "Add to queue", "Add to playlist", "Save offline"):
-            window.find(option + " · Synthetic Tone 001", roles=("Button",))
-        check(not any(window.matches(e, r"(?:Like|Unlike)(?: · .*)?") for e in window.elements()),
-              "obsolete Like action in track menu")
-        window.click("Save offline · Synthetic Tone 001")
-        window.find(r"Saved on this device\.", 15)
-        window.section("Downloads", retry_navigation=True)
-        window.find("Open Synthetic Tone 001")
+        row_menu = rf"(Add to queue|Add to playlist|Save offline) · {TRACK}"
+        window.absent(row_menu, roles=("Button",))
+        window.click(f"Show actions for {TRACK}")
+        for option in ("Add to queue", "Add to playlist", "Save offline"):
+            window.find(f"{option} · {TRACK}", roles=("Button",))
+        window.absent(r"(?:Like|Unlike)(?: · .*)?", roles=("Button",))
+        window.click(f"Save offline · {TRACK}")
+        window.title("Saved on this device.")
+        window.absent(row_menu, roles=("Button",))
+        window.click(SAVED)
+        window.section(SAVED)
+        window.find(f"Open {TRACK}", roles=("Button",))
+        window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
+        window.click("Settings")
+        window.title("Settings")
         window.click("Work offline")
-        window.find("Go online")
+        window.section(SAVED)  # Entering offline mode lands on saved music.
+        window.title("Offline mode")
+        window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
+        window.click("Settings")
+        window.find("Go online", roles=("Button",))
+        window.pixels("10-offline-settings")
+        window.click(SAVED)
+        window.section(SAVED)
+        window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
         window.find("No song selected")
-        window.find("Play Synthetic Tone 001", 15)
-        window.pixels("10-offline-ready")
+        window.find(f"Play {TRACK}", timeout=15, roles=("Button",))
+        window.pixels("11-offline-ready")
         if pcm is not None:
             baseline = pcm.stat().st_size
         window.click("Play Synthetic Tone 001")
         window.find("Now playing: Synthetic Tone 001")
-        window.pixels("11-offline-dock")
+        window.pixels("12-offline-dock")
         if pcm is not None:
             with verify(failures, "real Go saved/offline PCM"):
                 wait("220 Hz saved Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                 print("PASS saved Go track rendered 220 Hz PCM while offline", flush=True)
         print("PASS native save, manual offline switch and saved-audio dock", flush=True)
-        with verify(failures, "wide full player"):
-            full_player(window, "Now playing: Synthetic Tone 001", "12-now-playing-wide", WIDE[0], failures)
+        full_player(window, f"Now playing: {TRACK}", "13-now-playing-wide", WIDE[0], failures)
+        window.click("Back")
+        window.section(SAVED)
+        window.click("Settings")
+        window.click("Go online")
+        window.find("Work offline", roles=("Button",))
+        window.absent("Offline mode", roles=("Text",))
+        print("PASS Settings returns to online mode", flush=True)
+        committed_playlist_edits(window, api)
     check(not failures, "; ".join(failures))

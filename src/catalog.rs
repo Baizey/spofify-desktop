@@ -1,7 +1,7 @@
 //! Listener catalog and indexed search. Declare as a child of `api.rs` with
 //! `#[path = "catalog.rs"] pub mod catalog;` so credentials and HTTP stay private.
 //!
-//! Browser interface on `Api` (`&Session` first): `catalog(kind, page)`,
+//! Browser interface on `Api` (`&Session` first):
 //! `catalog_detail(kind, id)`, `album_tracks(id, page)`,
 //! `artist_albums(id, release_group, page)`, `unified_search(query, kind, limit)`,
 //! `unified_search_next(cursor)`. `kind` is `CatalogKind`, except search takes
@@ -168,15 +168,6 @@ impl CatalogItem {
 }
 
 impl Api {
-    pub async fn catalog(
-        &self,
-        session: &Session,
-        kind: CatalogKind,
-        page: PageRequest,
-    ) -> Result<CatalogPage, ApiError> {
-        self.catalog_page(session, kind, None, page).await
-    }
-
     pub async fn catalog_detail(
         &self,
         session: &Session,
@@ -204,7 +195,7 @@ impl Api {
         id: &str,
         page: PageRequest,
     ) -> Result<CatalogPage, ApiError> {
-        self.catalog_page(session, CatalogKind::Track, Some(Parent::Album(id)), page)
+        self.catalog_page(session, CatalogKind::Track, Parent::Album(id), page)
             .await
     }
 
@@ -218,7 +209,7 @@ impl Api {
         self.catalog_page(
             session,
             CatalogKind::Album,
-            Some(Parent::Artist(id, release_group)),
+            Parent::Artist(id, release_group),
             page,
         )
         .await
@@ -228,7 +219,7 @@ impl Api {
         &self,
         session: &Session,
         kind: CatalogKind,
-        parent: Option<Parent<'_>>,
+        parent: Parent<'_>,
         page: PageRequest,
     ) -> Result<CatalogPage, ApiError> {
         if !limit_ok(page.limit) || page.offset > 1_000_000 {
@@ -244,12 +235,11 @@ impl Api {
             ("offset", &offset),
         ];
         match parent {
-            Some(Parent::Album(id)) if valid_id(id) => query.push(("albumId", id)),
-            Some(Parent::Artist(id, group)) if valid_id(id) => {
+            Parent::Album(id) if valid_id(id) => query.push(("albumId", id)),
+            Parent::Artist(id, group) if valid_id(id) => {
                 query.extend([("artistId", id), ("releaseGroup", group.wire())])
             }
-            Some(_) => return Err(INVALID_INPUT),
-            None => (),
+            _ => return Err(INVALID_INPUT),
         }
         let wire: WireCatalogPage = self.catalog_get(session, Route::Catalog, &query).await?;
         if !page_matches(page, wire.limit, wire.offset, wire.items.len(), wire.total)
@@ -410,8 +400,7 @@ impl WireSearchPage {
 pub(super) struct WireItem {
     kind: CatalogKind,
     id: String,
-    #[serde(default)]
-    name: String,
+    name: Option<String>,
     #[serde(default)]
     artists: Vec<ArtistCredit>,
     #[serde(default)]
@@ -446,25 +435,29 @@ fn recorded_path<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Err
 
 impl WireItem {
     pub(super) fn project(
-        self,
+        mut self,
         expected: Option<CatalogKind>,
         legacy_admin: bool,
         metadata_missing: bool,
     ) -> Result<CatalogItem, ApiError> {
         let optional_text = |s: &str, max| s.is_empty() || valid_text(s, max);
+        // Go's legacy LibraryItem can omit an empty name. Positive search and
+        // listener items emit the field even when no label has been saved.
+        if self.name.is_none() && !legacy_admin && !metadata_missing {
+            return Err(INVALID_RESPONSE);
+        }
+        let name = self.name.unwrap_or_default();
         if expected.is_some_and(|kind| kind != self.kind)
             || !valid_id(&self.id)
             || (if metadata_missing {
-                !self.name.is_empty() || self.has_audio != Some(false)
+                !name.is_empty() || self.has_audio != Some(false)
             } else {
-                !valid_text(&self.name, 1024)
+                !optional_text(&name, 1024)
             })
-            || self.artists.len() > 32
-            || self
-                .artists
-                .iter()
-                .any(|a| (!a.id.is_empty() && !valid_id(&a.id)) || !valid_text(&a.name, 1024))
-            || self.artists.iter().map(|a| a.name.len() + 2).sum::<usize>() > 4096
+            || self.artists.iter().any(|a| {
+                // Empty names are legal on catalog references with a saved ID.
+                (!a.id.is_empty() && !valid_id(&a.id)) || !optional_text(&a.name, 1024)
+            })
             || self.genres.len() > 128
             || self.genres.iter().any(|g| !valid_text(g, 1024))
             || (!self.album_id.is_empty() && !valid_id(&self.album_id))
@@ -484,10 +477,14 @@ impl WireItem {
             None if legacy_admin => self.kind == CatalogKind::Track && self.library_path,
             None => return Err(INVALID_RESPONSE),
         };
+        // The search writer accepts up to 256 credits within its byte limit;
+        // a Library detail/listing can have more. Bound what we retain/display
+        // without rejecting the whole valid release page on credit count.
+        self.artists.truncate(256);
         Ok(CatalogItem {
             kind: self.kind,
             id: self.id,
-            name: self.name,
+            name,
             artists: self.artists,
             genres: self.genres,
             album_id: self.album_id,
@@ -677,7 +674,7 @@ impl Route<'_> {
 }
 
 // Go's oneSegment rejects path separators even in percent-encoded IDs.
-fn segment_id(id: &str) -> bool {
+pub(crate) fn segment_id(id: &str) -> bool {
     valid_id(id) && !id.contains(['/', '\\'])
 }
 
@@ -888,6 +885,65 @@ mod tests {
         assert!(item.artists[1].id.is_empty());
         assert!(item.playable_item().is_some());
         assert!(!format!("{item:?}").contains("fixtures/"));
+    }
+
+    #[test]
+    fn go_can_open_a_credit_whose_artist_has_no_saved_name() {
+        let raw = json!({"kind":"artist", "id":"guest-record", "name":"", "hasAudio":false,
+            "coverage":{"tracks":0,"inLibrary":0,"albums":0}});
+        let wire = |raw| serde_json::from_value::<WireItem>(raw).unwrap();
+        let listener = wire(raw.clone())
+            .project(Some(CatalogKind::Artist), false, false)
+            .unwrap();
+        assert_eq!(listener.id, "guest-record");
+        assert!(listener.name.is_empty());
+
+        let mut legacy = raw;
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("name"); // LibraryItem uses omitempty, unlike ListeningItem.
+        object.remove("hasAudio");
+        assert_eq!(
+            wire(legacy.clone())
+                .project(Some(CatalogKind::Artist), true, false)
+                .unwrap(),
+            listener
+        );
+        assert!(
+            wire(legacy)
+                .project(Some(CatalogKind::Artist), false, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn go_credit_budget_does_not_reject_a_release_page() {
+        let mut raw = wire_item("album", "many-credits");
+        // Valid within the Go search writer's 32 KiB / 256 credit budget;
+        // it also exceeds the desktop's old 32 credit / 4096 name-byte caps.
+        raw["artists"] = json!(
+            (0..48)
+                .map(|i| json!({"id":format!("artist-{i}"), "name":"x".repeat(128)}))
+                .collect::<Vec<_>>()
+        );
+        let item = serde_json::from_value::<WireItem>(raw.clone())
+            .unwrap()
+            .project(Some(CatalogKind::Album), false, false)
+            .unwrap();
+        assert_eq!(item.artists.len(), 48);
+        assert_eq!(item.artists.last().unwrap().id, "artist-47");
+
+        // Library is not restricted to the search writer's credit count.
+        raw["artists"] = json!(
+            (0..300)
+                .map(|i| json!({"id":format!("artist-{i}"), "name":""}))
+                .collect::<Vec<_>>()
+        );
+        let item = serde_json::from_value::<WireItem>(raw)
+            .unwrap()
+            .project(Some(CatalogKind::Album), false, false)
+            .unwrap();
+        assert_eq!(item.artists.len(), 256);
+        assert_eq!(item.artists.last().unwrap().id, "artist-255");
     }
 
     #[test]

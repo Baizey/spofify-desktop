@@ -482,11 +482,11 @@ mod tests {
             api,
             session: session.clone(),
             offline: false,
-            recent_change: 0,
+            personal: Default::default(),
         };
         let (tx, rx) = watch::channel(Some(access.clone()));
         let account = Account::current(&rx).unwrap();
-        access.recent_change += 1;
+        access.personal = Default::default();
         tx.send_replace(Some(access.clone()));
         assert!(account.matches(&rx));
         session.set_offline(true);

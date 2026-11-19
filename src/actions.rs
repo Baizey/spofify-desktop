@@ -5,7 +5,7 @@
 //! Example:
 //! ```text
 //! Source: Saved library
-//! Source: Saved library
+//! Source: Liked tracks
 //! Sort: Title
 //! Duplicates: Keep one copy
 //! Include:
@@ -32,14 +32,14 @@ use uuid::Uuid;
 use crate::{
     api::{
         ApiError,
-        catalog::PageRequest,
         library::{
             PlaylistKind, RuleAvailability, RuleDefinition, RuleDuplicates, RuleMembership,
             RulePredicate, RuleSide, RuleSort, RuleSource, RuleTake,
         },
     },
-    desk::Access,
     pages::{Page, PlaylistMetadata, Route, Row, RowKey},
+    personal::PersonalCommand,
+    personal_bridge::{Effect, Mutation},
 };
 
 pub const DEFAULT_RULES: &str =
@@ -557,8 +557,8 @@ fn write_limit(out: &mut String, indent: &str, take: RuleTake) {
     let _ = writeln!(out, "{indent}Limit: {side} {}", take.count);
 }
 
-/// Prefill from the retained page. Do not issue a second read when opening a
-/// form: the edited definition and expected revision must describe one snapshot.
+/// Prefill from the retained page so the form and its local edit basis describe
+/// the same snapshot. No reads are needed to open a form.
 pub fn prepare(route: &Route, page: &Page, op: &str) -> Result<Draft, ApiError> {
     match op.strip_prefix("prepare-").unwrap_or(op) {
         "new-manual" => Ok(Draft::default()),
@@ -587,54 +587,66 @@ pub fn prepare(route: &Route, page: &Page, op: &str) -> Result<Draft, ApiError> 
                 definition: format_definition(definition),
             })
         }
+        "copy" => {
+            let playlist = copy_source(route, page)?;
+            const SUFFIX: &str = " (copy)";
+            let name: String = playlist.name.chars().take(100 - SUFFIX.len()).collect();
+            Ok(Draft {
+                name: format!("{name}{SUFFIX}"),
+                description: page.description.clone(),
+                ..Draft::default()
+            })
+        }
         _ => Err(error("This playlist form is not available.")),
     }
 }
 
-/// Executes exactly one write at most. A conflict is never replayed with a
-/// newer revision. The caller can re-read affected views on status 409; account
-/// and navigation epoch checks on the returned result belong to the caller.
-pub async fn mutate(
-    access: &Access,
+/// Translate one explicit intent against the retained page. Revisions are local
+/// observation baselines only: Go resolves the store fence in its account lane.
+/// Submission, offline/account fencing and observing matching state are separate.
+pub fn mutation(
     route: &Route,
     page: &Page,
     op: &str,
     index: Option<usize>,
     value: &str,
-) -> Result<Option<Route>, ApiError> {
-    const OFFLINE: ApiError = error("Go online to make changes to your library.");
-    let mut network = access.session.network_changes();
-    if access.offline || *network.borrow_and_update() & 1 != 0 {
-        return Err(OFFLINE);
-    }
-    tokio::select! {
-        biased;
-        _ = network.changed() => Err(OFFLINE),
-        result = apply(access, route, page, op, index, value) => result,
-    }
-}
-
-async fn apply(
-    access: &Access,
-    route: &Route,
-    page: &Page,
-    op: &str,
-    index: Option<usize>,
-    value: &str,
-) -> Result<Option<Route>, ApiError> {
-    let api = &access.api;
-    let session = &access.session;
-    match op {
+) -> Result<Mutation, ApiError> {
+    let (command, effect) = match op {
         "new-manual" | "new-rules" => {
             let draft = read_draft(value)?;
             let (name, description) = metadata(&draft)?;
-            let definition = (op == "new-rules")
+            let rules = op == "new-rules";
+            let track_id = if matches!(route, Route::Picker(_)) {
+                require(
+                    !rules,
+                    "Only manual playlists can accept individual tracks.",
+                )?;
+                Some(picker_track(route, page)?.to_owned())
+            } else {
+                None
+            };
+            let definition = rules
                 .then(|| RecipeParser::new(&draft.definition)?.parse(None))
                 .transpose()?;
-            let created = api
-                .create_playlist(session, name, description, definition.as_ref())
-                .await?;
-            return Ok(Some(Route::Playlist(created.id)));
+            let effect = Effect::Create {
+                name: name.into(),
+                description: description.into(),
+                kind: if rules {
+                    PlaylistKind::Derived
+                } else {
+                    PlaylistKind::Manual
+                },
+                has_track: track_id.is_some(),
+            };
+            (
+                PersonalCommand::CreatePlaylist {
+                    name: name.into(),
+                    description: description.into(),
+                    definition,
+                    track_id,
+                },
+                effect,
+            )
         }
         "rename" => {
             let playlist = current_playlist(route, page)?;
@@ -644,16 +656,54 @@ async fn apply(
             )?;
             let draft = read_draft(value)?;
             let (name, description) = metadata(&draft)?;
-            api.update_playlist(session, &playlist.id, playlist.revision, name, description)
-                .await?;
+            (
+                PersonalCommand::RenamePlaylist {
+                    playlist_id: playlist.id.clone(),
+                    name: name.into(),
+                    description: description.into(),
+                },
+                Effect::Rename {
+                    id: playlist.id.clone(),
+                    name: name.into(),
+                    description: description.into(),
+                    revision: playlist.revision,
+                },
+            )
         }
         "rules" => {
             let playlist = current_playlist(route, page)?;
             let previous = current_definition(route, page)?;
             let draft = read_draft(value)?;
             let definition = RecipeParser::new(&draft.definition)?.parse(Some(previous))?;
-            api.update_playlist_definition(session, &playlist.id, playlist.revision, &definition)
-                .await?;
+            (
+                PersonalCommand::SetPlaylistRules {
+                    playlist_id: playlist.id.clone(),
+                    definition: definition.clone(),
+                },
+                Effect::Rules {
+                    id: playlist.id.clone(),
+                    definition,
+                    revision: playlist.revision,
+                },
+            )
+        }
+        "copy" => {
+            let playlist = copy_source(route, page)?;
+            let draft = read_draft(value)?;
+            let (name, description) = metadata(&draft)?;
+            (
+                PersonalCommand::CopyPlaylist {
+                    playlist_id: playlist.id.clone(),
+                    name: name.into(),
+                    description: description.into(),
+                },
+                Effect::Create {
+                    name: name.into(),
+                    description: description.into(),
+                    kind: PlaylistKind::Manual,
+                    has_track: false,
+                },
+            )
         }
         "delete" => {
             // The UI owns confirmation. Only a playlist detail can be deleted.
@@ -662,15 +712,29 @@ async fn apply(
                 playlist.capabilities.delete,
                 "You can’t delete this playlist.",
             )?;
-            api.delete_playlist(session, &playlist.id, playlist.revision)
-                .await?;
-            return Ok(Some(Route::Playlists));
+            (
+                PersonalCommand::DeletePlaylist {
+                    playlist_id: playlist.id.clone(),
+                },
+                Effect::Delete {
+                    id: playlist.id.clone(),
+                },
+            )
         }
         "add" => {
             let (track, playlist) = add_target(route, page, index)?;
-            api.add_playlist_track(session, &playlist.id, playlist.revision, track)
-                .await?;
-            return Ok(Some(Route::Playlist(playlist.id.clone())));
+            (
+                PersonalCommand::AddEntry {
+                    playlist_id: playlist.id.clone(),
+                    track_id: track.into(),
+                },
+                Effect::Add {
+                    id: playlist.id.clone(),
+                    track_id: track.into(),
+                    revision: playlist.revision,
+                    visit: true,
+                },
+            )
         }
         "remove" | "up" | "down" => {
             let playlist = current_playlist(route, page)?;
@@ -678,76 +742,47 @@ async fn apply(
                 playlist.kind == PlaylistKind::Manual && playlist.capabilities.edit_entries,
                 "Only tracks in a manual playlist can be removed or moved.",
             )?;
-            let entry = entry_id(selected(page, index)?, &playlist.id)?;
+            let (index, row) = selected(page, index)?;
+            let entry = entry_id(row, &playlist.id)?;
             if op == "remove" {
-                api.remove_playlist_entry(session, &playlist.id, playlist.revision, entry)
-                    .await?;
+                (
+                    PersonalCommand::RemoveEntry {
+                        playlist_id: playlist.id.clone(),
+                        entry_id: entry.into(),
+                    },
+                    Effect::Remove {
+                        id: playlist.id.clone(),
+                        entry_id: entry.into(),
+                        revision: playlist.revision,
+                    },
+                )
             } else {
-                let up = op == "up";
-                let mut order = retained_order(page, &playlist.id)?;
-                let total = page
-                    .total
-                    .or(playlist.available_count)
-                    .or(playlist.track_count);
-                let complete = !page.more && total.is_some_and(|total| order.len() as u64 == total);
-                if !complete {
-                    // This point-to-point read only runs when an explicit edit needs
-                    // the server's complete permutation, never on a timer or for nav.
-                    // Check the visible prefix against the result before writing.
-                    let mut fetched = Vec::new();
-                    loop {
-                        const LIMIT: u32 = 100;
-                        // The 64 KiB real server request cannot fit this many
-                        // generated 32-character entry IDs even if every ID is ASCII.
-                        const MAX_ENTRIES: u64 = (64 * 1024 - 64) / 35;
-                        if total.is_some_and(|total| total > MAX_ENTRIES) {
-                            return Err(error(
-                                "This playlist has too many tracks to reorder at once.",
-                            ));
-                        }
-                        let offset = fetched.len() as u32;
-                        let batch = api
-                            .manual_entries(
-                                session,
-                                &playlist.id,
-                                PageRequest {
-                                    offset,
-                                    limit: LIMIT,
-                                },
-                            )
-                            .await?;
-                        if total.is_some_and(|total| batch.total != total) {
-                            return Err(STALE_VIEW);
-                        }
-                        if batch.total > MAX_ENTRIES {
-                            return Err(error(
-                                "This playlist has too many tracks to reorder at once.",
-                            ));
-                        }
-                        let more =
-                            u64::from(batch.offset) + (batch.items.len() as u64) < batch.total;
-                        if batch.offset != offset || more && batch.items.is_empty() {
-                            return Err(STALE_VIEW);
-                        }
-                        fetched.extend(batch.items.into_iter().map(|item| item.id));
-                        if !more {
-                            break;
-                        }
-                    }
-                    if !fetched.starts_with(&order) {
-                        return Err(STALE_VIEW);
-                    }
-                    order = fetched;
-                }
-                if move_entry(&mut order, entry, up)? {
-                    api.reorder_playlist(session, &playlist.id, playlist.revision, &order)
-                        .await?;
-                }
+                let after = move_anchor(page, &playlist.id, index, entry, op == "up")?;
+                (
+                    PersonalCommand::MoveEntry {
+                        playlist_id: playlist.id.clone(),
+                        entry_id: entry.into(),
+                        after: after.into(),
+                    },
+                    Effect::Move {
+                        id: playlist.id.clone(),
+                        entry_id: entry.into(),
+                        after: after.into(),
+                        revision: playlist.revision,
+                    },
+                )
             }
         }
+        "clear-history" if matches!(route, Route::History) => {
+            (PersonalCommand::ClearHistory, Effect::ClearHistory)
+        }
         _ => return Err(error("That library action is not available here.")),
-    }
-    Ok(None)
+    };
+    require(
+        command.valid(),
+        "Review the playlist or track before trying again.",
+    )?;
+    Ok(Mutation { command, effect })
 }
 
 fn require(condition: bool, message: &'static str) -> Result<(), ApiError> {
@@ -779,10 +814,29 @@ fn current_definition<'a>(route: &Route, page: &'a Page) -> Result<&'a RuleDefin
         .ok_or(error("The rules aren’t available yet."))
 }
 
-fn selected(page: &Page, index: Option<usize>) -> Result<&Row, ApiError> {
+fn copy_source<'a>(route: &Route, page: &'a Page) -> Result<&'a PlaylistMetadata, ApiError> {
+    let playlist = current_playlist(route, page)?;
+    require(
+        playlist.kind == PlaylistKind::Derived && playlist.capabilities.copy_to_manual,
+        "This playlist can’t be copied to a manual playlist.",
+    )?;
+    Ok(playlist)
+}
+
+fn selected(page: &Page, index: Option<usize>) -> Result<(usize, &Row), ApiError> {
     index
-        .and_then(|index| page.rows.get(index))
+        .and_then(|index| page.rows.get(index).map(|row| (index, row)))
         .ok_or(error("Select an item first."))
+}
+
+fn picker_track<'a>(route: &'a Route, page: &Page) -> Result<&'a str, ApiError> {
+    let Route::Picker(track) = route else {
+        return Err(error("Choose a playlist to add the track to."));
+    };
+    if track.is_empty() || page.picker_track_id.as_ref() != Some(track) {
+        return Err(error("Select the track again before adding it."));
+    }
+    Ok(track)
 }
 
 fn add_target<'a>(
@@ -790,13 +844,8 @@ fn add_target<'a>(
     page: &'a Page,
     index: Option<usize>,
 ) -> Result<(&'a str, &'a PlaylistMetadata), ApiError> {
-    let Route::Picker(track) = route else {
-        return Err(error("Choose a playlist to add the track to."));
-    };
-    if track.is_empty() || page.picker_track_id.as_ref().is_some_and(|id| id != track) {
-        return Err(error("Select the track again before adding it."));
-    }
-    let row = selected(page, index)?;
+    let track = picker_track(route, page)?;
+    let (_, row) = selected(page, index)?;
     let playlist = row
         .playlist
         .as_ref()
@@ -821,29 +870,45 @@ fn entry_id<'a>(row: &'a Row, list_id: &str) -> Result<&'a str, ApiError> {
     }
 }
 
-fn retained_order(page: &Page, playlist_id: &str) -> Result<Vec<String>, ApiError> {
-    page.rows
-        .iter()
-        .map(|row| entry_id(row, playlist_id).map(str::to_owned))
-        .collect()
-}
-
-fn move_entry(order: &mut [String], entry: &str, up: bool) -> Result<bool, ApiError> {
-    let mut seen = HashSet::new();
-    if order.iter().any(|id| id.is_empty() || !seen.insert(id)) {
+/// One v3 move places the selected occurrence *after* its new predecessor.
+/// Moving up skips the previous row; moving down uses the next row as the anchor.
+fn move_anchor<'a>(
+    page: &'a Page,
+    playlist_id: &str,
+    index: usize,
+    entry: &str,
+    up: bool,
+) -> Result<&'a str, ApiError> {
+    let anchor = if up {
+        if index == 0 {
+            return Err(error("This track is already first in the playlist."));
+        }
+        let preceding = entry_id(&page.rows[index - 1], playlist_id)?;
+        if preceding == entry {
+            return Err(STALE_VIEW);
+        }
+        if index == 1 {
+            return Ok(""); // An explicit empty anchor is required by the wire protocol.
+        }
+        let anchor = entry_id(&page.rows[index - 2], playlist_id)?;
+        if anchor == preceding {
+            return Err(STALE_VIEW);
+        }
+        anchor
+    } else {
+        let next = page.rows.get(index + 1).ok_or_else(|| {
+            if page.more {
+                error("Load more tracks before moving this one down.")
+            } else {
+                error("This track is already last in the playlist.")
+            }
+        })?;
+        entry_id(next, playlist_id)?
+    };
+    if anchor == entry {
         return Err(STALE_VIEW);
     }
-    let current = order.iter().position(|id| id == entry).ok_or(STALE_VIEW)?;
-    let next = if up {
-        current.checked_sub(1)
-    } else {
-        current.checked_add(1)
-    };
-    let Some(next) = next.filter(|&index| index < order.len()) else {
-        return Ok(false);
-    };
-    order.swap(current, next);
-    Ok(true)
+    Ok(anchor)
 }
 
 fn write_condition(out: &mut String, level: usize, condition: &RulePredicate) {
@@ -906,13 +971,12 @@ fn write_condition(out: &mut String, level: usize, condition: &RulePredicate) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Api, Origin, library::PlaylistCapabilities};
+    use crate::api::library::PlaylistCapabilities;
     use serde_json::{Value, json};
-    use std::{future::Future, sync::Arc, time::Duration};
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-        net::TcpListener,
-    };
+
+    fn wire(mutation: &Mutation) -> Value {
+        serde_json::to_value(&mutation.command).unwrap()
+    }
 
     fn parse(text: &str) -> Result<RuleDefinition, ApiError> {
         RecipeParser::new(text)?.parse(None)
@@ -1067,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn reorder_swaps_occurrences_even_if_the_track_appears_twice() {
+    fn manual_commands_target_occurrences_even_when_tracks_repeat() {
         let row = |id: &str| Row {
             id: "same-track".into(),
             key: RowKey::ManualEntry {
@@ -1076,16 +1140,43 @@ mod tests {
             },
             ..Row::default()
         };
-        let page = Page {
-            rows: vec![row("entry-1"), row("entry-2")],
+        let route = Route::Playlist("list".into());
+        let mut page = Page {
+            rows: vec![row("entry-1"), row("entry-2"), row("entry-3")],
+            playlist: Some(playlist(PlaylistKind::Manual)),
+            more: true,
             ..Page::default()
         };
-        let mut order = retained_order(&page, "list").unwrap();
-        assert!(move_entry(&mut order, "entry-2", true).unwrap());
-        assert_eq!(order, ["entry-2", "entry-1"]);
-        assert!(!move_entry(&mut order, "entry-1", false).unwrap());
-        assert!(move_entry(&mut order, "same-track", true).is_err());
-        assert!(retained_order(&page, "other-list").is_err());
+        for (op, index, entry, after) in [
+            ("up", 1, "entry-2", ""),
+            ("up", 2, "entry-3", "entry-1"),
+            ("down", 1, "entry-2", "entry-3"),
+        ] {
+            let edit = mutation(&route, &page, op, Some(index), "").unwrap();
+            assert_eq!(
+                wire(&edit),
+                json!({
+                    "type": "moveEntry", "playlistId": "list", "entryId": entry, "after": after
+                })
+            );
+            assert!(
+                matches!(edit.effect, Effect::Move { id, entry_id, after: anchor, revision: 4 }
+                if id == "list" && entry_id == entry && anchor == after)
+            );
+        }
+        assert!(mutation(&route, &page, "up", Some(0), "").is_err());
+        assert!(mutation(&route, &page, "down", Some(2), "").is_err());
+        let removal = mutation(&route, &page, "remove", Some(1), "").unwrap();
+        assert_eq!(
+            wire(&removal),
+            json!({"type":"removeEntry", "playlistId":"list", "entryId":"entry-2"})
+        );
+        page.rows[1].key = RowKey::ManualEntry {
+            playlist_id: "another".into(),
+            entry_id: "entry-2".into(),
+        };
+        assert!(mutation(&route, &page, "remove", Some(1), "").is_err());
+        assert!(mutation(&route, &page, "down", Some(0), "").is_err());
     }
 
     #[test]
@@ -1101,77 +1192,22 @@ mod tests {
             ..Page::default()
         };
         let route = Route::Picker("track".into());
-        let (track, target) = add_target(&route, &page, Some(0)).unwrap();
+        let add = mutation(&route, &page, "add", Some(0), "").unwrap();
         assert_eq!(
-            (track, target.id.as_str(), target.revision),
-            ("track", "list", 4)
+            wire(&add),
+            json!({"type":"addEntry", "playlistId":"list", "trackId":"track"})
         );
-        assert!(add_target(&Route::Picker("another".into()), &page, Some(0)).is_err());
+        assert!(
+            matches!(add.effect, Effect::Add { id, track_id, revision: 4, visit: true }
+            if id == "list" && track_id == "track")
+        );
+        assert!(mutation(&Route::Picker("another".into()), &page, "add", Some(0), "").is_err());
         page.rows[0].playlist = Some(playlist(PlaylistKind::Derived));
-        assert!(add_target(&route, &page, Some(0)).is_err());
+        assert!(mutation(&route, &page, "add", Some(0), "").is_err());
     }
 
-    async fn wire_fixture() -> (Access, TcpListener) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = Origin::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-        let api = Arc::new(Api::new(origin).unwrap());
-        let access = Access {
-            session: api.test_session(),
-            api,
-            epoch: 1,
-            offline: false,
-            recent_change: 0,
-        };
-        (access, listener)
-    }
-
-    // In-process, one-shot HTTP fixture: no live service or UI. Capture the
-    // actual request sent by mutate.
-    async fn capture_write(
-        listener: TcpListener,
-        response: Value,
-        mutation: impl Future<Output = Result<Option<Route>, ApiError>>,
-    ) -> (String, Value) {
-        let server = async {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = BufReader::new(stream);
-            let mut request = String::new();
-            stream.read_line(&mut request).await.unwrap();
-            let mut length = None;
-            loop {
-                let mut header = String::new();
-                assert_ne!(stream.read_line(&mut header).await.unwrap(), 0);
-                if header == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = header.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = Some(value.trim().parse::<usize>().unwrap());
-                    }
-                }
-            }
-            let size = length.unwrap();
-            assert!(size < 4096);
-            let mut body = vec![0; size];
-            stream.read_exact(&mut body).await.unwrap();
-            let response = response.to_string();
-            stream.get_mut().write_all(format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()
-            ).as_bytes()).await.unwrap();
-            (request, serde_json::from_slice(&body).unwrap())
-        };
-        let (captured, result) = tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(server, mutation)
-        })
-        .await
-        .unwrap();
-        assert_eq!(result, Ok(None));
-        captured
-    }
-
-    #[tokio::test]
-    async fn description_only_patch_preserves_the_full_eighty_emoji_name() {
-        let (access, listener) = wire_fixture().await;
+    #[test]
+    fn description_only_edit_preserves_the_full_eighty_emoji_name() {
         let name = "🎵".repeat(80);
         let playlist = PlaylistMetadata {
             name: name.clone(),
@@ -1188,46 +1224,107 @@ mod tests {
         assert_eq!(draft.name, name);
         draft.description = "Changed description only".into();
         let envelope = json!({"name": draft.name, "description": draft.description, "definition": draft.definition}).to_string();
-        let summary = json!({
-            "id": "list", "name": name, "description": "Changed description only",
-            "kind": "manual", "countState": "exact", "trackCount": 2, "availableCount": 2,
-            "revision": 5, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:01Z",
-            "capabilities": {"editMetadata": true, "editEntries": true, "editDefinition": false,
-                "play": true, "copyToManual": false, "delete": true, "addTracks": true}
-        });
-        let (request, body) = capture_write(
-            listener,
-            summary,
-            mutate(&access, &route, &page, "rename", None, &envelope),
-        )
-        .await;
-        assert_eq!(request, "PATCH /api/me/playlists/list HTTP/1.1\r\n");
+        let edit = mutation(&route, &page, "rename", None, &envelope).unwrap();
         assert_eq!(
-            body,
-            json!({"name": name, "description": "Changed description only", "expectedRevision": 4})
+            wire(&edit),
+            json!({"type":"renamePlaylist", "playlistId":"list", "name":name, "description":"Changed description only"})
+        );
+        assert!(matches!(edit.effect, Effect::Rename { revision: 4, .. }));
+    }
+
+    #[test]
+    fn create_uses_definition_or_picker_track_as_appropriate() {
+        let envelope = json!({"name": "  A new list  ", "description": "Description", "definition": DEFAULT_RULES}).to_string();
+        let page = Page::default();
+        let manual = mutation(&Route::Playlists, &page, "new-manual", None, &envelope).unwrap();
+        let metadata =
+            json!({"type":"createPlaylist", "name":"A new list", "description":"Description"});
+        assert_eq!(wire(&manual), metadata);
+        let picker = Route::Picker("track".into());
+        let picker_page = Page {
+            picker_track_id: Some("track".into()),
+            ..Page::default()
+        };
+        let with_track = mutation(&picker, &picker_page, "new-manual", None, &envelope).unwrap();
+        let mut expected = metadata;
+        expected["trackId"] = json!("track");
+        assert_eq!(wire(&with_track), expected);
+        assert!(matches!(
+            with_track.effect,
+            Effect::Create {
+                kind: PlaylistKind::Manual,
+                has_track: true,
+                ..
+            }
+        ));
+        assert!(mutation(&picker, &picker_page, "new-rules", None, &envelope).is_err());
+        let rules = mutation(&Route::Playlists, &page, "new-rules", None, &envelope).unwrap();
+        let command = wire(&rules);
+        assert_eq!(command["type"], "createPlaylist");
+        assert_eq!(command["definition"]["sources"][0]["kind"], "allSaved");
+        assert!(command.get("trackId").is_none());
+        assert!(matches!(
+            rules.effect,
+            Effect::Create {
+                kind: PlaylistKind::Derived,
+                has_track: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rules_edit_keeps_slots_and_uses_the_v3_definition_command() {
+        let previous = parse(DEFAULT_RULES).unwrap();
+        let route = Route::Playlist("list".into());
+        let page = Page {
+            playlist: Some(playlist(PlaylistKind::Derived)),
+            definition: Some(previous.clone()),
+            ..Page::default()
+        };
+        let envelope = json!({"definition": "Source: Saved library\nSort: Title"}).to_string();
+        let edit = mutation(&route, &page, "rules", None, &envelope).unwrap();
+        let expected = RuleDefinition {
+            sort: RuleSort::Title,
+            ..previous
+        };
+        assert_eq!(
+            wire(&edit),
+            json!({"type":"setPlaylistRules", "playlistId":"list", "definition":expected})
+        );
+        assert!(
+            matches!(edit.effect, Effect::Rules { id, definition, revision: 4 }
+            if id == "list" && definition == expected)
         );
     }
 
-    #[tokio::test]
-    async fn retired_track_mutations_are_rejected_without_contacting_the_server() {
-        let (access, _listener) = wire_fixture().await;
-        let route = Route::Track("track".into());
+    #[test]
+    fn delete_requires_the_retained_playlist_and_retired_track_actions_stay_unavailable() {
         let page = Page {
-            rows: vec![Row {
-                id: "track".into(),
-                key: RowKey::Track("track".into()),
-                ..Row::default()
-            }],
+            playlist: Some(playlist(PlaylistKind::Manual)),
             ..Page::default()
         };
-        for operation in ["like", "unlike"] {
-            let error = tokio::time::timeout(
-                Duration::from_secs(1),
-                mutate(&access, &route, &page, operation, Some(0), ""),
+        let route = Route::Playlist("list".into());
+        let deletion = mutation(&route, &page, "delete", None, "").unwrap();
+        assert_eq!(
+            wire(&deletion),
+            json!({"type":"deletePlaylist", "playlistId":"list"})
+        );
+        assert!(
+            mutation(
+                &Route::Playlist("another".into()),
+                &page,
+                "delete",
+                None,
+                ""
             )
-            .await
-            .expect("retired mutation must not wait for an HTTP response")
-            .unwrap_err();
+            .is_err()
+        );
+        let route = Route::Track("track".into());
+        for operation in ["like", "unlike"] {
+            let error = mutation(&route, &page, operation, Some(0), "")
+                .err()
+                .unwrap();
             assert_eq!(error.message, "That library action is not available here.");
         }
     }

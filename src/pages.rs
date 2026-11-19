@@ -7,8 +7,6 @@
 //! `Row::playlist` (list/picker) provide ID, exact name, revision, counts and
 //! capabilities; `PlaylistMetadata::name`, `Page::definition`, and
 //! `Page::description` prefill editors. `Page::title` is display-only.
-//! `Page::pending_rules()` flags
-//! a saved rules playlist awaiting evaluation.
 //! `Page::kind` overrides the route kind with `playlist-manual` or `playlist-rules`
 //! on detail pages. `Row::playback` and `Page::playback` are server selection
 //! inputs, not queue keys or local audio authority. Never display signed inputs.
@@ -26,20 +24,18 @@ use crate::{
         },
     },
     desk::Access,
-    player,
+    personal, player,
 };
 
 pub const MAX_ROWS: usize = 500;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
     History,
     Search(String),
     Track(String),
     Album(String),
     Artist(String),
-    Albums,
-    Artists,
     Playlists,
     Playlist(String),
     Picker(String),
@@ -52,6 +48,13 @@ pub enum Route {
 }
 
 impl Route {
+    pub const fn personal(&self) -> bool {
+        matches!(
+            self,
+            Self::History | Self::Playlists | Self::Playlist(_) | Self::Picker(_)
+        )
+    }
+
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::History => "history",
@@ -59,8 +62,6 @@ impl Route {
             Self::Track(_) => "track",
             Self::Album(_) => "album",
             Self::Artist(_) => "artist",
-            Self::Albums => "albums",
-            Self::Artists => "artists",
             Self::Playlists => "playlists",
             Self::Playlist(_) => "playlist",
             Self::Picker(_) => "picker",
@@ -106,6 +107,75 @@ pub struct PlaylistMetadata {
     pub capabilities: PlaylistCapabilities,
 }
 
+/// A display label and its explicit, optional destination. This is separate
+/// from primary row activation and playback, which can have different targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credit {
+    pub name: String,
+    pub target: Option<Route>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MusicMetadata {
+    pub credits: Vec<Credit>,
+    pub album: Option<Credit>,
+}
+
+impl MusicMetadata {
+    fn from_catalog(item: &CatalogItem) -> Self {
+        let credits = item
+            .artists
+            .iter()
+            .filter_map(|credit| {
+                let target = music_route("artist", &credit.id);
+                let name = ui_text(&credit.name);
+                if target.is_none() && name.is_empty() {
+                    return None;
+                }
+                Some(Credit {
+                    name: if name.is_empty() {
+                        "Unknown artist".into()
+                    } else {
+                        name
+                    },
+                    target,
+                })
+            })
+            .collect();
+        // A release card already opens its own album; its metadata only links
+        // the credited artists, not its own title.
+        let album = (item.kind == CatalogKind::Track)
+            .then(|| {
+                let name = ui_text(&item.album_name);
+                let target = music_route("album", &item.album_id);
+                (target.is_some() || !name.is_empty()).then(|| Credit {
+                    name: if name.is_empty() {
+                        "Album details".into()
+                    } else {
+                        name
+                    },
+                    target,
+                })
+            })
+            .flatten();
+        Self { credits, album }
+    }
+}
+
+/// Go point-detail routes need one addressable segment. Never infer an ID
+/// from a label, nor reinterpret an opaque ID as a path or query string.
+pub(crate) fn music_route(kind: &str, id: &str) -> Option<Route> {
+    if !catalog::segment_id(id) {
+        return None;
+    }
+    match kind {
+        "artist" => Some(Route::Artist(id.into())),
+        "album" => Some(Route::Album(id.into())),
+        "track" => Some(Route::Track(id.into())),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
     pub kind: String,
@@ -114,8 +184,7 @@ pub struct Row {
     pub detail: String,
     pub playable: bool,
     pub id: String,
-    pub album_id: String,
-    pub artist_id: String,
+    pub music: MusicMetadata,
     pub key: RowKey,
     pub route: Option<Route>,
     pub playlist: Option<PlaylistMetadata>,
@@ -138,8 +207,7 @@ pub struct Page {
     /// Local status for unavailable rule evaluation or the cap.
     pub status: String,
     pub total: Option<u64>,
-    pub album_id: String,
-    pub artist_id: String,
+    pub music: MusicMetadata,
     pub picker_track_id: Option<String>,
     #[doc(hidden)]
     pub state: PageState,
@@ -269,7 +337,6 @@ pub struct PageState {
     next: Option<Next>,
     snapshot: Option<Snapshot>,
     used_cursors: HashSet<String>,
-    pending_rules: bool,
 }
 
 impl fmt::Debug for PageState {
@@ -287,12 +354,6 @@ enum Next {
 #[derive(Clone, PartialEq, Eq)]
 enum Snapshot {
     Catalog(u64),
-    Manual(u64),
-    Derived {
-        revision: u64,
-        fence: String,
-        available: u64,
-    },
 }
 
 const CHANGED: ApiError = ApiError {
@@ -310,7 +371,6 @@ const OFFLINE: ApiError = ApiError {
     expired: false,
     status: 0,
 };
-const MAX_SAFE_REVISION: u64 = 9_007_199_254_740_991;
 
 /// A continuation lost its snapshot. The actor may retain the old projection
 /// while scheduling a fresh first page instead of retrying the same cursor.
@@ -325,6 +385,20 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
     let (api, session) = (&access.api, &access.session);
     if session.is_expired() {
         return Err(EXPIRED);
+    }
+    if route.personal() {
+        // A read-only projection; navigation owns opening one playlist scope
+        // and the engine owns all wire I/O. No personal HTTP request can follow.
+        return Ok(access.personal.read(|status, replica| {
+            (status.epoch == access.epoch)
+                .then(|| personal_projection(route, replica))
+                .flatten()
+                .unwrap_or_else(|| Page {
+                    kind: route.kind().into(),
+                    status: "The account library has not loaded this page yet.".into(),
+                    ..Page::default()
+                })
+        }));
     }
     if access.offline
         && !matches!(
@@ -377,22 +451,6 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
     };
 
     match route {
-        Route::History => {
-            page.title = "History".into();
-            let result = api.history(session, request).await?;
-            let next = offset_next(
-                request,
-                result.offset,
-                result.limit,
-                result.items.len(),
-                result.total,
-            )?;
-            let rows = result.items.into_iter().map(history_row).collect();
-            page.append(rows, result.total, next, None, None)?;
-            if result.total > 0 {
-                page.subtitle = count_label(result.total, "play", "plays");
-            }
-        }
         Route::Search(query) => {
             page.title = "Search".into();
             if query.trim().is_empty() {
@@ -428,9 +486,8 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             let detail = api.catalog_detail(session, CatalogKind::Track, id).await?;
             let row = catalog_row(detail.item, None);
             page.title = row.title.clone();
-            page.subtitle = join_labels(&row.subtitle, &row.detail);
-            page.album_id = row.album_id.clone();
-            page.artist_id = row.artist_id.clone();
+            page.subtitle = row.detail.clone();
+            page.music = row.music.clone();
             page.playback = row.playback.clone();
             page.rows.push(row);
         }
@@ -445,11 +502,15 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
                 let detail = api.catalog_detail(session, kind, id).await?;
                 let row = catalog_row(detail.item, None);
                 page.title = row.title;
-                page.subtitle = join_labels(&row.subtitle, &row.detail);
-                page.album_id = row.album_id;
-                page.artist_id = row.artist_id;
-                page.state.snapshot = Some(Snapshot::Catalog(detail.revision));
+                page.subtitle = if album {
+                    row.detail
+                } else {
+                    join_labels(&row.subtitle, &row.detail)
+                };
+                page.music = row.music;
                 page.playback = row.playback;
+                // These are two separate Go transactions. Only the child
+                // listing's revision fences its subsequent offsets.
             }
             let result = if album {
                 api.album_tracks(session, id, request).await?
@@ -465,68 +526,10 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             };
             project_catalog(&mut page, request, result, context)?;
         }
-        Route::Albums | Route::Artists => {
-            let (kind, title) = if matches!(route, Route::Albums) {
-                (CatalogKind::Album, "Albums")
-            } else {
-                (CatalogKind::Artist, "Artists")
-            };
-            page.title = title.into();
-            let result = api.catalog(session, kind, request).await?;
-            page.subtitle = count_label(result.total, kind.singular(), kind.plural());
-            project_catalog(&mut page, request, result, None)?;
+        Route::History | Route::Playlists | Route::Playlist(_) | Route::Picker(_) => {
+            // Only the account socket can supply these projections.
+            return Err(CHANGED);
         }
-        Route::Playlists | Route::Picker(_) => {
-            let picker = if let Route::Picker(track_id) = route {
-                if !valid_id(track_id) {
-                    return Err(CHANGED);
-                }
-                page.picker_track_id = Some(track_id.clone());
-                true
-            } else {
-                false
-            };
-            page.title = if picker {
-                "Add to playlist"
-            } else {
-                "Playlists"
-            }
-            .into();
-            if picker {
-                page.subtitle = "Choose a playlist you can edit".into();
-            }
-            let result = api
-                .playlists(session, picker.then_some(PlaylistKind::Manual), request)
-                .await?;
-            let next = offset_next(
-                request,
-                result.offset,
-                result.limit,
-                result.items.len(),
-                result.total,
-            )?;
-            let rows = result
-                .items
-                .into_iter()
-                .filter_map(|summary| {
-                    if picker
-                        && (summary.kind != PlaylistKind::Manual
-                            || !summary.capabilities.add_tracks)
-                    {
-                        return None;
-                    }
-                    let mut row = playlist_row(summary);
-                    if picker {
-                        row.playable = false;
-                        row.playback = None;
-                        row.route = None;
-                    }
-                    Some(row)
-                })
-                .collect();
-            page.append(rows, result.total, next, None, None)?;
-        }
-        Route::Playlist(id) => load_playlist(access, &mut page, id, request, cursor).await?,
         // The actor supplies local/offline and live player projections.
         Route::Offline => page.title = "Offline".into(),
         Route::SavedCollection(_) => page.title = "Saved collection".into(),
@@ -571,11 +574,6 @@ pub fn search_downloads(downloads: &Page, query: &str) -> Page {
 }
 
 impl Page {
-    /// Only pending or stale evaluations warrant a bounded automatic recheck.
-    pub fn pending_rules(&self) -> bool {
-        self.state.pending_rules
-    }
-
     /// Commit only validated progress. Stable keys deliberately distinguish repeated
     /// songs in History and in playlists, while disallowing overlapping windows.
     fn append(
@@ -674,73 +672,126 @@ fn project_catalog(
     )
 }
 
-async fn load_playlist(
-    access: &Access,
-    page: &mut Page,
-    id: &str,
-    request: PageRequest,
-    cursor: Option<String>,
-) -> Result<(), ApiError> {
-    let (api, session) = (&access.api, &access.session);
-    let metadata = if let Some(metadata) = &page.playlist {
-        metadata.clone()
-    } else {
-        let summary = api.playlist(session, id).await?;
-        let metadata = apply_playlist_summary(page, &summary);
-        if metadata.kind == PlaylistKind::Derived && metadata.capabilities.edit_definition {
-            let definition = api.playlist_definition(session, id).await?;
-            if definition.revision != metadata.revision {
-                return Err(CHANGED);
-            }
-            page.definition = Some(definition.definition);
-        }
-        metadata
-    };
-    match metadata.kind {
-        PlaylistKind::Manual => {
-            let result = api.manual_entries(session, id, request).await?;
-            // Offset pages don't expose a revision. Confirm only this bounded read,
-            // never load a full remote collection just to render or start playback.
-            let confirmed = api.playlist(session, id).await?;
-            if confirmed.revision != metadata.revision
-                || confirmed.kind != metadata.kind
-                || confirmed
+pub fn personal_projection(route: &Route, replica: &personal::Replica) -> Option<Page> {
+    match route {
+        Route::History => replica.snapshot().map(|s| recent(&s.recent)),
+        Route::Playlists | Route::Picker(_) => replica
+            .snapshot()
+            .map(|s| personal_list(route, &s.playlists)),
+        Route::Playlist(id) => replica.playlist().filter(|p| &p.summary.id == id).map(|p| {
+            personal_playlist(
+                &p.summary,
+                p.definition.as_ref(),
+                &p.rows,
+                p.summary
                     .track_count
-                    .is_some_and(|count| count != result.total)
-            {
-                return Err(CHANGED);
-            }
-            let next = offset_next(
-                request,
-                result.offset,
-                result.limit,
-                result.items.len(),
-                result.total,
-            )?;
-            let context = context_for(ContextKind::Playlist, id, &page.title);
-            page.playback = (metadata.capabilities.play
-                && metadata.available_count.unwrap_or(0) > 0)
-                .then(|| collection(&context));
-            let rows = result
-                .items
-                .into_iter()
-                .map(|entry| manual_row(entry, &context, metadata.capabilities.play))
-                .collect();
-            page.append(
-                rows,
-                result.total,
-                next,
-                Some(Snapshot::Manual(metadata.revision)),
-                None,
+                    .is_some_and(|count| count > p.rows.len() as u64),
             )
-        }
-        PlaylistKind::Derived => {
-            let result = api
-                .derived_entries(session, id, request.limit, cursor.as_deref())
-                .await?;
-            project_derived(page, &metadata, result, cursor)
-        }
+        }),
+        _ => None,
     }
+}
+
+fn recent(entries: &[library::HistoryEntry]) -> Page {
+    Page {
+        kind: "history".into(),
+        title: "History".into(),
+        subtitle: "Recent plays".into(),
+        total: Some(entries.len() as u64),
+        rows: entries.iter().cloned().map(history_row).collect(),
+        ..Page::default()
+    }
+}
+
+pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
+    let picker = matches!(route, Route::Picker(_));
+    let mut page = Page {
+        kind: route.kind().into(),
+        title: if picker {
+            "Add to playlist"
+        } else {
+            "Playlists"
+        }
+        .into(),
+        ..Page::default()
+    };
+    if let Route::Picker(track_id) = route {
+        if !valid_id(track_id) {
+            page.status = "This track cannot be added to a playlist.".into();
+            return page;
+        }
+        page.picker_track_id = Some(track_id.clone());
+        page.subtitle = "Choose a playlist you can edit".into();
+    }
+    page.rows = summaries
+        .iter()
+        .filter(|p| !picker || (p.kind == PlaylistKind::Manual && p.capabilities.add_tracks))
+        .take(MAX_ROWS)
+        .cloned()
+        .map(|summary| {
+            let mut row = playlist_row(summary);
+            if picker {
+                row.playable = false;
+                row.playback = None;
+                row.route = None;
+            }
+            row
+        })
+        .collect();
+    // The wire carries no total, so 100 summaries is not proof there are more.
+    if summaries.len() == 100 {
+        page.status = "The account snapshot shows up to 100 playlists.".into();
+    }
+    page
+}
+
+pub fn personal_playlist(
+    summary: &PlaylistSummary,
+    definition: Option<&RuleDefinition>,
+    entries: &[library::ManualEntry],
+    truncated: bool,
+) -> Page {
+    let mut page = Page::default();
+    let metadata = apply_playlist_summary(&mut page, summary);
+    page.definition = definition.cloned();
+    page.total = summary.track_count.or(Some(entries.len() as u64));
+    let derived = metadata.kind == PlaylistKind::Derived;
+    let ready = !derived || summary.evaluation_state == Some(EvaluationState::Ready);
+    let allow_play = ready && metadata.capabilities.play;
+    let context = context_for(
+        if derived {
+            ContextKind::Derived
+        } else {
+            ContextKind::Playlist
+        },
+        &metadata.id,
+        &page.title,
+    );
+    if allow_play && metadata.available_count.unwrap_or(0) > 0 {
+        page.playback = Some(collection(&context));
+    }
+    page.rows = entries
+        .iter()
+        .take(MAX_ROWS)
+        .cloned()
+        .map(|entry| {
+            if derived {
+                derived_row(entry, &context, allow_play)
+            } else {
+                manual_row(entry, &context, allow_play)
+            }
+        })
+        .collect();
+    if !ready {
+        page.status = match summary.evaluation_state {
+            Some(EvaluationState::Error) => "Songs aren't available for this playlist right now.",
+            _ => "This playlist is still updating.",
+        }
+        .into();
+    } else if truncated || entries.len() > MAX_ROWS {
+        page.status = "Showing the first 500 songs.".into();
+    }
+    page
 }
 
 fn apply_playlist_summary(page: &mut Page, summary: &PlaylistSummary) -> PlaylistMetadata {
@@ -756,75 +807,6 @@ fn apply_playlist_summary(page: &mut Page, summary: &PlaylistSummary) -> Playlis
     let metadata = playlist_metadata(summary);
     page.playlist = Some(metadata.clone());
     metadata
-}
-
-fn project_derived(
-    page: &mut Page,
-    metadata: &PlaylistMetadata,
-    result: library::DerivedPage,
-    cursor: Option<String>,
-) -> Result<(), ApiError> {
-    if result.revision.is_some_and(|r| r != metadata.revision) {
-        return Err(CHANGED);
-    }
-    page.state.pending_rules = matches!(
-        result.evaluation_state,
-        Some(EvaluationState::Pending | EvaluationState::Stale)
-    );
-    let ready = result.complete && result.evaluation_state == Some(EvaluationState::Ready);
-    let context = if ready {
-        let revision = result
-            .revision
-            .filter(|rev| (1..=MAX_SAFE_REVISION).contains(rev))
-            .ok_or(CHANGED)?;
-        if !opaque(&result.fence, 4096)
-            || result
-                .items
-                .iter()
-                .enumerate()
-                .any(|(index, item)| item.position != (page.rows.len() + index) as u64)
-            || (result.next_cursor.is_some()
-                != (((page.rows.len() + result.items.len()) as u64) < result.total))
-        {
-            return Err(CHANGED);
-        }
-        Some(Arc::new(PlaybackContext {
-            kind: ContextKind::Derived,
-            id: metadata.id.clone(),
-            name: page.title.clone(),
-            revision: Some(revision),
-            fence: Some(result.fence.clone()),
-        }))
-    } else {
-        if cursor.is_some() {
-            return Err(CHANGED);
-        }
-        page.status = match result.evaluation_state {
-            Some(EvaluationState::Error) => "Songs aren't available for this playlist right now.",
-            _ => "This playlist is still updating.",
-        }
-        .into();
-        None
-    };
-    let snapshot = context.as_ref().map(|_| Snapshot::Derived {
-        revision: metadata.revision,
-        fence: result.fence,
-        available: result.available_total,
-    });
-    let next = if ready {
-        result.next_cursor.map(Next::Cursor)
-    } else {
-        None
-    };
-    let playable_context =
-        context.filter(|_| metadata.capabilities.play && result.available_total > 0);
-    page.playback = playable_context.as_ref().map(collection);
-    let rows = result
-        .items
-        .into_iter()
-        .map(|entry| derived_row(entry, &metadata.id, playable_context.as_ref()))
-        .collect();
-    page.append(rows, result.total, next, snapshot, cursor)
 }
 
 fn context_for(kind: ContextKind, id: &str, name: &str) -> Arc<PlaybackContext> {
@@ -864,44 +846,24 @@ fn catalog_row(item: CatalogItem, context: Option<&Arc<PlaybackContext>>) -> Row
             CatalogKind::Artist => "Unknown artist",
         },
     );
-    let artist_names = list_label(item.artists.iter().map(|credit| credit.name.as_str()));
-    let artist_id = if kind == CatalogKind::Artist {
-        id.clone()
-    } else {
-        item.artists
-            .iter()
-            .find(|credit| valid_id(&credit.id))
-            .map(|credit| credit.id.clone())
-            .unwrap_or_default()
-    };
-    let album_id = if kind == CatalogKind::Album {
-        id.clone()
-    } else {
-        item.album_id.clone()
-    };
+    let music = MusicMetadata::from_catalog(&item);
+    let artist_names = list_label(music.credits.iter().map(|credit| credit.name.as_str()));
     let mut row = Row {
         kind: kind.singular().into(),
         title,
         id: id.clone(),
-        album_id,
-        artist_id,
+        music,
+        route: music_route(kind.singular(), &id),
         ..Row::default()
     };
     match kind {
         CatalogKind::Track => {
             row.key = RowKey::Track(id.clone());
-            row.route = Some(Route::Track(id.clone()));
             row.subtitle = artist_names;
-            let album = ui_text(&item.album_name);
-            let availability = if item.has_audio {
+            row.detail = if item.has_audio {
                 duration_label(item.duration_ms)
             } else {
                 "Unavailable".into()
-            };
-            row.detail = if context.is_some_and(|context| context.kind == ContextKind::Album) {
-                availability
-            } else {
-                join_labels(&album, &availability)
             };
             row.playable = item.has_audio;
             row.playback = row.playable.then(|| track_selection(&id, context));
@@ -911,7 +873,7 @@ fn catalog_row(item: CatalogItem, context: Option<&Arc<PlaybackContext>>) -> Row
                     name: row.title.clone(),
                     kind: row.kind.clone(),
                     artists: row.subtitle.clone(),
-                    album_name: album,
+                    album_name: ui_text(&item.album_name),
                     duration_ms: item.duration_ms,
                     has_audio: true,
                     track_number: item.track_number,
@@ -920,23 +882,14 @@ fn catalog_row(item: CatalogItem, context: Option<&Arc<PlaybackContext>>) -> Row
             }
         }
         CatalogKind::Album | CatalogKind::Artist => {
-            let (key, route, kind) = if matches!(kind, CatalogKind::Album) {
+            let (key, kind) = if matches!(kind, CatalogKind::Album) {
                 row.subtitle = artist_names;
-                (
-                    RowKey::Album(id.clone()),
-                    Route::Album(id.clone()),
-                    ContextKind::Album,
-                )
+                (RowKey::Album(id.clone()), ContextKind::Album)
             } else {
                 row.subtitle = list_label(item.genres.iter().map(String::as_str));
-                (
-                    RowKey::Artist(id.clone()),
-                    Route::Artist(id.clone()),
-                    ContextKind::Artist,
-                )
+                (RowKey::Artist(id.clone()), ContextKind::Artist)
             };
             row.key = key;
-            row.route = Some(route);
             let year = item
                 .release_date
                 .get(..4)
@@ -968,8 +921,7 @@ fn history_row(entry: library::HistoryEntry) -> Row {
     if entry.metadata_missing {
         row.title = "Unavailable track".into();
         row.id.clear();
-        row.album_id.clear();
-        row.artist_id.clear();
+        row.music = MusicMetadata::default();
         row.subtitle.clear();
         row.detail.clear();
         row.playable = false;
@@ -1009,23 +961,21 @@ fn manual_row(
 }
 
 fn derived_row(
-    entry: library::DerivedEntry,
-    id: &str,
-    context: Option<&Arc<PlaybackContext>>,
+    entry: library::ManualEntry,
+    context: &Arc<PlaybackContext>,
+    allow_play: bool,
 ) -> Row {
-    let mut row = catalog_row(entry.track, context);
+    let mut row = catalog_row(entry.track, Some(context));
     row.key = RowKey::DerivedOccurrence {
-        playlist_id: id.into(),
-        occurrence_id: entry.occurrence_id.clone(),
+        playlist_id: context.id.clone(),
+        occurrence_id: entry.id.clone(),
     };
     row.position = Some(entry.position);
-    let token = entry.selection_token.filter(|value| opaque(value, 8192));
-    row.playable &= context.is_some() && token.is_some() && opaque(&entry.occurrence_id, 4096);
+    row.playable &= allow_play && opaque(&entry.id, 4096);
     if row.playable {
         if let Some(PlaybackSelection::Track { track, .. }) = &mut row.playback {
-            track.target_id = Some(id.into());
-            track.occurrence_id = Some(entry.occurrence_id);
-            track.selection_token = token;
+            track.target_id = Some(context.id.clone());
+            track.occurrence_id = Some(entry.id);
         }
     } else {
         row.playback = None;
@@ -1175,7 +1125,7 @@ mod tests {
     fn track() -> CatalogItem {
         CatalogItem {
             kind: CatalogKind::Track,
-            id: "track/音".into(),
+            id: "track%2F音".into(),
             name: format!("Music\u{202e}\u{001b}{}", "音".repeat(200)),
             artists: vec![
                 ArtistCredit {
@@ -1183,12 +1133,16 @@ mod tests {
                     name: "Name only".into(),
                 },
                 ArtistCredit {
-                    id: "artist/1".into(),
+                    id: "artist%2F1".into(),
                     name: "Artist".into(),
+                },
+                ArtistCredit {
+                    id: "artist-2".into(),
+                    name: "Guest".into(),
                 },
             ],
             genres: vec![],
-            album_id: "album/1".into(),
+            album_id: "album%2F1".into(),
             album_name: "Album".into(),
             album_type: String::new(),
             release_date: String::new(),
@@ -1221,21 +1175,48 @@ mod tests {
         let row = catalog_row(track(), None);
         assert!(row.title.len() <= 256);
         assert!(!row.title.contains(['\u{202e}', '\u{001b}']));
-        assert_eq!(row.artist_id, "artist/1");
-        assert_eq!(row.album_id, "album/1");
-        assert_eq!(row.subtitle, "Name only, Artist");
-        assert_eq!(row.detail, "Album · 1:01");
+        assert_eq!(row.music.credits.len(), 3);
+        assert_eq!(row.music.credits[0].target, None);
+        assert_eq!(
+            row.music.credits[1].target,
+            Some(Route::Artist("artist%2F1".into()))
+        );
+        assert_eq!(
+            row.music.credits[2].target,
+            Some(Route::Artist("artist-2".into()))
+        );
+        assert_eq!(
+            row.music.album.as_ref().unwrap().target,
+            Some(Route::Album("album%2F1".into()))
+        );
+        assert_eq!(row.subtitle, "Name only, Artist, Guest");
+        assert_eq!(row.detail, "1:01");
         assert_eq!(row.item.as_ref().unwrap().name, row.title);
-        assert_eq!(row.route, Some(Route::Track("track/音".into())));
+        assert_eq!(row.route, Some(Route::Track("track%2F音".into())));
         assert_eq!(
             selection(&row),
-            json!({"kind":"track", "track":{"id":"track/音"}})
+            json!({"kind":"track", "track":{"id":"track%2F音"}})
         );
     }
 
     #[test]
+    fn detail_links_do_not_guess_from_names_or_unsupported_path_ids() {
+        let mut item = track();
+        item.id = "track/音".into();
+        item.album_id.clear();
+        item.artists[1].id = "artist/1".into(); // Go's oneSegment rejects this ID.
+        let row = catalog_row(item, None);
+        assert!(row.route.is_none());
+        assert_eq!(row.music.credits[1].name, "Artist");
+        assert!(row.music.credits[1].target.is_none());
+        assert_eq!(row.music.album.as_ref().unwrap().name, "Album");
+        assert!(row.music.album.as_ref().unwrap().target.is_none());
+        assert_eq!(selection(&row)["track"]["id"], "track/音");
+    }
+
+    #[test]
     fn rows_in_album_keep_their_collection_context() {
-        let album = context_for(ContextKind::Album, "album/1", "Album");
+        let album = context_for(ContextKind::Album, "album%2F1", "Album");
         let row = catalog_row(track(), Some(&album));
         assert_eq!(
             row.playback
@@ -1244,7 +1225,7 @@ mod tests {
                 .context()
                 .unwrap()
                 .info_route(),
-            Route::Album("album/1".into())
+            Route::Album("album%2F1".into())
         );
         assert_eq!(selection(&row)["context"]["kind"], "album");
         assert_eq!(row.detail, "1:01");
@@ -1277,7 +1258,7 @@ mod tests {
         assert_eq!(b.position, Some(1));
         assert_eq!(
             selection(&b),
-            json!({"kind":"track", "track":{"id":"track/音","entryId":"entry2"},
+            json!({"kind":"track", "track":{"id":"track%2F音","entryId":"entry2"},
             "context":{"kind":"playlist","id":"mix","name":"Mix"}})
         );
         let mut page = Page::default();
@@ -1334,92 +1315,40 @@ mod tests {
         assert_eq!(row.playlist.unwrap().name, name);
     }
 
-    fn rule_page(pos: u64, state: EvaluationState, fence: &str) -> library::DerivedPage {
-        library::DerivedPage {
-            items: vec![library::DerivedEntry {
-                occurrence_id: format!("source/{pos}"),
-                selection_token: Some("signed-secret".into()),
-                position: pos,
-                track: track(),
-            }],
-            total: 2,
-            available_total: 2,
-            limit: 1,
-            next_cursor: (pos == 0).then(|| "cursor-secret".into()),
-            revision: Some(12),
-            fence: fence.into(),
-            complete: state == EvaluationState::Ready,
-            evaluation_state: Some(state),
-            evaluation_error_code: None,
-        }
-    }
-
     #[test]
-    fn only_pending_and_stale_rules_request_an_automatic_recheck() {
-        assert!(!Page::default().pending_rules());
-        for (state, pending) in [
-            (EvaluationState::Pending, true),
-            (EvaluationState::Stale, true),
-            (EvaluationState::Ready, false),
-            (EvaluationState::Error, false),
-        ] {
-            let mut page = Page::default();
-            project_derived(
-                &mut page,
-                &rule_metadata(),
-                rule_page(0, state, "fence"),
-                None,
-            )
-            .unwrap();
-            assert_eq!(page.pending_rules(), pending, "{state:?}");
-        }
-    }
-
-    #[test]
-    fn derived_context_is_fenced_playable_only_when_ready_and_redacted() {
-        let mut page = Page {
-            title: "Mix".into(),
-            ..Page::default()
-        };
+    fn derived_selection_uses_server_occurrence_without_legacy_credentials() {
         let metadata = rule_metadata();
-        project_derived(
-            &mut page,
-            &metadata,
-            rule_page(0, EvaluationState::Ready, "signed-fence"),
-            None,
-        )
-        .unwrap();
+        let mut summary = PlaylistSummary {
+            id: metadata.id,
+            name: "Mix".into(),
+            description: String::new(),
+            kind: metadata.kind,
+            count_state: library::CountState::Exact,
+            evaluation_state: Some(EvaluationState::Ready),
+            evaluation_error_code: None,
+            track_count: Some(1),
+            available_count: Some(1),
+            capabilities: metadata.capabilities,
+            revision: metadata.revision,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let entries = [library::ManualEntry {
+            id: "o1_source".into(),
+            position: 0,
+            track: track(),
+        }];
+        let page = personal_playlist(&summary, None, &entries, false);
         assert_eq!(
             selection(&page.rows[0]),
             json!({"kind":"track",
-            "track":{"id":"track/音","targetId":"mix","occurrenceId":"source/0","selectionToken":"signed-secret"},
-            "context":{"kind":"derived","id":"mix","name":"Mix","revision":12,"fence":"signed-fence"}})
+            "track":{"id":"track%2F音","targetId":"mix","occurrenceId":"o1_source"},
+            "context":{"kind":"derived","id":"mix","name":"Mix"}})
         );
         let context = page.playback.as_ref().unwrap().context().unwrap();
         assert_eq!(context.info_route(), Route::Playlist("mix".into()));
-        for secret in ["signed-secret", "signed-fence", "cursor-secret"] {
-            assert!(!format!("{page:?}").contains(secret));
-        }
-        assert_eq!(
-            project_derived(
-                &mut page,
-                &metadata,
-                rule_page(1, EvaluationState::Ready, "other-fence"),
-                Some("cursor-secret".into())
-            ),
-            Err(CHANGED)
-        );
-        assert_eq!(page.rows.len(), 1);
-
-        let mut stale = Page::default();
-        project_derived(
-            &mut stale,
-            &metadata,
-            rule_page(0, EvaluationState::Stale, "signed-fence"),
-            None,
-        )
-        .unwrap();
-        assert!(!stale.more);
+        summary.evaluation_state = Some(EvaluationState::Stale);
+        let stale = personal_playlist(&summary, None, &entries, false);
         assert!(stale.playback.is_none());
         assert!(!stale.rows[0].playable);
         assert!(stale.rows[0].playback.is_none());

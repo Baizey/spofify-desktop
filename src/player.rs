@@ -1,84 +1,49 @@
 //! Playback intents and a local-only queue. The online server owns its queue;
 //! commands contain canonical selection identifiers, never client media or paths.
 use crate::socket;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-/// Per-execution capability shared with the decoder. Revocation is permanent
-/// for every clone. An offline grant has no server deadline and is revoked on
-/// every source/mode change; the audio source also checks the app epoch.
+/// Irreversible per-run revocation, independent of the room's output grant.
+/// A socket loss can leave an already-audible run permitted, but cannot admit a
+/// source which has never produced a sample. Offline output has its own scope.
 #[derive(Clone)]
 pub struct Authority {
-    permit: Arc<Mutex<Permit>>,
-    link: Option<(
-        tokio::sync::watch::Receiver<socket::Link>,
-        socket::Generation,
-    )>,
-}
-enum Permit {
-    Until(Instant),
-    Offline,
-    Revoked,
+    revoked: Arc<AtomicBool>,
+    output: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    start: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 impl Authority {
-    #[cfg(test)]
-    pub fn new(deadline: Instant) -> Self {
-        Self {
-            permit: Arc::new(Mutex::new(Permit::Until(deadline))),
-            link: None,
-        }
-    }
     pub(crate) fn online(
-        deadline: Instant,
-        link: tokio::sync::watch::Receiver<socket::Link>,
-        generation: socket::Generation,
+        output: impl Fn() -> bool + Send + Sync + 'static,
+        start: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
-            permit: Arc::new(Mutex::new(Permit::Until(deadline))),
-            link: Some((link, generation)),
+            revoked: Arc::default(),
+            output: Some(Arc::new(output)),
+            start: Some(Arc::new(start)),
         }
     }
     pub fn offline() -> Self {
         Self {
-            permit: Arc::new(Mutex::new(Permit::Offline)),
-            link: None,
+            revoked: Arc::default(),
+            output: None,
+            start: None,
         }
-    }
-    fn live_link(&self) -> bool {
-        self.link.as_ref().is_none_or(|(link, generation)| {
-            link.has_changed().is_ok() && *link.borrow() == socket::Link::Connected(*generation)
-        })
-    }
-    pub fn renew_until(&self, deadline: Instant) -> bool {
-        self.live_link()
-            && self.permit.lock().is_ok_and(|mut permit| match *permit {
-                Permit::Until(old) if Instant::now() < old => {
-                    *permit = Permit::Until(old.max(deadline));
-                    true
-                }
-                _ => false,
-            })
     }
     pub fn revoke(&self) {
-        if let Ok(mut permit) = self.permit.lock() {
-            *permit = Permit::Revoked;
-        }
+        self.revoked.store(true, Ordering::Release);
     }
     pub fn is_valid(&self) -> bool {
-        self.is_valid_at(Instant::now())
+        !self.revoked.load(Ordering::Acquire) && self.output.as_ref().is_none_or(|f| f())
     }
-    pub fn is_valid_at(&self, now: Instant) -> bool {
-        self.live_link()
-            && self.permit.lock().is_ok_and(|permit| match *permit {
-                Permit::Until(deadline) => now < deadline,
-                Permit::Offline => true,
-                Permit::Revoked => false,
-            })
+    pub fn may_start(&self) -> bool {
+        self.is_valid() && self.start.as_ref().is_none_or(|f| f())
     }
 }
 
@@ -89,18 +54,7 @@ pub enum Status {
     Media,
     Rejected,
 }
-impl Status {
-    pub fn wire(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Blocked => "blocked",
-            Self::Media => "media",
-            Self::Rejected => "rejected",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Repeat {
     #[default]
@@ -225,9 +179,8 @@ pub enum Action {
     },
 }
 
-const SAFE: u64 = 9_007_199_254_740_991;
-fn key(k: u64) -> bool {
-    (1..=SAFE).contains(&k)
+pub(crate) fn key(k: u64) -> bool {
+    (1..(1 << 52)).contains(&k)
 }
 fn text(s: &str, max: usize) -> bool {
     s.len() <= max && !s.chars().any(char::is_control)
@@ -245,11 +198,6 @@ impl Context {
             "album" | "artist" | "playlist" | "likes" | "derived"
         ) && id(&self.id, 512)
             && text(&self.name, 512)
-            && self.revision.is_none_or(|r| r <= SAFE)
-            && self.fence.as_ref().is_none_or(|f| text(f, 4096))
-            && (self.kind != "derived"
-                || (self.revision.is_some_and(|r| r > 0)
-                    && self.fence.as_ref().is_some_and(|f| !f.is_empty())))
     }
 }
 impl Selection {
@@ -265,7 +213,6 @@ impl Selection {
                             track.entry_id.is_none()
                                 && track.target_id.as_ref() == context.as_ref().map(|c| &c.id)
                                 && track.occurrence_id.as_ref().is_some_and(|v| id(v, 4096))
-                                && track.selection_token.as_ref().is_some_and(|v| id(v, 8192))
                         }
                         kind => {
                             track.target_id.is_none()
@@ -282,43 +229,41 @@ impl Selection {
         }
     }
 }
-impl Context {
-    fn into_wire(self) -> socket::Context {
-        use socket::ContextKind as K;
-        let kind = match self.kind.as_str() {
-            "album" => K::Album,
-            "artist" => K::Artist,
-            "playlist" => K::Playlist,
-            "likes" => K::Likes,
-            "derived" => K::Derived,
-            _ => unreachable!("validated context kind"),
-        };
-        socket::Context {
-            kind,
-            id: self.id,
-            name: self.name,
-            revision: self.revision,
-            fence: self.fence,
-        }
-    }
-}
 impl Selection {
     fn into_wire(self) -> socket::Selection {
+        // Browse fences and signed preview tokens are HTTP-only; the account
+        // resolver looks up the actual occurrence using current stored state.
+        fn context(c: Context) -> socket::Context {
+            socket::Context {
+                kind: match c.kind.as_str() {
+                    "album" => socket::ContextKind::Album,
+                    "artist" => socket::ContextKind::Artist,
+                    "playlist" => socket::ContextKind::Playlist,
+                    "likes" => socket::ContextKind::Likes,
+                    "derived" => socket::ContextKind::Derived,
+                    _ => unreachable!("validated context kind"),
+                },
+                id: c.id,
+                name: c.name,
+            }
+        }
         match self {
-            Self::Track { track, context } => socket::Selection::Track {
+            Self::Track {
+                track,
+                context: source,
+            } => socket::Selection::Track {
                 track: socket::TrackRef {
                     id: track.id,
                     entry_id: track.entry_id,
                     target_id: track.target_id,
                     occurrence_id: track.occurrence_id,
-                    selection_token: track.selection_token,
                 },
-                context: context.map(Context::into_wire),
+                context: source.map(context),
             },
-            Self::Collection { context } => socket::Selection::Collection {
-                context: context.into_wire(),
+            Self::Collection { context: source } => socket::Selection::Collection {
+                context: context(source),
             },
-            Self::Occurrence { key } => socket::Selection::Occurrence { key },
+            Self::Occurrence { .. } => unreachable!("occurrences are addressed by jump"),
         }
     }
 }
@@ -341,90 +286,74 @@ impl Action {
                 }
         )
     }
-    /// Expected state version is required for operations whose meaning depends
-    /// on the displayed current occurrence/queue, not on a catalog selection.
-    pub(crate) fn wire(self) -> Option<(socket::Command, bool)> {
-        use socket::{Command as C, Intent as I};
+    pub(crate) fn wire(self, own_device: &str) -> Option<socket::Command> {
+        use socket::{Command as C, Intent};
         Some(match self {
-            Self::Play { selection, shuffle } if selection.valid() => {
-                let collection = matches!(selection, Selection::Collection { .. });
-                if shuffle && !collection {
+            Self::Play {
+                selection: Selection::Occurrence { key: k },
+                ..
+            } => {
+                if !key(k) {
                     return None;
                 }
-                let guarded = matches!(selection, Selection::Occurrence { .. });
-                (
-                    C::QueueIntent {
-                        intent: I::Now,
-                        selection: selection.into_wire(),
-                        shuffle: collection.then_some(shuffle),
-                    },
-                    guarded,
-                )
+                C::Jump { key: k }
             }
+            Self::Play { selection, shuffle } if selection.valid() => C::Play {
+                selection: selection.into_wire(),
+                shuffle: Some(shuffle),
+                seed: None,
+            },
             Self::Enqueue {
                 selection,
                 placement,
-            } if selection.valid() => {
-                let guarded = matches!(selection, Selection::Occurrence { .. });
-                let intent = match placement {
-                    Placement::Low => I::Low,
-                    Placement::High => I::High,
-                    Placement::Next => I::Next,
-                };
-                (
-                    C::QueueIntent {
-                        intent,
-                        selection: selection.into_wire(),
-                        shuffle: None,
+            } if selection.valid() && !matches!(selection, Selection::Occurrence { .. }) => {
+                C::Add {
+                    selection: selection.into_wire(),
+                    placement: match placement {
+                        Placement::Low => Intent::Low,
+                        Placement::High => Intent::High,
+                        Placement::Next => Intent::Next,
                     },
-                    guarded,
-                )
+                }
             }
-            Self::Pause => (C::Pause, false),
-            Self::Resume => (C::Resume, false),
-            Self::Next => (C::Next, false),
-            Self::Previous => (C::Previous, false),
-            Self::Clear => (C::Clear, true),
-            Self::Close => (C::Close, false),
-            Self::Seek(value) if seconds(value) => (C::Seek { value }, true),
-            Self::Jump(k) if key(k) => (C::Jump { key: k }, true),
-            Self::Remove(k) if key(k) => (C::Remove { key: k, undo: None }, true),
-            Self::Move { key: k, after } if key(k) && after.is_none_or(|a| key(a) && a != k) => (
+            Self::Pause => C::Pause,
+            Self::Resume => C::Resume,
+            Self::Next => C::Next,
+            Self::Previous => C::Previous,
+            Self::Clear => C::Clear,
+            Self::Close => C::Close,
+            Self::Seek(value) if seconds(value) => C::Seek { value },
+            Self::Jump(k) if key(k) => C::Jump { key: k },
+            Self::Remove(k) if key(k) => C::Remove { key: k },
+            Self::Move { key: k, after } if key(k) && after.is_none_or(|a| key(a) && a != k) => {
                 C::Move {
                     key: k,
-                    after_key: after,
-                },
-                true,
-            ),
-            Self::Shuffle(shuffle) => (C::SetShuffle { shuffle }, false),
-            Self::Repeat(repeat) => (
-                C::SetRepeat {
-                    repeat: match repeat {
-                        Repeat::Off => socket::Repeat::Off,
-                        Repeat::All => socket::Repeat::All,
-                        Repeat::One => socket::Repeat::One,
-                    },
-                },
-                false,
-            ),
-            Self::SelectDevice(device_id) if id(&device_id, 128) => {
-                (C::Select { device_id }, false)
+                    after: after.unwrap_or(0),
+                }
             }
-            Self::DeselectDevice => (C::Deselect, false),
-            Self::RenameDevice { device_id, name }
-                if text(&name, 256) && device_id.as_ref().is_none_or(|d| id(d, 128)) =>
-            {
-                let trimmed = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-                if trimmed.is_empty() || trimmed.chars().count() > 64 {
+            Self::Shuffle(shuffle) => C::Shuffle {
+                shuffle,
+                seed: None,
+            },
+            Self::Repeat(repeat) => C::Repeat {
+                repeat: match repeat {
+                    Repeat::Off => socket::Repeat::Off,
+                    Repeat::All => socket::Repeat::All,
+                    Repeat::One => socket::Repeat::One,
+                },
+            },
+            Self::SelectDevice(device_id) if id(&device_id, 128) => C::Select { device_id },
+            Self::DeselectDevice => C::Release,
+            Self::RenameDevice { device_id, name } => {
+                let device_id = device_id.as_deref().unwrap_or(own_device);
+                let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+                if !id(device_id, 128) || !id(name, 256) || name.chars().count() > 64 {
                     return None;
                 }
-                (
-                    C::Rename {
-                        device_id,
-                        name: trimmed.into(),
-                    },
-                    false,
-                )
+                C::Rename {
+                    device_id: device_id.into(),
+                    name: name.into(),
+                }
             }
             _ => return None,
         })
@@ -439,8 +368,7 @@ pub struct LocalTrack {
     pub id: String,
     pub title: String,
     pub subtitle: String,
-    pub album_id: String,
-    pub artist_id: String,
+    pub album_name: String,
     pub duration: f64,
 }
 #[derive(Clone)]
@@ -475,13 +403,12 @@ impl LocalQueue {
     pub fn replace(&mut self, tracks: Vec<LocalTrack>, selected: usize, shuffle: bool) -> Change {
         if tracks.len() > crate::offline::MAX_DOWNLOADS
             || selected >= tracks.len()
-            || self.next_key + tracks.len() as u64 > SAFE
+            || !key(self.next_key + tracks.len() as u64)
             || !tracks.iter().all(|t| {
                 id(&t.id, 512)
                     && text(&t.title, 1024)
                     && text(&t.subtitle, 4096)
-                    && text(&t.album_id, 512)
-                    && text(&t.artist_id, 512)
+                    && text(&t.album_name, 1024)
                     && seconds(t.duration)
             })
         {
@@ -668,19 +595,17 @@ fn shuffle_entries(entries: &mut [LocalEntry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     fn track(id: &str) -> LocalTrack {
         LocalTrack {
             id: id.into(),
             title: id.into(),
             subtitle: "Synthetic".into(),
-            album_id: "".into(),
-            artist_id: "".into(),
+            album_name: "".into(),
             duration: 60.0,
         }
     }
     #[test]
-    fn online_intents_are_canonical_and_move_has_nullable_anchor() {
+    fn account_choices_are_canonical_and_move_uses_zero_anchor() {
         let selection = Selection::Track {
             track: TrackRef {
                 id: "song".into(),
@@ -689,38 +614,37 @@ mod tests {
             },
             context: Some(Context::new("playlist", "list", "Synthetic")),
         };
-        let (wire, guarded) = (Action::Play {
+        let wire = Action::Play {
             selection,
             shuffle: false,
-        })
-        .wire()
+        }
+        .wire("desktop")
         .unwrap();
-        assert!(!guarded);
         assert_eq!(
             serde_json::to_value(wire).unwrap(),
-            json!({"type":"queueIntent","intent":"now","selection":{"kind":"track",
+            json!({"type":"play","shuffle":false,"selection":{"kind":"track",
             "track":{"id":"song","entryId":"second"},"context":{"kind":"playlist","id":"list","name":"Synthetic"}}})
         );
-        let (wire, guarded) = (Action::Move {
+        let wire = Action::Move {
             key: 7,
             after: None,
-        })
-        .wire()
+        }
+        .wire("desktop")
         .unwrap();
-        assert!(guarded);
         assert_eq!(
             serde_json::to_value(wire).unwrap(),
-            json!({"type":"move","key":7,"afterKey":null})
+            json!({"type":"move","key":7,"after":0})
         );
         assert!(
             (Action::Move {
                 key: 7,
                 after: Some(7)
             })
-            .wire()
+            .wire("desktop")
             .is_none()
         );
-        assert!(Action::Seek(f64::NAN).wire().is_none());
+        assert!(Action::Seek(f64::NAN).wire("desktop").is_none());
+        assert!(Action::Jump(1 << 52).wire("desktop").is_none());
     }
     #[test]
     fn duplicate_occurrences_rotate_without_history_and_repeat_one_only_on_end() {
@@ -768,28 +692,31 @@ mod tests {
         assert_eq!(q.elapsed, 12.0);
     }
     #[test]
-    fn known_socket_loss_invalidates_decoder_authority_before_any_actor_tick() {
-        let (tx, rx) = tokio::sync::watch::channel(socket::Link::Connected(3));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let authority = Authority::online(deadline, rx, 3);
-        assert!(authority.is_valid());
-        tx.send_replace(socket::Link::Disconnected);
-        assert!(!authority.is_valid());
-        assert!(!authority.renew_until(deadline));
-        tx.send_replace(socket::Link::Connected(4));
-        assert!(!authority.is_valid());
-    }
-    #[test]
-    fn lease_renewal_cannot_revive_revoked_or_expired_clones() {
-        let now = Instant::now();
-        let expired = Authority::new(now);
-        assert!(!expired.renew_until(now + Duration::from_secs(8)));
-        let live = Authority::new(now + Duration::from_secs(2));
-        let clone = live.clone();
-        assert!(live.renew_until(now + Duration::from_secs(8)));
-        assert!(clone.is_valid_at(now + Duration::from_secs(7)));
-        live.revoke();
-        assert!(!clone.is_valid());
-        assert!(!clone.renew_until(now + Duration::from_secs(8)));
+    fn derived_occurrence_is_preserved_without_sending_browse_credentials() {
+        let mut context = Context::new("derived", "mix", "Mix");
+        context.revision = Some(7);
+        context.fence = Some("browse-fence".into());
+        let selection = Selection::Track {
+            track: TrackRef {
+                id: "song".into(),
+                target_id: Some("mix".into()),
+                occurrence_id: Some("second".into()),
+                selection_token: Some("browse-token".into()),
+                ..TrackRef::default()
+            },
+            context: Some(context),
+        };
+        let wire = Action::Play {
+            selection,
+            shuffle: false,
+        }
+        .wire("desktop")
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(wire).unwrap()["selection"],
+            json!({"kind":"track",
+            "track":{"id":"song","targetId":"mix","occurrenceId":"second"},
+            "context":{"kind":"derived","id":"mix","name":"Mix"}})
+        );
     }
 }
