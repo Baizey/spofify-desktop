@@ -1,4 +1,4 @@
-import { ScrollView, TextEdit } from "std-widgets.slint";
+import { CheckBox, ScrollView, TextEdit } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 
 export component SignInView inherits Rectangle {
@@ -8,23 +8,29 @@ export component SignInView inherits Rectangle {
     in property <string> status;
     in property <bool> error;
     in property <bool> busy;
+    in property <bool> restoring;
+    in-out property <bool> keep-signed-in;
+    in property <string> auth-notice;
+    in property <bool> can-retry-session;
     property <bool> reveal-password;
     property <bool> ready: !root.busy && root.origin != "" && root.username != "" && root.password != "";
-    callback edited();
+    callback server-edited();
+    callback username-edited();
     callback sign-in();
+    callback retry-session();
     callback cancel();
     background: Theme.bg;
     ScrollView {
         content-width: self.visible-width;
-        content-height: max(self.visible-height, 490px);
+        content-height: max(self.visible-height, sign-in-form.preferred-height + 40px);
         Rectangle {
             width: parent.width; height: parent.height;
             background: Theme.bg;
             Rectangle {
                 x: (parent.width - self.width) / 2; y: max(20px, (parent.height - self.height) / 2);
-                width: min(392px, parent.width - 40px); height: 455px;
+                width: min(392px, parent.width - 40px); height: sign-in-form.preferred-height;
                 background: Theme.bg;
-                VerticalLayout {
+                sign-in-form := VerticalLayout {
                     padding: 8px; spacing: 9px; alignment: start;
                     HorizontalLayout {
                         height: 35px; spacing: 10px;
@@ -34,17 +40,20 @@ export component SignInView inherits Rectangle {
                     Text { text: "Sign in"; color: Theme.text; font-size: 26px; font-weight: 700; wrap: word-wrap; }
                     Rectangle { height: 11px; }
                     Caption { text: "Server address"; color: Theme.text; }
-                    Field { text <=> root.origin; field-label: "Server address"; placeholder-text: "https://music.example.com"; enabled: !root.busy; edited => { root.edited(); } }
+                    Field { text <=> root.origin; field-label: "Server address"; placeholder-text: "https://music.example.com"; enabled: !root.busy; edited => { root.server-edited(); } }
                     Caption { text: "Username"; color: Theme.text; }
-                    Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; }
-                    HorizontalLayout { height: 28px; Caption { text: "Password"; color: Theme.text; } Rectangle { horizontal-stretch: 1; } Action { text: root.reveal-password ? "Hide" : "Show"; accessible-label: root.reveal-password ? "Hide password" : "Show password"; quiet: true; height: 28px; clicked => { root.reveal-password = !root.reveal-password; } } }
+                    Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; edited => { root.username-edited(); } }
+                    HorizontalLayout { height: 28px; Caption { text: "Password"; color: Theme.text; } Rectangle { horizontal-stretch: 1; } Action { text: root.reveal-password ? "Hide" : "Show"; accessible-label: root.reveal-password ? "Hide password" : "Show password"; quiet: true; height: 28px; enabled: !root.busy; clicked => { root.reveal-password = !root.reveal-password; } } }
                     Field { text <=> root.password; field-label: "Password"; input-type: root.reveal-password ? InputType.text : InputType.password; enabled: !root.busy; accepted => { if root.ready { root.reveal-password = false; root.sign-in(); } } }
+                    CheckBox { text: "Keep me signed in"; checked <=> root.keep-signed-in; enabled: !root.busy; }
                     HorizontalLayout {
                         spacing: 8px;
-                        Action { text: root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: root.ready; clicked => { root.reveal-password = false; root.sign-in(); } }
+                        Action { text: root.restoring ? "Restoring session…" : root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: root.ready; clicked => { root.reveal-password = false; root.sign-in(); } }
                         if root.busy: Action { text: "Cancel"; accessible-label: "Cancel sign in"; clicked => { root.cancel(); } }
                     }
                     if root.status != "": Notice { text: root.status; error: root.error; }
+                    if root.auth-notice != "": Notice { text: root.auth-notice; }
+                    if root.can-retry-session && !root.busy: Action { text: "Retry saved session"; quiet: true; clicked => { root.retry-session(); } }
                 }
             }
         }

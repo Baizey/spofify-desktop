@@ -8,6 +8,7 @@ use crate::{
     AppWindow, ArtistCredit, DeviceRow, QueueRow,
     api::{Api, ApiError, Item, Session},
     audio::Audio,
+    auth::{self, Kind, Success, Write, Writer},
     desk::Access,
     mode::ModeControl,
     offline::{self, OfflineStore, PlaybackInput},
@@ -21,7 +22,7 @@ use slint::{Model, ModelRc, VecModel};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,14 +31,27 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub enum Command {
+// Auth intents must not compete for admission with the bounded playback queue.
+pub enum AuthCommand {
     Login {
         epoch: u64,
         origin: String,
         username: String,
         password: String,
+        remember: bool,
     },
+    Retry {
+        epoch: u64,
+        origin: String,
+        username: String,
+    },
+    Accept(u64),
+    Cancel(u64),
     Logout(u64),
+    Shutdown,
+}
+
+pub enum Command {
     Scoped(u64, Box<Command>),
     Toggle,
     Transport(&'static str),
@@ -56,7 +70,6 @@ pub enum Command {
         input: PlaybackInput,
         store: OfflineStore,
     },
-    Shutdown,
 }
 impl Command {
     pub fn scoped(self, epoch: u64) -> Self {
@@ -70,6 +83,15 @@ const TICK: Duration = Duration::from_millis(25);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
 const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
+const PROMOTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct OutputPromotion {
+    deadline: Instant,
+    command: socket::Command,
+    resume_key: Option<u64>,
+    // Explicit Play can arrive before the first passive room snapshot.
+    awaiting_room: bool,
+}
 
 struct Account {
     api: Arc<Api>,
@@ -80,7 +102,8 @@ struct Reconnect {
     task: JoinHandle<()>,
 }
 enum Reply {
-    Login(u64, Arc<Api>, Result<Session, ApiError>),
+    Prefill(u64, String, String),
+    Login(u64, auth::Outcome),
     Reconnect {
         epoch: u64,
         serial: u64,
@@ -106,10 +129,16 @@ struct Engine {
     window: slint::Weak<AppWindow>,
     device_id: String,
     login: Option<JoinHandle<()>>,
+    auth_ready: Option<(u64, Success)>,
+    auth_tx: Option<mpsc::UnboundedSender<AuthCommand>>,
+    auth_writer: Option<Writer>,
+    retained: Option<(Arc<AtomicBool>, Option<crate::login_store::LoginProfile>)>,
     reconnect: Option<Reconnect>,
     logouts: Vec<JoinHandle<()>>,
     account: Option<Account>,
     offline: bool,
+    passive_output: bool,
+    output_promotion: Option<OutputPromotion>,
     audio: Option<Audio>,
     local: LocalQueue,
     local_store: Option<OfflineStore>,
@@ -178,27 +207,33 @@ impl Engine {
                 ui.set_signed_in(signed);
                 if !signed {
                     ui.set_busy(busy);
+                    ui.set_restoring_login(false);
                     ui.set_error(error);
                     ui.set_status(status.into());
                 }
             }
         });
     }
-    fn reset(&mut self, epoch: u64) {
-        self.cancel_reconnect();
+    fn cancel_login(&mut self) {
         if let Some(task) = self.login.take() {
             task.abort();
             self.logouts.push(task);
         }
+    }
+    fn revoke(&mut self, a: Account) {
+        self.logouts.push(tokio::spawn(async move {
+            // Even offline, logout revokes every clone without creating a request.
+            let _ = a.api.logout(&a.session).await;
+        }));
+    }
+    fn reset(&mut self, epoch: u64) {
+        self.cancel_reconnect();
+        self.cancel_login();
         self.clear_output();
-        if let Some(a) = self.account.take()
-            && (a.session.is_offline() || !a.session.is_expired())
-        {
-            self.logouts.push(tokio::spawn(async move {
-                // Api revokes the shared capability even offline, and its mode
-                // fence returns before creating a request in that case.
-                let _ = a.api.logout(&a.session).await;
-            }));
+        self.passive_output = false;
+        self.retained = None;
+        if let Some(a) = self.account.take() {
+            self.revoke(a);
         }
         self.logouts.retain(|task| !task.is_finished());
         self.epoch = epoch;
@@ -206,7 +241,36 @@ impl Engine {
         self.personal.reset(epoch);
         self.publish_access();
     }
+    async fn shutdown(&mut self) {
+        let epoch = self
+            .shared_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let account = self.account.take();
+        let retained = self.retained.take();
+        self.retire_pending(false);
+        self.reset(epoch);
+        if let Some(writer) = self.auth_writer.take() {
+            // Complete accepted save/logout intent before deciding whether to
+            // revoke the server session. A failed opt-in is not remembered.
+            writer.finish().await;
+        }
+        if let Some(a) = account {
+            if retained.is_some_and(|(keep, _)| keep.load(Ordering::Acquire)) {
+                // Api::logout will only revoke local clones under this fence;
+                // the keyring credential remains usable on the next launch.
+                a.session.set_offline(true);
+            }
+            self.revoke(a);
+        }
+        for task in self.logouts.drain(..) {
+            let _ = task.await;
+        }
+    }
     fn clear_output(&mut self) {
+        if self.output_promotion.take().is_some() {
+            self.passive_output = true;
+        }
         self.room_incarnation = self.room_incarnation.wrapping_add(1);
         self.local_revision = 0;
         self.cancel_work();
@@ -237,7 +301,7 @@ impl Engine {
                 socket::DeviceIdentity {
                     device_id: self.device_id.clone(),
                     name: "Spofify Desktop".into(),
-                    can_play: true,
+                    can_play: !self.passive_output,
                 },
             )
             .ok();
@@ -361,10 +425,8 @@ impl Engine {
         if offline && let Some(a) = &self.account {
             a.session.set_offline(true);
         }
-        if let Some(task) = self.login.take() {
-            task.abort();
-            self.logouts.push(task);
-        }
+        self.cancel_login();
+        self.retire_pending(false);
         self.clear_output();
         // Previous account teardown requests must not keep running in offline mode.
         if offline {
@@ -395,46 +457,101 @@ impl Engine {
     }
     fn expire(&mut self) {
         let offline = self.offline;
+        if let Some((_, profile)) = self.retained.take() {
+            self.write_auth(self.epoch, Write::Forget(profile));
+        }
         self.reset(self.epoch);
         self.offline = offline;
         self.login_view(false, true, "Session expired. Sign in again.");
     }
-    fn command(&mut self, command: Command) -> bool {
+    fn write_auth(&self, epoch: u64, write: Write) {
+        if let Some(writer) = &self.auth_writer {
+            writer.send(epoch, write);
+        }
+    }
+    fn start_restore(&mut self, scope: Option<(String, String)>) {
+        let (epoch, current, results) =
+            (self.epoch, self.shared_epoch.clone(), self.results.clone());
+        self.login = Some(tokio::spawn(async move {
+            let prefill = results.clone();
+            let outcome =
+                auth::restore(scope, epoch, &current, move |origin, username| async move {
+                    let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
+                })
+                .await;
+            let _ = results.send(Reply::Login(epoch, outcome)).await;
+        }));
+    }
+    fn retire_pending(&mut self, logout: bool) {
+        if let Some((
+            _,
+            Success {
+                api, session, kind, ..
+            },
+        )) = self.auth_ready.take()
+            && (logout || matches!(kind, Kind::Password { .. }))
+        {
+            self.revoke(Account { api, session });
+        }
+    }
+    fn auth_command(&mut self, command: AuthCommand) -> bool {
         match command {
-            Command::Shutdown => {
-                self.reset(self.shared_epoch.load(Ordering::SeqCst));
-                return false;
+            AuthCommand::Shutdown => return false,
+            AuthCommand::Accept(epoch) => self.accept_login(epoch),
+            AuthCommand::Logout(epoch) => {
+                // This intent must not get skipped if another auth intent is
+                // already queued. The persistence worker orders it with saves.
+                let offline = self.explicit_offline();
+                self.retire_pending(true);
+                self.write_auth(epoch, Write::Forget(None));
+                if epoch == self.shared_epoch.load(Ordering::SeqCst) {
+                    self.reset(epoch);
+                    self.offline = offline;
+                    self.login_view(false, false, "Signed out on this desktop.");
+                }
             }
-            Command::Logout(epoch) if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
-                let offline = self.offline;
+            AuthCommand::Cancel(epoch) if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
+                self.retire_pending(false);
+                let offline = self.explicit_offline();
                 self.reset(epoch);
-                // Sign-out must not silently switch network policy.
                 self.offline = offline;
-                self.login_view(false, false, "Signed out on this desktop.");
+                self.login_view(false, false, "Sign-in canceled.");
             }
-            Command::Login {
+            AuthCommand::Retry {
+                epoch,
+                origin,
+                username,
+            } if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
+                self.retire_pending(false);
+                self.reset(epoch);
+                self.start_restore(Some((origin, username)));
+            }
+            AuthCommand::Login {
                 epoch,
                 origin,
                 username,
                 password,
+                remember,
             } if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
-                // Explicit sign-in is explicit Go Online. Retire the local
-                // queue and grant; never try to reuse its network credential.
+                self.retire_pending(false);
+                // Explicit sign-in goes online; retire the old account first.
                 self.reset(epoch);
-                match connection(&origin) {
-                    Ok(api) => {
-                        let api = Arc::new(api);
-                        let results = self.results.clone();
-                        self.login_view(true, false, "");
-                        self.login = Some(tokio::spawn(async move {
-                            let result = api.login(&username, &password).await;
-                            drop(password);
-                            let _ = results.send(Reply::Login(epoch, api, result)).await;
-                        }));
+                let (current, results) = (self.shared_epoch.clone(), self.results.clone());
+                self.login = Some(tokio::spawn(async move {
+                    if current.load(Ordering::SeqCst) != epoch {
+                        return;
                     }
-                    Err(e) => self.login_view(false, true, e.message),
-                }
+                    let outcome = auth::password(&origin, &username, &password, remember).await;
+                    drop(password);
+                    let _ = results.send(Reply::Login(epoch, outcome)).await;
+                }));
             }
+            _ => {}
+        }
+        true
+    }
+    fn command(&mut self, command: Command) {
+        match command {
             Command::Personal {
                 epoch,
                 generation,
@@ -449,7 +566,6 @@ impl Engine {
             }
             _ => {}
         }
-        true
     }
     fn scoped(&mut self, command: Command) {
         if !self.offline {
@@ -643,6 +759,98 @@ impl Engine {
                 .await;
         }));
     }
+    fn prepare_login(&mut self, success: Success) {
+        let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
+        let Some(auth_tx) = self.auth_tx.clone() else {
+            return;
+        };
+        let origin = success.origin.as_str().to_owned();
+        let username = success.session.username.clone();
+        self.auth_ready = Some((epoch, success));
+        // UI admission serializes completion with Cancel and edits. An engine
+        // result by itself has no authority to publish access or save a login.
+        let _ = slint::invoke_from_event_loop(move || {
+            if shared.load(Ordering::SeqCst) == epoch
+                && let Some(ui) = weak.upgrade()
+                && auth_tx.send(AuthCommand::Accept(epoch)).is_ok()
+            {
+                ui.set_origin(origin.into());
+                ui.set_username(username.into());
+                ui.set_password("".into());
+                ui.set_keep_signed_in(false);
+                ui.set_can_retry_session(false);
+                ui.set_busy(false);
+                ui.set_restoring_login(false);
+                ui.set_signed_in(true);
+            }
+        });
+    }
+    fn accept_login(&mut self, epoch: u64) {
+        if !self.current()
+            || epoch != self.epoch
+            || self.offline
+            || self
+                .auth_ready
+                .as_ref()
+                .is_none_or(|(ready, _)| *ready != epoch)
+        {
+            return;
+        }
+        let (
+            _,
+            Success {
+                api,
+                session,
+                origin,
+                kind,
+            },
+        ) = self.auth_ready.take().unwrap();
+        self.passive_output = matches!(&kind, Kind::Restored(_));
+        self.retained = match kind {
+            Kind::Restored(profile) => Some((Arc::new(AtomicBool::new(true)), Some(profile))),
+            Kind::Password { remember } => {
+                let retained = Arc::new(AtomicBool::new(false));
+                let credential = remember
+                    .then(|| api.remembered_credential(&session).ok())
+                    .flatten();
+                self.write_auth(
+                    epoch,
+                    Write::Record {
+                        origin,
+                        username: session.username.clone(),
+                        wanted: remember,
+                        credential,
+                        retained: retained.clone(),
+                    },
+                );
+                remember.then_some((retained, None))
+            }
+        };
+        self.account = Some(Account { api, session });
+        // A restored account joins as a fresh, passive controller. No output
+        // capability, ownership choice or playback action is sent on restore.
+        self.device_id = uuid::Uuid::new_v4().to_string();
+        self.publish_access();
+        self.connect();
+    }
+    fn finish_login(&self, fallback: auth::Fallback) {
+        if let Some(profile) = fallback.discard {
+            self.write_auth(self.epoch, Write::Forget(Some(profile)));
+        }
+        let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
+        let _ = slint::invoke_from_event_loop(move || {
+            if shared.load(Ordering::SeqCst) == epoch
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.set_busy(false);
+                ui.set_restoring_login(false);
+                ui.set_error(!fallback.status.is_empty());
+                ui.set_status(fallback.status.into());
+                ui.set_auth_notice(fallback.notice.into());
+                ui.set_can_retry_session(fallback.retry);
+            }
+        });
+    }
     fn reply(&mut self, reply: Reply) {
         if !self.current() {
             return;
@@ -654,18 +862,26 @@ impl Engine {
                 serial,
                 result,
             } => self.finish_reconnect(epoch, serial, result),
-            Reply::Login(epoch, api, result)
+            Reply::Prefill(epoch, origin, username)
+                if epoch == self.epoch && !self.offline && self.login.is_some() =>
+            {
+                let (weak, shared) = (self.window.clone(), self.shared_epoch.clone());
+                let _ = slint::invoke_from_event_loop(move || {
+                    if shared.load(Ordering::SeqCst) == epoch
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.set_origin(origin.into());
+                        ui.set_username(username.into());
+                    }
+                });
+            }
+            Reply::Login(epoch, outcome)
                 if epoch == self.epoch && !self.offline && self.login.is_some() =>
             {
                 self.login = None;
-                match result {
-                    Ok(session) => {
-                        self.account = Some(Account { api, session });
-                        self.login_view(false, false, "");
-                        self.publish_access();
-                        self.connect();
-                    }
-                    Err(e) => self.login_view(false, true, e.message),
+                match outcome {
+                    Ok(success) => self.prepare_login(success),
+                    Err(fallback) => self.finish_login(fallback),
                 }
             }
             Reply::OfflineMedia {
@@ -721,14 +937,17 @@ impl Engine {
     fn tick(&mut self) {
         self.tick_with_event(None);
     }
+    fn explicit_offline(&self) -> bool {
+        self.offline
+            || self
+                .account
+                .as_ref()
+                .is_some_and(|a| a.session.is_offline())
+    }
     fn tick_with_event(&mut self, event: Option<socket::Event>) {
         let requested_epoch = self.shared_epoch.load(Ordering::SeqCst);
         if self.epoch != requested_epoch {
-            let offline = self.offline
-                || self
-                    .account
-                    .as_ref()
-                    .is_some_and(|a| a.session.is_offline());
+            let offline = self.explicit_offline();
             self.reset(requested_epoch);
             self.offline = offline;
             self.login_view(false, false, "");
@@ -1131,6 +1350,7 @@ fn artist_subtitle(credits: &[CreditView]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+#[cfg(test)]
 fn connection(input: &str) -> Result<Api, ApiError> {
     Api::new(crate::api::Origin::parse(input)?)
 }
@@ -1140,6 +1360,8 @@ pub fn start(
     epoch: Arc<AtomicU64>,
     access: watch::Sender<Option<Access>>,
     mode: ModeControl,
+    mut auth_intents: mpsc::UnboundedReceiver<AuthCommand>,
+    auth_tx: mpsc::UnboundedSender<AuthCommand>,
 ) -> (mpsc::Sender<Command>, std::thread::JoinHandle<()>) {
     let (tx, mut commands) = mpsc::channel(32);
     let worker = std::thread::spawn(move || {
@@ -1149,6 +1371,17 @@ pub fn start(
             .expect("playback runtime");
         runtime.block_on(async move {
             let (results, mut replies) = mpsc::channel(16);
+            let (weak, shared) = (window.clone(), epoch.clone());
+            let writer = Writer::new(move |epoch, notice| {
+                let (weak, shared) = (weak.clone(), shared.clone());
+                let _ = slint::invoke_from_event_loop(move || {
+                    if shared.load(Ordering::SeqCst) == epoch
+                        && let Some(ui) = weak.upgrade()
+                    {
+                        ui.set_auth_notice(notice.into());
+                    }
+                });
+            });
             let mut e = Engine {
                 epoch: 0,
                 shared_epoch: epoch,
@@ -1158,10 +1391,16 @@ pub fn start(
                 window,
                 device_id: uuid::Uuid::new_v4().to_string(),
                 login: None,
+                auth_ready: None,
+                auth_tx: Some(auth_tx),
+                auth_writer: Some(writer),
+                retained: None,
                 reconnect: None,
                 logouts: vec![],
                 account: None,
                 offline: false,
+                passive_output: false,
+                output_promotion: None,
                 audio: None,
                 local: LocalQueue::default(),
                 local_status: Status::Ok,
@@ -1176,13 +1415,19 @@ pub fn start(
                 local_revision: 0,
                 action_status: "",
             };
+            e.start_restore(None);
             let mut cadence = tokio::time::interval(TICK);
             cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut refresh = 0;
             loop {
                 tokio::select! {
+                    intent = auth_intents.recv() => {
+                        if !e.auth_command(intent.unwrap_or(AuthCommand::Shutdown)) { break; }
+                        e.publish();
+                    }
                     command = commands.recv() => {
-                        if !e.command(command.unwrap_or(Command::Shutdown)) { break; }
+                        let Some(command) = command else { break; };
+                        e.command(command);
                         e.publish();
                     }
                     Some(reply) = replies.recv() => { e.reply(reply); e.publish(); },
@@ -1194,9 +1439,7 @@ pub fn start(
                     }
                 }
             }
-            for task in e.logouts {
-                let _ = task.await;
-            }
+            e.shutdown().await;
         });
         runtime.shutdown_timeout(Duration::from_secs(2));
     });
@@ -1277,10 +1520,16 @@ mod tests {
             window: slint::Weak::default(),
             device_id: "synthetic".into(),
             login: None,
+            auth_ready: None,
+            auth_tx: None,
+            auth_writer: None,
+            retained: None,
             reconnect: None,
             logouts: vec![],
             account: None,
             offline: false,
+            passive_output: false,
+            output_promotion: None,
             audio: None,
             local: LocalQueue::default(),
             local_status: Status::Ok,
@@ -1322,12 +1571,51 @@ mod tests {
         assert!(session.is_offline());
         assert!(e.access.borrow().as_ref().unwrap().offline);
         assert!(e.socket.is_none());
-        e.command(Command::Shutdown);
+        e.shutdown().await;
         assert!(e.access.borrow().is_none());
-        for task in e.logouts.drain(..) {
-            task.await.unwrap();
-        }
         assert!(session.is_expired());
+    }
+    #[tokio::test]
+    async fn remembered_shutdown_does_not_revoke_on_server() {
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
+        });
+        e.retained = Some((Arc::new(AtomicBool::new(true)), None));
+        e.publish_access();
+        e.shutdown().await;
+        assert!(e.access.borrow().is_none());
+        assert!(session.is_offline()); // Api::logout must not reach the server
+        assert!(!session.can_access_local());
+    }
+    #[tokio::test]
+    async fn old_auth_completion_cannot_publish_access_after_cancel() {
+        let mut e = engine();
+        let origin = crate::api::Origin::parse("http://127.0.0.1:1").unwrap();
+        let api = Arc::new(Api::new(origin.clone()).unwrap());
+        let session = api.test_session();
+        session.set_offline(true); // synthetic capability; cancellation cannot contact a server
+        e.auth_ready = Some((
+            7,
+            Success {
+                api,
+                session: session.clone(),
+                origin,
+                kind: Kind::Password { remember: true },
+            },
+        ));
+        e.shared_epoch.store(8, Ordering::SeqCst);
+        e.auth_command(AuthCommand::Accept(7));
+        assert!(e.account.is_none() && e.auth_ready.is_some());
+        e.auth_command(AuthCommand::Cancel(8));
+        e.auth_command(AuthCommand::Accept(7));
+        assert!(e.auth_ready.is_none() && e.access.borrow().is_none());
+        assert!(e.retained.is_none() && e.socket.is_none());
+        e.shutdown().await;
+        assert!(!session.can_access_local());
     }
     #[tokio::test]
     async fn cookie_expiry_keeps_local_access_but_go_online_requires_sign_in() {
@@ -1363,18 +1651,19 @@ mod tests {
         assert!(e.access.borrow().is_none());
         assert!(session.is_offline()); // never reopened the expired internet credential
     }
-    #[test]
-    fn explicit_sign_in_leaves_offline_even_if_the_new_origin_is_invalid() {
+    #[tokio::test]
+    async fn explicit_sign_in_leaves_offline_even_if_the_new_origin_is_invalid() {
         let mut e = engine();
         e.command(Command::Offline(true).scoped(7));
-        e.command(Command::Logout(7));
+        e.auth_command(AuthCommand::Logout(7));
         assert!(e.offline);
         e.shared_epoch.store(8, Ordering::SeqCst);
-        e.command(Command::Login {
+        e.auth_command(AuthCommand::Login {
             epoch: 8,
             origin: "not an origin".into(),
             username: "test".into(),
             password: "test".into(),
+            remember: false,
         });
         assert!(!e.offline && e.epoch == 8 && e.socket.is_none());
     }

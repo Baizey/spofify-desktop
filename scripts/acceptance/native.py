@@ -11,6 +11,7 @@ import signal
 import socket
 import struct
 import subprocess
+from threading import Event, Thread
 from time import monotonic, sleep
 from urllib.error import URLError
 
@@ -72,18 +73,27 @@ class Window:
             "elementHandle": self.properties["rootElementHandle"], "maxElements": 1000})
         check(not tree.get("debugInfoMissing"), "desktop requires SLINT_EMIT_DEBUG_INFO=1 at build time")
         elements = tree["elements"]
-        # With a populated catalog and queue, MCP's tree limit can precede the
-        # dock. Query that named subtree rather than mistaking truncation for
-        # an absent transport. Header and initial rows precede the limit.
-        if tree["truncated"] and not element_id(elements, "player"):
-            handles = self.mcp.value("find_elements_by_id", {"windowHandle": self.handle,
-                                      "elementsId": "AppWindow::player"})["elementHandles"]
+        # The catalog and queue can consume the tree budget before or halfway
+        # through the dock. A returned player root doesn't prove the transport
+        # was returned, so replace any partial dock with its complete subtree.
+        if tree["truncated"]:
+            player = element_id(elements, "player")
+            handles = [player["handle"]] if player else self.mcp.value("find_elements_by_id", {
+                "windowHandle": self.handle, "elementsId": "AppWindow::player"})["elementHandles"]
             check(len(handles) <= 1, "unexpected duplicate playback dock")
             for handle in handles:
-                dock = self.mcp.value("get_element_tree", {"elementHandle": handle, "maxElements": 256})
-                check(not dock["truncated"], "truncated playback dock inspection")
-                elements.extend(dock["elements"])
+                dock = self.subtree({"handle": handle})
+                def handle_key(element):
+                    h = element["handle"]
+                    return h["index"], h["generation"]
+                dock_keys = {handle_key(e) for e in dock}
+                elements = [e for e in elements if handle_key(e) not in dock_keys] + dock
         return elements
+
+    def subtree(self, element):
+        tree = self.mcp.value("get_element_tree", {"elementHandle": element["handle"], "maxElements": 256})
+        check(not tree["truncated"], "truncated native subtree inspection")
+        return tree["elements"]
 
     @staticmethod
     def matches(element, pattern):
@@ -122,12 +132,15 @@ class Window:
         check(element.get("accessibleEnabled", True), f"native control disabled: {pattern}")
         self.click_element(element)
 
-    def pointer_position_for_click(self, label):
-        # Popup items have popup-local bounds in the Slint tree. Recording the
-        # actual dispatched press gives the client-window coordinates instead.
+    def pointer_position_for_click(self, label, *, element=None):
+        # Record the actual client-window press, even for popup-local bounds
+        # or a non-accessible item such as a playlist icon or subtitle.
         self.mcp.call("start_event_recording", {})
         try:
-            self.click(label)
+            if element is None:
+                self.click(label)
+            else:
+                self.click_element(element)
         finally:
             events = self.mcp.value("stop_event_recording", {})
         check(not events.get("droppedCount") and not events.get("unknownEventCount"),
@@ -152,8 +165,8 @@ class Window:
         # Type through the real input rather than assigning a model property.
         self.key(value)
 
-    def title(self, name):
-        return self.find(re.escape(name), roles=("Text",))
+    def title(self, name, timeout=10):
+        return self.find(re.escape(name), timeout=timeout, roles=("Text",))
 
     def scroll_catalog(self, delta):
         width = self.window_properties()["size"]["width"] / self.properties["scaleFactor"]
@@ -232,8 +245,12 @@ def assert_dock_layout(window):
     check(abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
     check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= 100,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
-    transport = element_type(elements, "Transport")
+    transport = element_type(window.subtree(dock), "Transport")
     check(transport, "missing dock transport")
+    transport_controls = window.subtree(transport)
+    for label in ("Previous track", "Play|Pause", "Next track"):
+        check(any(window.matches(e, label) and e.get("accessibleRole") == "Button" for e in transport_controls),
+              f"missing dock transport control {label}")
     midpoint = sum(bounds(transport)[::2]) / 2
     check(abs(midpoint - width / 2) <= 1, "dock transport is not centered")
     rail = element_type(elements, "SeekBar")
@@ -260,7 +277,8 @@ def full_player(window, title, name, width, failures):
         window.pixels(name + "-pointer-failed", width)
         raise
     print(f"PASS {width}px dock identity opens full player by pointer", flush=True)
-    window.find("Open play queue", roles=("Button",))
+    window.find("Play queue", roles=("Button",))
+    window.find("Playback devices", roles=("Button",))
     window.find(r"Synthetic Tone \d{3}", roles=("Text",))
     window.pixels(name, width)
     with verify(failures, name + " slider hit target"):
@@ -346,10 +364,68 @@ def desktop(binary, root, env, pixels=None, *, multisize=False):
                 pass
 
 
+REMEMBER_LOGIN = "Keep me signed in"
+
+
+def login_options(window, *, required=False):
+    controls = [e for e in window.elements() if e.get("accessibleRole") == "Checkbox"]
+    check(len(controls) <= 1 and all(window.matches(e, REMEMBER_LOGIN) for e in controls),
+          "unexpected sign-in checkbox (HTTP consent is not part of sign-in)")
+    check(not required or controls, "missing Keep me signed in checkbox")
+    if controls:
+        option = controls[0]
+        x, y, right, bottom = bounds(option)
+        width, height = window.dimensions()
+        check(0 <= x < right <= width and 0 <= y < bottom <= height,
+              "Keep me signed in checkbox is not inside the native window")
+        return option
+
+
+@contextmanager
+def native_observer(api):
+    # Go pings every five seconds and closes an unresponsive socket. Keep the
+    # real read-only peer reading (and replying) while the main thread drives UI.
+    with Peer(api) as peer:
+        stopping = Event()
+        errors = []
+
+        def read_outputs():
+            try:
+                while not stopping.is_set():
+                    peer.wait_frame(lambda _: True, timeout=120)
+            except (Failure, OSError, ValueError) as error:
+                if not stopping.is_set():
+                    errors.append(error)
+
+        reader = Thread(target=read_outputs, name="native-account-observer")
+        reader.start()
+
+        def observe(label, predicate, timeout=10):
+            def matching_snapshot():
+                if errors:
+                    raise Failure(f"real Go account observer stopped while waiting for {label}: {errors[0]}")
+                snapshot = peer.snapshot
+                return snapshot if predicate(snapshot) else None
+            return wait(label, matching_snapshot, timeout)
+
+        try:
+            yield observe
+            check(not errors, f"real Go account observer stopped: {errors[0] if errors else ''}")
+        finally:
+            stopping.set()
+            # Unblock the reader, then let Peer close the owned socket.
+            try:
+                peer.sock.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+            reader.join()
+
+
 def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None):
     from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
-                                  compact_queue, keyboard_playlist_menu, manual_options, open_manual, open_playlists,
-                                  pane_layout, playlist_row_menu, rules_editor, typed_catalog,
+                                  compact_queue, empty_devices, keyboard_playlist_menu, manual_options, open_manual,
+                                  pane_layout, playlist_back, playlist_hit_checks, playlist_play, playlist_row_menu,
+                                  playlists_root, queue_state, root_navigation, rules_editor, typed_catalog,
                                   wide_queue_toggle)
 
     failures = []
@@ -357,7 +433,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         if ready is not None:
             window.resize(DESKTOP)
         window.find("Sign in")
-        check(not any(e.get("accessibleRole") == "Checkbox" for e in window.elements()), "unexpected sign-in gate")
+        login_options(window)
         window.pixels("01-login-empty")
         if ready is None:
             print("NOT RUN native sign-in/browsing/player (window-only run)", flush=True)
@@ -371,8 +447,10 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         pane_layout(window, wide=True)
         window.pixels("02-signed-in", DESKTOP[0])
 
-        open_playlists(window)
         if api is None:
+            root_navigation(window, wide=True)
+            playlist_back(window, wide=True)
+            playlist_hit_checks(window)
             rules_editor(window, "03-rules-editor")
             typed_catalog(window, DESKTOP[0], capture=True, via_shortcut=True)
             check_shortcut_back(window)
@@ -381,27 +459,23 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             keyboard_playlist_menu(window)
             playlist_row_menu(window)
             window.pixels("04-manual-playlist", DESKTOP[0])
-            wide_queue_toggle(window, lambda: window.title(PLAYLIST))
+            wide_queue_toggle(window, lambda: window.title(PLAYLIST), can_go_back=True)
             window.resize(COMPACT)
             pane_layout(window, wide=False, can_go_back=True)
             compact_queue(window, lambda: window.title(PLAYLIST), capture="05-queue-empty-compact")
             manual_options(window, capture="05-playlist-menu-640")
             window.click("Back")
             window.find(f"Open {PLAYLIST}", roles=("Button",))
-            typed_catalog(window, COMPACT[0], capture=True)
-            window.absent("Now playing: Nothing playing", roles=("Button",))
+            typed_catalog(window, COMPACT[0], capture=True, check_compact_targets=True)
             window.click("Settings")
             window.find("Work offline", roles=("Button",))
             window.find("Reset display defaults", roles=("Button",))
             window.pixels("06-settings-compact", COMPACT[0])
             print("PASS workspace interaction against Go-shaped wire data (no Go playback)", flush=True)
             return
-        open_manual(window)
-        manual_options(window)
-        window.pixels("03-manual-playlist", DESKTOP[0])
         # Join only after the desktop: an observer must not become the initial
         # selected logical output or change how the desktop is admitted.
-        with Peer(api) as observer:
+        with native_observer(api) as observe:
             def selected_desktop(snapshot):
                 return any(device.get("name") == "Spofify Desktop" and device.get("canPlay")
                            and device.get("id") == snapshot.get("owner")
@@ -410,17 +484,31 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             # The initial output transfer can still be draining while the
             # catalog is already interactive. This case exercises Play on a
             # settled output, not rejection of actions during a handoff.
-            if not selected_desktop(observer.snapshot):
-                observer.wait(selected_desktop, timeout=20)
-            window.click("Playback devices")
-            window.find("Deselect", roles=("Button",))
-            window.title("Acceptance observer")
-            peer_button = window.find("Select output", roles=("Button",))
-            check(not peer_button.get("accessibleEnabled"), "read-only remote peer was selectable for audio")
-            window.pixels("03-devices")
-            print("PASS device panel shows the real Go observer without selecting it for audio", flush=True)
+            observe("desktop selected as the real Go output", selected_desktop, timeout=20)
+
+            def restore_playlists():
+                playlists_root(window)
+
+            for mode in (DESKTOP, WIDE, COMPACT):
+                if mode != DESKTOP:
+                    window.resize(mode)
+                    window.click("History")
+                wide = mode != COMPACT
+                root_navigation(window, wide=wide)
+                playlist_back(window, wide=wide)
+                playlist_hit_checks(window)
+                empty_devices(window, restore_playlists, wide=wide, observer=True,
+                              capture="03-devices" if mode == DESKTOP else None)
+                if wide:
+                    wide_queue_toggle(window, restore_playlists)
+                else:
+                    compact_queue(window, restore_playlists, capture="05-queue-empty-compact")
+            window.resize(DESKTOP)
+            open_manual(window)
+            manual_options(window)
+            window.pixels("03-manual-playlist", DESKTOP[0])
             window.click("Back")
-            window.title(PLAYLIST)
+            restore_playlists()
 
             def canonical_track(snapshot):
                 state = snapshot.get("player", {})
@@ -433,36 +521,51 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 from audio_smoke import heard_tone
                 baseline = pcm.stat().st_size
             # The actual Go fixture clips last one second. Start the full
-            # playlist to keep media and upcoming rows present during resize.
-            window.click("Play")
-            try:
-                observer.wait(canonical_track, timeout=20)
-            except TimeoutError as error:
-                raise Failure("desktop Play did not update the canonical online queue") from error
+            # playlist using the row's separate Play target, not its open target.
+            playlist_play(window)
+            observe("playlist row Play to update the canonical online queue", canonical_track, timeout=20)
             if pcm is not None:
                 with verify(failures, "real Go online PCM"):
                     wait("220 Hz Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                     print("PASS real Go online track rendered 220 Hz PCM", flush=True)
             window.find(DOCK_TITLE, roles=("Button",))
             window.find("Pause", roles=("Button",))
-            print("PASS native Play updated canonical online queue and dock", flush=True)
+            restore_playlists()
+            window.absent("Back", roles=("Button",))
+            print("PASS playlist row Play updates the canonical online queue and dock without opening detail", flush=True)
+            open_manual(window)
             for mode in (DESKTOP, WIDE):
                 if mode != DESKTOP:
                     window.resize(mode)
                 window.title(PLAYLIST)
-                pane_layout(window, wide=True, populated=True, can_go_back=True)
+                pane_layout(window, wide=True, docked=True, can_go_back=True)
+                queue_state(window, populated=True)
                 window.find("Pause", roles=("Button",))
                 window.pixels(f"04-playing-{mode[0]}", mode[0])
                 with verify(failures, f"dock geometry at {mode[0]}"):
                     assert_dock_layout(window)
             window.resize(COMPACT)
             window.find(DOCK_TITLE, roles=("Button",))
-            pane_layout(window, wide=False, can_go_back=True)
+            pane_layout(window, wide=False, docked=True, can_go_back=True)
             window.find("Pause", roles=("Button",))
             window.pixels("05-dock-compact", COMPACT[0])
             with verify(failures, "compact dock geometry"):
                 assert_dock_layout(window)
-            compact_queue(window, lambda: window.title(PLAYLIST), populated=True, capture="06-queue-playing-compact")
+            window.click("Pause")
+
+            def paused_selection(snapshot):
+                player = snapshot["player"]
+                cursor = player["cursor"]
+                return not cursor["desired"] and not cursor["playing"] and any(
+                    cursor["key"] == row["key"] for row in player["queue"])
+
+            observe("native Pause to leave a selected canonical queue occurrence", paused_selection)
+            wait("paused dock transport", lambda: not any(window.matches(e, "Pause") for e in window.elements()))
+            pane_layout(window, wide=False, docked=True, can_go_back=True)
+            assert_dock_layout(window)
+            window.pixels("06-dock-paused-compact", COMPACT[0])
+            print("PASS canonical paused selection retains the dock and its controls", flush=True)
+            compact_queue(window, lambda: window.title(PLAYLIST), populated=True, capture="06-queue-paused-compact")
             full_player(window, DOCK_TITLE, "07-player-compact", COMPACT[0], failures)
             window.click("Back")
             window.title(PLAYLIST)
@@ -486,6 +589,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.absent(row_menu, roles=("Button",))
         window.click(SAVED)
         window.section(SAVED)
+        window.absent("Back", roles=("Button",))
         window.find(f"Open {TRACK}", roles=("Button",))
         window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
         window.click("Settings")
@@ -500,7 +604,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.click(SAVED)
         window.section(SAVED)
         window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
-        window.find("No song selected")
+        pane_layout(window, wide=True)
         window.find(f"Play {TRACK}", timeout=15, roles=("Button",))
         window.pixels("11-offline-ready")
         if pcm is not None:

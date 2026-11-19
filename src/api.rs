@@ -6,22 +6,22 @@ use std::{
     fmt,
     future::Future,
     net::IpAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
-use cookie::{Cookie, Expiration};
+use cookie::{Cookie, Expiration, time::OffsetDateTime};
 use reqwest::{
     Client, RequestBuilder, Response,
     header::{self, HeaderValue},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::watch;
 use url::Url;
 
+#[path = "api_auth.rs"]
+mod api_auth;
+pub use api_auth::RememberedCredential;
 #[path = "catalog.rs"]
 pub mod catalog;
 #[path = "library.rs"]
@@ -80,6 +80,13 @@ const EXPIRED: ApiError = ApiError {
     expired: true,
     status: 401,
 };
+// Rolling credentials can be revalidated after the local deadline. This is not
+// evidence of server revocation and must not be used to delete the saved cookie.
+const ROLLING_DEADLINE: ApiError = ApiError {
+    status: 0,
+    ..EXPIRED
+};
+const STALE_DENIAL: ApiError = error("The session changed while the request was in progress.");
 
 const fn error(message: &'static str) -> ApiError {
     ApiError {
@@ -190,18 +197,25 @@ impl Session {
     /// Whether the network credential is past its deadline or has been revoked.
     /// Local playback and storage must use `can_access_local` instead.
     pub fn is_expired(&self) -> bool {
-        self.cookie_expired() || self.secrets.revoked.load(Ordering::SeqCst)
+        self.lifetime().check_live().is_err()
     }
 
     /// An explicitly offline session may access its account's local data past the
     /// cookie deadline. A server 401 or local logout still ends all access.
     pub fn can_access_local(&self) -> bool {
-        (self.is_offline() || !self.cookie_expired())
-            && !self.secrets.revoked.load(Ordering::SeqCst)
+        let offline = self.is_offline();
+        let lifetime = self.lifetime();
+        lifetime.revocation.is_none() && (offline || !lifetime.deadline.elapsed())
     }
 
-    fn cookie_expired(&self) -> bool {
-        Instant::now() >= self.secrets.deadline
+    /// A current HTTP 401, not local expiry or an explicit local logout.
+    pub(crate) fn was_server_revoked(&self) -> bool {
+        let lifetime = self.lifetime();
+        lifetime.deadline.server_expires.is_some() && lifetime.revocation == Some(EXPIRED)
+    }
+
+    fn lifetime(&self) -> MutexGuard<'_, SessionLifetime> {
+        self.secrets.lifetime.lock().unwrap()
     }
 
     /// A session capability and every clone share the same explicit network mode.
@@ -236,8 +250,76 @@ struct SessionSecrets {
     network: watch::Sender<u64>,
     cookie: HeaderValue,
     csrf: HeaderValue,
-    deadline: Instant,
-    revoked: AtomicBool,
+    lifetime: Mutex<SessionLifetime>,
+}
+
+#[derive(Clone, Copy)]
+struct CredentialDeadline {
+    instant: Instant,
+    // The absolute server expiry is also the rolling credential version; two
+    // publications of the same expiry must not rebase the monotonic deadline.
+    server_expires: Option<OffsetDateTime>,
+}
+
+impl CredentialDeadline {
+    fn elapsed(self) -> bool {
+        Instant::now() >= self.instant
+    }
+
+    fn local_expiry(self) -> ApiError {
+        if self.server_expires.is_some() {
+            ROLLING_DEADLINE
+        } else {
+            EXPIRED
+        }
+    }
+}
+
+struct SessionLifetime {
+    deadline: CredentialDeadline,
+    revocation: Option<ApiError>,
+}
+
+impl SessionLifetime {
+    fn check_live(&self) -> Result<(), ApiError> {
+        self.check_revocation()?;
+        if self.deadline.elapsed() {
+            return Err(self.deadline.local_expiry());
+        }
+        Ok(())
+    }
+
+    fn check_revocation(&self) -> Result<(), ApiError> {
+        self.revocation.map_or(Ok(()), Err)
+    }
+
+    fn apply_denial(&mut self, used: CredentialDeadline, error: ApiError) -> ApiError {
+        if let Some(revocation) = self.revocation {
+            return revocation;
+        }
+        if used.server_expires != self.deadline.server_expires {
+            return STALE_DENIAL;
+        }
+        // Report a mismatch to the probe that found it, but subsequent uses
+        // see an expired capability. An account mismatch is not an HTTP 401.
+        self.revocation = Some(if error.status == 401 {
+            EXPIRED
+        } else {
+            self.deadline.local_expiry()
+        });
+        error
+    }
+
+    fn extend(&mut self, candidate: CredentialDeadline) {
+        debug_assert!(self.revocation.is_none());
+        if self.deadline.server_expires.is_some()
+            && candidate.server_expires > self.deadline.server_expires
+            && candidate.instant > self.deadline.instant
+            && !candidate.elapsed()
+        {
+            self.deadline = candidate;
+        }
+    }
 }
 
 struct NetworkFence {
@@ -345,66 +427,15 @@ impl Api {
                 network: watch::Sender::new(0),
                 cookie: HeaderValue::from_static("spofify_session=synthetic"),
                 csrf: HeaderValue::from_static("synthetic"),
-                deadline,
-                revoked: AtomicBool::new(false),
+                lifetime: Mutex::new(SessionLifetime {
+                    deadline: CredentialDeadline {
+                        instant: deadline,
+                        server_expires: None,
+                    },
+                    revocation: None,
+                }),
             }),
         }
-    }
-
-    pub async fn login(&self, username: &str, password: &str) -> Result<Session, ApiError> {
-        if !valid_text(username, 256) || password.is_empty() || password.len() > 2048 {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        struct Login<'a> {
-            username: &'a str,
-            password: &'a str,
-        }
-        // The server accepts at most 4 KiB, including JSON escaping overhead.
-        let body = serde_json::to_vec(&Login { username, password }).map_err(|_| INVALID_INPUT)?;
-        if body.len() > 4096 {
-            return Err(INVALID_INPUT);
-        }
-        let request = self
-            .request(self.origin.endpoint("/api/auth/login"))?
-            .header("X-Spofify-Login", "1")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body);
-        let response = self.send(request, None, true).await?;
-        if response.status() != 200 {
-            return Err(INVALID_RESPONSE);
-        }
-        let (cookie, deadline) = session_cookie(&self.origin, response.headers())?;
-        let summary: SessionSummary = decode(response, LOGIN_BODY).await?;
-        if !valid_id(&summary.account_id)
-            || !valid_text(&summary.username, 256)
-            || !matches!(summary.role.as_str(), "admin" | "user")
-            || summary.csrf_token.len() > 512
-            || summary.csrf_token.is_empty()
-            || !summary
-                .csrf_token
-                .bytes()
-                .all(|b| (0x21..=0x7e).contains(&b))
-            || Instant::now() >= deadline
-        {
-            return Err(INVALID_RESPONSE);
-        }
-        let mut csrf = HeaderValue::from_str(&summary.csrf_token).map_err(|_| INVALID_RESPONSE)?;
-        csrf.set_sensitive(true);
-        Ok(Session {
-            account_id: summary.account_id.clone(),
-            username: summary.username,
-            role: summary.role,
-            secrets: Arc::new(SessionSecrets {
-                owner: self.identity.clone(),
-                account_id: summary.account_id,
-                network: watch::Sender::new(0),
-                cookie,
-                csrf,
-                deadline,
-                revoked: AtomicBool::new(false),
-            }),
-        })
     }
 
     /// Bounded, explicit track search only. Empty input never contacts the server.
@@ -518,22 +549,8 @@ impl Api {
                 .header(header::SEC_WEBSOCKET_VERSION, "13")
                 .header(header::SEC_WEBSOCKET_KEY, key)
                 .header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
-            self.check_session(session)?;
-            if session.network_generation() != generation {
-                return Err(OFFLINE);
-            }
-            let response = request.send().await.map_err(|_| NETWORK)?;
-            if session.network_generation() != generation {
-                return Err(OFFLINE);
-            }
+            let response = self.send_inner(request, Some(session), false, true).await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
-                if !response.status().is_success() {
-                    return Err(Self::response_error(
-                        response.status().as_u16(),
-                        Some(session),
-                        false,
-                    ));
-                }
                 return Err(INVALID_RESPONSE);
             }
             validate_websocket_upgrade(&response, &expected_accept, protocol)?;
@@ -841,18 +858,27 @@ impl Api {
     pub async fn logout(&self, session: &Session) -> Result<(), ApiError> {
         self.check_session_owner(session)?;
         let fence = NetworkFence::new(session);
-        if session.secrets.revoked.swap(true, Ordering::SeqCst) {
-            return Err(EXPIRED);
-        }
+        let deadline = {
+            let mut lifetime = session.lifetime();
+            lifetime.check_revocation()?;
+            let deadline = lifetime.deadline;
+            lifetime.revocation = Some(deadline.local_expiry());
+            deadline
+        };
         fence?
             .run(async {
+                // Preserve the original ordinary-login deadline. Rolling credentials
+                // may still be server-valid after the locally observed deadline.
+                if deadline.server_expires.is_none() && deadline.elapsed() {
+                    return Err(EXPIRED);
+                }
                 let request = self
                     .request(self.origin.endpoint("/api/auth/logout"))?
                     .header(header::COOKIE, session.secrets.cookie.clone())
                     .header("X-CSRF-Token", session.secrets.csrf.clone())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body("{}");
-                let response = self.send(request, Some(session), false).await?;
+                let response = self.send(request, None, false).await?;
                 if response.status() != 204 {
                     return Err(INVALID_RESPONSE);
                 }
@@ -881,10 +907,7 @@ impl Api {
 
     fn check_session(&self, session: &Session) -> Result<(), ApiError> {
         self.check_session_owner(session)?;
-        if session.is_expired() {
-            return Err(EXPIRED);
-        }
-        Ok(())
+        session.lifetime().check_live()
     }
 
     fn check_session_owner(&self, session: &Session) -> Result<(), ApiError> {
@@ -939,39 +962,64 @@ impl Api {
         session: Option<&Session>,
         login: bool,
     ) -> Result<Response, ApiError> {
-        let generation = session.map(Session::network_generation);
-        if generation.is_some_and(|value| value & 1 != 0) {
-            return Err(OFFLINE);
-        }
-        // Logout marks the capability revoked before I/O, but its one authorized
-        // request is still limited by the original network deadline.
-        if session.is_some_and(Session::cookie_expired) {
-            return Err(EXPIRED);
-        }
+        self.send_inner(request, session, login, false).await
+    }
+
+    async fn send_inner(
+        &self,
+        request: RequestBuilder,
+        session: Option<&Session>,
+        login: bool,
+        upgrading: bool,
+    ) -> Result<Response, ApiError> {
+        let request_scope = if let Some(session) = session {
+            self.check_session_owner(session)?;
+            let generation = session.secrets.network.borrow();
+            if *generation & 1 != 0 {
+                return Err(OFFLINE);
+            }
+            let lifetime = session.lifetime();
+            lifetime.check_live()?;
+            Some((session, *generation, lifetime.deadline))
+        } else {
+            None
+        };
         let response = request.send().await.map_err(|_| NETWORK)?;
-        if session.map(Session::network_generation) != generation {
-            return Err(OFFLINE);
+        let status = response.status();
+        if let Some((session, generation, used)) = request_scope {
+            // Keep the mode fence held through publication or revocation.
+            let current = session.secrets.network.borrow();
+            if *current != generation {
+                return Err(OFFLINE);
+            }
+            let mut lifetime = session.lifetime();
+            if status == 401 {
+                // Before checking local expiry: this denial may be authoritative
+                // even if the captured deadline elapsed while it was in flight.
+                return Err(lifetime.apply_denial(used, EXPIRED));
+            }
+            lifetime.check_live()?;
+            if used.server_expires.is_some()
+                && (status.is_success() || status == 304)
+                && let Ok(next) = self.rolling_publication(session, response.headers())
+            {
+                lifetime.extend(next);
+            }
+            if upgrading && status == reqwest::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok(response); // validated by the account-upgrade caller
+            }
         }
-        if response.status().is_success() {
+        if status.is_success() {
             return Ok(response);
         }
         // Do not read or retain error bodies (which can contain credentials, URLs or paths).
-        Err(Self::response_error(
-            response.status().as_u16(),
-            session,
-            login,
-        ))
+        Err(Self::response_error(status.as_u16(), login))
     }
 
-    fn response_error(status: u16, session: Option<&Session>, login: bool) -> ApiError {
+    fn response_error(status: u16, login: bool) -> ApiError {
         let mapped = match status {
             401 if login => error("Invalid username or password."),
-            401 => {
-                if let Some(session) = session {
-                    session.secrets.revoked.store(true, Ordering::SeqCst);
-                }
-                EXPIRED
-            }
+            401 => EXPIRED,
             403 => error("The server refused this request. Check your account permissions."),
             404 => error("This item is no longer available."),
             409 => error("The item changed on the server. Refresh and try again."),
@@ -1025,17 +1073,44 @@ struct SessionSummary {
     csrf_token: String,
 }
 
-/// Only login can install a cookie, and only a single exact-host root cookie is accepted.
+fn session_cookie_name(origin: &Origin) -> &'static str {
+    if origin.0.scheme() == "https" {
+        "__Host-spofify_session"
+    } else {
+        "spofify_session"
+    }
+}
+
 fn session_cookie(
     origin: &Origin,
     headers: &header::HeaderMap,
 ) -> Result<(HeaderValue, Instant), ApiError> {
-    let secure = origin.0.scheme() == "https";
-    let expected = if secure {
-        "__Host-spofify_session"
+    let (header, cookie) = parse_session_cookie(origin, headers)?;
+    // Max-Age takes precedence over Expires for ordinary login, per RFC 6265.
+    let seconds = if let Some(age) = cookie.max_age() {
+        age.whole_seconds()
+    } else if let Some(Expiration::DateTime(expires)) = cookie.expires() {
+        (expires - cookie::time::OffsetDateTime::now_utc()).whole_seconds()
     } else {
-        "spofify_session"
+        return Err(INVALID_RESPONSE);
     };
+    if seconds <= 0 {
+        return Err(INVALID_RESPONSE);
+    }
+    // A monotonic deadline prevents clock rollback from resurrecting an expired token.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(seconds as u64))
+        .ok_or(INVALID_RESPONSE)?;
+    Ok((header, deadline))
+}
+
+/// Accept only one session cookie and require it to be a host-only root cookie.
+fn parse_session_cookie<'a>(
+    origin: &Origin,
+    headers: &'a header::HeaderMap,
+) -> Result<(HeaderValue, Cookie<'a>), ApiError> {
+    let secure = origin.0.scheme() == "https";
+    let expected = session_cookie_name(origin);
     let mut candidate = None;
     let mut total = 0;
     for (count, header) in headers.get_all(header::SET_COOKIE).iter().enumerate() {
@@ -1081,9 +1156,7 @@ fn session_cookie(
         }
         let value = cookie.value();
         if cookie.name() != expected
-            || value.is_empty()
-            || value.len() > 512
-            || !value.bytes().all(cookie_octet)
+            || !valid_session_cookie_value(value)
             || !attrs.contains("path")
             || cookie.path() != Some("/")
             || cookie.domain().is_some()
@@ -1092,31 +1165,20 @@ fn session_cookie(
         {
             return Err(INVALID_RESPONSE);
         }
-        // Max-Age takes precedence over Expires, per RFC 6265. Persistence is required.
-        let seconds = if let Some(age) = cookie.max_age() {
-            age.whole_seconds()
-        } else if let Some(Expiration::DateTime(expires)) = cookie.expires() {
-            (expires - cookie::time::OffsetDateTime::now_utc()).whole_seconds()
-        } else {
-            return Err(INVALID_RESPONSE);
-        };
-        if seconds <= 0 {
-            return Err(INVALID_RESPONSE);
-        }
-        // A monotonic deadline prevents clock rollback from resurrecting an expired token.
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(seconds as u64))
-            .ok_or(INVALID_RESPONSE)?;
         let mut header =
             HeaderValue::from_str(&format!("{expected}={value}")).map_err(|_| INVALID_RESPONSE)?;
         header.set_sensitive(true);
-        candidate = Some((header, deadline));
+        candidate = Some((header, cookie));
     }
     candidate.ok_or(INVALID_RESPONSE)
 }
 
-fn cookie_octet(byte: u8) -> bool {
-    matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
+fn valid_session_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
 }
 
 fn single_header(headers: &header::HeaderMap, name: header::HeaderName) -> Option<&HeaderValue> {
@@ -1280,7 +1342,7 @@ mod tests {
         collections::VecDeque,
         io::{Read, Write},
         net::TcpListener,
-        sync::Mutex,
+        sync::atomic::{AtomicBool, Ordering},
         thread::{self, JoinHandle},
     };
 
@@ -1296,6 +1358,10 @@ mod tests {
         let item = wire.into_item("track").unwrap();
         assert_eq!(item.artists, "Juniper Radio");
         assert!(item.has_audio);
+    }
+
+    mod auth {
+        include!("api_auth_tests.rs");
     }
 
     const SUMMARY: &str = r#"{"accountId":"a1","username":"listener","role":"user","csrfToken":"csrf-secret","futureField":true}"#;
@@ -2257,6 +2323,7 @@ mod tests {
         assert_eq!(login.first_line, "POST /api/auth/login HTTP/1.1");
         assert_eq!(login.header("origin"), Some(wire.origin.as_str()));
         assert_eq!(login.header("x-spofify-login"), Some("1"));
+        assert_eq!(login.header("x-spofify-session-mode"), None);
         assert_eq!(login.header("cookie"), None);
         assert_eq!(login.header("x-csrf-token"), None);
         let body: serde_json::Value = serde_json::from_slice(&login.body).unwrap();
@@ -2572,15 +2639,14 @@ mod tests {
             json(RESULTS),
         ]);
         let api = wire.api();
-        let mut session = api.login("listener", "password").await.unwrap();
+        let session = api.login("listener", "password").await.unwrap();
         api.search(&session, "one").await.unwrap();
         api.search(&session, "two").await.unwrap();
         assert_eq!(
             wire.recorded()[2].header("cookie"),
             Some("spofify_session=cookie-secret")
         );
-        Arc::get_mut(&mut session.secrets).unwrap().deadline =
-            Instant::now() - Duration::from_secs(1);
+        session.lifetime().deadline.instant = Instant::now() - Duration::from_secs(1);
         assert!(failure(api.search(&session, "expired").await).expired);
         assert_eq!(wire.recorded().len(), 3);
     }

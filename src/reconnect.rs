@@ -1,6 +1,6 @@
 //! The only authenticated network exception while the session is fenced offline.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::time::Duration;
 
 use reqwest::{Method, header};
 
@@ -20,9 +20,18 @@ const WRONG_ACCOUNT: ApiError = ApiError {
 impl Api {
     /// Validate the existing credential once, only for an explicit Go online intent.
     /// The caller owns the intent token, cancellation, retries and any mode change.
-    /// Success does not open networking or refresh credentials.
+    /// Success may install a newer rolling deadline, but does not open networking.
     pub(crate) async fn validate_reconnect(&self, session: &Session) -> Result<(), ApiError> {
-        self.check_session(session)?;
+        self.check_session_owner(session)?;
+        let used = {
+            let lifetime = session.lifetime();
+            lifetime.check_revocation()?;
+            if lifetime.deadline.server_expires.is_none() {
+                lifetime.check_live()?;
+            }
+            lifetime.deadline
+        };
+        let rolling = used.server_expires.is_some();
         let mut changes = session.network_changes();
         let generation = *changes.borrow_and_update();
         if generation & 1 == 0 {
@@ -32,17 +41,17 @@ impl Api {
         let result = tokio::select! {
             biased;
             _ = changes.changed() => return Err(OFFLINE),
-            _ = tokio::time::sleep_until(session.secrets.deadline.into()) => return Err(EXPIRED),
+            _ = tokio::time::sleep_until(used.instant.into()), if !rolling => return Err(EXPIRED),
             result = async {
-                self.check_session(session)?;
                 if session.network_generation() != generation {
                     return Err(OFFLINE);
                 }
-                // Go authenticates this GET by cookie alone. It returns the login summary
-                // (including CSRF for writes), with no server deadline. Never send CSRF or
-                // install Set-Cookie here; the desktop uses a fixed lifetime from login.
+                session.lifetime().check_revocation()?;
+                // Go authenticates this GET by cookie alone. An explicitly requested
+                // rolling probe can recover a deadline that had advanced at the server.
                 let response = self
                     .request_with_method(Method::GET, self.origin.endpoint("/api/auth/session"))?
+                    .header(header::CACHE_CONTROL, "no-cache, no-store")
                     .header(header::COOKIE, session.secrets.cookie.clone())
                     .timeout(PROBE_TIMEOUT)
                     .send()
@@ -50,10 +59,16 @@ impl Api {
                     .map_err(|_| NETWORK)?;
                 match response.status().as_u16() {
                     200 if content_type(&response)? == "application/json" => {
-                        decode::<SessionSummary>(response, LOGIN_BODY).await
+                        let next = if rolling {
+                            Some(self.rolling_publication(session, response.headers())?)
+                        } else {
+                            None // Ordinary reconnect never installs Set-Cookie.
+                        };
+                        let summary = decode::<SessionSummary>(response, LOGIN_BODY).await?;
+                        Ok((summary, next))
                     }
                     200..=299 => Err(INVALID_RESPONSE),
-                    status => Err(Self::response_error(status, None, false)),
+                    status => Err(Self::response_error(status, false)),
                 }
             } => result,
         };
@@ -64,19 +79,17 @@ impl Api {
         if *current != generation {
             return Err(OFFLINE);
         }
-        self.check_session(session)?;
-        let summary = match result {
-            Err(err) if err.status == 401 => {
-                return Err(Self::response_error(401, Some(session), false));
-            }
+        let mut lifetime = session.lifetime();
+        lifetime.check_revocation()?;
+        let (summary, next) = match result {
+            Err(err) if err.status == 401 => return Err(lifetime.apply_denial(used, EXPIRED)),
             other => other?,
         };
         if !valid_id(&summary.account_id) {
             return Err(INVALID_RESPONSE);
         }
         if summary.account_id != session.secrets.account_id {
-            session.secrets.revoked.store(true, Ordering::SeqCst);
-            return Err(WRONG_ACCOUNT);
+            return Err(lifetime.apply_denial(used, WRONG_ACCOUNT));
         }
         if !valid_text(&summary.username, 256)
             || !matches!(summary.role.as_str(), "admin" | "user")
@@ -84,7 +97,10 @@ impl Api {
         {
             return Err(INVALID_RESPONSE);
         }
-        self.check_session(session)
+        if let Some(next) = next {
+            lifetime.extend(next);
+        }
+        lifetime.check_live()
     }
 }
 
@@ -183,14 +199,11 @@ mod tests {
             (reply(200, ignored_cookie, SAME_ACCOUNT), Ok(())),
             (reply(401, "", "{}"), Err(EXPIRED)),
             (reply(200, "", OTHER_ACCOUNT), Err(WRONG_ACCOUNT)),
-            (
-                reply(503, "", "{}"),
-                Err(Api::response_error(503, None, false)),
-            ),
+            (reply(503, "", "{}"), Err(Api::response_error(503, false))),
             (String::new(), Err(NETWORK)), // disconnect without a response
             (
                 reply(302, "Location: /api/library/tracks/track/audio\r\n", ""),
-                Err(Api::response_error(302, None, false)),
+                Err(Api::response_error(302, false)),
             ),
             (reply(200, "", &oversized), Err(INVALID_RESPONSE)),
             (chunked, Err(INVALID_RESPONSE)),
@@ -201,7 +214,7 @@ mod tests {
             session.account_id = "other".into(); // presentation cannot choose the principal
             session.set_offline(true);
             let generation = session.network_generation();
-            let deadline = session.secrets.deadline;
+            let deadline = session.lifetime().deadline.instant;
             let server = async {
                 let mut stream = receive_probe(&listener).await;
                 assert_media_fenced(&api, &clone, OFFLINE).await;
@@ -219,7 +232,7 @@ mod tests {
             let revoked = expected.is_err_and(|err| err.expired);
             assert_eq!(clone.can_access_local(), !revoked);
             assert_eq!(session.network_generation(), generation);
-            assert_eq!(session.secrets.deadline, deadline);
+            assert_eq!(session.lifetime().deadline.instant, deadline);
             assert_eq!(
                 session.secrets.cookie.as_bytes(),
                 b"spofify_session=synthetic"
@@ -253,6 +266,92 @@ mod tests {
         assert!(!revoked.can_access_local());
         assert_media_fenced(&api, &expired, EXPIRED).await;
         assert_media_fenced(&api, &revoked, EXPIRED).await;
+        assert_no_more_http(&listener).await;
+    }
+
+    fn rolling_headers(expires: cookie::time::OffsetDateTime) -> String {
+        let cookie = super::super::api_auth::test_rolling_cookie("synthetic", expires);
+        format!("X-Spofify-Session-Mode: rolling-v1\r\nSet-Cookie: {cookie}\r\n")
+    }
+
+    #[tokio::test]
+    async fn a_rolling_reconnect_can_recover_a_server_deadline_without_opening_networking() {
+        use cookie::time::{Duration as WallDuration, OffsetDateTime};
+        let (listener, api) = mock().await;
+        let session = api.test_session_with_deadline(Instant::now() - Duration::from_secs(1));
+        let old = OffsetDateTime::now_utc() - WallDuration::minutes(1);
+        session.lifetime().deadline.server_expires = Some(old);
+        let headers = rolling_headers(old + WallDuration::hours(2));
+        session.set_offline(true);
+        let server = async {
+            let mut stream = receive_probe(&listener).await;
+            stream
+                .write_all(reply(503, "", "{}").as_bytes())
+                .await
+                .unwrap();
+            let mut stream = receive_probe(&listener).await;
+            assert_media_fenced(&api, &session, super::super::ROLLING_DEADLINE).await;
+            stream
+                .write_all(reply(200, &headers, SAME_ACCOUNT).as_bytes())
+                .await
+                .unwrap();
+        };
+        let client = async {
+            assert_eq!(
+                api.validate_reconnect(&session).await,
+                Err(Api::response_error(503, false))
+            );
+            assert!(session.is_expired());
+            assert!(!session.was_server_revoked());
+            let generation = session.network_generation();
+            assert_eq!(api.validate_reconnect(&session).await, Ok(()));
+            assert!(!session.is_expired());
+            assert_eq!(session.network_generation(), generation);
+            assert_media_fenced(&api, &session, OFFLINE).await;
+        };
+        timeout(TEST_TIMEOUT, async { tokio::join!(client, server) })
+            .await
+            .unwrap();
+        assert_no_more_http(&listener).await;
+    }
+
+    #[tokio::test]
+    async fn an_older_http_401_cannot_revoke_a_renewed_credential() {
+        use cookie::time::{Duration as WallDuration, OffsetDateTime};
+        let (listener, api) = mock().await;
+        let now = OffsetDateTime::now_utc();
+        let session = api.test_session();
+        session.lifetime().deadline.server_expires = Some(now + WallDuration::minutes(1));
+        let headers = rolling_headers(now + WallDuration::hours(2));
+        let request = || {
+            api.request_with_method(Method::GET, api.origin.endpoint("/api/auth/session"))
+                .unwrap()
+                .header(header::COOKIE, session.secrets.cookie.clone())
+        };
+        let server = async {
+            let mut first = receive_probe(&listener).await;
+            let respond = async {
+                let mut newer = receive_probe(&listener).await;
+                newer
+                    .write_all(reply(200, &headers, SAME_ACCOUNT).as_bytes())
+                    .await
+                    .unwrap();
+            };
+            let (renewed, ()) = tokio::join!(api.send(request(), Some(&session), false), respond);
+            assert!(renewed.is_ok());
+            first
+                .write_all(reply(401, "", "{}").as_bytes())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(api.send(request(), Some(&session), false), server)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.err(), Some(super::super::STALE_DENIAL));
+        assert!(!session.was_server_revoked());
+        assert!(session.can_access_local());
         assert_no_more_http(&listener).await;
     }
 

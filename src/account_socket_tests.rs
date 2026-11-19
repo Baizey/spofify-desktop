@@ -239,11 +239,11 @@ fn grant_must_match_a_sent_basis_and_cannot_remake_or_extend_it() {
     let older = pulses.next(time).unwrap();
     let newer = pulses.next(time + Duration::from_secs(1)).unwrap();
     assert_eq!(pulses.accept(92, 8000, "handle", time), None);
-    assert_eq!(pulses.accept(newer, 8001, "handle", time), None);
+    assert_eq!(pulses.accept(newer, 15_001, "handle", time), None);
     assert_eq!(pulses.accept(newer, 8000, "", time), None);
     assert_eq!(
-        pulses.accept(newer, 8000, "handle", time + Duration::from_secs(3)),
-        Some(time + Duration::from_secs(9))
+        pulses.accept(newer, 15_000, "handle", time + Duration::from_secs(3)),
+        Some(time + Duration::from_secs(16))
     );
     assert_eq!(pulses.accept(older, 8000, "handle", time), None);
     assert_eq!(pulses.accept(newer, 8000, "handle", time), None);

@@ -1,4 +1,70 @@
-import { Action, Caption, Divider, Eyebrow, Theme } from "theme.slint";
+import { Action, Caption, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+
+component PlaybackStatus inherits Action {
+    in property <string> message;
+    in property <string> context-key;
+    text: "Status";
+    accessible-label: "Playback status";
+    accessible-description: root.message;
+    accessible-expanded: details.is-open;
+    selected: details.is-open;
+    changed message => { if details.is-open { details.close(); } }
+    changed context-key => { if details.is-open { details.close(); } }
+    changed enabled => { if !self.enabled && details.is-open { details.close(); } }
+    clicked => {
+        if details.is-open { details.close(); }
+        else { self.take-focus(); details.show(); }
+    }
+    details := PopupWindow {
+        x: root.width - self.width; y: root.height + 6px;
+        width: 264px; height: message-panel.min-height;
+        close-policy: close-on-click-outside;
+        forward-focus: keys;
+        init => { keys.focus(); }
+        message-panel := Notice { width: 100%; height: 100%; text: root.message; }
+        keys := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.Escape || event.text == Key.Return || event.text == Key.Space {
+                    details.close(); return accept;
+                }
+                if event.text == Key.Tab || event.text == Key.Backtab { details.close(); }
+                return reject;
+            }
+        }
+    }
+}
+
+// Surface playback destinations here only when there is no playback dock.
+export component PlaybackTools inherits Rectangle {
+    in property <bool> labeled;
+    in property <bool> enabled;
+    in property <bool> queue-open;
+    in property <bool> devices-open;
+    in property <string> status;
+    in property <string> context-key;
+    callback navigate(string);
+    public function focus-queue() { queue-trigger.take-focus(); }
+    preferred-width: tools.preferred-width;
+    horizontal-stretch: 0;
+    tools := HorizontalLayout {
+        spacing: 6px;
+        queue-trigger := Action {
+            text: root.labeled ? "Queue" : ""; icon: "≡"; selected: root.queue-open;
+            accessible-label: "Play queue"; accessible-expanded: root.queue-open;
+            enabled: root.enabled; clicked => { root.navigate("queue"); }
+        }
+        Action {
+            text: root.labeled ? "Devices" : ""; icon: "◫"; selected: root.devices-open;
+            accessible-label: "Playback devices";
+            enabled: root.enabled; clicked => { root.navigate("devices"); }
+        }
+        if root.status != "": PlaybackStatus {
+            message: root.status; context-key: root.context-key;
+            enabled: root.enabled;
+        }
+    }
+}
 
 export component WorkspaceRail inherits Rectangle {
     in property <string> kind;

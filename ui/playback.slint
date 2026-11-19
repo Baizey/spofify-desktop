@@ -85,7 +85,6 @@ component Clock inherits Caption {
 }
 
 export component PlayerBar inherits Rectangle {
-    in property <bool> has-track;
     in property <string> track;
     in property <string> subtitle;
     in property <string> output;
@@ -98,7 +97,6 @@ export component PlayerBar inherits Rectangle {
     in property <bool> can-toggle;
     in property <bool> can-skip;
     in property <bool> offline;
-    in property <bool> compact;
     in property <string> page;
     in property <bool> queue-open;
     in property <[ArtistCredit]> credits;
@@ -115,11 +113,9 @@ export component PlayerBar inherits Rectangle {
     property <bool> narrow: root.width < 760px;
     property <length> pad: max(clamp(root.width * 0.04, 16px, 36px), (root.width - 1220px) / 2);
     property <length> center-width: clamp(root.width * 0.36, 162px, 480px);
-    height: !root.has-track ? 48px : (root.status == "" ? 82px : 96px);
     vertical-stretch: 0; background: Theme.panel;
     Divider { y: 0px; }
-    if !root.has-track: Caption { x: root.pad; width: parent.width - 2 * root.pad - 96px; text: root.status != "" ? root.status : "No song selected"; accessible-label: self.text; font-size: 13px; }
-    if root.has-track: Rectangle {
+    Rectangle {
         x: root.pad; width: max(0px, (root.width - root.center-width)/2 - root.pad - 10px);
         height: root.height;
         property <bool> show-cover: self.width >= 150px;
@@ -148,7 +144,7 @@ export component PlayerBar inherits Rectangle {
             if root.status != "": Caption { text: root.status; color: Theme.amber; }
         }
     }
-    if root.has-track: Rectangle {
+    Rectangle {
         width: root.center-width; x: (root.width - self.width)/2;
         Transport { x: (parent.width - self.width)/2; y: root.duration <= 0 ? (root.height - self.height)/2 : 7px;
             playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip; previous => {root.previous();} toggle => {root.toggle();} next => {root.next();} }
@@ -164,6 +160,6 @@ export component PlayerBar inherits Rectangle {
             accessible-label: "Play queue"; accessible-expanded: root.queue-open;
             clicked => { root.navigate("queue"); }
         }
-        Action { text: root.narrow || !root.has-track ? "" : root.offline ? "This computer" : root.output; width: self.text == "" ? 37px : 154px; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; accessible-description: root.output; clicked => { root.navigate("devices"); } }
+        Action { text: root.narrow ? "" : root.offline ? "This computer" : root.output; width: self.text == "" ? 37px : 154px; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; accessible-description: root.output; clicked => { root.navigate("devices"); } }
     }
 }

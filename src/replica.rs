@@ -59,6 +59,12 @@ impl Replica {
 #[derive(Default)]
 pub struct Trail(VecDeque<Route>);
 impl Trail {
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Follow a link from the actual current route. A rail selection clears
+    /// the trail instead of calling this.
     pub fn visit(&mut self, old: &Route, new: &Route) {
         if old == new || matches!((old, new), (Route::Search(_), Route::Search(_))) {
             return;
@@ -119,20 +125,23 @@ mod tests {
         assert_eq!(t.pop(), Some(query));
         assert_eq!(t.pop(), Some(Route::History));
         for i in 0..100 {
-            t.visit(&Route::Album(i.to_string()), &Route::History);
+            t.visit(&Route::Album(i.to_string()), &Route::Artist("a".into()));
         }
         assert_eq!(t.0.len(), MAX_HISTORY);
     }
     #[test]
     fn direct_returns_and_transient_screens_do_not_duplicate_back() {
         let mut t = Trail::default();
-        t.visit(&Route::History, &Route::Playlists);
-        t.visit(&Route::Playlists, &Route::History);
+        let album = Route::Album("a".into());
+        let artist = Route::Artist("ar".into());
+        t.visit(&album, &artist);
+        t.visit(&artist, &album);
         assert!(!t.can_back());
 
-        t.visit(&Route::History, &Route::Search(String::new()));
-        t.visit(&Route::Search(String::new()), &Route::Playlists);
-        assert_eq!(t.pop(), Some(Route::History));
+        let blank = Route::Search(String::new());
+        t.visit(&album, &blank);
+        t.visit(&blank, &artist);
+        assert_eq!(t.pop(), Some(album));
         assert!(!t.can_back());
 
         let playlist = Route::Playlist("list".into());
@@ -141,12 +150,6 @@ mod tests {
         t.visit(&playlist, &picker);
         t.landed(&playlist); // Add succeeds and returns to its destination.
         assert_eq!(t.pop(), Some(Route::Playlists));
-        assert!(!t.can_back());
-
-        t.visit(&Route::History, &Route::Offline);
-        t.visit(&Route::Offline, &Route::Appearance);
-        t.visit(&Route::Appearance, &Route::Offline);
-        assert_eq!(t.pop(), Some(Route::History));
         assert!(!t.can_back());
     }
     #[test]

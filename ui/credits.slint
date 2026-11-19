@@ -62,6 +62,8 @@ export component CreditLine inherits Rectangle {
     in property <bool> centered;
     in property <bool> interactive: true;
     in property <length> font-size: 13px * Theme.density;
+    in property <bool> background-clickable;
+    callback background-clicked();
     callback activated(string /* id */);
     callback focused();
 
@@ -83,7 +85,19 @@ export component CreditLine inherits Rectangle {
         width: parent.width; height: parent.height;
         content-width: max(self.width, strip.width);
         content-height: self.height;
-        mouse-drag-pan-enabled: self.content-width > self.width;
+        interactive: self.content-width > self.width;
+        mouse-drag-pan-enabled: self.interactive;
+
+        // When the strip overflows, Flickable handles the press before the
+        // surrounding row can see it. Keep plain clicks working without
+        // swallowing linked names or interfering with horizontal drags.
+        if root.background-clickable: TouchArea {
+            x: -viewport.content-x;
+            width: viewport.width; height: viewport.height;
+            enabled: viewport.interactive;
+            mouse-cursor: MouseCursor.pointer;
+            clicked => { root.background-clicked(); }
+        }
 
         strip := HorizontalLayout {
             x: root.centered ? max(0px, (viewport.width - self.width) / 2) : 0px;

@@ -2,9 +2,11 @@ mod actions;
 mod api;
 mod artwork;
 mod audio;
+mod auth;
 mod collections;
 mod desk;
 mod engine;
+mod login_store;
 mod media;
 mod mode;
 #[cfg(target_os = "linux")]
@@ -21,7 +23,7 @@ mod saved;
 mod socket;
 mod storage;
 slint::include_modules!();
-use engine::Command;
+use engine::{AuthCommand, Command};
 use slint::{ComponentHandle, Model};
 use std::{
     cell::RefCell,
@@ -97,55 +99,24 @@ fn main() -> Result<(), slint::PlatformError> {
     let epoch = Arc::new(AtomicU64::new(0));
     let (access_tx, access) = watch::channel(None);
     let mode = mode::ModeControl::default();
-    let (tx, worker) = engine::start(ui.as_weak(), epoch.clone(), access_tx, mode.clone());
+    let (auth_tx, auth_rx) = mpsc::unbounded_channel();
+    ui.set_busy(true);
+    ui.set_restoring_login(true);
+    let (tx, worker) = engine::start(
+        ui.as_weak(),
+        epoch.clone(),
+        access_tx,
+        mode.clone(),
+        auth_rx,
+        auth_tx.clone(),
+    );
     let (art, pages) = watch::channel(None);
     let _covers = artwork::install(&ui, access.clone(), pages);
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx.clone(), art);
     desk.bind(&ui, mode, access.clone());
     let _media = presentation::install(&ui, access.clone());
     let _prefs = preferences::install(&ui, access.clone());
-    {
-        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
-        ui.on_sign_in(move || {
-            if let Some(ui) = w.upgrade()
-                && !ui.get_busy()
-            {
-                let e = epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                let command = Command::Login {
-                    epoch: e,
-                    origin: ui.get_origin().into(),
-                    username: ui.get_username().into(),
-                    password: ui.get_password().into(),
-                };
-                ui.set_password("".into());
-                ui.set_busy(true);
-                ui.set_status("".into());
-                send(&tx, command, &ui);
-            }
-        });
-    }
-    for logout in [true, false] {
-        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
-        let callback = move || {
-            if let Some(ui) = w.upgrade() {
-                let e = epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                ui.set_password("".into());
-                ui.set_signed_in(false);
-                if logout {
-                    ui.set_username("".into());
-                }
-                ui.set_status("".into());
-                ui.set_busy(false);
-                clear(&ui);
-                send(&tx, Command::Logout(e), &ui);
-            }
-        };
-        if logout {
-            ui.on_sign_out(callback);
-        } else {
-            ui.on_server_edited(callback);
-        }
-    }
+    bind_auth(&ui, &auth_tx, &epoch);
     for op in ["previous", "next", "toggle"] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
         let callback = move || {
@@ -266,8 +237,7 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(target_os = "linux")]
     let _media_keys = mpris::attach(&ui, epoch.clone());
     let result = ui.run();
-    epoch.fetch_add(1, Ordering::SeqCst);
-    let _ = tx.blocking_send(Command::Shutdown);
+    let _ = auth_tx.send(AuthCommand::Shutdown);
     if worker.join().is_err() {
         eprintln!("Audio worker closed unexpectedly.");
     }
@@ -276,6 +246,91 @@ fn main() -> Result<(), slint::PlatformError> {
         eprintln!("Library worker closed unexpectedly.");
     }
     result
+}
+fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Arc<AtomicU64>) {
+    for retry in [false, true] {
+        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
+        let callback = move || {
+            let Some(ui) = w.upgrade() else { return };
+            if ui.get_busy() || ui.get_signed_in() || (retry && !ui.get_can_retry_session()) {
+                return;
+            }
+            let epoch = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            let origin = ui.get_origin().into();
+            let username = ui.get_username().into();
+            let command = if retry {
+                AuthCommand::Retry {
+                    epoch,
+                    origin,
+                    username,
+                }
+            } else {
+                AuthCommand::Login {
+                    epoch,
+                    origin,
+                    username,
+                    password: ui.get_password().into(),
+                    remember: ui.get_keep_signed_in(),
+                }
+            };
+            ui.set_password("".into());
+            ui.set_busy(true);
+            ui.set_restoring_login(retry);
+            ui.set_can_retry_session(false);
+            ui.set_status("".into());
+            ui.set_error(false);
+            ui.set_auth_notice("".into());
+            if tx.send(command).is_err() {
+                ui.set_busy(false);
+                ui.set_restoring_login(false);
+                ui.set_error(true);
+                ui.set_status("Sign-in is unavailable. Reopen the desktop and try again.".into());
+            }
+        };
+        if retry {
+            ui.on_retry_session(callback);
+        } else {
+            ui.on_sign_in(callback);
+        }
+    }
+    for kind in ["logout", "cancel", "server", "username"] {
+        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
+        let callback = move || {
+            let Some(ui) = w.upgrade() else { return };
+            let editing = matches!(kind, "server" | "username");
+            // Ordinary edits need no worker round trip. If an auth result is
+            // queued, fence it before changing either part of the login scope.
+            let interrupt = ui.get_busy() || ui.get_signed_in();
+            if !editing && !interrupt {
+                return;
+            }
+            ui.set_password("".into());
+            ui.set_keep_signed_in(false);
+            ui.set_can_retry_session(false);
+            ui.set_auth_notice("".into());
+            ui.set_status("".into());
+            ui.set_error(false);
+            if !interrupt {
+                return;
+            }
+            let epoch = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            ui.set_signed_in(false);
+            ui.set_busy(false);
+            ui.set_restoring_login(false);
+            clear(&ui);
+            let _ = tx.send(if kind == "logout" {
+                AuthCommand::Logout(epoch)
+            } else {
+                AuthCommand::Cancel(epoch)
+            });
+        };
+        match kind {
+            "logout" => ui.on_sign_out(callback),
+            "cancel" => ui.on_cancel_sign_in(callback),
+            "server" => ui.on_server_edited(callback),
+            _ => ui.on_username_edited(callback),
+        }
+    }
 }
 fn upcoming_keys(rows: impl Iterator<Item = QueueRow>) -> Vec<u64> {
     rows.filter(|r| r.upcoming)

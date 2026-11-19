@@ -130,6 +130,7 @@ struct Pending {
     before: Status,
     due: tokio::time::Instant,
 }
+const INITIAL_ROUTE: Route = Route::History;
 const PERSONAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const PERSONAL_WRITE_TIMEOUT: Duration = Duration::from_secs(12);
 struct Browser {
@@ -186,18 +187,58 @@ fn label(route: &Route) -> &'static str {
         Route::Track(_) => "Track",
     }
 }
-fn named_route(name: &str) -> Option<Route> {
-    Some(match name {
-        "history" => Route::History,
-        "search" => Route::Search(String::new()),
-        "playlists" => Route::Playlists,
-        "offline" => Route::Offline,
-        "appearance" | "settings" => Route::Appearance,
-        "now" => Route::Now,
-        "queue" => Route::Queue,
-        "devices" => Route::Devices,
-        _ => return None,
-    })
+enum Navigation {
+    Section(Route),
+    Follow(Route),
+    Untracked(Route), // Refresh or land after a mutation without adding a Back entry.
+    Back,
+}
+
+impl Navigation {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "history" => Self::Section(Route::History),
+            "playlists" => Self::Section(Route::Playlists),
+            "offline" => Self::Section(Route::Offline),
+            "appearance" | "settings" => Self::Section(Route::Appearance),
+            "search" => Self::Follow(Route::Search(String::new())),
+            "now" => Self::Follow(Route::Now),
+            "queue" => Self::Follow(Route::Queue),
+            "devices" => Self::Follow(Route::Devices),
+            "back" => Self::Back,
+            _ => return None,
+        })
+    }
+
+    fn resolve(
+        self,
+        current: &Route,
+        trail: &mut Trail,
+        reading: bool,
+        failed: bool,
+    ) -> Option<Route> {
+        match self {
+            Self::Section(next) => {
+                // A selected rail item can still be showing a detail. Decide
+                // from the actual route, and clear Back even on a same-route
+                // click if this section was reached through another action.
+                if !trail.can_back() && repeat_navigation(current, &next, reading, failed) {
+                    return None;
+                }
+                trail.clear();
+                Some(next)
+            }
+            Self::Follow(next) => {
+                if repeat_navigation(current, &next, reading, failed) {
+                    return None;
+                }
+                trail.visit(current, &next);
+                Some(next)
+            }
+            Self::Untracked(next) => Some(next),
+            Self::Back => trail.pop(),
+        }
+    }
 }
 fn context_route(kind: &str, id: &str) -> Option<Route> {
     // A remote player may still have a likes context, but it has no desktop page.
@@ -504,7 +545,7 @@ impl Browser {
         self.cache = Replica::default();
         self.trail = Trail::default();
         self.page_keys = RandomState::new();
-        self.route = Route::History;
+        self.route = INITIAL_ROUTE;
         self.page = Arc::default();
         self.message.clear();
         self.error = false;
@@ -514,7 +555,7 @@ impl Browser {
             clear_form(&ui);
         });
         if self.access.is_some() {
-            self.visit(Route::History, false, false);
+            self.visit(Navigation::Untracked(INITIAL_ROUTE), false);
         } else {
             self.render(true);
         }
@@ -544,11 +585,10 @@ impl Browser {
                 offline && !saved_route(&self.route) && !matches!(self.route, Route::Search(_));
             self.visit(
                 if jump_to_downloads {
-                    Route::Offline
+                    Navigation::Follow(Route::Offline)
                 } else {
-                    self.route.clone()
+                    Navigation::Untracked(self.route.clone())
                 },
-                jump_to_downloads,
                 false,
             );
             if interrupted {
@@ -674,7 +714,7 @@ impl Browser {
                 self.scoped_ui(clear_form_owned);
                 if let Some(next) = observed {
                     self.trail.landed(&next);
-                    self.visit(next, false, false);
+                    self.visit(Navigation::Untracked(next), false);
                 }
                 self.error = false;
                 self.message = "The matching change is now visible in your account library.".into();
@@ -767,19 +807,29 @@ impl Browser {
         }
     }
 
-    fn visit(&mut self, next: Route, remember: bool, more: bool) {
-        if self.writing
-            || remember && repeat_navigation(&self.route, &next, self.task.is_some(), self.error)
-        {
+    fn visit(&mut self, navigation: Navigation, more: bool) {
+        if self.writing {
             return;
         }
+        let back = matches!(navigation, Navigation::Back);
+        let Some(next) = navigation.resolve(
+            &self.route,
+            &mut self.trail,
+            self.task.is_some(),
+            self.error,
+        ) else {
+            return;
+        };
         let changed = next != self.route;
         let retry_personal = !changed && self.error && matches!(next, Route::Playlist(_));
-        if changed && matches!(self.route, Route::Search(_)) && !matches!(next, Route::Search(_)) {
+        if back && let Route::Search(q) = &next {
+            let q = q.clone();
+            self.scoped_ui(move |ui| ui.set_query(q.into()));
+        } else if changed
+            && matches!(self.route, Route::Search(_))
+            && !matches!(next, Route::Search(_))
+        {
             self.scoped_ui(|ui| ui.set_query("".into()));
-        }
-        if remember {
-            self.trail.visit(&self.route, &next);
         }
         self.cancel();
         self.message.clear();
@@ -958,22 +1008,14 @@ impl Browser {
         }
         let (mut op, idx, val) = match i.intent {
             Intent::Navigate(s) => {
-                if s == "back" {
-                    if let Some(r) = self.trail.pop() {
-                        if let Route::Search(q) = &r {
-                            let q = q.clone();
-                            self.scoped_ui(move |ui| ui.set_query(q.into()));
-                        }
-                        self.visit(r, false, false);
-                    }
-                } else if let Some(r) = named_route(&s) {
-                    self.visit(r, true, false);
+                if let Some(navigation) = Navigation::named(&s) {
+                    self.visit(navigation, false);
                 }
                 return;
             }
             Intent::Search(q) => {
                 if q.len() <= 1000 {
-                    self.visit(Route::Search(q.trim().into()), true, false);
+                    self.visit(Navigation::Follow(Route::Search(q.trim().into())), false);
                 }
                 return;
             }
@@ -990,7 +1032,7 @@ impl Browser {
         let page = self.page.clone();
         if op == "more" {
             if page.more && self.task.is_none() && !a.offline {
-                self.visit(route, false, true);
+                self.visit(Navigation::Untracked(route), true);
             }
             return;
         }
@@ -1051,7 +1093,7 @@ impl Browser {
         }
         if let Some(kind) = op.strip_prefix("context-") {
             if !offline && let Some(target) = context_route(kind, &val) {
-                self.visit(target, true, false);
+                self.visit(Navigation::Follow(target), false);
             }
             return;
         }
@@ -1062,7 +1104,7 @@ impl Browser {
                 metadata_route(&op, &val, offline)
             };
             if let Some(target) = target.filter(|target| *target != route) {
-                self.visit(target, true, false);
+                self.visit(Navigation::Follow(target), false);
             }
             return;
         }
@@ -1086,7 +1128,7 @@ impl Browser {
             });
             if let Some(target) = target {
                 if (!offline || saved_route(&target)) && target != route {
-                    self.visit(target, true, false);
+                    self.visit(Navigation::Follow(target), false);
                 }
                 return;
             }
@@ -1099,7 +1141,7 @@ impl Browser {
             if let Some(r) = row
                 && !a.offline
             {
-                self.visit(Route::Picker(r.id), true, false);
+                self.visit(Navigation::Follow(Route::Picker(r.id)), false);
             }
             return;
         }
@@ -1278,7 +1320,10 @@ impl Browser {
                 if let Some(next) = &route {
                     self.trail.landed(next);
                 }
-                self.visit(route.unwrap_or_else(|| self.route.clone()), false, false);
+                self.visit(
+                    Navigation::Untracked(route.unwrap_or_else(|| self.route.clone())),
+                    false,
+                );
             }
             Update::CollectionSaved(result) => {
                 self.cache.saved_changed();
@@ -1449,8 +1494,122 @@ mod tests {
         );
         assert_eq!(projected_music(Some(&credit), true, true), ("", "Artist"));
     }
+    fn step(route: &mut Route, trail: &mut Trail, navigation: Navigation) {
+        *route = navigation.resolve(route, trail, false, false).unwrap();
+    }
+
     #[test]
-    fn page_keys_match_back_routes_without_exposing_query_or_entity_identity() {
+    fn peer_rail_clicks_start_roots_with_no_back() {
+        let mut route = INITIAL_ROUTE;
+        let mut trail = Trail::default();
+        assert_eq!(route, Route::History);
+        assert!(!trail.can_back());
+        step(
+            &mut route,
+            &mut trail,
+            Navigation::Follow(Route::Album("from-history".into())),
+        );
+        step(&mut route, &mut trail, Navigation::Back);
+        assert_eq!(route, Route::History);
+        assert!(!trail.can_back());
+
+        for (target, expected) in [
+            ("playlists", Route::Playlists),
+            ("offline", Route::Offline),
+            ("history", Route::History),
+            ("playlists", Route::Playlists),
+            ("offline", Route::Offline),
+            ("settings", Route::Appearance),
+        ] {
+            step(&mut route, &mut trail, Navigation::named(target).unwrap());
+            assert_eq!(route, expected);
+            assert!(!trail.can_back(), "{target} must not offer Back");
+            assert_eq!(
+                Navigation::Back.resolve(&route, &mut trail, false, false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_the_active_rail_section_from_detail_discards_prior_routes() {
+        for (target, root, detail) in [
+            (
+                "playlists",
+                Route::Playlists,
+                Route::Playlist("list".into()),
+            ),
+            (
+                "offline",
+                Route::Offline,
+                Route::SavedCollection("saved".into()),
+            ),
+        ] {
+            let mut route = root.clone();
+            let mut trail = Trail::default();
+            step(&mut route, &mut trail, Navigation::Follow(detail.clone()));
+            assert_eq!(route, detail);
+            assert!(trail.can_back());
+            step(&mut route, &mut trail, Navigation::named(target).unwrap());
+            assert_eq!(route, root);
+            assert!(!trail.can_back());
+        }
+    }
+
+    #[test]
+    fn reselecting_a_root_reached_by_following_a_link_clears_back_even_while_reading() {
+        let mut trail = Trail::default();
+        let saved = Navigation::Follow(Route::Offline)
+            .resolve(&Route::Appearance, &mut trail, false, false)
+            .unwrap();
+        assert!(trail.can_back());
+        let root = Navigation::named("offline").unwrap();
+        assert_eq!(root.resolve(&saved, &mut trail, true, false), Some(saved));
+        assert!(!trail.can_back());
+    }
+
+    #[test]
+    fn back_restores_entity_and_ranked_search_sources_without_inserting_history() {
+        let keys = RandomState::new();
+        let playlist = Route::Playlist("list".into());
+        let query = Route::Search("a ranked query".into());
+        let artist = Route::Artist("artist".into());
+        let album = Route::Album("album".into());
+        let sources = [
+            album.clone(),
+            artist.clone(),
+            query.clone(),
+            playlist.clone(),
+            Route::Playlists,
+        ]
+        .map(|r| (page_key(&r, Some(&keys)), r));
+        let mut route = INITIAL_ROUTE;
+        let mut trail = Trail::default();
+        step(
+            &mut route,
+            &mut trail,
+            Navigation::named("playlists").unwrap(),
+        );
+        for next in [
+            playlist.clone(),
+            Route::Search("a ranked".into()),
+            query.clone(),
+            artist.clone(),
+            album.clone(),
+            Route::Track("track".into()),
+        ] {
+            step(&mut route, &mut trail, Navigation::Follow(next));
+        }
+        for (key, source) in sources {
+            step(&mut route, &mut trail, Navigation::named("back").unwrap());
+            assert_eq!(route, source);
+            assert_eq!(page_key(&route, Some(&keys)), key);
+        }
+        assert!(!trail.can_back());
+    }
+
+    #[test]
+    fn page_keys_do_not_expose_query_or_entity_identity() {
         let keys = RandomState::new();
         let private = "synthetic private query/id";
         let query = Route::Search(private.into());
@@ -1464,17 +1623,17 @@ mod tests {
         );
         assert_ne!(key, page_key(&Route::Playlist(private.into()), Some(&keys)));
 
-        let mut trail = Trail::default();
-        trail.visit(&query, &Route::Artist("synthetic".into()));
-        assert_eq!(page_key(&trail.pop().unwrap(), Some(&keys)), key);
         assert_ne!(page_key(&query, Some(&RandomState::new())), key);
         assert!(page_key(&Route::History, None).is_empty());
     }
     #[test]
     fn catalog_indexes_are_not_named_destinations() {
-        assert_eq!(named_route("albums"), None);
-        assert_eq!(named_route("artists"), None);
-        assert_eq!(named_route("search"), Some(Route::Search(String::new())));
+        assert!(Navigation::named("albums").is_none());
+        assert!(Navigation::named("artists").is_none());
+        assert!(matches!(
+            Navigation::named("search"),
+            Some(Navigation::Follow(Route::Search(q))) if q.is_empty()
+        ));
     }
     #[test]
     fn stale_form_cannot_borrow_new_playlist_revision() {
@@ -1561,7 +1720,7 @@ pub fn start(
             .build()
             .expect("browser runtime");
         runtime.block_on(async move {
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:Route::History,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);

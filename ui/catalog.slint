@@ -1,4 +1,4 @@
-import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, TextTarget, Theme } from "theme.slint";
+import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
 import { ArtistCredit, CreditLine, WrappingCredits } from "credits.slint";
 import { ActionCopy, OverflowMenu } from "overflow-menu.slint";
 
@@ -104,14 +104,6 @@ export component EmptyState inherits Rectangle {
     }
 }
 
-export component LineButton inherits TextTarget {
-    in property <string> title;
-    in property <bool> selected;
-    text: title;
-    label: "Open " + title;
-    ink: selected ? Theme.accent : Theme.text;
-}
-
 export component MediaLine inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -141,66 +133,127 @@ export component MediaLine inherits Rectangle {
     vertical-stretch: 0;
     border-radius: 10px;
     background: selected ? Theme.panel : transparent;
-    HorizontalLayout {
-        padding-top: 6px; padding-bottom: 6px; spacing: 8px;
-        if root.sequence > 0: Caption {
-            width: 33px; text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
+    function open-row() {
+        if root.can-open {
+            open-keys.focus();
+            root.action("open");
         }
-        if root.sequence == 0 && !root.compact: Rectangle {
-            width: 39px;
-            Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
-                artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist";
-            }
+    }
+
+    // One accessible Open button, separate from the other row controls.
+    Rectangle {
+        width: parent.width; height: parent.height;
+        border-radius: root.border-radius;
+        border-width: root.can-open && open-keys.has-focus ? 2px : 0px;
+        border-color: Theme.blue;
+        background: !root.can-open ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
+            : row-face.has-hover || open-keys.has-focus ? Theme.raised.with-alpha(0.55) : transparent;
+
+        if root.can-open: Rectangle {
+            width: parent.width; height: parent.height;
+            accessible-role: button;
+            accessible-label: "Open " + root.title;
+            accessible-action-default => { root.open-row(); }
+            forward-focus: open-keys;
         }
-        words := VerticalLayout {
-            min-width: 0px; horizontal-stretch: 1; alignment: center;
-            LineButton {
-                title: root.title; interactive: root.can-open; selected: root.selected;
-                activated => { root.action("open"); }
-                focused => { root.focused(); }
-            }
-            if root.result-type != "": Rectangle {
-                height: max(18px, 16px * Theme.density);
-                Caption {
-                    x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-                    text: root.result-type + (root.detail == "" ? "" : " · " + root.detail);
+
+        open-keys := FocusScope {
+            enabled: root.can-open;
+            focus-on-click: false;
+            focus-gained(_) => { root.focused(); }
+            key-pressed(event) => {
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { root.open-row(); }
+                    return accept;
                 }
-            }
-            if root.credits.length > 0 || root.subtitle != "": CreditLine {
-                credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
-                height: max(20px, self.font-size + 6px);
-                activated(id) => { root.page-action("artist", id); }
-                focused => { root.focused(); }
-            }
-            if root.album-name != "": AlbumLine {
-                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
-                activated => { root.page-action("album", root.album-id); }
-                focused => { root.focused(); }
-            }
-        }
-        if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
-            width: root.sequence > 0 ? 64px : 126px;
-            text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
-        }
-        if root.playable: Rectangle {
-            width: 37px;
-            Action {
-                y: (parent.height - self.height) / 2; width: parent.width;
-                icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
-                changed has-focus => { if self.has-focus { root.focused(); } }
-                clicked => { root.action("play"); }
-            }
-        }
-        if root.actions.length > 0: Rectangle {
-            width: 37px;
-            OverflowMenu {
-                y: (parent.height - self.height) / 2;
-                actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
-                item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
-                action(op) => { root.action(op); }
-                focused => { root.focused(); }
+                return reject;
             }
         }
     }
-    Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: 0.5; }
+
+    // Slint offers the press to descendants first, so links and controls
+    // consume their own clicks and the rest of the face opens the row.
+    row-face := TouchArea {
+        width: parent.width; height: parent.height;
+        enabled: root.can-open;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.open-row(); }
+
+        HorizontalLayout {
+            padding-top: 6px; padding-bottom: 6px; spacing: 8px;
+            if root.sequence > 0: Caption {
+                width: 33px; text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
+            }
+            if root.sequence == 0 && !root.compact: Rectangle {
+                width: 39px;
+                Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
+                    artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist";
+                }
+            }
+            words := VerticalLayout {
+                min-width: 0px; horizontal-stretch: 1; alignment: center;
+                Rectangle {
+                    property <length> font-size: 15px * Theme.density;
+                    height: max(20px, font-size + 7px);
+                    Text {
+                        x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
+                        text: root.title; color: root.selected ? Theme.accent : Theme.text;
+                        font-size: parent.font-size; font-weight: 600;
+                        vertical-alignment: center; overflow: elide;
+                        accessible-role: none;
+                    }
+                    if !root.can-open: Rectangle {
+                        width: parent.width; height: parent.height;
+                        accessible-role: text;
+                        accessible-label: root.title;
+                    }
+                }
+                if root.result-type != "": Rectangle {
+                    height: max(18px, 16px * Theme.density);
+                    Caption {
+                        x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
+                        text: root.result-type + (root.detail == "" ? "" : " · " + root.detail);
+                    }
+                }
+                if root.credits.length > 0 || root.subtitle != "": CreditLine {
+                    credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                    height: max(20px, self.font-size + 6px);
+                    background-clickable: root.can-open;
+                    background-clicked => { root.open-row(); }
+                    activated(id) => { root.page-action("artist", id); }
+                    focused => { root.focused(); }
+                }
+                if root.album-name != "": AlbumLine {
+                    text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
+                    fit-link: true;
+                    activated => { root.page-action("album", root.album-id); }
+                    focused => { root.focused(); }
+                }
+            }
+            if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
+                width: root.sequence > 0 ? 64px : 126px;
+                text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
+            }
+            if root.playable: Rectangle {
+                width: 37px;
+                Action {
+                    y: (parent.height - self.height) / 2; width: parent.width;
+                    icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
+                    changed has-focus => { if self.has-focus { root.focused(); } }
+                    clicked => { root.action("play"); }
+                }
+            }
+            if root.actions.length > 0: Rectangle {
+                width: 37px;
+                OverflowMenu {
+                    y: (parent.height - self.height) / 2;
+                    actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
+                    item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+                    action(op) => { root.action(op); }
+                    focused => { root.focused(); }
+                }
+            }
+        }
+    }
+    Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: open-keys.has-focus ? 0 : 0.5; }
 }

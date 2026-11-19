@@ -125,7 +125,6 @@ export component NowPlaying inherits Rectangle {
     callback toggle();
     callback next();
     callback seek(float);
-    callback navigate(string);
     callback page-action(string, string);
     callback queue-action(string, string);
 
@@ -187,12 +186,6 @@ export component NowPlaying inherits Rectangle {
                     horizontal-alignment: right;
                     min-width: 0px; max-width: root.split ? 320px : 170px;
                     horizontal-stretch: 2;
-                }
-                Action {
-                    text: "Queue"; icon: "≡";
-                    accessible-label: "Open play queue";
-                    changed has-focus => { if self.has-focus { root.reveal(stage.y, self.height); } }
-                    clicked => { root.navigate("queue"); }
                 }
             }
 

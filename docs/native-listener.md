@@ -2,6 +2,8 @@
 
 `src/main.rs` installs Slint callbacks. The GUI thread never waits for a library read, decoder, artwork request, or playlist write. Account changes advance the shared epoch. Player controls, browser events, MPRIS intents and completed reads are checked against their scope before use.
 
+The sidebar switches between independent sections. History is the initial section, not the parent of Playlists, Saved offline or Settings. Back retraces a drill-down within the current section, including a search and its results. The bottom player is present only while there is a current track, including a paused one.
+
 ## Data ownership
 
 | Owner | Data / contract |
@@ -18,7 +20,7 @@ Browser models are capped at 500 rows per view, 24 cached views and 1,400 retain
 
 Save a track or collection while online. In **Settings**, use **Work offline** to switch from the server-owned room to the independent local queue; **Go online** first validates the same account through `GET /api/auth/session`. While an explicit reconnect is pending the local queue remains usable, and the validation probe is the only network operation permitted. A transient failure backs off; Stay offline cancels. A successful validation retires the local queue before normal online features resume, while a revoked/expired session needs a fresh sign-in. Play on Saved is deliberately local-only so neither order nor repeated occurrences silently change. Audio is fetched through Go's versioned offline endpoints, checked against metadata, size and digest, and stored privately under the exact origin/account scope. Each selected occurrence is verified when read; the desktop does not preload all audio into memory. Limits include 32 MiB per track, 256 stored tracks and 1 GiB total track storage. Collection membership preserves occurrences; removing a collection does not delete the shared audio files.
 
-Downloads persist across restarts. This is **not** a credential vault or disk encryption. After process exit, sign in to the same server/account to reopen its files. An already-admitted explicit offline session can outlast its network cookie, but cannot make requests with an expired cookie. Sign-out revokes local access. No passwords, cookies, command receipts or socket tickets are written to the offline index.
+Downloads persist across restarts. This is **not** a credential vault or disk encryption. After process exit, reopen its files by signing in to the same server/account or by allowing the app to validate a remembered session with that server. An already-admitted explicit offline session can outlast its network cookie, but cannot make requests with an expired cookie. Sign-out revokes local access. No passwords, cookies, command receipts or socket tickets are written to the offline index.
 
 ## Verification environment
 

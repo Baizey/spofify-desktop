@@ -50,7 +50,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_IDLE: Duration = Duration::from_secs(15); // Go pings every five seconds
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_LEASE: Duration = Duration::from_secs(8);
+// Maximum server output grant since Go bab272b. Shorter grants keep their own deadline.
+const MAX_LEASE: Duration = Duration::from_secs(15);
 const RETRY_MIN: Duration = Duration::from_millis(300);
 const RETRY_MAX: Duration = Duration::from_secs(8);
 

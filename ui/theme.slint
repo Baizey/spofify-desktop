@@ -109,6 +109,7 @@ export component TextTarget inherits Rectangle {
     in property <string> label: text;
     in property <bool> interactive: true;
     in property <bool> accent;
+    in property <bool> fit-link;
     in property <color> ink: Theme.text;
     in property <length> font-size: 15px * Theme.density;
     in property <int> font-weight: 600;
@@ -119,7 +120,9 @@ export component TextTarget inherits Rectangle {
     height: max(20px, font-size + 7px);
 
     if root.interactive: Rectangle {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        x: 0px; y: 0px;
+        width: root.fit-link ? min(parent.width, words.preferred-width + 8px) : parent.width;
+        height: parent.height;
         forward-focus: key;
         accessible-role: button;
         accessible-label: root.label;
@@ -128,7 +131,7 @@ export component TextTarget inherits Rectangle {
         border-width: key.has-focus ? 2px : 0px;
         border-color: Theme.blue;
         background: pointer.has-hover || key.has-focus ? Theme.raised : transparent;
-        Text {
+        words := Text {
             x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
             text: root.text; color: root.accent ? Theme.blue : root.ink;
             font-size: root.font-size; font-weight: root.font-weight;
@@ -191,8 +194,9 @@ export component Field inherits Rectangle {
     vertical-stretch: 0;
     background: Theme.bg;
     border-radius: pill ? 23px : 8px;
-    border-width: input.has-focus ? 2px : 1px;
-    border-color: input.has-focus ? Theme.blue : Theme.line;
+    property <bool> show-focus: root.enabled && input.has-focus;
+    border-width: show-focus ? 2px : 1px;
+    border-color: show-focus ? Theme.blue : Theme.line;
     opacity: enabled ? 1 : 0.55;
     clip: true;
     if root.prefix != "": Glyph { x: 13px; y: (parent.height - self.height)/2; width: 16px; height: 16px; name: root.prefix; ink: Theme.muted; }

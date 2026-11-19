@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--desktop", type=Path,
                         help="prebuilt debug desktop with Slint MCP and debug info; needs cage and wlr-randr for multisize checks")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--window-only", action="store_true", help="check empty sign-in pixels and absence of a consent checkbox without starting Go")
+    mode.add_argument("--window-only", action="store_true", help="check empty sign-in, allowing only the Remember Login checkbox, without starting Go")
     mode.add_argument("--synthetic-wire-ui", action="store_true",
                       help="native typed-search and navigation checks against a Go-shaped Python wire fixture; not Go integration")
     parser.add_argument("--scratch-dir", type=Path,

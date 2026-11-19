@@ -4,7 +4,7 @@ import re
 
 from fixture import Failure, check
 from native import (ALT, CONTROL, DOWN, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
-                    RETURN, TRACK, bounds, element_id, wait)
+                    RETURN, TRACK, bounds, element_id, element_type, wait)
 from wire_ui import ALBUM_NAME, ARTIST_NAME, GUEST_NAME, ID_ONLY_RELEASE, NAME_ONLY
 
 
@@ -20,10 +20,14 @@ def open_playlists(window):
 
 def open_manual(window):
     window.click(f"Open {PLAYLIST}")
-    window.title(PLAYLIST)
+    manual_detail(window)
+
+
+def manual_detail(window, timeout=10):
+    window.title(PLAYLIST, timeout=timeout)
     wait("two distinct playlist occurrences", lambda: sum(
         window.matches(element, f"Open {TRACK}") and element.get("accessibleRole") == "Button"
-        for element in window.elements()) >= 2)
+        for element in window.elements()) >= 2, timeout=timeout)
 
 
 def manual_options(window, *, capture=None):
@@ -209,7 +213,59 @@ def qualified_credits(window):
     window.absent(rf"(Open artist: )?{NAME_ONLY}", roles=("Button",))
 
 
-def typed_catalog(window, width, *, capture=False, via_shortcut=False):
+def containing_item(elements, name, target):
+    x, y, right, bottom = bounds(target)
+    return next((e for e in elements if element_type([e], name)
+                 and bounds(e)[0] <= x < right <= bounds(e)[2]
+                 and bounds(e)[1] <= y < bottom <= bounds(e)[3]), None)
+
+
+def compact_track_row(window):
+    opening = window.find(f"Open {TRACK}", roles=("Button",))
+    row = containing_item(window.elements(), "MediaLine", opening)
+    check(row, "missing compact search-result row for track hit testing")
+    return row, window.subtree(row)
+
+
+def compact_track_face(window, region):
+    row, elements = compact_track_row(window)
+    # The accessible Open rectangle covers the whole row and its center can
+    # coincide with a credit. Target the rendered title or padding directly.
+    words = element_id(elements, "words")
+    check(words, "missing compact track copy")
+    target = (element_type(window.subtree(words), "Text") if region == "title"
+              else element_type(elements, "Divider"))
+    links = [e for e in elements if e.get("accessibleRole") == "Button"
+             and window.matches(e, r"Open (artist|album): .+")]
+    check(target and len(links) >= 2, f"missing compact track {region} or its independent metadata links")
+    point = window.pointer_position_for_click(f"compact track {region}", element=target)
+    check(inside(point, target) and inside(point, row) and not any(inside(point, e) for e in links),
+          f"compact track {region} press {point} landed on a metadata link or outside its row")
+    window.title(TRACK, timeout=3)
+
+
+def compact_track_targets(window):
+    compact_track_face(window, "bottom padding")
+    window.click("Back")
+    search_results(window)
+    for link, verify_destination in (
+        (f"Open artist: {ARTIST_NAME}", lambda: artist(window, ARTIST_NAME)),
+        (f"Open album: {ALBUM_NAME}", lambda: window.title(ALBUM_NAME, timeout=3)),
+    ):
+        row, elements = compact_track_row(window)
+        target = next((e for e in elements if e.get("accessibleRole") == "Button" and window.matches(e, re.escape(link))), None)
+        check(target, f"missing compact track row link {link}")
+        point = window.pointer_position_for_click(link, element=target)
+        check(inside(point, target) and inside(point, row), f"{link} press {point} did not hit the compact row link")
+        verify_destination()
+        window.click("Back")
+        search_results(window)
+    compact_track_face(window, "title")
+    print("PASS compact track title and padding open the track; in-row artist and album links open their own destinations",
+          flush=True)
+
+
+def typed_catalog(window, width, *, capture=False, via_shortcut=False, check_compact_targets=False):
     # This always originates in /search. The fixture rejects local browse text
     # queries, so a legacy catalog lookup cannot accidentally satisfy the test.
     if via_shortcut:
@@ -238,7 +294,10 @@ def typed_catalog(window, width, *, capture=False, via_shortcut=False):
     window.click("Back")
     search_results(window)
 
-    window.click(f"Open {TRACK}")
+    if check_compact_targets:
+        compact_track_targets(window)
+    else:
+        window.click(f"Open {TRACK}")
     window.title(TRACK)
     qualified_credits(window)
     window.click(f"Open artist: {GUEST_NAME}")
@@ -259,9 +318,8 @@ def typed_catalog(window, width, *, capture=False, via_shortcut=False):
     window.title(TRACK)
     window.click("Back")
     search_results(window)
-    # Shortcut has its own assertion; a failed shortcut never gets a mouse fallback.
-    window.key(ESCAPE)
-    window.find(f"Open {PLAYLIST}", roles=("Button",))
+    open_playlists(window)
+    window.absent("Back", roles=("Button",))
     print(f"PASS at {width}px: typed search, ID-only release, named credit routes and Back", flush=True)
 
 
@@ -269,15 +327,51 @@ def check_shortcut_back(window):
     open_manual(window)
     window.shortcut(ALT, LEFT)
     window.find(f"Open {PLAYLIST}", roles=("Button",))
+    window.absent("Back", roles=("Button",))
 
 
-def pane_layout(window, *, wide, populated=False, can_go_back=False):
+def search_layout(window, elements, toolbar, *, docked):
+    # TextInput excludes the icon and clear affordance; measure the painted Field.
+    field = element_id(elements, "search")
+    hero = element_id(elements, "detail-hero")
+    check(field and hero, "missing rendered Search field or catalog content inset")
+    input_target = window.find("Search (tracks, albums or artists|downloads)", roles=("TextInput",))
+    brand = window.title("Spofify")
+    tx, ty, tright, tbottom = bounds(toolbar)
+    x, y, right, bottom = bounds(field)
+    ix, iy, iright, ibottom = bounds(input_target)
+    check(tx <= x <= ix < iright <= right <= tright and ty <= y <= iy < ibottom <= bottom <= tbottom,
+          f"Search or its input leaves the toolbar: {bounds(field)}, {bounds(input_target)}, {bounds(toolbar)}")
+    check(abs((y + bottom - ty - tbottom) / 2) <= 1
+          and abs((y + bottom - bounds(brand)[1] - bounds(brand)[3]) / 2) <= 10,
+          f"Search is not centered in the toolbar and aligned with the rail brand: {bounds(field)}")
+    content_left, _, content_right, _ = bounds(hero)
+    inset = x - tx
+    check(0 < inset <= 40 and abs(x - content_left) <= 2,
+          f"Search is not aligned with the catalog gutter: {x:g} vs {content_left:g}")
+    usable_right = tright - inset
+    check(abs(content_right - usable_right) <= 2,
+          f"catalog content does not fill its usable width: ends at {content_right:g}, expected {usable_right:g}")
+    tools = element_id(elements, "playback-tools")
+    if docked:
+        check(abs(right - usable_right) <= 2,
+              f"Search leaves unused toolbar space: field ends at {right:g}, usable edge at {usable_right:g}")
+    else:
+        check(tools, "missing playback shortcuts in the toolbar without a dock")
+        cx, cy, cr, cb = bounds(tools)
+        check(0 <= cx - right <= 12 and ty <= cy < cb <= tbottom and abs(cr - usable_right) <= 2,
+              f"Search and playback shortcuts do not fill the toolbar: {bounds(field)}, {bounds(tools)}")
+    return x, right - x
+
+
+def pane_layout(window, *, wide, docked=False, queue_open=None, can_go_back=False):
     elements = window.elements()
     work = element_id(elements, "work")
     rail = element_id(elements, "rail")
     toolbar = element_id(elements, "toolbar")
     catalog = element_id(elements, "catalog-scroll")
     queue = element_id(elements, "queue-pane")
+    dock = element_type(elements, "PlayerBar")
     check(work and rail and toolbar and catalog, "missing work area, navigation rail, toolbar or catalog viewport")
     width, height = window.dimensions()
     x, y, right, bottom = bounds(catalog)
@@ -287,35 +381,163 @@ def pane_layout(window, *, wide, populated=False, can_go_back=False):
     check(wx == rx == wy == ry == 0 and wright == width
           and abs(rright - x) <= 2 and abs(rbottom - bottom) <= 2 and abs(wbottom - bottom) <= 2,
           f"navigation rail and workspace do not line up: {bounds(rail)}, {bounds(work)}, {bounds(catalog)}")
+    if docked:
+        check(dock and abs(bottom - bounds(dock)[1]) <= 1, "workspace does not meet the populated dock")
+    else:
+        check(not dock, "empty state renders a playback dock")
+        check(abs(bottom - height) <= 1,
+              f"empty state reserves a bottom strip: viewport ends at {bottom:g}, client ends at {height:g}")
+        window.absent("No song selected|Now playing: Nothing playing")
     tx, ty, tright, tbottom = bounds(toolbar)
-    check(ty == 0 and abs(tbottom - y) <= 1 and abs(tx - x) <= 1 and abs(tright - right) <= 1,
-          f"toolbar overlaps the catalog or floats below the top: {bounds(toolbar)}, {bounds(catalog)}")
-    targets = [window.find("Search tracks, albums or artists", roles=("TextInput",))]
+    check(ty == 0 and abs(tx - x) <= 1 and abs(tright - right) <= 1,
+          f"toolbar and catalog have different edges: {bounds(toolbar)}, {bounds(catalog)}")
+    search = search_layout(window, elements, toolbar, docked=docked)
     if can_go_back:
-        targets.append(window.find("Back", roles=("Button",)))
-    brand = window.title("Spofify")
-    for element in targets:
-        left, top, edge, base = bounds(element)
-        check(tx <= left < edge <= tright and ty <= top < base <= tbottom,
-              f"{element['accessibleLabel']} leaves the top toolbar: {bounds(element)}")
-        check(abs((top + base - bounds(brand)[1] - bounds(brand)[3]) / 2) <= 10,
-              f"{element['accessibleLabel']} is not aligned with the rail brand")
-    if not wide:
-        check(not queue, "compact window showed the queue without a request")
-        check(right - x >= 0.72 * width, "compact workspace squeezes the catalog")
-        return
-    check(queue, "desktop is missing its persistent queue pane")
-    qx, qy, qright, qbottom = bounds(queue)
-    check(right <= qx < qright <= width and bottom <= height and qbottom <= height,
-          f"overlapping or clipped catalog/queue: {bounds(catalog)}, {bounds(queue)}")
-    check(qy == wy and 0 < y - qy <= 80 and abs(qbottom - bottom) <= 2,
-          "desktop panes do not reach the same dock (with catalog below its toolbar)")
-    check(right - x >= 0.55 * width and 245 <= qright - qx <= 0.35 * width,
-          f"unusable pane widths: catalog {right - x:g}, queue {qright - qx:g}, window {width:g}")
-    check(width - qright <= 32 and qx - right <= 24 and x <= 0.2 * width,
-          "desktop wastes substantial space outside its panes")
-    queue_state(window, populated)
-    print(f"PASS desktop pane geometry at {width:g}×{height:g}", flush=True)
+        back = window.find("Back", roles=("Button",))
+        bx, by, br, bb = bounds(back)
+        check(abs(bx - search[0]) <= 2 and tbottom <= by < bb <= y and bx < br <= right,
+              f"Back does not sit below Search and above the catalog: {bounds(back)}, {bounds(catalog)}")
+    else:
+        window.absent("Back", roles=("Button",))
+        check(abs(tbottom - y) <= 1,
+              f"root reserves space for Back: toolbar ends at {tbottom:g}, catalog begins at {y:g}")
+    if queue_open is None:
+        queue_open = wide
+    check(bool(queue) == queue_open, "queue pane visibility does not match the requested layout")
+    if not queue:
+        check(abs(width - right) <= 2 and right - x >= 0.72 * width,
+              f"workspace does not fill the space to the right of the rail: {bounds(catalog)}")
+    else:
+        qx, qy, qright, qbottom = bounds(queue)
+        check(right <= qx < qright <= width and abs(qbottom - bottom) <= 2 and qy == wy,
+              f"overlapping or clipped catalog/queue: {bounds(catalog)}, {bounds(queue)}")
+        check(right - x >= 0.55 * width and 245 <= qright - qx <= 0.35 * width,
+              f"unusable pane widths: catalog {right - x:g}, queue {qright - qx:g}, window {width:g}")
+        check(abs(width - qright) <= 2 and abs(qx - right) <= 2 and x <= 0.2 * width,
+              "desktop wastes space outside its panes")
+    return search
+
+
+def root_navigation(window, *, wide):
+    window.section("History")
+    expected_search = pane_layout(window, wide=wide)
+    # Exercise the actual rail, including both ways away from Saved offline.
+    for label in ("Playlists", "Saved offline", "History", "Saved offline", "Settings", "Playlists"):
+        window.click(label)
+        window.section(label)
+        actual_search = pane_layout(window, wide=wide)
+        check(all(abs(a - b) <= 1 for a, b in zip(actual_search, expected_search)),
+              f"Search x/width moved on root {label}: {actual_search} vs {expected_search}")
+    window.find(f"Open {PLAYLIST}", roles=("Button",))
+    width, _ = window.dimensions()
+    print(f"PASS {width:g}px no empty dock/strip; rail roots (including Saved offline) have no Back and preserve Search x/width",
+          flush=True)
+
+
+def playlist_back(window, *, wide):
+    before = pane_layout(window, wide=wide)
+    open_manual(window)
+    detail = pane_layout(window, wide=wide, can_go_back=True)
+    check(all(abs(a - b) <= 1 for a, b in zip(detail, before)),
+          f"Back shifted Search: root {before}, detail {detail}")
+    window.click("Back")
+    playlists_root(window)
+    print(f"PASS {window.dimensions()[0]:g}px playlist detail Back returns to the Playlists root", flush=True)
+
+
+def playlists_root(window):
+    window.section("Playlists")
+    window.find(f"Open {PLAYLIST}", roles=("Button",))
+    window.absent("Back", roles=("Button",))
+
+
+def playlist_hit_checks(window):
+    for region in ("icon", "subtitle", "whitespace"):
+        playlist_open_by_pointer(window, region)
+    playlist_overflow(window)
+
+
+def playlist_hit_targets(window):
+    play = window.find(f"Play {PLAYLIST}", roles=("Button",))
+    overflow = window.find(f"Show actions for {PLAYLIST}", roles=("Button",))
+    px, py, pr, pb = bounds(play)
+    ox, oy, oright, ob = bounds(overflow)
+    check(px < pr <= ox < oright and py < pb and oy < ob, "playlist Play and overflow hit targets overlap")
+    row = next((e for e in window.elements() if element_type([e], "MediaLine")
+                and bounds(e)[0] <= px and bounds(e)[2] >= oright
+                and bounds(e)[1] <= min(py, oy) < max(pb, ob) <= bounds(e)[3]), None)
+    check(row, f"could not find the visible playlist row for {PLAYLIST}")
+    elements = window.subtree(row)
+    subtitle = next((e for e in elements if window.matches(e, r"Playlist · \d+ songs(?: · .+)?")), None)
+    # The noninteractive separator sits inside the blank bottom padding, away
+    # from the controls and the copy. It supplies an MCP pointer coordinate.
+    return {"icon": element_type(elements, "Cover"), "subtitle": subtitle,
+            "whitespace": element_type(elements, "Divider")}, play, overflow
+
+
+def inside(point, element):
+    x, y, right, bottom = bounds(element)
+    return x <= point[0] < right and y <= point[1] < bottom
+
+
+def playlist_open_by_pointer(window, region):
+    playlists_root(window)
+    targets, play, overflow = playlist_hit_targets(window)
+    target = targets[region]
+    check(target, f"missing {PLAYLIST} row {region} pointer target")
+    point = window.pointer_position_for_click(region, element=target)
+    check(inside(point, target) and not any(inside(point, e) for e in (play, overflow)),
+          f"{region} press {point} did not hit its own part of the playlist row")
+    manual_detail(window, timeout=2)
+    window.absent(r"Now playing: .+", roles=("Button",))
+    window.click("Back")
+    playlists_root(window)
+    print(f"PASS {window.dimensions()[0]:g}px playlist row {region} opens the correct detail by pointer", flush=True)
+
+
+def playlist_overflow(window):
+    playlists_root(window)
+    _, play, overflow = playlist_hit_targets(window)
+    point = window.pointer_position_for_click("playlist overflow", element=overflow)
+    check(inside(point, overflow) and not inside(point, play), "playlist overflow press hit the Play target")
+    window.find(f"Add to queue · {PLAYLIST}", roles=("Button",))
+    playlists_root(window)
+    window.absent(r"Now playing: .+", roles=("Button",))
+    window.click(f"Hide actions for {PLAYLIST}")
+    window.absent(f"Add to queue · {PLAYLIST}", roles=("Button",))
+    print(f"PASS {window.dimensions()[0]:g}px playlist row overflow opens its menu without opening or playing the playlist",
+          flush=True)
+
+
+def playlist_play(window):
+    _, play, overflow = playlist_hit_targets(window)
+    check(play.get("accessibleEnabled", True), "playlist row Play is disabled")
+    point = window.pointer_position_for_click("playlist Play", element=play)
+    check(inside(point, play) and not inside(point, overflow), "playlist Play press hit the overflow target")
+
+
+def empty_devices(window, restore, *, wide, observer=False, capture=None):
+    window.click("Playback devices")
+    window.title("Devices")
+    if observer:
+        deselect = window.find("Deselect", roles=("Button",))
+        check(deselect.get("accessibleEnabled"), "the selected desktop output cannot be deselected")
+        name = window.title("Acceptance observer")
+        card = containing_item(window.elements(), "SettingCard", name)
+        check(card, "missing Devices card for the real Go observer")
+        elements = window.subtree(card)
+        peer_button = next((e for e in elements if window.matches(e, "Select output")
+                            and e.get("accessibleRole") == "Button"), None)
+        check(peer_button and not peer_button.get("accessibleEnabled")
+              and any(window.matches(e, "Cannot play audio") for e in elements),
+              "real Go observer must be present and not selectable for audio")
+    pane_layout(window, wide=wide, can_go_back=True)
+    if capture:
+        window.pixels(capture)
+    window.click("Back")
+    restore()
+    window.absent("Back", roles=("Button",))
+    print(f"PASS {window.dimensions()[0]:g}px device panel is reachable with no selected track", flush=True)
 
 
 def queue_state(window, populated):
@@ -334,7 +556,7 @@ def queue_state(window, populated):
             window.absent(label, roles=("Button",))
 
 
-def wide_queue_toggle(window, restore):
+def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
     before = window.elements()
     catalog = element_id(before, "catalog-scroll")
     queue = element_id(before, "queue-pane")
@@ -346,15 +568,33 @@ def wide_queue_toggle(window, restore):
     resized = element_id(closed, "catalog-scroll")
     check(resized and abs(bounds(resized)[2] - bounds(queue)[2]) <= 2,
           "closing the desktop queue does not give its width back to the catalog")
+    expanded = pane_layout(window, wide=True, docked=populated, queue_open=False, can_go_back=can_go_back)
     window.click("Play queue")
     restore()
-    pane_layout(window, wide=True, can_go_back=True)
-    print("PASS desktop queue toggles independently and returns its width to the catalog", flush=True)
+    narrowed = pane_layout(window, wide=True, docked=populated, can_go_back=can_go_back)
+    queue_left, _, queue_right, _ = bounds(queue)
+    # Each pane uses its own responsive gutter on both sides. Account for
+    # that change, not just the width released by the queue pane.
+    gutter_delta = expanded[0] - narrowed[0]
+    check(expanded[1] > narrowed[1]
+          and abs(expanded[1] - narrowed[1] + 2 * gutter_delta - (queue_right - queue_left)) <= 2,
+          f"Search and catalog do not expand and contract together: {expanded} vs {narrowed}")
+    queue_state(window, populated)
+    print("PASS desktop queue toggles independently and returns its width to Search and the catalog", flush=True)
 
 
 def compact_queue(window, restore, *, capture=None, populated=False):
     window.click("Play queue")
     queue_state(window, populated)
+    elements = window.elements()
+    queue = element_id(elements, "queue-pane")
+    work = element_id(elements, "work")
+    toolbar = element_id(elements, "toolbar")
+    check(queue and work and toolbar, "compact queue is missing its pane, workspace or toolbar")
+    qx, qy, qr, qb = bounds(queue)
+    tx, _, tr, tb = bounds(toolbar)
+    check(abs(qx - tx) <= 1 and abs(qy - tb) <= 1 and abs(qr - tr) <= 1 and abs(qb - bounds(work)[3]) <= 1,
+          f"compact queue does not fill the workspace below the toolbar: {bounds(queue)}")
     if capture:
         window.pixels(capture)
     window.click("Play queue")
