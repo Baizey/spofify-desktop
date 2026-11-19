@@ -77,7 +77,9 @@ export component Action inherits Rectangle {
     property <color> ink: primary && enabled ? Theme.button-ink : danger ? Theme.red : selected ? Theme.accent : Theme.text;
     property <length> glyph-size: root.icon == "" ? 0px : 18px;
     property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
-    property <length> inset: root.leading ? 10px : max(0px, (root.width - root.glyph-size - root.gap - words.preferred-width) / 2);
+    // An empty Text still has a preferred width. An icon-only button has no label to reserve room for.
+    property <length> inset: root.text == "" ? (root.width - root.glyph-size) / 2
+        : root.leading ? 10px : max(0px, (root.width - root.glyph-size - root.gap - words.preferred-width) / 2);
     if root.icon != "": Glyph { x: root.inset; y: (root.height - self.height) / 2; width: root.glyph-size; height: self.width; name: root.icon; ink: root.ink; }
     words := Text {
         x: root.inset + root.glyph-size + root.gap; y: 0px; height: root.height;
