@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Spofify
+GenericName=Music Player
+Comment=Listen to your Spofify library
+Exec=spofify-desktop
+Icon=spofify-desktop
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=music;library;playlist;

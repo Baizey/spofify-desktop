@@ -1,20 +1,28 @@
-import { ScrollView, Slider } from "std-widgets.slint";
-import { Theme, Action, Field, Consent, Cover } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Action, Caption, Cover, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
+import { Copy, EmptyState, Hero, LineButton, MediaLine } from "catalog.slint";
+import { Editor, SignInView } from "forms.slint";
+import { PlayerBar, SeekBar } from "playback.slint";
+import { PaletteRow, Settings, SettingCard } from "settings.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export struct TrackRow { title: string, subtitle: string, detail: string, playable: bool }
+export { PaletteRow }
+
+export struct BrowseRow { kind: string, title: string, subtitle: string, detail: string, playable: bool, actions: [string], section: string }
+export struct QueueRow { key: string, title: string, subtitle: string, current: bool, upcoming: bool }
+export struct DeviceRow { id: string, name: string, selected: bool, available: bool, can-play: bool }
 
 export component AppWindow inherits Window {
     title: "Spofify Desktop";
     in property <length> inspection-width: 0px;
     in property <length> inspection-height: 0px;
-    preferred-width: 1100px; preferred-height: 760px;
-    min-width: root.inspection-width > 0px ? root.inspection-width : 800px;
+    preferred-width: 1180px;
+    preferred-height: 790px;
+    min-width: root.inspection-width > 0px ? root.inspection-width : 480px;
     max-width: root.inspection-width > 0px ? root.inspection-width : 65535px;
-    min-height: root.inspection-height > 0px ? root.inspection-height : 600px;
+    min-height: root.inspection-height > 0px ? root.inspection-height : 440px;
     max-height: root.inspection-height > 0px ? root.inspection-height : 65535px;
-    background: Theme.bg;
     default-font-family: "JetBrains Mono";
-    default-font-size: 14px;
+
     in-out property <string> origin;
     in-out property <string> username;
     in-out property <string> password;
@@ -22,11 +30,8 @@ export component AppWindow inherits Window {
     in-out property <bool> lan-consent;
     in property <bool> signed-in;
     in property <bool> busy;
-    in property <bool> retry-visible;
     in property <string> status;
-    in property <string> result-label;
     in property <bool> error;
-    in property <[TrackRow]> rows;
     in property <string> now-title: "Nothing playing";
     in property <string> now-detail: "Find a track to begin";
     in property <string> player-status;
@@ -34,8 +39,6 @@ export component AppWindow inherits Window {
     in property <bool> can-control;
     in property <bool> remote-controls;
     in property <bool> can-seek;
-    in property <bool> player-retry;
-    in property <bool> player-retry-allowed;
     in property <string> output-name;
     in property <float> elapsed;
     in property <float> duration;
@@ -44,130 +47,435 @@ export component AppWindow inherits Window {
     callback sign-out();
     callback server-edited();
     callback search-edited();
-    callback play-track(int);
     callback toggle-play();
     callback previous();
     callback next();
     callback seek(float);
-    callback retry-player();
-    callback retry();
 
-    VerticalLayout {
-        padding: 0px; spacing: 0px;
-        Rectangle {
-            height: 58px; background: #10151b;
-            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
-            HorizontalLayout {
-                padding-left: 24px; padding-right: 24px; padding-top: 12px; padding-bottom: 12px; spacing: 12px;
-                Rectangle { width: 28px; Image { y: (parent.height - 28px) / 2; width: 28px; height: 28px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; } }
-                Text { text: "Spofify"; color: Theme.text; font-size: 17px; font-weight: 700; vertical-alignment: center; }
-                Rectangle { width: 1px; Rectangle { y: (parent.height - 20px) / 2; height: 20px; background: Theme.line; } }
-                Text { text: "Desktop"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
-                Rectangle { horizontal-stretch: 1; }
-                if root.signed-in: Action { text: "Sign out"; clicked => { root.sign-out(); } }
+    in property <[BrowseRow]> browse-rows;
+    in property <[image]> browse-artwork;
+    in property <image> page-artwork;
+    in property <string> page-title;
+    in property <string> page-subtitle;
+    in property <string> page-kind: "search";
+    in property <string> page-status;
+    in property <bool> page-busy;
+    in property <bool> page-error;
+    in property <bool> has-more;
+    in property <bool> can-back;
+    in property <[string]> page-actions;
+    callback navigate(string);
+    callback row-action(string, int);
+    callback page-action(string, string);
+
+    in-out property <string> form-mode;
+    in-out property <string> form-name;
+    in-out property <string> form-description;
+    in-out property <string> form-value;
+    in property <string> form-error;
+    in property <bool> form-busy;
+    in property <string> form-help;
+
+    in property <string> now-track-id;
+    in property <string> now-album-id;
+    in property <string> now-artist-id;
+    in property <string> now-context-kind;
+    in property <string> now-context-id;
+    in property <string> now-context-name;
+    in property <image> cover-art;
+    in property <string> lyrics-text;
+    in property <[float]> waveform;
+    in property <string> media-status;
+    in property <string> account-label;
+    in property <bool> manual-offline;
+    in property <bool> reconnecting;
+    in property <bool> offline-playback;
+    in property <int> appearance-mode;
+    in property <float> appearance-scale: 1.0;
+    in property <int> appearance-accent;
+    in property <[PaletteRow]> palettes;
+    in property <string> palette-id;
+    in property <string> palette-status;
+    in property <bool> palette-enabled;
+    callback palette-selected(string);
+    callback appearance-changed(int, float, int);
+    callback reset-appearance();
+
+    in property <string> room-token;
+    in property <[QueueRow]> queue-rows;
+    in property <[DeviceRow]> device-rows;
+    in property <string> queue-status;
+    in property <string> device-status;
+    in property <bool> shuffle;
+    in property <string> repeat-mode: "off";
+    callback queue-action(string, string);
+    callback device-action(string, string);
+
+    default-font-size: 13px * Theme.density;
+    background: Theme.bg;
+    changed appearance-mode => { Theme.light = root.appearance-mode == 1; }
+    changed appearance-scale => { Theme.density = clamp(root.appearance-scale, 0.85, 1.25); }
+    property <image> no-artwork;
+    changed palette-id => {
+        if root.palette-id == "" {
+            Theme.primary = Theme.light ? #147357 : #66e3b4;
+            Theme.on-accent = Theme.light ? #ffffff : #08271d;
+            Theme.secondary = Theme.light ? #275da5 : #91bfff;
+            Theme.tertiary = Theme.light ? #875611 : #dfbd78;
+        }
+    }
+    for preset in root.palettes: Rectangle {
+        visible: false;
+        property <bool> current: preset.id == root.palette-id;
+        function apply() {
+            if self.current {
+                Theme.primary = preset.primary;
+                Theme.on-accent = preset.on-primary;
+                Theme.secondary = preset.secondary;
+                Theme.tertiary = preset.tertiary;
             }
         }
-        if !root.signed-in: Rectangle {
-            vertical-stretch: 1;
-            // Explicit card width and bounded content height avoid width/wrap layout cycles.
-            VerticalLayout {
-                x: (parent.width - 480px) / 2;
-                y: max(12px, (parent.height - 492px) / 2);
-                width: 480px; height: 492px;
-                padding: 0px; spacing: 7px;
-                Text { height: 32px; text: "Connect to your music"; color: Theme.text; font-size: 23px; font-weight: 700; }
-                Text { height: 22px; text: "Sign in to your Spofify server to search and play."; color: Theme.muted; font-size: 12px; }
-                Text { height: 18px; text: "Server origin"; color: Theme.muted; font-size: 12px; }
-                Field { text <=> root.origin; field-label: "Server origin"; placeholder-text: "https://music.example.com"; edited => { root.server-edited(); } }
-                Text { height: 18px; text: "HTTPS recommended. Origin only, no path."; color: Theme.muted; font-size: 11px; }
-                Text { height: 18px; text: "Username"; color: Theme.muted; font-size: 12px; }
-                Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; }
-                Text { height: 18px; text: "Password"; color: Theme.muted; font-size: 12px; }
-                Field { text <=> root.password; input-type: InputType.password; field-label: "Password"; enabled: !root.busy; accepted => { root.sign-in(); } }
-                Consent { text: "Allow trusted-LAN HTTP"; checked <=> root.lan-consent; enabled: !root.busy; }
-                Text { height: 34px; text: "HTTP sends credentials unencrypted. Only private, loopback or Tailscale IPs are allowed. Use a network you trust."; color: Theme.amber; font-size: 11px; wrap: word-wrap; }
-                HorizontalLayout {
-                    spacing: 12px; height: 36px;
-                    Action { text: root.busy ? "Signing in…" : "Sign in"; accessible-label: "Sign in"; enabled: !root.busy; primary: true; horizontal-stretch: 1; clicked => { root.sign-in(); } }
-                    if root.busy: Action { text: "Cancel sign in"; clicked => { root.sign-out(); } }
-                }
-                Text { height: 50px; text: root.status; color: root.error ? Theme.red : Theme.muted; font-size: 12px; wrap: word-wrap; accessible-label: root.status; }
+        init => { self.apply(); }
+        changed current => { self.apply(); }
+        property <color> active-primary: preset.primary;
+        changed active-primary => { self.apply(); }
+    }
+    property <bool> compact: self.width < 806px;
+    property <bool> dense: self.width < 950px;
+    property <bool> editor-open: form-mode != "" && form-mode != "closed";
+    property <bool> is-search: page-kind == "search";
+    property <bool> is-history: page-kind == "history" || page-kind == "recent";
+    property <bool> is-playlist: page-kind == "playlist" || page-kind == "playlist-manual" || page-kind == "playlist-rules";
+    property <bool> has-now-context: now-context-name != "" && now-context-id != "" &&
+        (now-context-kind == "album" || now-context-kind == "artist" || now-context-kind == "likes" || now-context-kind == "playlist" || now-context-kind == "derived");
+    property <bool> is-settings: page-kind == "appearance" || page-kind == "settings" || page-kind == "account";
+    property <bool> is-playback-page: page-kind == "now" || page-kind == "queue" || page-kind == "devices";
+    property <string> displayed-kind: page-kind;
+    property <bool> saved-view: displayed-kind == "offline" || displayed-kind == "saved-collection";
+    property <bool> local-mode: manual-offline || reconnecting;
+    property <bool> can-play-saved: saved-view && local-mode;
+    property <bool> queue-controls: local-mode ? offline-playback && can-control : !offline-playback && remote-controls;
+    property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
+    property <string> catalog-title: page-title != "" ? page-title : Copy.title(displayed-kind);
+    property <string> catalog-subtitle: page-subtitle != "" ? page-subtitle : Copy.subtitle(displayed-kind);
+    property <int> expanded-row: -1;
+    property <string> expanded-queue-key;
+    property <[string]> sections: ["home", "search", "history", "liked", "playlists", "offline"];
+    changed page-kind => { root.expanded-row = -1; root.expanded-queue-key = ""; }
+    changed page-title => { root.expanded-row = -1; }
+    changed browse-rows => { root.expanded-row = -1; }
+
+    function back() { if root.can-back { root.navigate("back"); } }
+    function flip-offline() { root.page-action("offline", root.reconnecting || !root.manual-offline ? "on" : "off"); }
+    function edit-form(mode: string) {
+        root.form-name = "";
+        root.form-description = "";
+        root.form-value = "";
+        root.form-mode = mode;
+        root.page-action("prepare-" + mode, "");
+    }
+    function cancel-form() {
+        if root.form-mode != "device-rename" { root.page-action("cancel-form", root.form-mode); }
+        root.form-mode = "";
+        root.form-name = "";
+        root.form-description = "";
+        root.form-value = "";
+    }
+    function submit-form() {
+        if root.form-mode == "device-rename" { root.device-action("rename", root.form-name); }
+        else if root.form-mode == "remove-saved" { root.form-mode = ""; root.page-action("remove", ""); }
+        else { root.page-action(root.form-mode, root.form-mode == "rules" || root.form-mode == "new-rules" ? root.form-value : root.form-mode == "delete" ? "" : root.form-name); }
+    }
+    function catalog-action(action: string) {
+        if action == "new-manual" || action == "new-rules" || action == "rename" || action == "rules" || action == "delete" { root.edit-form(action); }
+        else if action == "remove" { root.form-mode = "remove-saved"; }
+        else { root.page-action(action, ""); }
+    }
+    pure function section-label(kind: string) -> string {
+        return kind == "home" ? "Home" : kind == "history" ? "History" : kind == "liked" ? "Liked" : kind == "offline" ? "Offline" : Copy.title(kind);
+    }
+    pure function is-current(section: string) -> bool {
+        return root.displayed-kind == section || (section == "history" && root.displayed-kind == "recent")
+            || (section == "playlists" && (root.displayed-kind == "playlist-manual" || root.displayed-kind == "playlist-rules" || root.displayed-kind == "picker"));
+    }
+
+    if !root.signed-in: SignInView {
+        origin <=> root.origin; username <=> root.username; password <=> root.password; consent <=> root.lan-consent;
+        status: root.status; error: root.error; busy: root.busy;
+        edited => { root.server-edited(); } sign-in => { root.sign-in(); } cancel => { root.sign-out(); }
+    }
+    if root.signed-in && root.editor-open: Editor {
+        mode: root.form-mode; name <=> root.form-name; description <=> root.form-description; definition <=> root.form-value;
+        error: root.form-error; help: root.form-help; busy: root.form-busy; offline: root.local-mode; reconnecting: root.reconnecting;
+        cancel => { root.cancel-form(); } save => { root.submit-form(); }
+        toggle-offline => { root.flip-offline(); }
+    }
+    if root.signed-in && !root.editor-open: FocusScope {
+        focus-on-tab-navigation: false;
+        focus-on-click: false;
+        capture-key-pressed(event) => {
+            if event.modifiers.control && (event.text == "f" || event.text == "l" || event.text == "F" || event.text == "L") {
+                if !root.is-search { root.navigate("search"); }
+                search.take-focus(); return accept;
             }
+            if root.can-back && (event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow)) {
+                if !event.repeat { root.back(); }
+                return accept;
+            }
+            return reject;
         }
-        if root.signed-in: VerticalLayout {
-            padding-left: 32px; padding-right: 32px; padding-top: 24px; padding-bottom: 20px; spacing: 16px;
-            Field { text <=> root.query; pill: true; field-label: "Search tracks"; placeholder-text: "Search tracks, artists or albums"; edited => { root.search-edited(); } }
+        VerticalLayout {
             HorizontalLayout {
-                height: 26px;
-                Text { text: "Tracks"; color: Theme.text; font-size: 19px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
-                Text { text: root.busy ? "Searching…" : root.result-label; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
-            }
-            if root.status != "": Text { text: root.status; color: root.error ? Theme.red : Theme.muted; font-size: 12px; wrap: word-wrap; accessible-label: root.status; }
-            if root.retry-visible && !root.busy: Action { text: "Retry search"; clicked => { root.retry(); } }
-            Rectangle {
                 vertical-stretch: 1;
-                if root.rows.length == 0 && !root.busy && !root.error: VerticalLayout {
-                    padding-top: 36px; spacing: 10px; alignment: start;
-                    Text { text: root.query == "" ? "Your next listen starts here." : "No tracks found."; color: Theme.text; font-size: 16px; horizontal-alignment: center; }
-                    Text { text: root.query == "" ? "Search your library by track, artist or album." : "Try another title, artist or album."; color: Theme.muted; font-size: 12px; horizontal-alignment: center; }
-                }
-                ScrollView {
-                    width: parent.width; height: parent.height; content-width: self.visible-width;
+                if !root.compact: Rectangle {
+                    width: root.dense ? 189px : 219px; background: Theme.rail;
+                    Rectangle { x: parent.width - 1px; width: 1px; background: Theme.line; }
                     VerticalLayout {
-                        spacing: 0px; padding: 0px;
-                        for row[index] in root.rows: Rectangle {
-                            height: 66px;
-                            Rectangle { y: parent.height - 1px; height: 1px; background: #ffffff0b; }
-                            HorizontalLayout {
-                                padding-top: 10px; padding-bottom: 10px; padding-left: 4px; padding-right: 8px; spacing: 14px;
-                                Rectangle { width: 34px; Action { y: 7px; text: "▶"; round: true; width: 34px; height: 32px; accessible-label: "Play " + row.title; enabled: row.playable && !root.busy; clicked => { root.play-track(index); } } }
-                                Cover { width: 46px; height: 46px; }
-                                VerticalLayout {
-                                    spacing: 4px; alignment: center; horizontal-stretch: 1;
-                                    Text { text: row.title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
-                                    Text { text: row.subtitle; color: Theme.muted; font-size: 11px; overflow: elide; }
-                                }
-                                Text { text: row.detail; color: Theme.muted; font-size: 11px; vertical-alignment: center; }
+                        padding: 16px; spacing: 5px; alignment: start;
+                        HorizontalLayout {
+                            height: 49px; spacing: 11px;
+                            Image { width: 31px; height: 31px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
+                            Text { text: "Spofify"; color: Theme.text; font-size: 21px; font-weight: 700; vertical-alignment: center; }
+                        }
+                        Eyebrow { text: "YOUR LIBRARY"; color: Theme.subtle; height: 30px; }
+                        for section in root.sections: Action {
+                            text: root.section-label(section); icon: Copy.mark(section); leading: true; quiet: true; height: 41px;
+                            selected: root.is-current(section); accessible-description: self.selected ? "Current section" : "";
+                            clicked => { root.navigate(section); if section == "search" { search.take-focus(); } }
+                        }
+                        Divider { }
+                        Action { text: "Settings"; icon: "⚙"; quiet: true; leading: true; selected: root.is-settings; clicked => { root.navigate("settings"); } }
+                        Rectangle { vertical-stretch: 1; }
+                        Rectangle {
+                            height: 62px; background: Theme.panel; border-radius: 9px; border-width: 1px; border-color: Theme.line;
+                            VerticalLayout {
+                                padding: 10px; spacing: 3px;
+                                Caption { text: root.account-label == "" ? "Music library" : root.account-label; color: Theme.text; }
+                                Eyebrow { text: root.reconnecting ? "CONNECTING…" : root.local-mode ? "WORKING OFFLINE" : "DESKTOP"; color: root.local-mode ? Theme.amber : Theme.subtle; }
                             }
                         }
-                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    Rectangle {
+                        height: 61px; background: Theme.rail;
+                        HorizontalLayout {
+                            padding-left: root.compact ? 12px : 21px; padding-right: root.compact ? 12px : 21px;
+                            padding-top: 9px; padding-bottom: 9px; spacing: 8px;
+                            if root.compact: Image { width: 27px; height: 27px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
+                            Action { icon: "←"; quiet: true; enabled: root.can-back; accessible-label: "Back"; clicked => { root.back(); } }
+                            search := Field {
+                                text <=> root.query; prefix: "⌕"; pill: true; field-label: "Search music";
+                                placeholder-text: root.compact ? "Search music" : "Search tracks, albums or artists";
+                                max-width: 440px;
+                                edited => { root.search-edited(); }
+                                accepted => { root.search-edited(); }
+                            }
+                            if root.query != "": Action {
+                                icon: "×"; quiet: true; accessible-label: "Clear search";
+                                clicked => { root.query = ""; root.search-edited(); search.take-focus(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Action {
+                                text: root.reconnecting ? "Stay offline" : root.local-mode ? "Go online" : "Work offline";
+                                selected: root.local-mode;
+                                clicked => { root.flip-offline(); }
+                            }
+                            if root.compact: Action { icon: "⚙"; quiet: true; selected: root.is-settings; accessible-label: "Settings"; clicked => { root.navigate("settings"); } }
+                        }
+                        Divider { y: parent.height - 1px; }
+                    }
+                    if root.compact: Rectangle {
+                        height: 49px; background: Theme.rail;
+                        HorizontalLayout {
+                            padding-left: 7px; padding-right: 7px; padding-top: 5px; spacing: 4px;
+                            for section in root.sections: Action {
+                                text: root.width < 562px && (section == "history" || section == "search") ? "" : root.section-label(section);
+                                icon: self.text == "" ? Copy.mark(section) : "";
+                                min-width: 34px; horizontal-stretch: 1; quiet: true; selected: root.is-current(section);
+                                accessible-label: root.section-label(section); accessible-description: self.selected ? "Current section" : "";
+                                clicked => { root.navigate(section); if section == "search" { search.take-focus(); } }
+                            }
+                        }
+                        Divider { y: parent.height - 1px; }
+                    }
+                    catalog-scroll := ScrollView {
+                        min-height: 0px; vertical-stretch: 1;
+                        content-width: self.visible-width;
+                        property <string> scroll-key: root.displayed-kind + "|" + root.catalog-title;
+                        changed scroll-key => { self.content-y = 0px; }
+                        function reveal(y: length, h: length) {
+                            if y < -self.content-y { self.content-y = -y; }
+                            else if y + h > -self.content-y + self.visible-height { self.content-y = min(0px, self.visible-height - y - h); }
+                        }
+                        VerticalLayout {
+                            padding-left: root.compact ? 12px : 22px; padding-right: root.compact ? 12px : 22px;
+                            padding-top: root.compact ? 13px : 20px; padding-bottom: 20px; spacing: 12px; alignment: start;
+                            Hero {
+                                title: root.is-settings ? "Settings" : root.displayed-kind == "now" && root.now-track-id != "" ? root.now-title : root.catalog-title;
+                                subtitle: root.displayed-kind == "now" ? root.now-detail : root.catalog-subtitle;
+                                section: root.displayed-kind == "now" && root.now-track-id != "" ? "NOW PLAYING" : root.saved-view ? "ON THIS COMPUTER" : "";
+                                glyph: Copy.mark(root.displayed-kind); tint: Copy.tint(root.displayed-kind);
+                                artwork: root.displayed-kind == "now" ? root.cover-art : root.page-artwork;
+                                compact: root.compact; show-art: !root.compact || root.displayed-kind == "now" || root.displayed-kind == "album" || root.displayed-kind == "artist" || root.displayed-kind == "track";
+                            }
+                            if root.displayed-kind == "home": HorizontalLayout {
+                                spacing: 8px;
+                                Action { text: "Albums"; icon: "◎"; clicked => { root.navigate("albums"); } }
+                                Action { text: "Artists"; icon: "◉"; clicked => { root.navigate("artists"); } }
+                                Action { text: "History"; icon: "◷"; clicked => { root.navigate("history"); } }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            if root.saved-view && !root.local-mode: Notice { text: "To play saved music, choose Work offline in the header."; }
+                            if root.page-actions.length > 0: FlexboxLayout {
+                                flex-wrap: wrap; spacing: 6px;
+                                for action in root.page-actions: Action {
+                                    text: action == "save" && root.displayed-kind != "track" ? "Save this collection" : action == "remove" ? "Remove download" : Copy.action-label(action);
+                                    icon: Copy.action-mark(action);
+                                    primary: action == "play" || action == "new-manual";
+                                    enabled: action != "play" || !root.saved-view || root.can-play-saved;
+                                    danger: action == "delete" || action == "remove"; clicked => { root.catalog-action(action); }
+                                }
+                            }
+                            if root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
+                            if root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
+                            if root.is-settings: Settings {
+                                account: root.account-label; offline: root.local-mode; reconnecting: root.reconnecting;
+                                mode: root.appearance-mode; scale: root.appearance-scale;
+                                palettes: root.palettes; palette-id: root.palette-id; palette-status: root.palette-status; palette-enabled: root.palette-enabled;
+                                sign-out => { root.sign-out(); } toggle-offline => { root.flip-offline(); }
+                                appearance(mode, scale) => { root.appearance-changed(mode, scale, root.appearance-accent); }
+                                select-palette(id) => { root.palette-selected(id); } reset => { root.reset-appearance(); }
+                            }
+                            if root.displayed-kind == "now": SettingCard {
+                                title: "Playback position";
+                                detail: root.offline-playback ? "Playing saved audio on this computer." : root.output-name;
+                                SeekBar { elapsed: root.elapsed; duration: root.duration; enabled: root.can-seek; waveform: root.waveform; seek(v) => { root.seek(v); } }
+                                if root.time-label != "": Caption { text: root.time-label; }
+                                if root.has-now-context: Action {
+                                    text: "From " + root.now-context-name; icon: "↗"; leading: true; quiet: true; min-width: 0px;
+                                    clicked => { root.page-action("context-" + root.now-context-kind, root.now-context-id); }
+                                }
+                                if root.now-track-id != "" || root.now-album-id != "" || root.now-artist-id != "": HorizontalLayout {
+                                    spacing: 7px;
+                                    if root.now-track-id != "": Action { text: "Open track"; clicked => { root.page-action("track", root.now-track-id); } }
+                                    if root.now-album-id != "": Action { text: "Open album"; clicked => { root.page-action("album", root.now-album-id); } }
+                                    if root.now-artist-id != "": Action { text: "Open artist"; clicked => { root.page-action("artist", root.now-artist-id); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                            if root.displayed-kind == "now" && root.media-status != "": Notice { text: root.media-status; }
+                            if root.displayed-kind == "now": SettingCard {
+                                title: "Up next";
+                                detail: root.queue-has-upcoming ? "" : "No tracks are lined up yet.";
+                                for row[i] in root.queue-rows: Caption {
+                                    property <bool> first-upcoming: row.upcoming && (i == 0 || !root.queue-rows[i - 1].upcoming);
+                                    height: self.first-upcoming ? 25px : 0px;
+                                    visible: self.first-upcoming;
+                                    text: row.title + (row.subtitle == "" ? "" : " · " + row.subtitle);
+                                    color: Theme.text;
+                                }
+                                HorizontalLayout {
+                                    Action { text: "View queue"; icon: "≡"; clicked => { root.navigate("queue"); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                            if root.displayed-kind == "now": SettingCard {
+                                title: "Lyrics";
+                                detail: root.lyrics-text == "" ? "No lyrics are available for this track." : "";
+                                if root.lyrics-text != "": Text { text: root.lyrics-text; color: Theme.text; wrap: word-wrap; }
+                            }
+                            if root.displayed-kind == "queue": FlexboxLayout {
+                                flex-wrap: wrap; spacing: 7px;
+                                Action { text: "Shuffle"; selected: root.shuffle; enabled: root.queue-controls; accessible-description: root.shuffle ? "On" : "Off"; clicked => { root.queue-action("shuffle", ""); } }
+                                Action { text: root.repeat-mode == "one" ? "Repeat: one" : root.repeat-mode == "all" ? "Repeat: all" : "Repeat: off"; selected: root.repeat-mode != "off"; enabled: root.queue-controls; clicked => { root.queue-action("repeat", ""); } }
+                                if root.queue-has-upcoming: Action { text: "Clear upcoming"; enabled: root.queue-controls; clicked => { root.queue-action("clear", ""); } }
+                            }
+                            if root.displayed-kind == "queue" && root.queue-rows.length > 0 && root.queue-status != "": Notice { text: root.queue-status; }
+                            if root.displayed-kind == "queue" && root.queue-rows.length == 0: EmptyState { title: "The queue is empty"; subtitle: "Play or queue tracks from your library."; glyph: "≡"; }
+                            if root.displayed-kind == "queue": queue-list := VerticalLayout {
+                                spacing: 3px;
+                                for row[i] in root.queue-rows: MediaLine {
+                                    title: row.title; subtitle: row.current ? "Playing now · " + row.subtitle : row.subtitle;
+                                    detail: row.upcoming ? "UP NEXT" : row.current ? "NOW PLAYING" : "PLAYED"; kind: "track";
+                                    property <bool> can-up: i > 0 && root.queue-rows[i - 1].upcoming;
+                                    property <bool> can-down: i + 1 < root.queue-rows.length && root.queue-rows[i + 1].upcoming;
+                                    selected: row.current; can-open: false; playable: row.upcoming && root.queue-controls;
+                                    actions: !self.playable ? [] : self.can-up && self.can-down ? ["up", "down", "remove"]
+                                        : self.can-up ? ["up", "remove"] : self.can-down ? ["down", "remove"] : ["remove"];
+                                    compact: root.compact; expanded: root.expanded-queue-key == row.key;
+                                    toggle-options => { root.expanded-queue-key = self.expanded ? "" : row.key; }
+                                    focused => { catalog-scroll.reveal(queue-list.y + self.y, self.height); }
+                                    action(op) => { if op != "open" { root.queue-action(op, row.key); } }
+                                }
+                            }
+                            if root.displayed-kind == "devices" && root.device-status != "" && (root.local-mode || root.device-rows.length > 0): Notice { text: root.device-status; }
+                            if root.displayed-kind == "devices" && root.device-rows.length == 0: EmptyState { title: "No playback devices yet"; subtitle: "Available outputs will appear here."; glyph: "◫"; }
+                            if root.displayed-kind == "devices": VerticalLayout {
+                                spacing: 6px;
+                                for device in root.device-rows: SettingCard {
+                                    title: device.name;
+                                    detail: device.selected ? "Selected output" : !device.available ? "Not available" : device.can-play ? "Available for playback" : "Cannot play audio";
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Action {
+                                            text: device.selected ? "Deselect" : "Select output"; enabled: !root.local-mode && (device.selected || (device.available && device.can-play));
+                                            primary: !device.selected; clicked => { root.device-action(device.selected ? "deselect" : "select", device.id); }
+                                        }
+                                        if device.selected: Action {
+                                            text: "Rename"; enabled: !root.local-mode;
+                                            clicked => { root.form-name = device.name; root.form-mode = "device-rename"; root.device-action("prepare-rename", device.id); }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                }
+                            }
+                            if !root.is-settings && !root.is-playback-page && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
+                                EmptyState {
+                                    glyph: Copy.mark(root.displayed-kind);
+                                    title: root.is-history ? "No recent plays to show" : root.is-search && root.query == "" ? "What would you like to hear?" : root.is-search ? "No matching results" : root.displayed-kind == "picker" ? "No manual playlists" : root.displayed-kind == "offline" ? "Nothing saved yet" : "No items here yet";
+                                    subtitle: root.is-history ? (root.reconnecting ? "Connecting…" : root.local-mode ? "Go online to see listening history for this account." : "Tracks will appear here when they’re recorded in your account’s listening history.") : root.is-search && root.query == "" ? "Use the search field above to explore your library." : root.is-search ? "Try a different title, artist or album." : root.displayed-kind == "picker" ? "Create a manual playlist before adding tracks." : root.displayed-kind == "offline" ? "Use Save offline on a track while you’re online." : "Items will appear here when they’re available.";
+                                }
+                            if root.browse-rows.length > 0 && (root.is-search || root.is-playlist || root.displayed-kind == "picker"): Eyebrow {
+                                text: root.is-search ? "SEARCH RESULTS" : root.is-playlist ? "TRACKS" : "MANUAL PLAYLISTS";
+                            }
+                            for row[i] in root.browse-rows: shelf-row := VerticalLayout {
+                                visible: !root.is-settings && !root.is-playback-page;
+                                spacing: 4px;
+                                if row.section != "": Eyebrow { text: row.section; height: 28px; }
+                                MediaLine {
+                                    title: row.title; subtitle: row.subtitle; detail: row.detail; kind: row.kind;
+                                    artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
+                                    playable: row.playable && (root.saved-view ? root.can-play-saved : !root.local-mode) && root.displayed-kind != "picker";
+                                    compact: root.compact; expanded: root.expanded-row == i;
+                                    actions: root.displayed-kind == "picker" ? [] : row.actions;
+                                    toggle-options => { root.expanded-row = root.expanded-row == i ? -1 : i; }
+                                    focused => { catalog-scroll.reveal(shelf-row.y + self.y, self.height); }
+                                    action(op) => { root.row-action(op, i); }
+                                }
+                            }
+                            if root.has-more: HorizontalLayout {
+                                Action { text: "Load more"; enabled: !root.page-busy; clicked => { root.page-action("more", ""); } }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                        }
                     }
                 }
             }
-            Text { text: "Up to 20 tracks · Refine your search for more specific results"; color: Theme.muted; font-size: 11px; }
-        }
-        if root.signed-in: Rectangle {
-            height: 132px; min-width: 0px; background: #111716;
-            Rectangle { y: 0px; height: 1px; background: Theme.line; }
-            // Bounded regions keep transport centered without feeding window width into layout minima.
-            Cover { x: 24px; y: 24px; width: 58px; height: 58px; border-radius: Theme.radius; }
-            Text { x: 98px; y: 34px; width: parent.width / 3 - 110px; height: 20px; text: root.now-title; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; accessible-label: root.now-title; }
-            Text { x: 98px; y: 59px; width: parent.width / 3 - 110px; height: 16px; text: root.now-detail; color: Theme.muted; font-size: 11px; overflow: elide; }
-            Action { x: parent.width / 2 - 82px; y: 20px; text: "|◀"; round: true; width: 40px; height: 36px; accessible-label: "Previous"; enabled: root.remote-controls; clicked => { root.previous(); } }
-            Action { x: parent.width / 2 - 20px; y: 18px; text: root.playing ? "Ⅱ" : "▶"; round: true; light: true; width: 40px; height: 40px; accessible-label: root.playing ? "Pause" : "Resume"; enabled: root.can-control; clicked => { root.toggle-play(); } }
-            Action { x: parent.width / 2 + 42px; y: 20px; text: "▶|"; round: true; width: 40px; height: 36px; accessible-label: "Next"; enabled: root.remote-controls; clicked => { root.next(); } }
-            seek := Slider { x: parent.width / 3 + 12px; y: 64px; width: parent.width / 3 - 24px; height: 26px; minimum: 0; maximum: max(1,root.duration); value: root.elapsed; enabled: root.can-seek; accessible-label: "Seek on selected output"; changed(value) => { root.seek(value); } }
-            // Paint-only skin: the standard Slider still owns all input, focus,
-            // value and accessibility. These non-interactive rectangles only
-            // replace its stock blue paint; no hidden/duplicate input control.
-            Rectangle {
-                x: seek.x; y: seek.y; width: seek.width; height: seek.height;
-                background: #111716; accessible-role: none;
-                property <length> thumb-x: (self.width - 20px) * clamp(seek.value / seek.maximum, 0, 1);
-                Rectangle { x: 10px; y: 11px; width: parent.width - 20px; height: 4px; border-radius: 2px; background: Theme.line; accessible-role: none; }
-                Rectangle { x: 10px; y: 11px; width: parent.thumb-x; height: 4px; border-radius: 2px; background: root.can-seek ? Theme.green : Theme.muted.with-alpha(0.35); accessible-role: none; }
-                Rectangle { x: parent.thumb-x; y: 3px; width: 20px; height: 20px; border-radius: 10px; background: Theme.raised; border-width: seek.has-focus && root.can-seek ? 2px : 1px; border-color: seek.has-focus && root.can-seek ? Theme.focus : Theme.line; accessible-role: none;
-                    Rectangle { x: 4px; y: 4px; width: 12px; height: 12px; border-radius: 6px; background: root.can-seek ? Theme.green : Theme.muted.with-alpha(0.35); accessible-role: none; }
-                }
+            PlayerBar {
+                track: root.now-title; subtitle: root.now-detail; output: root.output-name;
+                status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
+                time: root.time-label;
+                artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
+                can-seek: root.can-seek && (!root.local-mode || root.offline-playback);
+                playing: root.playing;
+                can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
+                can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
+                page: root.displayed-kind; compact: root.compact; offline: root.local-mode || root.offline-playback;
+                previous => { root.previous(); } next => { root.next(); } toggle => { root.toggle-play(); }
+                seek(v) => { root.seek(v); } navigate(page) => { root.navigate(page); }
             }
-            Text { x: parent.width / 3; y: 98px; width: parent.width / 3; height: 16px; text: root.time-label; color: Theme.muted; font-size: 11px; horizontal-alignment: center; accessible-label: root.time-label; }
-            Text { x: parent.width * 2 / 3 + 14px; y: 18px; width: parent.width / 3 - 38px; height: 18px; text: root.output-name; color: Theme.green; font-size: 11px; overflow: elide; horizontal-alignment: right; accessible-label: root.output-name; }
-            Text { x: parent.width * 2 / 3 + 14px; y: 42px; width: parent.width / 3 - 38px; height: 58px; text: root.player-status; color: Theme.muted; font-size: 11px; wrap: word-wrap; horizontal-alignment: right; accessible-label: root.player-status; }
-            if root.player-retry: Action { x: parent.width - 164px; y: 98px; height: 28px; width: 140px; text: "Retry connection"; enabled: root.player-retry-allowed; clicked => { root.retry-player(); } }
-        }
-        Rectangle {
-            height: 28px;
-            Text { x: 24px; height: parent.height; text: "Selected-output playback · No credentials saved"; color: Theme.muted; font-size: 10px; vertical-alignment: center; }
         }
     }
 }

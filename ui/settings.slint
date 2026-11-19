@@ -1,0 +1,95 @@
+import { Action, Caption, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+
+export struct PaletteRow { id: string, title: string, primary: color, on-primary: color, secondary: color, tertiary: color }
+
+export component SettingCard inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+    min-height: layout.preferred-height;
+    vertical-stretch: 0;
+    layout := VerticalLayout {
+        padding: 15px;
+        spacing: 9px;
+        Text { text: root.title; color: Theme.text; font-size: 15px * Theme.density; font-weight: 700; }
+        if root.detail != "": Caption { text: root.detail; wrap: word-wrap; }
+        @children
+    }
+}
+
+export component Settings inherits VerticalLayout {
+    in property <string> account;
+    in property <bool> offline;
+    in property <bool> reconnecting;
+    in property <int> mode;
+    in property <float> scale;
+    in property <[PaletteRow]> palettes;
+    in property <string> palette-id;
+    in property <string> palette-status;
+    in property <bool> palette-enabled;
+    callback sign-out();
+    callback toggle-offline();
+    callback appearance(int, float);
+    callback select-palette(string);
+    callback reset();
+    spacing: 11px;
+    alignment: start;
+    SettingCard {
+        title: "Connection";
+        detail: root.reconnecting ? "Connecting… You can still play saved music." : root.offline ? "You’re working offline. You can play music saved on this computer." : "Go offline to pause all network activity and listen to saved music.";
+        HorizontalLayout {
+            Action { text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline"; primary: root.offline; clicked => { root.toggle-offline(); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+    SettingCard {
+        title: "Display on this computer";
+        detail: "Choose a light or dark background and change the size of text and list rows.";
+        HorizontalLayout {
+            spacing: 7px;
+            Action { text: "Dark"; selected: root.mode == 0; clicked => { root.appearance(0, root.scale); } }
+            Action { text: "Light"; selected: root.mode == 1; clicked => { root.appearance(1, root.scale); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        HorizontalLayout {
+            spacing: 7px;
+            Action { text: "Compact"; selected: root.scale < 0.95; clicked => { root.appearance(root.mode, 0.85); } }
+            Action { text: "Standard"; selected: root.scale >= 0.95 && root.scale < 1.10; clicked => { root.appearance(root.mode, 1.0); } }
+            Action { text: "Large"; selected: root.scale >= 1.10; clicked => { root.appearance(root.mode, 1.2); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        HorizontalLayout {
+            Action { text: "Reset display defaults"; quiet: true; clicked => { root.reset(); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+    SettingCard {
+        title: "Account colors";
+        detail: root.reconnecting ? "Account colors will be available once you’re connected." : root.offline ? "Go online to choose an account palette." : "Palettes are provided by your music server.";
+        if root.palette-status != "": Notice { text: root.palette-status; }
+        for palette in root.palettes: HorizontalLayout {
+            spacing: 9px;
+            Action {
+                text: palette.title; leading: true; quiet: true; min-width: 0px; horizontal-stretch: 1;
+                selected: palette.id == root.palette-id; enabled: root.palette-enabled && !root.offline;
+                accessible-label: palette.title + (self.selected ? ", selected palette" : ", choose palette");
+                clicked => { root.select-palette(palette.id); }
+            }
+            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.primary; border-width: 1px; border-color: Theme.line; } }
+            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.secondary; border-width: 1px; border-color: Theme.line; } }
+            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.tertiary; border-width: 1px; border-color: Theme.line; } }
+        }
+        if root.palette-status == "" && root.palettes.length == 0 && !root.offline: Caption { text: "No palettes are available yet."; }
+    }
+    SettingCard {
+        title: "Account";
+        detail: root.account == "" ? "Your current listening session." : "Signed in as " + root.account;
+        HorizontalLayout {
+            Action { text: "Sign out"; clicked => { root.sign-out(); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

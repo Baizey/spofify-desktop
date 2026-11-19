@@ -1,9 +1,10 @@
-//! Bounded, in-memory native client for the existing auth and read-only library API.
+//! Bounded, in-memory native transport for authenticated library and playback APIs.
 //! No arbitrary request URLs, cookie jar, persistence, redirects, proxies or retries.
 
 use std::{
     collections::HashSet,
     fmt,
+    future::Future,
     net::IpAddr,
     sync::{
         Arc,
@@ -18,17 +19,37 @@ use reqwest::{
     header::{self, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use url::Url;
+
+#[path = "catalog.rs"]
+pub mod catalog;
+#[path = "library.rs"]
+pub mod library;
+#[path = "preferences.rs"]
+pub(crate) mod preferences;
+#[path = "reconnect.rs"]
+mod reconnect;
 
 pub const PAGE_SIZE: u32 = 20;
 const MAX_BODY: usize = 256 * 1024;
 const LOGIN_BODY: usize = 8 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
-// Go accepts <=2MiB publications. A view can contain the room state plus up to
-// 16 directive snapshots/commands: 17*2MiB plus bounded device/outcome envelopes.
-const PLAYER_REQUEST: usize = 2 * 1024 * 1024;
-const PLAYER_RESPONSE: usize = 36 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(4);
+const TICKET_BODY: usize = 1024;
+const OFFLINE_MEDIA_BODY: usize = 16 * 1024;
+const OFFLINE_COLLECTION_BODY: usize = 2 * 1024 * 1024;
+const OFFLINE_AUDIO_TYPES: [&str; 8] = [
+    "audio/mpeg",
+    "audio/flac",
+    "audio/mp4",
+    "audio/aac",
+    "audio/ogg",
+    "audio/wav",
+    "audio/aiff",
+    "audio/webm",
+];
 
 /// All messages are local constants. Never retains a transport error, URL or server body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +75,7 @@ const INVALID_RESPONSE: ApiError = error("The server returned an incompatible AP
 const INVALID_INPUT: ApiError = error("The request contains invalid or oversized input.");
 const NETWORK: ApiError =
     error("Unable to reach the server. Check your connection and server address.");
+const OFFLINE: ApiError = error("This session is offline.");
 const EXPIRED: ApiError = ApiError {
     message: "Your session has expired. Sign in again.",
     expired: true,
@@ -137,6 +159,17 @@ impl Origin {
         url.set_path(path);
         url
     }
+
+    // Dynamic segments must be validated by the fixed-route callers before they reach this
+    // helper (in particular, the URL library normalizes dot segments rather than encoding them).
+    fn endpoint_segments(&self, segments: &[&str]) -> Result<Url, ApiError> {
+        let mut url = self.0.clone();
+        url.path_segments_mut()
+            .map_err(|_| INVALID_INPUT)?
+            .clear()
+            .extend(segments.iter().copied());
+        Ok(url)
+    }
 }
 
 fn valid_port_suffix(suffix: &str) -> bool {
@@ -168,24 +201,93 @@ pub struct Session {
 }
 
 impl Session {
-    /// Lets the UI/player actor stop existing audio when a clone is revoked or expires,
-    /// without requiring another network request or exposing credentials.
+    /// Whether the network credential is past its deadline or has been revoked.
+    /// Local playback and storage must use `can_access_local` instead.
     pub fn is_expired(&self) -> bool {
-        let expired =
-            self.secrets.revoked.load(Ordering::SeqCst) || Instant::now() >= self.secrets.deadline;
-        if expired {
-            self.secrets.revoked.store(true, Ordering::SeqCst);
-        }
-        expired
+        self.cookie_expired() || self.secrets.revoked.load(Ordering::SeqCst)
+    }
+
+    /// An explicitly offline session may access its account's local data past the
+    /// cookie deadline. A server 401 or local logout still ends all access.
+    pub fn can_access_local(&self) -> bool {
+        (self.is_offline() || !self.cookie_expired())
+            && !self.secrets.revoked.load(Ordering::SeqCst)
+    }
+
+    fn cookie_expired(&self) -> bool {
+        Instant::now() >= self.secrets.deadline
+    }
+
+    /// A session capability and every clone share the same explicit network mode.
+    pub fn set_offline(&self, offline: bool) {
+        self.secrets.network.send_if_modified(|generation| {
+            if (*generation & 1 != 0) == offline {
+                return false;
+            }
+            *generation = generation.wrapping_add(1);
+            true
+        });
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.network_generation() & 1 != 0
+    }
+
+    fn network_generation(&self) -> u64 {
+        *self.secrets.network.borrow()
+    }
+
+    /// Any change fences an already-open socket, even if the current mode is online again.
+    /// Odd generations are offline; repeated calls with the same mode do not advance it.
+    pub(crate) fn network_changes(&self) -> watch::Receiver<u64> {
+        self.secrets.network.subscribe()
     }
 }
 
 struct SessionSecrets {
     owner: Arc<()>,
+    account_id: String,
+    network: watch::Sender<u64>,
     cookie: HeaderValue,
     csrf: HeaderValue,
     deadline: Instant,
     revoked: AtomicBool,
+}
+
+struct NetworkFence {
+    changes: watch::Receiver<u64>,
+    generation: u64,
+}
+
+impl NetworkFence {
+    fn new(session: &Session) -> Result<Self, ApiError> {
+        let mut changes = session.network_changes();
+        let generation = *changes.borrow_and_update();
+        if generation & 1 != 0 {
+            return Err(OFFLINE);
+        }
+        Ok(Self {
+            changes,
+            generation,
+        })
+    }
+
+    async fn run<T>(
+        mut self,
+        operation: impl Future<Output = Result<T, ApiError>>,
+    ) -> Result<T, ApiError> {
+        tokio::select! {
+            biased;
+            _ = self.changes.changed() => Err(OFFLINE),
+            result = operation => {
+                if *self.changes.borrow() == self.generation {
+                    result
+                } else {
+                    Err(OFFLINE)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,15 +344,22 @@ impl Api {
 
     #[cfg(test)]
     pub(crate) fn test_session(&self) -> Session {
+        self.test_session_with_deadline(Instant::now() + Duration::from_secs(60))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_session_with_deadline(&self, deadline: Instant) -> Session {
         Session {
             account_id: "synthetic".into(),
             username: "synthetic".into(),
             role: "admin".into(),
             secrets: Arc::new(SessionSecrets {
                 owner: self.identity.clone(),
+                account_id: "synthetic".into(),
+                network: watch::Sender::new(0),
                 cookie: HeaderValue::from_static("spofify_session=synthetic"),
                 csrf: HeaderValue::from_static("synthetic"),
-                deadline: Instant::now() + Duration::from_secs(60),
+                deadline,
                 revoked: AtomicBool::new(false),
             }),
         }
@@ -297,11 +406,13 @@ impl Api {
         let mut csrf = HeaderValue::from_str(&summary.csrf_token).map_err(|_| INVALID_RESPONSE)?;
         csrf.set_sensitive(true);
         Ok(Session {
-            account_id: summary.account_id,
+            account_id: summary.account_id.clone(),
             username: summary.username,
             role: summary.role,
             secrets: Arc::new(SessionSecrets {
                 owner: self.identity.clone(),
+                account_id: summary.account_id,
+                network: watch::Sender::new(0),
                 cookie,
                 csrf,
                 deadline,
@@ -325,130 +436,405 @@ impl Api {
                 limit: PAGE_SIZE,
             });
         }
-        self.check_session(session)?;
-        let mut url = self.origin.endpoint("/api/library");
-        url.query_pairs_mut()
-            .append_pair("kind", "tracks")
-            .append_pair("scope", "all")
-            .append_pair("availability", "in-library")
-            .append_pair("q", query)
-            .append_pair("limit", &PAGE_SIZE.to_string())
-            .append_pair("offset", "0");
-        let request = self
-            .request(url)?
-            .header(header::COOKIE, session.secrets.cookie.clone());
-        let response = self.send(request, Some(session), false).await?;
-        if response.status() != 200 {
-            return Err(INVALID_RESPONSE);
-        }
-        let wire: WirePage = decode(response, MAX_BODY).await?;
-        self.check_session(session)?;
-        if wire.limit != PAGE_SIZE
-            || wire.offset != 0
-            || wire.items.len() > PAGE_SIZE as usize
-            || wire.items.len() as u32 > wire.total
-        {
-            return Err(INVALID_RESPONSE);
-        }
-        let mut seen = HashSet::new();
-        let mut items = Vec::with_capacity(wire.items.len());
-        for item in wire.items {
-            if !seen.insert(item.id.clone()) {
+        self.with_authenticated_network(session, async {
+            let mut url = self.origin.endpoint("/api/library");
+            url.query_pairs_mut()
+                .append_pair("kind", "tracks")
+                .append_pair("scope", "all")
+                .append_pair("availability", "in-library")
+                .append_pair("q", query)
+                .append_pair("limit", &PAGE_SIZE.to_string())
+                .append_pair("offset", "0");
+            let request = self
+                .request(url)?
+                .header(header::COOKIE, session.secrets.cookie.clone());
+            let response = self.send(request, Some(session), false).await?;
+            if response.status() != 200 {
                 return Err(INVALID_RESPONSE);
             }
-            items.push(item.into_item("track")?);
-        }
-        Ok(Page {
-            items,
-            total: wire.total,
-            offset: wire.offset,
-            limit: wire.limit,
+            let wire: WirePage = decode(response, MAX_BODY).await?;
+            self.check_session(session)?;
+            if wire.limit != PAGE_SIZE
+                || wire.offset != 0
+                || wire.items.len() > PAGE_SIZE as usize
+                || wire.items.len() as u32 > wire.total
+            {
+                return Err(INVALID_RESPONSE);
+            }
+            let mut seen = HashSet::new();
+            let mut items = Vec::with_capacity(wire.items.len());
+            for item in wire.items {
+                if !seen.insert(item.id.clone()) {
+                    return Err(INVALID_RESPONSE);
+                }
+                items.push(item.into_item("track")?);
+            }
+            Ok(Page {
+                items,
+                total: wire.total,
+                offset: wire.offset,
+                limit: wire.limit,
+            })
         })
+        .await
     }
 
-    /// Opaque bounded coordinator command transport. Playback policy and response DTO
-    /// validation belong to the player actor. A 409 never grants playback authority:
-    /// callers must explicitly reconcile status before attempting any further action.
-    pub async fn player(
+    /// Opens the configured origin's v2 playback socket. The caller owns framing and must
+    /// fence every use of the returned connection against session expiry and network changes.
+    pub(crate) async fn playback_upgrade(
         &self,
         session: &Session,
-        command: serde_json::Value,
-    ) -> Result<serde_json::Value, ApiError> {
-        self.check_session(session)?;
-        if !command.is_object() {
-            return Err(INVALID_INPUT);
-        }
-        let body = serde_json::to_vec(&command).map_err(|_| INVALID_INPUT)?;
-        if body.len() > PLAYER_REQUEST {
-            return Err(INVALID_INPUT);
-        }
-        let request = self
-            .request(self.origin.endpoint("/api/me/player"))?
-            .timeout(Duration::from_secs(4))
-            .header(header::COOKIE, session.secrets.cookie.clone())
-            .header("X-CSRF-Token", session.secrets.csrf.clone())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body);
-        let response = self.send(request, Some(session), false).await?;
-        if response.status() != 200 {
-            return Err(INVALID_RESPONSE);
-        }
-        let crate::observation::StrictValue(state) = decode(response, PLAYER_RESPONSE).await?;
-        self.check_session(session)?;
-        Ok(state)
-    }
+    ) -> Result<crate::socket::PlaybackUpgrade, ApiError> {
+        use tokio_tungstenite::tungstenite::handshake::{client::generate_key, derive_accept_key};
 
-    /// Observational coordinator view for explicit stale-epoch reconciliation. This
-    /// sends no command and never grants permission to execute returned directives;
-    /// the player actor must validate/reconcile the view before polling again.
-    pub async fn player_view(&self, session: &Session) -> Result<serde_json::Value, ApiError> {
-        self.check_session(session)?;
-        let request = self
-            .request_with_method(reqwest::Method::GET, self.origin.endpoint("/api/me/player"))?
-            .timeout(Duration::from_secs(4))
-            .header(header::COOKIE, session.secrets.cookie.clone());
-        let response = self.send(request, Some(session), false).await?;
-        if response.status() != 200 {
-            return Err(INVALID_RESPONSE);
-        }
-        let crate::observation::StrictValue(view) = decode(response, PLAYER_RESPONSE).await?;
-        self.check_session(session)?;
-        Ok(view)
+        self.with_authenticated_network(session, async {
+            let generation = session.network_generation();
+            let request = self
+                .request_with_method(
+                    reqwest::Method::POST,
+                    self.origin.endpoint("/api/me/player/connect"),
+                )?
+                .timeout(SOCKET_TIMEOUT)
+                .header(header::COOKIE, session.secrets.cookie.clone())
+                .header("X-CSRF-Token", session.secrets.csrf.clone())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{}");
+            let response = self.send(request, Some(session), false).await?;
+            if response.status() != 200 {
+                return Err(INVALID_RESPONSE);
+            }
+            #[derive(Deserialize)]
+            struct Ticket {
+                ticket: String,
+            }
+            let Ticket { ticket } = decode(response, TICKET_BODY).await?;
+            if !valid_lower_hex_32(&ticket) {
+                return Err(INVALID_RESPONSE);
+            }
+            self.check_session(session)?;
+            if generation & 1 != 0 || session.network_generation() != generation {
+                return Err(OFFLINE);
+            }
+
+            // No ticket in the URL or upgrade headers: the framing worker sends it in hello.
+            let key = generate_key();
+            let expected_accept = derive_accept_key(key.as_bytes());
+            let protocol = crate::socket::SUBPROTOCOL;
+            let request = self
+                .request_with_method(
+                    reqwest::Method::GET,
+                    self.origin.endpoint("/api/me/player/socket"),
+                )?
+                .timeout(SOCKET_TIMEOUT)
+                .header(header::COOKIE, session.secrets.cookie.clone())
+                .header(header::CONNECTION, "Upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .header(header::SEC_WEBSOCKET_KEY, key)
+                .header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+            self.check_session(session)?;
+            if session.network_generation() != generation {
+                return Err(OFFLINE);
+            }
+            let response = request.send().await.map_err(|_| NETWORK)?;
+            if session.network_generation() != generation {
+                return Err(OFFLINE);
+            }
+            if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+                if !response.status().is_success() {
+                    return Err(Self::response_error(
+                        response.status().as_u16(),
+                        Some(session),
+                        false,
+                    ));
+                }
+                return Err(INVALID_RESPONSE);
+            }
+            validate_websocket_upgrade(&response, &expected_accept, protocol)?;
+            let upgraded = tokio::time::timeout(SOCKET_TIMEOUT, response.upgrade())
+                .await
+                .map_err(|_| NETWORK)?
+                .map_err(|_| INVALID_RESPONSE)?;
+            Ok(crate::socket::PlaybackUpgrade { upgraded, ticket })
+        })
+        .await
     }
 
     /// Fetch one original-format audio file into bounded ephemeral memory. The caller
     /// must obtain coordinator authority before calling and stop audio on session expiry.
     pub async fn media(&self, session: &Session, id: &str) -> Result<Vec<u8>, ApiError> {
+        self.with_authenticated_network(session, async {
+            let request = self
+                .track_request(session, id, "audio", "audio/*, application/octet-stream")?
+                .timeout(Duration::from_secs(45));
+            let response = self.send(request, Some(session), false).await?;
+            if response.status() != 200 {
+                return Err(INVALID_RESPONSE);
+            }
+            let media = content_type(&response)?;
+            if !(media.starts_with("audio/") && media.len() > "audio/".len())
+                && media != "application/octet-stream"
+            {
+                return Err(error("The server returned an unsupported audio response."));
+            }
+            let bytes = self
+                .resource_bytes(
+                    session,
+                    response,
+                    MAX_MEDIA,
+                    error("This track exceeds the 32 MiB in-memory playback limit."),
+                )
+                .await?;
+            if bytes.is_empty() {
+                return Err(error("The server returned an empty audio response."));
+            }
+            Ok(bytes)
+        })
+        .await
+    }
+
+    /// Account identity for local data, not permission to send credentials. The
+    /// immutable authenticated principal, not mutable display fields, defines the scope.
+    pub(crate) fn authenticated_account<'a, 's>(
+        &'a self,
+        session: &'s Session,
+    ) -> Result<(&'a str, &'s str), ApiError> {
+        self.check_session_owner(session)?;
+        if !session.can_access_local() {
+            return Err(EXPIRED);
+        }
+        Ok((self.origin.as_str(), &session.secrets.account_id))
+    }
+
+    pub(crate) async fn track_resource(
+        &self,
+        session: &Session,
+        track_id: &str,
+        resource: crate::media::TrackResource,
+    ) -> Result<(String, Vec<u8>), ApiError> {
+        self.with_authenticated_network(session, async {
+            let request =
+                self.track_request(session, track_id, resource.suffix(), resource.accept())?;
+            self.fetch_media_resource(session, request, resource).await
+        })
+        .await
+    }
+
+    /// Missing artwork is ordinary; callers provide a static fallback.
+    pub(crate) async fn catalog_artwork(
+        &self,
+        session: &Session,
+        kind: catalog::CatalogKind,
+        id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>, ApiError> {
+        self.with_authenticated_network(session, async {
+            if !valid_id(id) {
+                return Err(INVALID_INPUT);
+            }
+            let resource = crate::media::TrackResource::Artwork;
+            let url = self.origin.endpoint_segments(&[
+                "api",
+                "library",
+                kind.plural(),
+                id,
+                resource.suffix(),
+            ])?;
+            let request = self
+                .request_with_accept(reqwest::Method::GET, url, resource.accept())?
+                .header(header::COOKIE, session.secrets.cookie.clone());
+            match self.fetch_media_resource(session, request, resource).await {
+                Ok(result) => Ok(Some(result)),
+                Err(err) if err.status == 404 => Ok(None),
+                Err(err) => Err(err),
+            }
+        })
+        .await
+    }
+
+    async fn fetch_media_resource(
+        &self,
+        session: &Session,
+        request: RequestBuilder,
+        resource: crate::media::TrackResource,
+    ) -> Result<(String, Vec<u8>), ApiError> {
+        let response = self.send(request, Some(session), false).await?;
+        if response.status() != 200 {
+            return Err(INVALID_RESPONSE);
+        }
+        let mime = content_type(&response)?;
+        if !resource.accepts(&mime) {
+            return Err(INVALID_RESPONSE);
+        }
+        let bytes = self
+            .resource_bytes(session, response, resource.max_bytes(), INVALID_RESPONSE)
+            .await?;
+        if bytes.is_empty() {
+            return Err(INVALID_RESPONSE);
+        }
+        Ok((mime, bytes))
+    }
+
+    /// The current per-track media descriptor, not a collection manifest.
+    pub(crate) async fn offline_manifest(
+        &self,
+        session: &Session,
+        track_id: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.with_authenticated_network(session, async {
+            let url = self.offline_track_url(track_id, "media")?;
+            self.offline_json_bytes(session, url, OFFLINE_MEDIA_BODY)
+                .await
+        })
+        .await
+    }
+
+    /// Read one bounded manifest page for an album, artist, or personal playlist.
+    pub(crate) async fn offline_collection_manifest(
+        &self,
+        session: &Session,
+        resource: &str,
+        id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.with_authenticated_network(session, async {
+            match resource {
+                "albums" | "artists" if valid_id(id) => (),
+                "playlists" if catalog::derived_id(id) => (),
+                _ => return Err(INVALID_INPUT),
+            }
+            if cursor.is_some_and(|value| !catalog::opaque_token(value, 4096)) {
+                return Err(INVALID_INPUT);
+            }
+            let mut url = self
+                .origin
+                .endpoint_segments(&["api", "me", "offline", "v1", resource, id, "manifest"])?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", "20");
+                if let Some(cursor) = cursor {
+                    query.append_pair("cursor", cursor);
+                }
+            }
+            if url.query().is_some_and(|query| query.len() > 8192) {
+                return Err(INVALID_INPUT);
+            }
+            self.offline_json_bytes(session, url, OFFLINE_COLLECTION_BODY)
+                .await
+        })
+        .await
+    }
+
+    /// Retrieve one pinned representation. Never follow the descriptor's downloadUrl;
+    /// reconstruct the fixed route and query from independently validated values.
+    pub(crate) async fn offline_audio(
+        &self,
+        session: &Session,
+        id: &str,
+        version: &str,
+        content_type: &str,
+        byte_length: usize,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.with_authenticated_network(session, async {
+            if !version
+                .strip_prefix("sha256:")
+                .is_some_and(valid_lower_hex_32)
+                || !OFFLINE_AUDIO_TYPES.contains(&content_type)
+                || !(1..=MAX_MEDIA).contains(&byte_length)
+            {
+                return Err(INVALID_INPUT);
+            }
+            let mut url = self.offline_track_url(id, "audio")?;
+            url.query_pairs_mut().append_pair("version", version);
+            let request = self
+                .request_with_accept(reqwest::Method::GET, url, content_type)?
+                .header(header::COOKIE, session.secrets.cookie.clone())
+                .timeout(Duration::from_secs(45));
+            let response = self.send(request, Some(session), false).await?;
+            let headers = response.headers();
+            let etag = format!("\"{version}\"");
+            if response.status() != 200
+                || single_header(headers, header::CONTENT_TYPE).map(HeaderValue::as_bytes)
+                    != Some(content_type.as_bytes())
+                || single_header(headers, header::ETAG).map(HeaderValue::as_bytes)
+                    != Some(etag.as_bytes())
+                || single_header(headers, header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+                    != Some(byte_length)
+                || headers.contains_key(header::CONTENT_ENCODING)
+                || headers.contains_key(header::TRANSFER_ENCODING)
+            {
+                return Err(INVALID_RESPONSE);
+            }
+            let bytes = self
+                .resource_bytes(session, response, byte_length, INVALID_RESPONSE)
+                .await?;
+            if bytes.len() != byte_length {
+                return Err(INVALID_RESPONSE);
+            }
+            Ok(bytes)
+        })
+        .await
+    }
+
+    fn offline_track_url(&self, id: &str, suffix: &'static str) -> Result<Url, ApiError> {
+        if !valid_id(id) {
+            return Err(INVALID_INPUT);
+        }
+        self.origin
+            .endpoint_segments(&["api", "me", "offline", "v1", "tracks", id, suffix])
+    }
+
+    async fn offline_json_bytes(
+        &self,
+        session: &Session,
+        url: Url,
+        bound: usize,
+    ) -> Result<Vec<u8>, ApiError> {
+        let request = self
+            .request_with_method(reqwest::Method::GET, url)?
+            .header(header::COOKIE, session.secrets.cookie.clone());
+        let response = self.send(request, Some(session), false).await?;
+        if response.status() != 200 || content_type(&response)? != "application/json" {
+            return Err(INVALID_RESPONSE);
+        }
+        let bytes = self
+            .resource_bytes(session, response, bound, INVALID_RESPONSE)
+            .await?;
+        if bytes.is_empty() {
+            return Err(INVALID_RESPONSE);
+        }
+        Ok(bytes)
+    }
+
+    fn track_request(
+        &self,
+        session: &Session,
+        id: &str,
+        suffix: &'static str,
+        accept: &'static str,
+    ) -> Result<RequestBuilder, ApiError> {
         self.check_session(session)?;
         if !valid_id(id) {
             return Err(INVALID_INPUT);
         }
-        let mut url = self.origin.0.clone();
-        url.path_segments_mut()
-            .map_err(|_| INVALID_INPUT)?
-            .clear()
-            .extend(["api", "library", "tracks", id, "audio"]);
-        let request = self
-            .request(url)?
-            .header(header::COOKIE, session.secrets.cookie.clone())
-            .timeout(Duration::from_secs(45));
-        let mut response = self.send(request, Some(session), false).await?;
-        if response.status() != 200 {
-            return Err(INVALID_RESPONSE);
-        }
-        let media = content_type(&response)?;
-        if !(media.starts_with("audio/") && media.len() > "audio/".len())
-            && media != "application/octet-stream"
-        {
-            return Err(error("The server returned an unsupported audio response."));
-        }
-        if response
-            .content_length()
-            .is_some_and(|n| n > MAX_MEDIA as u64)
-        {
-            return Err(error(
-                "This track exceeds the 32 MiB in-memory playback limit.",
-            ));
+        let url = self
+            .origin
+            .endpoint_segments(&["api", "library", "tracks", id, suffix])?;
+        Ok(self
+            .request_with_accept(reqwest::Method::GET, url, accept)?
+            .header(header::COOKIE, session.secrets.cookie.clone()))
+    }
+
+    async fn resource_bytes(
+        &self,
+        session: &Session,
+        mut response: Response,
+        bound: usize,
+        oversized: ApiError,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.check_session(session)?;
+        if response.content_length().is_some_and(|n| n > bound as u64) {
+            return Err(oversized);
         }
         let mut bytes = Vec::new();
         loop {
@@ -456,55 +842,77 @@ impl Api {
             let Some(chunk) = response.chunk().await.map_err(|_| NETWORK)? else {
                 break;
             };
-            if chunk.len() > MAX_MEDIA - bytes.len() {
-                return Err(error(
-                    "This track exceeds the 32 MiB in-memory playback limit.",
-                ));
+            if chunk.len() > bound - bytes.len() {
+                return Err(oversized);
             }
-            extend_bounded(&mut bytes, &chunk, MAX_MEDIA);
+            extend_bounded(&mut bytes, &chunk, bound);
         }
         self.check_session(session)?;
-        if bytes.is_empty() {
-            return Err(error("The server returned an empty audio response."));
-        }
         Ok(bytes)
     }
 
-    /// Revokes the local capability before awaiting I/O, even if logout fails or is cancelled.
+    /// Revokes the local capability before awaiting I/O, even offline, on failure or on cancellation.
     pub async fn logout(&self, session: &Session) -> Result<(), ApiError> {
-        self.check_session(session)?;
-        session.secrets.revoked.store(true, Ordering::SeqCst);
-        let request = self
-            .request(self.origin.endpoint("/api/auth/logout"))?
-            .header(header::COOKIE, session.secrets.cookie.clone())
-            .header("X-CSRF-Token", session.secrets.csrf.clone())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body("{}");
-        let response = self.send(request, Some(session), false).await?;
-        if response.status() != 204 {
-            return Err(INVALID_RESPONSE);
+        self.check_session_owner(session)?;
+        let fence = NetworkFence::new(session);
+        if session.secrets.revoked.swap(true, Ordering::SeqCst) {
+            return Err(EXPIRED);
         }
-        Ok(())
+        fence?
+            .run(async {
+                let request = self
+                    .request(self.origin.endpoint("/api/auth/logout"))?
+                    .header(header::COOKIE, session.secrets.cookie.clone())
+                    .header("X-CSRF-Token", session.secrets.csrf.clone())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body("{}");
+                let response = self.send(request, Some(session), false).await?;
+                if response.status() != 204 {
+                    return Err(INVALID_RESPONSE);
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Covers an entire operation, including response body consumption. Do not wrap only send:
+    /// an offline→online transition must cancel work begun on the previous network generation.
+    async fn with_authenticated_network<T>(
+        &self,
+        session: &Session,
+        operation: impl Future<Output = Result<T, ApiError>>,
+    ) -> Result<T, ApiError> {
+        self.check_session(session)?;
+        NetworkFence::new(session)?
+            .run(async {
+                self.check_session(session)?;
+                let result = operation.await?;
+                self.check_session(session)?;
+                Ok(result)
+            })
+            .await
     }
 
     fn check_session(&self, session: &Session) -> Result<(), ApiError> {
-        // The API-instance capability also prevents cross-origin/cross-client cookie reuse.
-        if !Arc::ptr_eq(&self.identity, &session.secrets.owner) {
-            return Err(error(
-                "This session belongs to a different connection. Sign in again.",
-            ));
-        }
+        self.check_session_owner(session)?;
         if session.is_expired() {
             return Err(EXPIRED);
         }
         Ok(())
     }
 
+    fn check_session_owner(&self, session: &Session) -> Result<(), ApiError> {
+        // The API-instance capability prevents cross-origin/cross-client cookie or local scope reuse.
+        if !Arc::ptr_eq(&self.identity, &session.secrets.owner) {
+            return Err(error(
+                "This session belongs to a different connection. Sign in again.",
+            ));
+        }
+        Ok(())
+    }
+
     fn request(&self, url: Url) -> Result<RequestBuilder, ApiError> {
-        let method = if matches!(
-            url.path(),
-            "/api/auth/login" | "/api/auth/logout" | "/api/me/player"
-        ) {
+        let method = if matches!(url.path(), "/api/auth/login" | "/api/auth/logout") {
             reqwest::Method::POST
         } else {
             reqwest::Method::GET
@@ -517,17 +925,21 @@ impl Api {
         method: reqwest::Method,
         url: Url,
     ) -> Result<RequestBuilder, ApiError> {
+        self.request_with_accept(method, url, "application/json")
+    }
+
+    fn request_with_accept(
+        &self,
+        method: reqwest::Method,
+        url: Url,
+        accept: &str,
+    ) -> Result<RequestBuilder, ApiError> {
         if url.origin() != self.origin.0.origin()
             || !url.username().is_empty()
             || url.password().is_some()
         {
             return Err(error("Off-origin requests are not allowed."));
         }
-        let accept = if url.path().ends_with("/audio") {
-            "audio/*, application/octet-stream"
-        } else {
-            "application/json"
-        };
         Ok(self
             .client
             .request(method, url)
@@ -541,12 +953,31 @@ impl Api {
         session: Option<&Session>,
         login: bool,
     ) -> Result<Response, ApiError> {
+        let generation = session.map(Session::network_generation);
+        if generation.is_some_and(|value| value & 1 != 0) {
+            return Err(OFFLINE);
+        }
+        // Logout marks the capability revoked before I/O, but its one authorized
+        // request is still limited by the original network deadline.
+        if session.is_some_and(Session::cookie_expired) {
+            return Err(EXPIRED);
+        }
         let response = request.send().await.map_err(|_| NETWORK)?;
+        if session.map(Session::network_generation) != generation {
+            return Err(OFFLINE);
+        }
         if response.status().is_success() {
             return Ok(response);
         }
         // Do not read or retain error bodies (which can contain credentials, URLs or paths).
-        let status = response.status().as_u16();
+        Err(Self::response_error(
+            response.status().as_u16(),
+            session,
+            login,
+        ))
+    }
+
+    fn response_error(status: u16, session: Option<&Session>, login: bool) -> ApiError {
         let mapped = match status {
             401 if login => error("Invalid username or password."),
             401 => {
@@ -565,8 +996,38 @@ impl Api {
             500..=599 => error("The server is temporarily unavailable."),
             _ => error("The server could not complete the request."),
         };
-        Err(ApiError { status, ..mapped })
+        ApiError { status, ..mapped }
     }
+}
+
+fn validate_websocket_upgrade(
+    response: &Response,
+    expected_accept: &str,
+    protocol: &str,
+) -> Result<(), ApiError> {
+    let headers = response.headers();
+    let connection_upgrade = headers.get_all(header::CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim_ascii().eq_ignore_ascii_case("upgrade"))
+        })
+    });
+    if response.version() != reqwest::Version::HTTP_11
+        || !connection_upgrade
+        || !single_header(headers, header::UPGRADE)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        || single_header(headers, header::SEC_WEBSOCKET_PROTOCOL).map(HeaderValue::as_bytes)
+            != Some(protocol.as_bytes())
+        || single_header(headers, header::SEC_WEBSOCKET_ACCEPT).map(HeaderValue::as_bytes)
+            != Some(expected_accept.as_bytes())
+        || headers.contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
+        || headers.contains_key(header::CONTENT_LENGTH)
+        || headers.contains_key(header::TRANSFER_ENCODING)
+    {
+        return Err(INVALID_RESPONSE);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -672,19 +1133,15 @@ fn cookie_octet(byte: u8) -> bool {
     matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
 }
 
+fn single_header(headers: &header::HeaderMap, name: header::HeaderName) -> Option<&HeaderValue> {
+    let values = headers.get_all(name);
+    let mut values = values.iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
 fn content_type(response: &Response) -> Result<String, ApiError> {
-    if response
-        .headers()
-        .get_all(header::CONTENT_TYPE)
-        .iter()
-        .count()
-        != 1
-    {
-        return Err(INVALID_RESPONSE);
-    }
-    response
-        .headers()
-        .get(header::CONTENT_TYPE)
+    single_header(response.headers(), header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(';').next())
         .map(|s| s.trim().to_ascii_lowercase())
@@ -823,6 +1280,13 @@ fn valid_id(id: &str) -> bool {
     valid_text(id, 512) && id.trim() == id && id != "." && id != ".."
 }
 
+fn valid_lower_hex_32(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,6 +1343,13 @@ mod tests {
 
     impl Wire {
         fn new(responses: Vec<Vec<u8>>) -> Self {
+            Self::with_responder(responses, |_, response| response)
+        }
+
+        fn with_responder(
+            responses: Vec<Vec<u8>>,
+            mut prepare: impl FnMut(&Recorded, Vec<u8>) -> Vec<u8> + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let origin =
@@ -908,9 +1379,8 @@ mod tests {
                     let mut bytes = Vec::new();
                     let mut chunk = [0u8; 16 * 1024];
                     let mut parsed = None;
-                    // The fixture must accept legitimate full player publications,
-                    // while remaining finite (2MiB body + bounded HTTP headers).
-                    while bytes.len() <= PLAYER_REQUEST + 8192 && !stopping.load(Ordering::SeqCst) {
+                    // Accept bounded mutation requests plus HTTP headers.
+                    while bytes.len() <= 64 * 1024 + 8192 && !stopping.load(Ordering::SeqCst) {
                         let size = match stream.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => n,
@@ -940,16 +1410,17 @@ mod tests {
                         }
                     }
                     if let Some(request) = parsed {
+                        // Empty response deliberately simulates disconnection after the request.
+                        let response = responses
+                            .pop_front()
+                            .unwrap_or_else(|| reply(500, &[], "unexpected extra request"));
+                        let response = prepare(&request, response);
                         let mut saved = saved.lock().unwrap();
                         saved.push(request);
                         if saved.len() >= 32 {
                             break;
                         }
                         drop(saved);
-                        // Empty response deliberately simulates disconnection after the request.
-                        let response = responses
-                            .pop_front()
-                            .unwrap_or_else(|| reply(500, &[], "unexpected extra request"));
                         if response == b"STALL" {
                             thread::sleep(Duration::from_millis(100));
                         } else {
@@ -1016,6 +1487,473 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("Unexpected API success"),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_offline_blocks_authenticated_io_and_logout_still_revokes() {
+        let wire = Wire::new(vec![]);
+        let api = wire.api();
+        let session = api.test_session();
+        let mut clone = session.clone();
+        clone.account_id = "different-display-account".into();
+        let changes = session.network_changes();
+        clone.set_offline(true);
+        assert!(session.is_offline());
+        assert_eq!(*changes.borrow(), 1);
+        clone.set_offline(true);
+        assert_eq!(*changes.borrow(), 1);
+        assert_eq!(
+            api.authenticated_account(&clone).unwrap(),
+            (wire.origin.as_str(), "synthetic")
+        );
+        assert_eq!(failure(api.search(&session, "track").await), OFFLINE);
+        assert_eq!(failure(api.media(&session, "track").await), OFFLINE);
+        assert_eq!(failure(api.playback_upgrade(&session).await), OFFLINE);
+        assert_eq!(failure(api.logout(&clone).await), OFFLINE);
+        assert!(session.is_expired());
+        assert!(wire.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_cookie_keeps_only_the_explicit_offline_local_capability() {
+        let wire = Wire::new(vec![]);
+        let api = wire.api();
+        let foreign = wire.api();
+        let session = api.test_session_with_deadline(Instant::now());
+        let clone = session.clone();
+
+        assert!(session.is_expired());
+        assert!(!clone.can_access_local());
+        assert_eq!(failure(api.authenticated_account(&clone)), EXPIRED);
+        session.set_offline(true);
+        assert!(session.is_expired());
+        assert!(clone.can_access_local());
+        assert_eq!(
+            api.authenticated_account(&clone).unwrap(),
+            (wire.origin.as_str(), "synthetic")
+        );
+        assert!(foreign.authenticated_account(&clone).is_err());
+        assert!(api.media(&clone, "track").await.is_err());
+
+        clone.set_offline(false);
+        assert!(session.is_expired());
+        assert!(!session.can_access_local());
+        assert_eq!(failure(api.authenticated_account(&session)), EXPIRED);
+        assert_eq!(failure(api.search(&session, "track").await), EXPIRED);
+        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+
+        session.set_offline(true);
+        assert!(session.can_access_local());
+        assert_eq!(failure(api.logout(&clone).await), OFFLINE);
+        assert!(!session.can_access_local());
+        assert_eq!(failure(api.authenticated_account(&session)), EXPIRED);
+        assert!(wire.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_401_stays_revoked_in_explicit_offline_mode() {
+        let wire = Wire::new(vec![reply(401, &[], "synthetic denial")]);
+        let api = wire.api();
+        let session = api.test_session();
+        let clone = session.clone();
+        assert!(clone.can_access_local());
+        assert_eq!(failure(api.search(&session, "track").await), EXPIRED);
+        clone.set_offline(true);
+        assert!(session.is_expired());
+        assert!(!session.can_access_local());
+        assert_eq!(failure(api.authenticated_account(&session)), EXPIRED);
+        assert_eq!(wire.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn offline_online_cycle_disposes_an_in_flight_response() {
+        let api = Api::new(Origin::parse("http://127.0.0.1").unwrap()).unwrap();
+        let session = api.test_session();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let ongoing = api.with_authenticated_network(&session, async {
+            started_tx.send(()).unwrap();
+            response_rx.await.map_err(|_| NETWORK)
+        });
+        let cycle = async {
+            started_rx.await.unwrap();
+            session.set_offline(true);
+            session.set_offline(false);
+            let _ = response_tx.send("old response");
+        };
+        let (result, ()) = tokio::join!(ongoing, cycle);
+        assert_eq!(failure(result), OFFLINE);
+        assert!(!session.is_offline());
+        assert_eq!(
+            api.with_authenticated_network(&session, async { Ok("new response") })
+                .await
+                .unwrap(),
+            "new response"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_resources_encode_segments_and_enforce_type_status_and_chunk_bounds() {
+        use crate::media::TrackResource::{Artwork, Lyrics, Waveform};
+
+        let oversized = "x".repeat(Waveform.max_bytes() + 1);
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{oversized}\r\n0\r\n\r\n",
+            oversized.len()
+        );
+        let wire = Wire::new(vec![
+            reply(
+                200,
+                &[("Content-Type", "Image/PNG; charset=binary")],
+                "image",
+            ),
+            reply(200, &[("Content-Type", "image/svg+xml")], "image"),
+            reply(
+                200,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Content-Type", "application/json"),
+                ],
+                "{}",
+            ),
+            chunked.into_bytes(),
+            reply(206, &[("Content-Type", "application/json")], "{}"),
+            reply(401, &[], "synthetic error"),
+        ]);
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(
+            api.track_resource(&session, "x/y% ?#", Artwork)
+                .await
+                .unwrap(),
+            ("image/png".into(), b"image".to_vec())
+        );
+        for resource in [Artwork, Lyrics, Waveform, Lyrics] {
+            assert_eq!(
+                failure(api.track_resource(&session, "id", resource).await),
+                INVALID_RESPONSE
+            );
+        }
+        assert_eq!(
+            failure(api.track_resource(&session, "..", Lyrics).await),
+            INVALID_INPUT
+        );
+        assert_eq!(
+            failure(api.track_resource(&session, "id", Lyrics).await),
+            EXPIRED
+        );
+        assert!(session.is_expired());
+        let requests = wire.recorded();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests[0].first_line,
+            "GET /api/library/tracks/x%2Fy%25%20%3F%23/artwork HTTP/1.1"
+        );
+        assert_eq!(requests[0].header("accept"), Some("image/png, image/jpeg"));
+        assert_eq!(
+            requests[3].first_line,
+            "GET /api/library/tracks/id/waveform HTTP/1.1"
+        );
+        assert!(requests.iter().all(|request| {
+            request.header("cookie") == Some("spofify_session=synthetic")
+                && request.header("origin") == Some(wire.origin.as_str())
+                && request.header("x-csrf-token").is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn catalog_artwork_uses_typed_routes_and_only_404_is_absence() {
+        use catalog::CatalogKind::{Album, Artist, Track};
+        let oversized = format!(
+            "HTTP/1.1 200 Test\r\nContent-Length: {}\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n",
+            2 * 1024 * 1024 + 1
+        );
+        let wire = Wire::new(vec![
+            reply(200, &[("Content-Type", "image/jpeg")], "jpeg"),
+            reply(404, &[], "no cover"),
+            oversized.into_bytes(),
+            reply(403, &[], "forbidden"),
+        ]);
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(
+            api.catalog_artwork(&session, Album, "al%?").await.unwrap(),
+            Some(("image/jpeg".into(), b"jpeg".to_vec()))
+        );
+        assert_eq!(
+            api.catalog_artwork(&session, Artist, "ar").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            failure(api.catalog_artwork(&session, Track, "tr").await),
+            INVALID_RESPONSE
+        );
+        assert_eq!(
+            failure(api.catalog_artwork(&session, Artist, "ar").await).status,
+            403
+        );
+        let requests = wire.recorded();
+        assert_eq!(
+            requests[0].first_line,
+            "GET /api/library/albums/al%25%3F/artwork HTTP/1.1"
+        );
+        assert_eq!(
+            requests[1].first_line,
+            "GET /api/library/artists/ar/artwork HTTP/1.1"
+        );
+        assert_eq!(
+            requests[2].first_line,
+            "GET /api/library/tracks/tr/artwork HTTP/1.1"
+        );
+        assert_eq!(requests[2].header("accept"), Some("image/png, image/jpeg"));
+    }
+
+    #[tokio::test]
+    async fn offline_audio_is_pinned_to_exact_origin_version_and_representation() {
+        let version = format!("sha256:{}", "0".repeat(64));
+        let etag = format!("\"{version}\"");
+        let weak = format!("W/{etag}");
+        let wire = Wire::new(vec![
+            json(r#"{"version":1}"#),
+            reply(
+                200,
+                &[("Content-Type", "audio/flac"), ("ETag", &etag)],
+                "beep",
+            ),
+            reply(
+                200,
+                &[("Content-Type", "audio/flac"), ("ETag", &weak)],
+                "beep",
+            ),
+            reply(
+                200,
+                &[
+                    ("Content-Type", "audio/flac; charset=binary"),
+                    ("ETag", &etag),
+                ],
+                "beep",
+            ),
+            reply(
+                200,
+                &[("Content-Type", "audio/flac"), ("ETag", &etag)],
+                "beep!",
+            ),
+            reply(409, &[], "media changed"),
+        ]);
+        let api = wire.api();
+        let session = api.test_session();
+        let id = "track% ?#";
+        assert_eq!(
+            api.offline_manifest(&session, id).await.unwrap(),
+            br#"{"version":1}"#
+        );
+        assert_eq!(
+            api.offline_audio(&session, id, &version, "audio/flac", 4)
+                .await
+                .unwrap(),
+            b"beep"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                failure(
+                    api.offline_audio(&session, id, &version, "audio/flac", 4)
+                        .await
+                ),
+                INVALID_RESPONSE
+            );
+        }
+        assert_eq!(
+            failure(
+                api.offline_audio(&session, id, &version, "audio/flac", 4)
+                    .await
+            )
+            .status,
+            409
+        );
+        assert_eq!(
+            failure(
+                api.offline_audio(&session, id, "sha256:unbound", "audio/flac", 4)
+                    .await
+            ),
+            INVALID_INPUT
+        );
+        assert_eq!(
+            failure(
+                api.offline_audio(&session, id, &version, "audio/flac", MAX_MEDIA + 1)
+                    .await
+            ),
+            INVALID_INPUT
+        );
+        session.set_offline(true);
+        assert_eq!(failure(api.offline_manifest(&session, id).await), OFFLINE);
+        let requests = wire.recorded();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests[0].first_line,
+            "GET /api/me/offline/v1/tracks/track%25%20%3F%23/media HTTP/1.1"
+        );
+        assert_eq!(
+            requests[1].first_line,
+            format!(
+                "GET /api/me/offline/v1/tracks/track%25%20%3F%23/audio?version=sha256%3A{} HTTP/1.1",
+                "0".repeat(64)
+            )
+        );
+        assert_eq!(requests[1].header("accept"), Some("audio/flac"));
+        assert!(requests[1].header("range").is_none());
+        assert!(requests.iter().all(|request| {
+            request.header("cookie") == Some("spofify_session=synthetic")
+                && request.header("origin") == Some(wire.origin.as_str())
+        }));
+    }
+
+    #[tokio::test]
+    async fn offline_collections_use_only_fixed_manifest_routes() {
+        let wire = Wire::new(vec![json("{}"), json("{}"), json("{}")]);
+        let api = wire.api();
+        let session = api.test_session();
+        for (kind, id, cursor) in [
+            ("albums", "album %?", None),
+            ("artists", "artist:1", Some("opaque&=cursor")),
+            ("playlists", "pl1_demo", Some("of1_ok.test")),
+        ] {
+            assert_eq!(
+                api.offline_collection_manifest(&session, kind, id, cursor)
+                    .await
+                    .unwrap(),
+                b"{}"
+            );
+        }
+        assert_eq!(
+            failure(
+                api.offline_collection_manifest(&session, "tracks", "t", None)
+                    .await
+            ),
+            INVALID_INPUT
+        );
+        assert_eq!(
+            failure(
+                api.offline_collection_manifest(&session, "playlists", "not/a/playlist", None)
+                    .await
+            ),
+            INVALID_INPUT
+        );
+        assert_eq!(
+            failure(
+                api.offline_collection_manifest(&session, "artists", "ar", Some("\n"))
+                    .await
+            ),
+            INVALID_INPUT
+        );
+        let requests = wire.recorded();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[0].first_line,
+            "GET /api/me/offline/v1/albums/album%20%25%3F/manifest?limit=20 HTTP/1.1"
+        );
+        assert_eq!(
+            requests[1].first_line,
+            "GET /api/me/offline/v1/artists/artist:1/manifest?limit=20&cursor=opaque%26%3Dcursor HTTP/1.1"
+        );
+        assert_eq!(
+            requests[2].first_line,
+            "GET /api/me/offline/v1/playlists/pl1_demo/manifest?limit=20&cursor=of1_ok.test HTTP/1.1"
+        );
+    }
+
+    const SOCKET_TICKET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn socket_reply(request: &Recorded, extra: &str) -> Vec<u8> {
+        use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+        let key = request.header("sec-websocket-key").unwrap();
+        let accept = derive_accept_key(key.as_bytes());
+        let protocol = crate::socket::SUBPROTOCOL;
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: {protocol}\r\n{extra}\r\n"
+        ).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn playback_upgrade_uses_csrf_ticket_and_exact_credentialed_handshake() {
+        let wire = Wire::with_responder(
+            vec![
+                json(&format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#)),
+                Vec::new(),
+            ],
+            |request, response| {
+                if response.is_empty() {
+                    socket_reply(request, "")
+                } else {
+                    response
+                }
+            },
+        );
+        let api = wire.api();
+        let session = api.test_session();
+        let upgrade = api.playback_upgrade(&session).await.unwrap();
+        assert_eq!(upgrade.ticket, SOCKET_TICKET);
+        let requests = wire.recorded();
+        let [ticket, socket] = requests.as_slice() else {
+            panic!("expected exactly two requests")
+        };
+        assert_eq!(ticket.first_line, "POST /api/me/player/connect HTTP/1.1");
+        assert_eq!(ticket.body, b"{}");
+        assert_eq!(ticket.header("x-csrf-token"), Some("synthetic"));
+        assert_eq!(ticket.header("content-type"), Some("application/json"));
+        assert_eq!(socket.first_line, "GET /api/me/player/socket HTTP/1.1");
+        assert_eq!(
+            socket.header("sec-websocket-protocol"),
+            Some(crate::socket::SUBPROTOCOL)
+        );
+        assert_eq!(socket.header("sec-websocket-version"), Some("13"));
+        assert!(socket.body.is_empty());
+        assert!(socket.header("x-csrf-token").is_none());
+        assert!(
+            socket
+                .headers
+                .iter()
+                .all(|(_, value)| !value.contains(SOCKET_TICKET))
+        );
+        for request in [ticket, socket] {
+            assert_eq!(request.header("cookie"), Some("spofify_session=synthetic"));
+            assert_eq!(request.header("origin"), Some(wire.origin.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_upgrade_rejects_bad_ticket_and_bad_handshake_and_revokes_on_401() {
+        let wire = Wire::new(vec![json(r#"{"ticket":"short"}"#)]);
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(
+            failure(api.playback_upgrade(&session).await),
+            INVALID_RESPONSE
+        );
+        assert_eq!(wire.recorded().len(), 1);
+
+        let ticket = json(&format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#));
+        let wire = Wire::with_responder(vec![ticket.clone(), Vec::new()], |request, response| {
+            if response.is_empty() {
+                socket_reply(request, "Sec-WebSocket-Extensions: permessage-deflate\r\n")
+            } else {
+                response
+            }
+        });
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(
+            failure(api.playback_upgrade(&session).await),
+            INVALID_RESPONSE
+        );
+        assert_eq!(wire.recorded().len(), 2);
+
+        let wire = Wire::new(vec![ticket, reply(401, &[], "synthetic error")]);
+        let api = wire.api();
+        let session = api.test_session();
+        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert!(session.is_expired());
+        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(wire.recorded().len(), 2);
     }
 
     #[test]
@@ -1363,137 +2301,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn player_posts_csrf_and_reports_safe_conflict_without_retry() {
-        let state = r#"{"revision":1,"devices":[],"activeDeviceId":""}"#;
+    async fn playback_ticket_failures_are_bounded_redacted_and_never_retried() {
+        let ticket = format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#);
         let wire = Wire::new(vec![
-            login_reply(),
-            json(state),
-            reply(
-                409,
-                &[("Content-Type", "application/json")],
-                r#"{"error":"cookie-secret /private/path","state":{"untrusted":true}}"#,
-            ),
-        ]);
-        let api = wire.api();
-        let session = api.login("listener", "password").await.unwrap();
-        let command = serde_json::json!({"action":"status","deviceId":"synthetic-device"});
-        assert_eq!(
-            api.player(&session, command.clone()).await.unwrap()["revision"],
-            1
-        );
-        let error = failure(api.player(&session, command.clone()).await);
-        assert_eq!(error.status, 409);
-        assert!(!error.expired);
-        assert!(!format!("{error:?}").contains("secret"));
-        let requests = wire.recorded();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[1].first_line, "POST /api/me/player HTTP/1.1");
-        assert_eq!(requests[1].header("origin"), Some(wire.origin.as_str()));
-        assert_eq!(
-            requests[1].header("cookie"),
-            Some("spofify_session=cookie-secret")
-        );
-        assert_eq!(requests[1].header("x-csrf-token"), Some("csrf-secret"));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
-            command
-        );
-        assert_eq!(
-            failure(api.player(&session, serde_json::json!([])).await),
-            INVALID_INPUT
-        );
-        assert_eq!(
-            failure(
-                api.player(
-                    &session,
-                    serde_json::json!({"oversized":"x".repeat(PLAYER_REQUEST)})
-                )
-                .await
-            ),
-            INVALID_INPUT
-        );
-        assert_eq!(wire.recorded().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn player_control_failures_are_single_attempt_and_auth_loss_revokes() {
-        let wire = Wire::new(vec![
-            login_reply(),
-            reply(403, &[], "private diagnostic"),
-            reply(404, &[], "private diagnostic"),
-            reply(409, &[], "private diagnostic"),
+            json(&format!("{ticket}{}", " ".repeat(TICKET_BODY))),
+            json(&format!(
+                r#"{{"ticket":"{SOCKET_TICKET}","ticket":"{SOCKET_TICKET}"}}"#
+            )),
+            reply(409, &[], "private diagnostic and synthetic secret"),
             reply(401, &[], "private diagnostic"),
         ]);
         let api = wire.api();
-        let session = api.login("listener", "password").await.unwrap();
-        for (index, status) in [403, 404, 409, 401].into_iter().enumerate() {
-            let command = serde_json::json!({"action":"command","deviceId":"controller","epoch":1,"commandId":format!("command-{index}"),"command":{"type":"pause"}});
-            let e = failure(api.player(&session, command).await);
-            assert_eq!(e.status, status);
-            assert_eq!(e.expired, status == 401);
-            assert_eq!(wire.recorded().len(), index + 2);
-            assert!(!e.message.contains("private"));
-        }
-        assert!(session.is_expired());
-        assert_eq!(failure(api.player_view(&session).await), EXPIRED);
-        assert_eq!(wire.recorded().len(), 5);
-    }
-
-    #[tokio::test]
-    async fn player_view_get_is_observational_authenticated_and_bounded() {
-        let state = r#"{"epoch":7,"devices":[],"activeDeviceId":"","directives":[]}"#;
-        let wire = Wire::new(vec![
-            login_reply(),
-            json(state),
-            json(&" ".repeat(MAX_BODY + 1)),
-        ]);
-        let api = wire.api();
-        let session = api.login("listener", "password").await.unwrap();
-        let view = api.player_view(&session).await.unwrap();
-        assert_eq!(view["epoch"], 7);
-        assert_eq!(failure(api.player_view(&session).await), INVALID_RESPONSE);
-        let requests = wire.recorded();
-        assert_eq!(requests.len(), 3);
-        for request in &requests[1..] {
-            assert_eq!(request.first_line, "GET /api/me/player HTTP/1.1");
-            assert_eq!(request.header("origin"), Some(wire.origin.as_str()));
+        let session = api.test_session();
+        for index in 0..2 {
             assert_eq!(
-                request.header("cookie"),
-                Some("spofify_session=cookie-secret")
+                failure(api.playback_upgrade(&session).await),
+                INVALID_RESPONSE
             );
-            assert_eq!(request.header("accept"), Some("application/json"));
-            assert_eq!(request.header("x-csrf-token"), None);
-            assert_eq!(request.header("x-spofify-login"), None);
-            assert!(request.body.is_empty());
+            assert_eq!(wire.recorded().len(), index + 1);
         }
-    }
-
-    #[tokio::test]
-    async fn player_full_publication_envelopes_duplicate_keys_and_endpoint_bounds() {
-        let mut state = crate::player::empty_snapshot();
-        state["queue"]=serde_json::Value::Array((0..1000).map(|i| serde_json::json!({"id":format!("track-{i}"),"name":"n".repeat(512),"artists":[{"name":"a".repeat(512)}],"albumName":"album","albumId":"a","duration":24,"key":i+1,"order":i})).collect());
-        state["position"] = serde_json::json!(0);
-        assert!(crate::observation::valid_state(&state));
-        let publication = serde_json::json!({"action":"poll","deviceId":"desktop","epoch":1,"stateSeq":1,"state":state});
-        let bytes = publication.to_string().len();
-        assert!(bytes > MAX_BODY && bytes < PLAYER_REQUEST);
-        let view =
-            serde_json::json!({"state":state,"directives":[{"type":"prepare","state":state}]})
-                .to_string();
-        assert!(view.len() > PLAYER_REQUEST && view.len() < PLAYER_RESPONSE);
-        let too_big=format!("HTTP/1.1 200 Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",PLAYER_RESPONSE+1).into_bytes();
-        let wire = Wire::new(vec![
-            login_reply(),
-            json(&view),
-            json(r#"{"epoch":1,"epoch":2}"#),
-            too_big,
-        ]);
-        let api = wire.api();
-        let session = api.login("listener", "password").await.unwrap();
-        let got = api.player(&session, publication).await.unwrap();
-        assert_eq!(got["state"]["queue"].as_array().unwrap().len(), 1000);
-        assert_eq!(failure(api.player_view(&session).await), INVALID_RESPONSE);
-        assert_eq!(failure(api.player_view(&session).await), INVALID_RESPONSE);
+        let err = failure(api.playback_upgrade(&session).await);
+        assert_eq!(err.status, 409);
+        assert!(!err.expired);
+        assert!(!format!("{err:?}").contains("secret"));
+        assert_eq!(wire.recorded().len(), 3);
+        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
+        assert_eq!(failure(api.playback_upgrade(&session).await), EXPIRED);
         assert_eq!(wire.recorded().len(), 4);
     }
 

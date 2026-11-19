@@ -1,0 +1,228 @@
+import { Action, Caption, Cover, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+
+export global Copy {
+    public pure function title(kind: string) -> string {
+        return kind == "home" ? "Your library" : kind == "history" || kind == "recent" ? "Recently played"
+            : kind == "liked" ? "Liked tracks" : kind == "playlists" ? "Playlists" : kind == "offline" ? "Saved offline"
+            : kind == "appearance" || kind == "settings" || kind == "account" ? "Settings"
+            : kind == "albums" ? "Albums" : kind == "artists" ? "Artists" : kind == "picker" ? "Add to playlist"
+            : kind == "now" ? "Now playing" : kind == "queue" ? "Play queue" : kind == "devices" ? "Playback devices"
+            : kind == "album" ? "Album" : kind == "artist" ? "Artist" : kind == "track" ? "Track"
+            : kind == "saved-collection" ? "Saved collection"
+            : kind == "playlist" || kind == "playlist-manual" || kind == "playlist-rules" ? "Playlist" : "Search";
+    }
+    public pure function subtitle(kind: string) -> string {
+        return kind == "home" ? "Pick up where you left off or take your listening in a new direction."
+            : kind == "history" || kind == "recent" ? "Find your way back to the tracks you’ve been listening to."
+            : kind == "liked" ? "The tracks you’ve marked as favorites."
+            : kind == "playlists" ? "Hand-picked collections and playlists that follow your rules."
+            : kind == "offline" ? "Music saved on this computer, ready to play without a connection."
+            : kind == "picker" ? "Choose the manual playlist you want to add this track to."
+            : kind == "albums" ? "Browse releases in your music library."
+            : kind == "artists" ? "Browse artists in your music library."
+            : kind == "search" ? "Find a track, artist or album in your music library."
+            : "";
+    }
+    public pure function mark(kind: string) -> string {
+        return kind == "home" ? "⌂" : kind == "search" ? "⌕" : kind == "history" || kind == "recent" ? "◷"
+            : kind == "liked" ? "♥" : kind == "offline" ? "↓" : kind == "albums" || kind == "album" ? "◎"
+            : kind == "artist" || kind == "artists" ? "◉" : kind == "appearance" ? "◐" : kind == "settings" ? "⚙"
+            : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" || kind == "queue" ? "≡"
+            : kind == "devices" ? "◫" : kind == "saved-collection" ? "↓" : "♫";
+    }
+    public pure function tint(kind: string) -> color {
+        return kind == "history" || kind == "recent" || kind == "album" || kind == "albums" ? Theme.blue
+            : kind == "liked" || kind == "artist" || kind == "artists" ? Theme.amber : Theme.accent;
+    }
+    public pure function action-label(action: string) -> string {
+        return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
+            : action == "like" ? "Like" : action == "unlike" ? "Unlike" : action == "save" ? "Save offline"
+            : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
+            : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
+            : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
+            : action == "new-rules" ? "New rules playlist" : action;
+    }
+    public pure function action-mark(action: string) -> string {
+        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "like" ? "♡"
+            : action == "unlike" ? "♥" : action == "save" ? "↓" : action == "remove" ? "−" : action == "up" ? "↑"
+            : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+    }
+}
+
+export component Hero inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> section;
+    in property <string> glyph;
+    in property <image> artwork;
+    in property <color> tint: Theme.accent;
+    in property <bool> compact;
+    in property <bool> show-art: true;
+    height: compact ? 154px : 174px;
+    vertical-stretch: 0;
+    border-radius: 16px;
+    border-width: 1px;
+    border-color: tint.with-alpha(0.28);
+    background: Theme.panel;
+    HorizontalLayout {
+        padding: root.compact ? 17px : 23px;
+        spacing: root.compact ? 16px : 23px;
+        if root.show-art: Rectangle {
+            width: root.compact ? 78px : 116px;
+            Cover {
+                y: (parent.height - self.height) / 2;
+                width: parent.width; height: self.width;
+                artwork: root.artwork; mark: root.glyph; tint: root.tint;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 7px;
+            if root.section != "": Eyebrow { text: root.section; color: root.tint; }
+            Text {
+                text: root.title; color: Theme.text; font-size: (root.compact ? 25px : 35px) * Theme.density;
+                font-weight: 700; letter-spacing: -1px; overflow: elide; wrap: word-wrap; max-height: root.compact ? 61px : 86px;
+            }
+            if root.subtitle != "": Caption { text: root.subtitle; wrap: word-wrap; max-height: 40px; }
+        }
+    }
+}
+
+export component EmptyState inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> glyph: "♫";
+    min-height: 162px;
+    vertical-stretch: 0;
+    border-radius: 13px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+    VerticalLayout {
+        padding: 18px;
+        spacing: 6px;
+        alignment: center;
+        Rectangle { height: 41px; Cover { x: (parent.width - 38px) / 2; width: 38px; height: 38px; mark: root.glyph; } }
+        Text { text: root.title; color: Theme.text; font-size: 15px; font-weight: 700; horizontal-alignment: center; wrap: word-wrap; }
+        Caption { text: root.subtitle; horizontal-alignment: center; wrap: word-wrap; }
+    }
+}
+
+export component LineButton inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> kind;
+    in property <image> artwork;
+    in property <bool> enabled: true;
+    in property <bool> selected;
+    in property <bool> compact;
+    in property <string> action-name: "Open";
+    callback activated();
+    callback focused();
+    forward-focus: key;
+    accessible-role: button;
+    accessible-label: action-name + " " + title;
+    accessible-description: subtitle;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    min-width: 0px;
+    horizontal-stretch: 1;
+    border-radius: 8px;
+    border-width: key.has-focus ? 2px : 0px;
+    border-color: Theme.blue;
+    background: (pointer.has-hover && enabled) || key.has-focus ? Theme.raised : transparent;
+    HorizontalLayout {
+        spacing: 10px;
+        padding-left: 6px;
+        padding-right: 8px;
+        if !root.compact: Rectangle {
+            width: 39px;
+            Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px; artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist"; }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 3px;
+            Text { text: root.title; color: root.selected ? Theme.accent : Theme.text; font-size: 14px; font-weight: 600; overflow: elide; accessible-role: none; }
+            if root.subtitle != "": Caption { text: root.subtitle; font-size: 11px; accessible-role: none; }
+        }
+    }
+    pointer := TouchArea { enabled: root.enabled; mouse-cursor: MouseCursor.pointer; clicked => { key.focus(); root.activated(); } }
+    key := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        focus-gained(_) => { root.focused(); }
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == Key.Space {
+                if !event.repeat { root.activated(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+export component MediaLine inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> detail;
+    in property <string> kind;
+    in property <image> artwork;
+    in property <bool> playable;
+    in property <bool> can-open: true;
+    in property <bool> compact;
+    in property <bool> expanded;
+    in property <bool> selected;
+    in property <[string]> actions;
+    callback action(string);
+    callback toggle-options();
+    callback focused();
+    height: line-height + (expanded && actions.length > 0 ? ceil(actions.length / option-columns) * 41px + 4px : 0px);
+    vertical-stretch: 0;
+    property <length> line-height: max(52px, 61px * Theme.density);
+    property <int> option-columns: self.width > 810px ? 4 : self.width > 575px ? 3 : 2;
+    property <length> option-width: (self.width - 18px - (option-columns - 1) * 6px) / option-columns;
+    border-radius: 10px;
+    background: expanded || selected ? Theme.panel : transparent;
+    HorizontalLayout {
+        height: root.line-height;
+        padding: 5px; spacing: 5px;
+        LineButton {
+            title: root.title; subtitle: root.subtitle; kind: root.kind; artwork: root.artwork;
+            enabled: root.can-open; selected: root.selected;
+            activated => { root.action("open"); }
+            focused => { root.focused(); }
+        }
+        if !root.compact && root.detail != "": Caption { width: 118px; text: root.detail; horizontal-alignment: right; }
+        if root.playable: Action {
+            width: 37px; icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.action("play"); }
+        }
+        if root.actions.length > 0: Action {
+            width: 37px; icon: root.expanded ? "×" : "···"; quiet: true; selected: root.expanded;
+            accessible-label: (root.expanded ? "Hide actions for " : "Show actions for ") + root.title;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.toggle-options(); }
+        }
+    }
+    if root.expanded && root.actions.length > 0: Rectangle {
+        y: root.line-height; height: parent.height - root.line-height;
+        for item-action[i] in root.actions: Action {
+            x: 9px + mod(i, root.option-columns) * (root.option-width + 6px);
+            y: floor(i / root.option-columns) * 41px;
+            width: root.option-width;
+            min-width: 0px;
+            height: 37px;
+            icon: Copy.action-mark(item-action);
+            text: Copy.action-label(item-action);
+            accessible-label: Copy.action-label(item-action) + " · " + root.title;
+            leading: true;
+            danger: item-action == "remove";
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.action(item-action); }
+        }
+    }
+    Divider { y: parent.height - 1px; x: 9px; width: parent.width - 18px; }
+}

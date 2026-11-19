@@ -1,0 +1,143 @@
+import { ScrollView, TextEdit } from "std-widgets.slint";
+import { Action, Caption, Consent, Cover, Eyebrow, Field, Notice, Theme } from "theme.slint";
+
+export component SignInView inherits Rectangle {
+    in-out property <string> origin;
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <bool> consent;
+    in property <string> status;
+    in property <bool> error;
+    in property <bool> busy;
+    callback edited();
+    callback sign-in();
+    callback cancel();
+    background: Theme.bg;
+    ScrollView {
+        content-width: self.visible-width;
+        content-height: max(self.visible-height, 694px);
+        Rectangle {
+            width: parent.width; height: parent.height;
+            background: Theme.bg;
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: max(20px, (parent.height - self.height) / 2);
+                width: min(518px, parent.width - 34px); height: 650px;
+                border-radius: 19px; border-width: 1px; border-color: Theme.line; background: Theme.panel;
+                VerticalLayout {
+                    padding: 25px; spacing: 7px; alignment: start;
+                    HorizontalLayout {
+                        height: 35px; spacing: 10px;
+                        Image { width: 31px; height: 31px; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
+                        Eyebrow { text: "SPOFIFY / DESKTOP"; }
+                    }
+                    Text { text: "Connect to your music"; color: Theme.text; font-size: 26px; font-weight: 700; wrap: word-wrap; }
+                    Caption { text: "Sign in to the server that hosts your library."; wrap: word-wrap; }
+                    Rectangle { height: 11px; }
+                    Caption { text: "Server origin"; color: Theme.text; }
+                    Field { text <=> root.origin; field-label: "Server origin"; placeholder-text: "https://music.example.com"; enabled: !root.busy; edited => { root.edited(); } }
+                    Caption { text: "Use HTTPS and enter the origin without a path."; wrap: word-wrap; }
+                    Caption { text: "Username"; color: Theme.text; }
+                    Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; }
+                    Caption { text: "Password"; color: Theme.text; }
+                    Field { text <=> root.password; field-label: "Password"; input-type: InputType.password; enabled: !root.busy; accepted => { if !root.busy { root.sign-in(); } } }
+                    Consent { text: "Allow trusted-LAN HTTP"; checked <=> root.consent; enabled: !root.busy; }
+                    Caption { text: "HTTP sends credentials unencrypted. Only enable it for a private, loopback or Tailscale IP on a network you trust."; color: Theme.amber; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Action { text: root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: !root.busy; clicked => { root.sign-in(); } }
+                        if root.busy: Action { text: "Cancel"; accessible-label: "Cancel sign in"; clicked => { root.cancel(); } }
+                    }
+                    if root.status != "": Notice { text: root.status; error: root.error; }
+                }
+            }
+        }
+    }
+}
+
+export component Editor inherits Rectangle {
+    in property <string> mode;
+    in property <string> help;
+    in property <string> error;
+    in property <bool> busy;
+    in property <bool> offline;
+    in property <bool> reconnecting;
+    in-out property <string> name;
+    in-out property <string> description;
+    in-out property <string> definition;
+    callback save();
+    callback cancel();
+    callback toggle-offline();
+    property <bool> deleting: mode == "delete" || mode == "remove-saved";
+    property <bool> editing-rules: mode == "rules" || mode == "new-rules";
+    property <bool> editing-name: mode == "new-manual" || mode == "new-rules" || mode == "rename" || mode == "device-rename";
+    property <bool> creating: mode == "new-manual" || mode == "new-rules";
+    property <bool> editing-description: creating || mode == "rename";
+    property <bool> ready: !busy && (!editing-name || name != "") && (!editing-rules || definition != "");
+    background: Theme.bg;
+    FocusScope {
+        focus-on-tab-navigation: false;
+        focus-on-click: false;
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape && !root.busy { if !event.repeat { root.cancel(); } return accept; }
+            return reject;
+        }
+        ScrollView {
+            content-width: self.visible-width;
+            VerticalLayout {
+                padding-top: 30px; padding-bottom: 30px;
+                alignment: start;
+                Rectangle {
+                    width: min(656px, max(300px, root.width - 52px));
+                    x: (root.width - self.width) / 2;
+                    min-height: editor-form.preferred-height;
+                    vertical-stretch: 0;
+                    background: Theme.panel; border-radius: 14px; border-width: 1px; border-color: Theme.line;
+                    editor-form := VerticalLayout {
+                        padding: 24px; spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Eyebrow { text: root.mode == "device-rename" ? "PLAYBACK DEVICES" : root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Action { text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline"; quiet: true; clicked => { root.toggle-offline(); } }
+                        }
+                        Text {
+                            text: root.mode == "remove-saved" ? "Remove this download?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
+                                : root.mode == "rules" ? "Edit playlist rules" : root.mode == "new-rules" ? "New rules playlist"
+                                : root.mode == "device-rename" ? "Rename playback device" : "New playlist";
+                            color: Theme.text; font-weight: 700; font-size: 25px; wrap: word-wrap;
+                        }
+                        if root.deleting: Caption { text: root.mode == "remove-saved" ? "This removes the saved download from this computer, not the collection from your library." : "The playlist will be deleted. Tracks in your library won’t be affected."; wrap: word-wrap; }
+                        if root.editing-name: Caption { text: root.mode == "device-rename" ? "Device name" : "Playlist name"; color: Theme.text; }
+                        if root.editing-name: Field {
+                            text <=> root.name;
+                            field-label: root.mode == "device-rename" ? "Device name" : "Playlist name";
+                            enabled: !root.busy;
+                            init => { self.take-focus(); }
+                            accepted => { if root.ready && !root.editing-rules { root.save(); } }
+                        }
+                        if root.editing-description: Caption { text: "Description (optional)"; color: Theme.text; }
+                        if root.editing-description: Field { text <=> root.description; field-label: "Playlist description"; enabled: !root.busy; }
+                        if root.editing-rules: Caption { text: "Rules"; color: Theme.text; }
+                        if root.editing-rules: Caption { text: root.help == "" ? "Write one directive per line. Use two spaces to indent conditions." : root.help; wrap: word-wrap; }
+                        if root.editing-rules: TextEdit {
+                            text <=> root.definition; accessible-label: "Playlist rules definition";
+                            font-family: "JetBrains Mono"; font-size: 13px * Theme.density;
+                            height: 178px; enabled: !root.busy; wrap: word-wrap;
+                        }
+                        if root.error != "": Notice { text: root.error; error: true; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Action {
+                                text: "Cancel"; enabled: !root.busy;
+                                init => { if root.deleting { self.take-focus(); } }
+                                clicked => { root.cancel(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Action { text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove download" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes"; enabled: root.ready; primary: !root.deleting; danger: root.deleting; clicked => { root.save(); } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

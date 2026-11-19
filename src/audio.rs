@@ -1,195 +1,213 @@
-//! Native decoder/output. Authenticated media bytes are memory-only and bounded by Api.
-//! The source itself fences every sample, independently of UI/network task scheduling.
+//! Native output. The decoder checks its exact operation capability, session
+//! and account/mode epoch at the sample boundary, outside the actor's scheduler.
 use crate::{
     api::Session,
-    player::{self, Authority, Endpoint, Outcome, Status},
+    player::{Authority, Status},
 };
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
-use serde_json::{Value, json};
+use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source, source::SeekError};
 use std::{
     io::Cursor,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
+const MAX_SECONDS: f64 = 604800.0;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Facts {
+    pub elapsed: f64,
+    pub duration: f64,
+    pub playing: bool,
+    pub loading: bool,
+    pub ended: bool,
+}
+
 pub struct Audio {
     stream: Option<OutputStream>,
     sink: Option<Sink>,
-    prepared: Option<(String, Vec<u8>)>,
-    state: Value,
+    cached: Option<(String, Arc<[u8]>)>,
     authority: Option<Authority>,
-    session: Session,
+    started: Option<Arc<AtomicBool>>,
+    session: Option<Session>,
+    offline: bool,
     epoch: Arc<AtomicU64>,
-    expected_epoch: u64,
+    expected: u64,
+    elapsed: f64,
+    duration: f64,
 }
 impl Audio {
-    pub fn new(session: Session, epoch: Arc<AtomicU64>, expected_epoch: u64) -> Self {
+    pub fn new(
+        session: Option<Session>,
+        offline: bool,
+        epoch: Arc<AtomicU64>,
+        expected: u64,
+    ) -> Self {
         Self {
             stream: None,
             sink: None,
-            prepared: None,
-            state: player::empty_snapshot(),
+            cached: None,
             authority: None,
+            started: None,
             session,
+            offline,
             epoch,
-            expected_epoch,
+            expected,
+            elapsed: 0.0,
+            duration: 0.0,
         }
     }
-    pub fn preload(&mut self, id: String, bytes: Vec<u8>) {
-        self.prepared = Some((id, bytes));
+    pub fn cached(&self, id: &str) -> Option<Arc<[u8]>> {
+        self.cached
+            .as_ref()
+            .filter(|(loaded, _)| loaded == id)
+            .map(|(_, bytes)| bytes.clone())
     }
-    pub fn clear(&mut self) {
+    pub fn discard_cache(&mut self) {
+        self.cached = None;
+    }
+    fn output(&mut self) -> Result<(), Status> {
+        if self.stream.is_none() {
+            let mut stream =
+                OutputStreamBuilder::open_default_stream().map_err(|_| Status::Blocked)?;
+            stream.log_on_drop(false);
+            self.stream = Some(stream);
+        }
+        Ok(())
+    }
+    /// Decode enough to validate the media and open the output without appending
+    /// or starting any samples. Keep only one bounded encoded file in memory.
+    pub fn prepare(&mut self, id: String, bytes: Arc<[u8]>, elapsed: f64) -> Status {
+        if !self.current() {
+            return Status::Rejected;
+        }
+        let status = decoder(bytes.clone(), elapsed).and_then(|_| self.output());
+        if status.is_ok() {
+            self.cached = Some((id, bytes));
+        }
+        status.err().unwrap_or(Status::Ok)
+    }
+    pub fn play(
+        &mut self,
+        id: String,
+        bytes: Arc<[u8]>,
+        elapsed: f64,
+        duration: f64,
+        authority: Authority,
+    ) -> Status {
+        self.stop();
+        self.anchor(elapsed, duration);
+        if !self.current() || !authority.is_valid() {
+            return Status::Rejected;
+        }
+        let source = match decoder(bytes.clone(), self.elapsed) {
+            Ok(source) => source,
+            Err(e) => return e,
+        };
+        if let Some(duration) = source.total_duration() {
+            self.duration = duration.as_secs_f64().min(MAX_SECONDS);
+            self.elapsed = self.elapsed.min(self.duration);
+        }
+        self.cached = Some((id, bytes));
+        if let Err(e) = self.output() {
+            return e;
+        }
+        if !self.current() || !authority.is_valid() {
+            return Status::Rejected;
+        }
+        let sink = Sink::connect_new(self.stream.as_ref().expect("output initialized").mixer());
+        sink.pause();
+        let started = Arc::new(AtomicBool::new(false));
+        sink.append(Fenced {
+            inner: source,
+            started: started.clone(),
+            authority: authority.clone(),
+            session: self.session.clone(),
+            offline: self.offline,
+            epoch: self.epoch.clone(),
+            expected: self.expected,
+        });
+        self.authority = Some(authority);
+        self.started = Some(started);
+        self.sink = Some(sink);
+        if self.allowed() {
+            self.sink.as_ref().unwrap().play();
+            Status::Ok
+        } else {
+            self.stop();
+            Status::Rejected
+        }
+    }
+    pub fn anchor(&mut self, elapsed: f64, duration: f64) {
+        self.elapsed = if duration > 0.0 {
+            elapsed.min(duration)
+        } else {
+            elapsed
+        };
+        self.duration = duration;
+    }
+    pub fn stop(&mut self) {
+        let elapsed = self.facts().elapsed;
+        if let Some(authority) = self.authority.take() {
+            authority.revoke();
+        }
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
-        self.prepared = None;
-        self.authority = None;
-        self.state = player::empty_snapshot();
+        self.started = None;
+        self.elapsed = elapsed;
+    }
+    pub fn clear(&mut self) {
+        self.stop();
+        self.cached = None;
+        self.stream = None;
+        self.anchor(0.0, 0.0);
+    }
+    fn current(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.expected
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|s| session_allows_output(s, self.offline))
     }
     fn allowed(&self) -> bool {
-        self.epoch.load(Ordering::SeqCst) == self.expected_epoch
-            && !self.session.is_expired()
-            && self.authority.as_ref().is_some_and(Authority::is_valid)
+        self.current() && self.authority.as_ref().is_some_and(Authority::is_valid)
     }
-    fn outcome(&self, status: Status) -> Outcome {
-        Outcome {
-            status,
-            state: self.snapshot(),
-        }
-    }
-    fn fail(&mut self, status: Status) -> Outcome {
-        self.stop();
-        self.state["error"] = json!(if status == Status::Blocked {
-            "blocked"
-        } else {
-            "media"
-        });
-        self.outcome(status)
-    }
-}
-impl Endpoint for Audio {
-    fn stop(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.pause();
-        }
-        self.state["playing"] = json!(false);
-        self.state["waiting"] = json!(false);
-        self.state["loading"] = json!(false);
-    }
-    fn snapshot(&self) -> Value {
-        let mut state = self.state.clone();
-        if let Some(sink) = &self.sink {
-            state["elapsed"] = json!(sink.get_pos().as_secs_f64().min(604800.0));
-            state["playing"] = json!(!sink.is_paused() && !sink.empty() && self.allowed());
-        } else {
-            state["playing"] = json!(false);
-        }
-        state
-    }
-    fn prepare(&mut self, state: &Value) -> bool {
-        // Admission validates supported metadata only. A used room can retain a paused
-        // track whose bytes this fresh session has never loaded.
-        player::valid_snapshot(state)
-    }
-    fn activate(&mut self, state: &Value, authority: Authority) -> Outcome {
-        if !player::valid_snapshot(state) || !authority.is_valid() {
-            self.stop();
-            return self.outcome(Status::Rejected);
-        }
-        self.authority = Some(authority.clone());
-        if state["queue"].as_array().is_some_and(Vec::is_empty) {
-            self.clear();
-            self.authority = Some(authority);
-            return self.outcome(Status::Ok);
-        }
-        let id = state["queue"][0]["id"].as_str().unwrap_or("");
-        if self
-            .prepared
+    pub fn facts(&self) -> Facts {
+        let allowed = self.allowed();
+        let started = self
+            .started
             .as_ref()
-            .is_some_and(|(loaded, _)| loaded == id)
-        {
-            if let Some(sink) = self.sink.take() {
-                sink.stop();
-            }
-            self.state = state.clone();
-            self.state["playing"] = json!(false);
-            let (_, bytes) = self.prepared.take().expect("checked prepared media");
-            let Ok(decoder) = Decoder::try_from(Cursor::new(bytes)) else {
-                return self.fail(Status::Media);
-            };
-            if self.stream.is_none() {
-                match OutputStreamBuilder::open_default_stream() {
-                    Ok(mut stream) => {
-                        stream.log_on_drop(false);
-                        self.stream = Some(stream);
-                    }
-                    Err(_) => return self.fail(Status::Blocked),
-                }
-            }
-            let sink = Sink::connect_new(self.stream.as_ref().expect("output initialized").mixer());
-            sink.pause();
-            sink.append(Fenced {
-                inner: decoder,
-                authority,
-                session: self.session.clone(),
-                epoch: self.epoch.clone(),
-                expected: self.expected_epoch,
-            });
-            self.sink = Some(sink);
-        } else if self.sink.is_none() || self.state["queue"][0]["id"] != id {
-            if let Some(sink) = self.sink.take() {
-                sink.stop();
-            }
-            self.state = state.clone();
-            if state["playing"] == false {
-                // Recovery is metadata-only and paused. Explicit Play will fetch bytes
-                // only after the new lease and activation ACK have been established.
-                self.stop();
-                self.state["error"] = json!("");
-                return self.outcome(Status::Ok);
-            }
-            return self.fail(Status::Media);
-        }
-        self.state["error"] = json!("");
-        if state["playing"] == true && self.allowed() {
-            if let Some(sink) = &self.sink {
-                sink.play();
-            }
-        } else {
-            self.stop();
-        }
-        self.outcome(Status::Ok)
-    }
-    fn execute(&mut self, command: &Value, authority: Authority) -> Outcome {
-        if !authority.is_valid() {
-            self.stop();
-            return self.outcome(Status::Rejected);
-        }
-        self.authority = Some(authority);
-        match command["type"].as_str() {
-            Some("pause") => {
-                self.stop();
-                self.state["error"] = json!("");
-                self.outcome(Status::Ok)
-            }
-            Some("resume") if self.sink.as_ref().is_some_and(|s| !s.empty()) && self.allowed() => {
-                self.sink.as_ref().unwrap().play();
-                self.state["error"] = json!("");
-                self.outcome(Status::Ok)
-            }
-            Some("clear") => {
-                // Restricted receiver has no upcoming entries. Keep current/history,
-                // sink, elapsed and playing intent intact; this is not close/reset.
-                self.outcome(Status::Ok)
-            }
-            Some("close") => {
-                self.clear();
-                self.outcome(Status::Ok)
-            }
-            _ => self.outcome(Status::Rejected),
+            .is_some_and(|started| started.load(Ordering::Acquire));
+        let (elapsed, playing, ended) =
+            self.sink
+                .as_ref()
+                .map_or((self.elapsed, false, false), |sink| {
+                    let ended = allowed && sink.empty();
+                    let elapsed = (self.elapsed + sink.get_pos().as_secs_f64()).min(MAX_SECONDS);
+                    let elapsed = if self.duration > 0.0 {
+                        if ended {
+                            self.duration
+                        } else {
+                            elapsed.min(self.duration)
+                        }
+                    } else {
+                        elapsed
+                    };
+                    (
+                        elapsed,
+                        allowed && started && !ended && !sink.is_paused(),
+                        ended,
+                    )
+                });
+        Facts {
+            elapsed,
+            duration: self.duration,
+            playing,
+            loading: allowed && !started && !ended && self.sink.is_some(),
+            ended,
         }
     }
 }
@@ -199,10 +217,40 @@ impl Drop for Audio {
     }
 }
 
+fn session_allows_output(session: &Session, offline: bool) -> bool {
+    // Offline is an explicit local grant; cookie time is irrelevant until
+    // Go Online. Account/mode retirement revokes the per-output capability.
+    session.is_offline() == offline && session.can_access_local()
+}
+
+fn decoder(bytes: Arc<[u8]>, elapsed: f64) -> Result<Decoder<Cursor<Arc<[u8]>>>, Status> {
+    // Cursor::try_from does not set the length/seekability required by
+    // Symphonia. Encoded bytes are complete, so advertise both explicitly.
+    let byte_len = bytes.len() as u64;
+    let mut source = Decoder::builder()
+        .with_data(Cursor::new(bytes))
+        .with_byte_len(byte_len)
+        .with_seekable(true)
+        .build()
+        .map_err(|_| Status::Media)?;
+    if elapsed > 0.0 {
+        let seek = Duration::from_secs_f64(elapsed);
+        source
+            .try_seek(
+                source
+                    .total_duration()
+                    .map_or(seek, |duration| duration.min(seek)),
+            )
+            .map_err(|_| Status::Media)?;
+    }
+    Ok(source)
+}
 struct Fenced<S> {
     inner: S,
+    started: Arc<AtomicBool>,
     authority: Authority,
-    session: Session,
+    session: Option<Session>,
+    offline: bool,
     epoch: Arc<AtomicU64>,
     expected: u64,
 }
@@ -210,12 +258,19 @@ impl<S: Source<Item = f32>> Iterator for Fenced<S> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         if self.epoch.load(Ordering::SeqCst) != self.expected
-            || self.session.is_expired()
             || !self.authority.is_valid()
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|s| !session_allows_output(s, self.offline))
         {
             None
         } else {
-            self.inner.next()
+            let sample = self.inner.next();
+            if sample.is_some() && !self.started.load(Ordering::Relaxed) {
+                self.started.store(true, Ordering::Release);
+            }
+            sample
         }
     }
 }
@@ -232,25 +287,16 @@ impl<S: Source<Item = f32>> Source for Fenced<S> {
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        self.inner.try_seek(pos)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Api, Origin};
     use std::time::Instant;
-    fn setup() -> (Api, Audio, player::Player, Arc<AtomicU64>) {
-        let api = Api::new(Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
-        let epoch = Arc::new(AtomicU64::new(1));
-        let mut audio = Audio::new(api.test_session(), epoch.clone(), 1);
-        let mut player = player::Player::new();
-        let now = Instant::now();
-        let request = player.register("Synthetic", now).unwrap();
-        player.consume(&request, json!({"deviceId":"desktop", "devices":[{"deviceId":"desktop"}], "activeDeviceId":"desktop", "epoch":1, "leaseMs":8000, "state":null, "stateSeq":0, "transfer":null, "directives":[]}), &mut audio, now).unwrap();
-        (api, audio, player, epoch)
-    }
-    fn wav() -> Vec<u8> {
-        // Real little-endian mono PCM WAV; no output device is needed for decoding.
+    fn wav() -> Arc<[u8]> {
         let mut b = Vec::new();
         b.extend(b"RIFF");
         b.extend(236u32.to_le_bytes());
@@ -267,162 +313,42 @@ mod tests {
         for _ in 0..100 {
             b.extend(1000i16.to_le_bytes());
         }
-        b
+        b.into()
     }
     #[test]
-    fn incoming_clear_preserves_current_but_close_resets() {
-        let (_, mut audio, mut player, _) = setup();
-        let now = Instant::now();
-        let mut state=player::single_track(&json!({"id":"track","name":"Current","artists":[{"name":"Manual"}],"albumName":"Album","albumId":"","duration":24}),1).unwrap();
-        state["playing"] = json!(false);
-        player.play(state, &mut audio, now).unwrap();
-        let before = audio.snapshot();
-        assert_eq!(
-            player
-                .local(json!({"type":"clear"}), &mut audio, now)
-                .unwrap(),
-            Status::Ok
-        );
-        assert_eq!(audio.snapshot(), before);
-        assert_eq!(
-            player
-                .local(json!({"type":"close"}), &mut audio, now)
-                .unwrap(),
-            Status::Ok
-        );
-        assert_eq!(audio.snapshot(), player::empty_snapshot());
-    }
-    #[test]
-    fn incoming_clear_ack_preserves_existing_blocked_and_media_errors() {
-        for error in ["blocked", "media"] {
-            let (_, mut audio, mut player, _) = setup();
-            let now = Instant::now();
-            let mut state=player::single_track(&json!({"id":"track","name":"Current","artists":[],"albumName":"Album","albumId":"","duration":24}),1).unwrap();
-            state["playing"] = json!(false);
-            player.play(state, &mut audio, now).unwrap();
-            audio.state["error"] = json!(error);
-            let before = audio.snapshot();
-            let poll = player.poll(&mut audio, now).unwrap();
-            player.consume(&poll,json!({"devices":[{"deviceId":"desktop"}],"activeDeviceId":"desktop","epoch":1,"leaseMs":8000,"state":before,"stateSeq":1,"transfer":null,"directives":[{"deliveryId":"clear","epoch":1,"type":"command","command":{"type":"clear"}}]}),&mut audio,now).unwrap();
-            assert_eq!(audio.snapshot(), before);
-            let ack = player.poll(&mut audio, now).unwrap();
-            assert_eq!(ack.body["acks"][0]["status"], "ok");
-            assert_eq!(ack.body["state"], before);
-        }
-    }
-    #[test]
-    fn real_decode_and_sample_fences_for_epoch_lease_and_revocation() {
-        for reason in 0..3 {
-            let (_, mut audio, mut player, epoch) = setup();
-            let decoder = Decoder::try_from(Cursor::new(wav())).unwrap();
+    fn real_decoder_seeks_and_sample_fences_revocation_and_epoch() {
+        for online in [false, true] {
+            let epoch = Arc::new(AtomicU64::new(1));
+            let grant = if online {
+                Authority::new(Instant::now() + Duration::from_secs(1))
+            } else {
+                Authority::offline()
+            };
             let mut source = Fenced {
-                inner: decoder,
-                authority: player.authority(Instant::now()).unwrap(),
-                session: audio.session.clone(),
+                inner: decoder(wav(), 0.004).unwrap(),
+                started: Arc::new(AtomicBool::new(false)),
+                authority: grant.clone(),
+                session: None,
+                offline: !online,
                 epoch: epoch.clone(),
                 expected: 1,
             };
             assert!(source.next().unwrap() > 0.0);
-            match reason {
-                0 => {
-                    epoch.store(2, Ordering::SeqCst);
-                }
-                1 => player.tick(&mut audio, Instant::now() + Duration::from_secs(7)),
-                _ => player.failed(&mut audio),
+            if online {
+                grant.revoke();
+            } else {
+                epoch.store(2, Ordering::SeqCst);
             }
-            assert_eq!(source.next(), None);
-            assert_eq!(source.next(), None);
+            assert!(source.next().is_none());
         }
     }
-    #[tokio::test]
-    async fn logout_revokes_decoder_even_when_network_fails() {
-        let (api, audio, player, epoch) = setup();
-        let mut source = Fenced {
-            inner: Decoder::try_from(Cursor::new(wav())).unwrap(),
-            authority: player.authority(Instant::now()).unwrap(),
-            session: audio.session.clone(),
-            epoch,
-            expected: 1,
-        };
-        assert!(source.next().is_some());
-        let _ = api.logout(&audio.session).await;
-        assert_eq!(source.next(), None);
-    }
     #[test]
-    fn retained_single_track_admission_is_paused_without_cached_media() {
-        let (_, mut audio, mut player, _) = setup();
-        let now = Instant::now();
-        let mut state = player::single_track(
-            &json!({"id":"retained","name":"Retained", "artists":[],"albumName":"","duration":24}),
-            1,
-        )
-        .unwrap();
-        // Go playbackArtist uses omitempty for an unlinked artist ID.
-        state["queue"][0]["artists"] = json!([{"name":"Synthetic artist"}]);
-        let view = |epoch, active: &str, directives| json!({"deviceId":"desktop", "devices":[{"deviceId":"desktop"}], "activeDeviceId":active, "epoch":epoch, "leaseMs":8000, "state":state, "stateSeq":5, "transfer":null, "directives":directives});
-        player
-            .reconcile(view(2, "", json!([])), &mut audio, now)
-            .unwrap();
-        let claim = player.claim("fresh-claim", now).unwrap();
-        player
-            .consume(&claim, view(2, "", json!([])), &mut audio, now)
-            .unwrap();
-        let poll = player.poll(&mut audio, now).unwrap();
-        player
-            .consume(
-                &poll,
-                view(
-                    2,
-                    "",
-                    json!([{"deliveryId":"prepare","epoch":2,"type":"prepare","state":state}]),
-                ),
-                &mut audio,
-                now,
-            )
-            .unwrap();
-        let ack = player.poll(&mut audio, now).unwrap();
-        assert_eq!(ack.body["acks"][0]["status"], "ok");
-        player
-            .consume(
-                &ack,
-                view(
-                    3,
-                    "desktop",
-                    json!([{"deliveryId":"activate","epoch":3,"type":"activate","state":state}]),
-                ),
-                &mut audio,
-                now,
-            )
-            .unwrap();
-        let ack = player.poll(&mut audio, now).unwrap();
-        assert_eq!(ack.body["acks"][0]["status"], "ok");
-        assert_eq!(ack.body["state"]["playing"], false);
-        assert!(audio.stream.is_none() && audio.sink.is_none());
-        player
-            .consume(&ack, view(3, "desktop", json!([])), &mut audio, now)
-            .unwrap();
-        // Explicit selected media is admitted under the lease (bad bytes fail decoding,
-        // rather than deadlocking prepare or starting any output).
-        audio.preload("retained".into(), b"bad media".to_vec());
-        assert_eq!(player.play(state, &mut audio, now).unwrap(), Status::Media);
-        assert!(audio.stream.is_none());
-    }
-
-    #[test]
-    fn malformed_media_reports_failure_without_opening_output() {
-        let (_, mut audio, mut player, _) = setup();
-        audio.preload("song".into(), b"not media".to_vec());
-        let state = player::single_track(
-            &json!({"id":"song","name":"Song","artists":[],"albumName":"","duration":1}),
-            1,
-        )
-        .unwrap();
+    fn malformed_media_never_opens_an_output() {
+        let mut a = Audio::new(None, false, Arc::new(AtomicU64::new(1)), 1);
         assert_eq!(
-            player.play(state, &mut audio, Instant::now()).unwrap(),
+            a.prepare("bad".into(), Arc::from([1u8]), 0.0),
             Status::Media
         );
-        assert_eq!(audio.snapshot()["playing"], false);
-        assert_eq!(audio.snapshot()["error"], "media");
-        assert!(audio.stream.is_none());
+        assert!(a.stream.is_none());
     }
 }
