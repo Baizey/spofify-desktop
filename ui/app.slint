@@ -31,7 +31,7 @@ export component AppWindow inherits Window {
     max-width: root.inspection-width > 0px ? root.inspection-width : 65535px;
     min-height: root.inspection-height > 0px ? root.inspection-height : 440px;
     max-height: root.inspection-height > 0px ? root.inspection-height : 65535px;
-    default-font-family: "sans-serif";
+    default-font-family: "JetBrains Mono";
 
     in-out property <string> origin;
     in-out property <string> username;
@@ -168,7 +168,7 @@ export component AppWindow inherits Window {
 
     property <bool> compact: self.width < 820px;
     property <bool> wide: self.width >= 1136px;
-    property <length> rail-width: self.width >= 1480px ? 224px : root.compact ? 150px : 194px;
+    property <length> rail-width: self.width >= 1480px ? 224px : root.compact ? 164px : 194px;
     property <length> queue-width: clamp(self.width * 0.229, 304px, 390px);
     property <length> toolbar-height: root.compact ? 57px : 65px;
     property <string> playback-status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
