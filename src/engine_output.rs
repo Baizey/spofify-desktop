@@ -9,7 +9,10 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::watch;
@@ -238,17 +241,43 @@ impl RunPermit {
         })
     }
     pub fn source(&self, link: watch::Receiver<Link>, generation: Generation) -> Authority {
+        self.source_with_preview(link, generation, None)
+    }
+    /// A queued successor may overlap locally only under a live attached
+    /// grant. It acquires ordinary run grace only after canonical confirmation
+    /// of the exact successor, not merely admission of the EOF fact.
+    pub fn preview_source(
+        &self,
+        link: watch::Receiver<Link>,
+        generation: Generation,
+        confirmed: Arc<AtomicBool>,
+    ) -> Authority {
+        self.source_with_preview(link, generation, Some(confirmed))
+    }
+    fn source_with_preview(
+        &self,
+        link: watch::Receiver<Link>,
+        generation: Generation,
+        confirmed: Option<Arc<AtomicBool>>,
+    ) -> Authority {
         let permit = self.clone();
         let start_grant = self.watch.clone();
+        let start = move || {
+            link.has_changed().is_ok()
+                && *link.borrow() == Link::Connected(generation)
+                && start_grant.borrow().is_some_and(|g| {
+                    g.attached && g.generation == generation && g.permits(Instant::now())
+                })
+        };
+        let preview_start = start.clone();
         Authority::online(
-            move || permit.granted(),
             move || {
-                link.has_changed().is_ok()
-                    && *link.borrow() == Link::Connected(generation)
-                    && start_grant.borrow().is_some_and(|g| {
-                        g.attached && g.generation == generation && g.permits(Instant::now())
-                    })
+                confirmed
+                    .as_ref()
+                    .is_none_or(|c| c.load(Ordering::Acquire) || preview_start())
+                    && permit.granted()
             },
+            start,
         )
     }
 }
@@ -368,6 +397,33 @@ mod tests {
         );
         grants.send_replace(None);
         assert!(!source.is_valid());
+    }
+
+    #[test]
+    fn queued_eof_cannot_give_an_unconfirmed_overlap_detached_grace() {
+        let grant = OutputAuthority {
+            generation: 4,
+            deadline: Instant::now() + Duration::from_secs(5),
+            attached: true,
+        };
+        let (grants, rx) = watch::channel(Some(grant));
+        let (links, link) = watch::channel(Link::Connected(4));
+        let permit = RunPermit::new(rx, grant);
+        let confirmed: Arc<AtomicBool> = Arc::default();
+        let committed = permit.preview_source(link.clone(), 4, confirmed.clone());
+        let pending = permit.preview_source(link, 4, Arc::default());
+        assert!(pending.may_start() && committed.may_start());
+        confirmed.store(true, Ordering::Release); // matching successor published by Go
+        links.send_replace(Link::Disconnected);
+        grants.send_replace(Some(OutputAuthority {
+            attached: false,
+            ..grant
+        }));
+        assert!(!pending.is_valid());
+        assert!(committed.is_valid());
+        assert!(!committed.may_start());
+        grants.send_replace(None);
+        assert!(!committed.is_valid());
     }
 
     #[test]

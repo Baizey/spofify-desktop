@@ -102,6 +102,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     ui.set_busy(true);
     ui.set_restoring_login(true);
+    let crossfade = preferences::install_playback(&ui);
     let (tx, worker) = engine::start(
         ui.as_weak(),
         epoch.clone(),
@@ -109,6 +110,7 @@ fn main() -> Result<(), slint::PlatformError> {
         mode.clone(),
         auth_rx,
         auth_tx.clone(),
+        crossfade,
     );
     let (art, pages) = watch::channel(None);
     let _covers = artwork::install(&ui, access.clone(), pages);

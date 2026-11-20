@@ -115,6 +115,9 @@ export component AppWindow inherits Window {
     in property <bool> manual-offline;
     in property <bool> reconnecting;
     in property <bool> offline-playback;
+    in property <bool> crossfade-enabled;
+    in property <string> crossfade-status;
+    callback crossfade-changed(bool);
     in property <int> appearance-mode;
     in property <float> appearance-scale: 1.0;
     in property <int> appearance-accent;
@@ -521,6 +524,8 @@ export component AppWindow inherits Window {
                             if root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
                             if root.is-settings: Settings {
                                 account: root.account-label; offline: root.local-mode; reconnecting: root.reconnecting;
+                                crossfade-enabled: root.crossfade-enabled; crossfade-status: root.crossfade-status;
+                                crossfade-changed(enabled) => { root.crossfade-changed(enabled); }
                                 mode: root.appearance-mode; scale: root.appearance-scale;
                                 palettes: root.palettes; palette-id: root.palette-id; palette-status: root.palette-status; palette-enabled: root.palette-enabled;
                                 sign-out => { root.sign-out(); } toggle-offline => { root.flip-offline(); }

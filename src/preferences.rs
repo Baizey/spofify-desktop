@@ -1,6 +1,4 @@
-//! Appearance integration: declare `#[path = "preferences.rs"] pub(crate) mod preferences;`
-//! inside `api.rs` and keep the `install(&ui, access_rx)` guard alive through `ui.run()`.
-//! Theme/scale are device-local; account palette uses the real Go GET/PUT contract.
+//! Theme, scale and crossfade are device-local. The palette is account-scoped.
 
 use super::{ApiError, INVALID_RESPONSE, decode};
 use crate::{
@@ -8,7 +6,7 @@ use crate::{
     presentation::{AccessRx, Account, TIMEOUT, Worker, read_with_backoff, scope_changed},
 };
 use reqwest::{Method, header};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use slint::{Color, ComponentHandle, ModelRc, VecModel};
 use std::{
     cell::Cell,
@@ -17,7 +15,10 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -76,7 +77,14 @@ impl Local {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Playback {
+    version: u8,
+    crossfade: bool,
+}
+
+fn config_path(file: &str) -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -86,10 +94,10 @@ fn config_path() -> Option<PathBuf> {
                 .filter(|p| p.is_absolute())
                 .map(|p| p.join(".config"))
         })?;
-    Some(base.join("spofify-desktop").join("appearance.json"))
+    Some(base.join("spofify-desktop").join(file))
 }
 
-fn load(path: &Path) -> Option<Local> {
+fn load<T>(path: &Path, parse: fn(&[u8]) -> Option<T>) -> Option<T> {
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_BYTES as u64 {
         return None;
@@ -100,16 +108,25 @@ fn load(path: &Path) -> Option<Local> {
         .take(MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .ok()?;
-    parse_local(&bytes)
+    parse(&bytes)
 }
 
-fn parse_local(bytes: &[u8]) -> Option<Local> {
+fn parse_config<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     if bytes.len() > MAX_BYTES {
         return None;
     }
-    let local: Local = serde_json::from_slice(bytes).ok()?;
+    serde_json::from_slice(bytes).ok()
+}
+
+fn parse_local(bytes: &[u8]) -> Option<Local> {
+    let local: Local = parse_config(bytes)?;
     (local.version == VERSION && (MIN_SCALE..=MAX_SCALE).contains(&local.scale_percent))
         .then_some(local)
+}
+
+fn parse_playback(bytes: &[u8]) -> Option<Playback> {
+    let playback: Playback = parse_config(bytes)?;
+    (playback.version == VERSION).then_some(playback)
 }
 
 struct TempFile(Option<PathBuf>);
@@ -121,7 +138,7 @@ impl Drop for TempFile {
     }
 }
 
-fn save(path: &Path, local: Local) -> io::Result<()> {
+fn save(path: &Path, config: &impl Serialize) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing config directory"))?;
@@ -133,8 +150,8 @@ fn save(path: &Path, local: Local) -> io::Result<()> {
         dirs.mode(0o700);
     }
     dirs.create(parent)?;
-    let bytes = serde_json::to_vec(&local)?;
-    let tmp = parent.join(format!(".appearance-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(config)?;
+    let tmp = parent.join(format!(".preferences-{}.tmp", uuid::Uuid::new_v4()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -150,6 +167,45 @@ fn save(path: &Path, local: Local) -> io::Result<()> {
     fs::rename(pending.0.as_ref().expect("owned temporary file"), path)?;
     pending.0 = None;
     Ok(())
+}
+
+fn load_crossfade(path: Option<&Path>) -> bool {
+    path.and_then(|p| load(p, parse_playback))
+        .is_some_and(|p| p.crossfade)
+}
+
+fn save_crossfade(path: Option<&Path>, live: &AtomicBool, enabled: bool) -> io::Result<()> {
+    let path = path.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No config path"))?;
+    save(
+        path,
+        &Playback {
+            version: VERSION,
+            crossfade: enabled,
+        },
+    )?;
+    live.store(enabled, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Bind the offline-capable playback preference before the engine starts.
+pub(crate) fn install_playback(ui: &AppWindow) -> Arc<AtomicBool> {
+    let path = config_path("playback.json");
+    let initial = load_crossfade(path.as_deref());
+    let live = Arc::new(AtomicBool::new(initial));
+    ui.set_crossfade_enabled(initial);
+    let (weak, setting) = (ui.as_weak(), live.clone());
+    ui.on_crossfade_changed(move |enabled| {
+        let Some(ui) = weak.upgrade() else { return };
+        if save_crossfade(path.as_deref(), &setting, enabled).is_ok() {
+            ui.set_crossfade_enabled(enabled);
+            ui.set_crossfade_status("".into());
+        } else {
+            ui.set_crossfade_status(
+                "Couldn’t save Crossfade on this desktop. The setting hasn’t changed.".into(),
+            );
+        }
+    });
+    live
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -347,8 +403,11 @@ struct Selection {
 /// Install local settings synchronously before showing the window. The remote
 /// palette is retained across navigation and is never persisted on this device.
 pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Worker {
-    let path = config_path();
-    let initial = path.as_deref().and_then(load).unwrap_or_default();
+    let path = config_path("appearance.json");
+    let initial = path
+        .as_deref()
+        .and_then(|p| load(p, parse_local))
+        .unwrap_or_default();
     initial.apply(ui);
     apply_palette(ui, None);
     ui.set_palette_enabled(false);
@@ -368,7 +427,7 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Worker {
                 .and(held.palette.as_ref());
             apply_palette(&ui, p);
             if (reset || local.get() != next)
-                && path.as_deref().is_some_and(|p| save(p, next).is_ok())
+                && path.as_deref().is_some_and(|p| save(p, &next).is_ok())
             {
                 local.set(next);
             }
@@ -593,6 +652,78 @@ mod tests {
         for value in ["transparent", "#fff", "000000", "#zz0000", "#000000ff"] {
             assert!(rgb(value).is_none());
         }
+    }
+
+    struct TestConfig(PathBuf);
+
+    impl TestConfig {
+        fn new() -> Self {
+            let path =
+                env::temp_dir().join(format!("spofify-preferences-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestConfig {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn existing_appearance_without_playback_config_keeps_crossfade_off() {
+        let config = TestConfig::new();
+        let appearance = config.0.join("appearance.json");
+        let playback = config.0.join("playback.json");
+        let old_json = br#"{"version":1,"theme":"light","scale_percent":115}"#;
+        fs::write(&appearance, old_json).unwrap();
+        assert_eq!(load(&appearance, parse_local), Local::from_ui(1, 1.15));
+        assert!(!load_crossfade(Some(&playback)));
+        assert!(!load_crossfade(None));
+        assert_eq!(fs::read(&appearance).unwrap(), old_json.as_slice());
+        assert!(!playback.exists());
+    }
+
+    #[test]
+    fn playback_config_is_bounded_and_versioned() {
+        assert!(parse_playback(br#"{"version":1,"crossfade":true}"#).is_some());
+        assert!(parse_playback(br#"{"version":2,"crossfade":true}"#).is_none());
+        assert!(parse_playback(br#"{"version":1,"crossfade":"true"}"#).is_none());
+        assert!(parse_playback(&[b' '; MAX_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn crossfade_persists_independently_of_display_defaults() {
+        let config = TestConfig::new();
+        let appearance = config.0.join("appearance.json");
+        let playback = config.0.join("playback.json");
+        let custom = Local::from_ui(1, 1.15).unwrap();
+        save(&appearance, &custom).unwrap();
+        let live = AtomicBool::new(load_crossfade(Some(&playback)));
+        save_crossfade(Some(&playback), &live, true).unwrap();
+        assert!(live.load(Ordering::Relaxed));
+        assert!(load_crossfade(Some(&playback)));
+        assert_eq!(load(&appearance, parse_local), Some(custom));
+        save(&appearance, &Local::default()).unwrap();
+        assert!(load_crossfade(Some(&playback)));
+        save_crossfade(Some(&playback), &live, false).unwrap();
+        assert!(!live.load(Ordering::Relaxed));
+        assert!(!load(&playback, parse_playback).unwrap().crossfade);
+        assert_eq!(load(&appearance, parse_local), Some(Local::default()));
+    }
+
+    #[test]
+    fn failed_crossfade_save_keeps_live_state_and_cleans_up() {
+        let config = TestConfig::new();
+        let playback = config.0.join("playback.json");
+        fs::create_dir(&playback).unwrap();
+        let live = AtomicBool::new(true);
+        assert!(save_crossfade(None, &live, false).is_err());
+        assert!(save_crossfade(Some(&playback), &live, false).is_err());
+        assert!(live.load(Ordering::Relaxed));
+        assert!(playback.is_dir());
+        assert_eq!(fs::read_dir(&config.0).unwrap().count(), 1);
     }
 
     fn wire(id: Id, revision: u64) -> Wire {

@@ -362,7 +362,7 @@ impl Action {
 
 /// Presentation metadata for an occurrence in the local-only queue. Engine
 /// accepts Command::PlayOffline { queue: Vec<Item>, index, input: PlaybackInput,
-/// store: OfflineStore }, retaining only one verified media file at a time.
+/// store: OfflineStore }. The optional crossfade may also verify one successor.
 #[derive(Clone)]
 pub struct LocalTrack {
     pub id: String,
@@ -445,19 +445,31 @@ impl LocalQueue {
         self.elapsed = 0.0;
         Change::Start
     }
-    pub fn advance(&mut self, natural: bool) -> Change {
-        let Some(p) = self.position else {
-            return Change::Invalid;
-        };
+    fn next_position(&self, natural: bool) -> Option<usize> {
+        let p = self.position?;
         if natural && self.repeat == Repeat::One {
-            self.select(p)
+            Some(p)
         } else if p + 1 < self.entries.len() {
-            self.select(p + 1)
+            Some(p + 1)
         } else if self.repeat == Repeat::All {
-            self.select(0)
+            Some(0)
         } else {
+            None
+        }
+    }
+    pub fn crossfade_successor(&self) -> Option<&LocalEntry> {
+        let to = self.next_position(true)?;
+        // Repeat-one (or repeat-all with only one entry) replays from zero.
+        (Some(to) != self.position).then(|| &self.entries[to])
+    }
+    pub fn advance(&mut self, natural: bool) -> Change {
+        if let Some(to) = self.next_position(natural) {
+            self.select(to)
+        } else if self.position.is_some() {
             self.desired = false;
             Change::Stop
+        } else {
+            Change::Invalid
         }
     }
     pub fn action(&mut self, action: Action) -> Change {
@@ -669,6 +681,22 @@ mod tests {
         q.replace(vec![track("new")], 0, false);
         assert!(q.current().unwrap().key > initial);
         assert_eq!(q.repeat, Repeat::One);
+    }
+    #[test]
+    fn saved_crossfade_uses_natural_occurrences_but_not_self_repeat() {
+        let mut q = LocalQueue::default();
+        q.replace(vec![track("same"), track("same")], 0, false);
+        assert_eq!(q.crossfade_successor().unwrap().key, q.entries[1].key);
+        q.repeat = Repeat::One;
+        assert!(q.crossfade_successor().is_none());
+        q.repeat = Repeat::Off;
+        q.advance(true);
+        assert!(q.crossfade_successor().is_none());
+        q.repeat = Repeat::All;
+        assert_eq!(q.crossfade_successor().unwrap().key, q.entries[0].key);
+        q.advance(true);
+        q.action(Action::Clear);
+        assert!(q.crossfade_successor().is_none());
     }
     #[test]
     fn shuffle_and_move_preserve_current_occurrence_and_position() {

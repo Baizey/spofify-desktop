@@ -1,12 +1,14 @@
 //! Online actor. Socket admission is not a server acknowledgement. Player state
-//! comes from Go; only a native EOF may predict the next published occurrence.
+//! comes from Go; only a native EOF can advance the shared cursor. A local
+//! crossfade can overlap its known successor under the attached output grant.
 use super::{
     CreditView, Engine, LOAD_BUDGET, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply,
-    artist_subtitle, context_kind, credit_views, metadata_id, output,
+    artist_subtitle, context_kind, credit_views, crossfade, metadata_id, output,
 };
 use crate::{
     DeviceRow,
     api::ApiError,
+    audio::CROSSFADE_SECONDS,
     personal::{Command as PersonalCommand, Update as PersonalUpdate},
     player::{Action, Status},
     socket::{
@@ -14,7 +16,14 @@ use crate::{
         State,
     },
 };
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 pub(super) struct Work {
     generation: Generation,
@@ -26,8 +35,31 @@ pub(super) struct Work {
 pub(super) struct Execution {
     cursor: Cursor,
     permit: output::RunPermit,
+    pending_crossfade: Option<CrossfadeConfirmation>,
     status: Status,
     last_fact: Option<Instant>,
+}
+
+struct PreviewKey {
+    generation: Generation,
+    from: Cursor,
+    to: Cursor,
+    id: String,
+}
+impl PreviewKey {
+    fn matches_landing(&self, generation: Generation, from: &Cursor, to: &Cursor) -> bool {
+        self.generation == generation
+            && output::same_execution(&self.from, from)
+            && output::same_execution(&self.to, to)
+    }
+}
+struct PreviewPlayback {
+    permit: output::RunPermit,
+    confirmation: CrossfadeConfirmation,
+}
+struct CrossfadeConfirmation {
+    generation: Generation,
+    confirmed: Arc<AtomicBool>,
 }
 
 struct Advance {
@@ -50,6 +82,8 @@ pub(super) struct Online {
     observed_at: Option<Instant>,
     advance: Option<Advance>,
     stopped: Option<Cursor>,
+    lookahead: Option<crossfade::Lookahead<PreviewKey, PreviewPlayback>>,
+    suppress_crossfade: Option<Cursor>,
 }
 
 impl Online {
@@ -88,6 +122,13 @@ impl Online {
         }
         if !self.stop_for(cursor) {
             self.stopped = None;
+        }
+        if self
+            .suppress_crossfade
+            .as_ref()
+            .is_some_and(|c| !output::same_execution(c, cursor))
+        {
+            self.suppress_crossfade = None;
         }
     }
 }
@@ -295,6 +336,7 @@ impl Engine {
             return;
         }
         self.reconcile_online();
+        self.tick_online_crossfade();
         if self.sample_online(true, false) {
             self.reconcile_online();
         }
@@ -353,11 +395,26 @@ impl Engine {
             self.action_status = "Playback controls are disconnected.";
             return;
         };
+        let changes_run = matches!(
+            command,
+            socket::Command::Play { .. }
+                | socket::Command::Next
+                | socket::Command::Previous
+                | socket::Command::Seek { .. }
+                | socket::Command::Jump { .. }
+                | socket::Command::Select { .. }
+        );
         self.action_status = if self
             .socket
             .as_ref()
             .is_some_and(|s| s.command(generation, command).is_ok())
         {
+            if changes_run && self.crossfade_enabled.load(Ordering::Acquire) {
+                // Don't (re)start an overlap of the run a manual navigation
+                // is about to replace. A rejected choice can simply use EOF.
+                self.online.suppress_crossfade = self.online.cursor().cloned();
+                self.cancel_online_crossfade();
+            }
             ""
         } else {
             "The playback action was not sent."
@@ -440,6 +497,27 @@ impl Engine {
             self.online.revision = self.online.revision.wrapping_add(1);
         }
         let attached = self.attached();
+        if let Some(execution) = &mut self.online.execution
+            && let Some(pending) = &execution.pending_crossfade
+        {
+            if attached.is_none_or(|g| g.generation != pending.generation) {
+                // A queued EOF might not have reached Go. Never export the
+                // speculative successor or let it qualify for detached grace.
+                if self.online.advance.take().is_some() {
+                    self.online.revision = self.online.revision.wrapping_add(1);
+                }
+                self.stop();
+            } else if self.online.advance.is_none()
+                && self
+                    .online
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| output::same_execution(&state.cursor, &execution.cursor))
+            {
+                pending.confirmed.store(true, Ordering::Release);
+                execution.pending_crossfade = None;
+            }
+        }
         let cursor = self.online.cursor().cloned();
         let current = cursor.as_ref().filter(|cursor| {
             cursor.desired
@@ -575,10 +653,143 @@ impl Engine {
             self.online.execution = Some(Execution {
                 cursor: work.cursor,
                 permit,
+                pending_crossfade: None,
                 status,
                 last_fact: None,
             });
         }
+    }
+    pub(super) fn cancel_online_crossfade(&mut self) {
+        self.online.lookahead = None;
+        if let Some(audio) = &mut self.audio {
+            audio.cancel_crossfade();
+        }
+    }
+    fn tick_online_crossfade(&mut self) {
+        if !self.crossfade_enabled.load(Ordering::Acquire) {
+            self.cancel_online_crossfade();
+            return;
+        }
+        let Some(audio) = &self.audio else { return };
+        let remaining = audio.crossfade_remaining();
+        if self.online.lookahead.is_none()
+            && remaining.is_none_or(|s| s > crossfade::ONLINE_LOOKAHEAD)
+        {
+            return;
+        }
+        let target = self.attached().and_then(|grant| {
+            let execution = self.online.execution.as_ref()?;
+            let state = self.online.state.as_ref()?;
+            let from = &execution.cursor;
+            if !output::same_execution(&state.cursor, from)
+                || self.online.advance.is_some()
+                || execution.status != Status::Ok
+                || self
+                    .online
+                    .suppress_crossfade
+                    .as_ref()
+                    .is_some_and(|c| output::same_execution(c, from))
+            {
+                return None;
+            }
+            let to = output::successor(state, from, 0.0)?;
+            if !to.desired || to.key == from.key {
+                return None;
+            }
+            let id = &state.queue.iter().find(|t| t.key == to.key)?.id;
+            Some((grant, from, to, id))
+        });
+        let Some((grant, from, to, id)) = target else {
+            self.cancel_online_crossfade();
+            return;
+        };
+        let audio = self.audio.as_mut().unwrap();
+        if self.online.lookahead.as_ref().is_some_and(|look| {
+            !look.key.matches_landing(grant.generation, from, &to) || look.key.id != *id
+        }) {
+            self.online.lookahead = None;
+            audio.cancel_crossfade();
+        }
+        audio.maintain_crossfade();
+        let Some(remaining) = remaining else { return };
+        let Some(socket) = &self.socket else { return };
+        // Drain already queued canonical edits before admitting a new source,
+        // without restarting a fade just because unrelated updates are busy.
+        if !socket.events.is_empty() {
+            return;
+        }
+        if self.online.lookahead.is_none() {
+            let Some(account) = &self.account else { return };
+            let (api, session, media_id) =
+                (account.api.clone(), account.session.clone(), id.clone());
+            let key = PreviewKey {
+                generation: grant.generation,
+                from: from.clone(),
+                to,
+                id: id.clone(),
+            };
+            self.online.lookahead = Some(crossfade::Lookahead::new(key, async move {
+                let bytes = tokio::time::timeout(LOAD_BUDGET, api.media(&session, &media_id))
+                    .await
+                    .ok()?
+                    .ok()?;
+                Some(bytes.into())
+            }));
+        }
+        if remaining <= CROSSFADE_SECONDS
+            && let Some(look) = &mut self.online.lookahead
+            && let Some(bytes) = look.take_bytes()
+        {
+            let permit = output::RunPermit::new(socket.authority.clone(), grant);
+            let confirmation = CrossfadeConfirmation {
+                generation: grant.generation,
+                confirmed: Arc::default(),
+            };
+            let authority = permit.preview_source(
+                socket.link.clone(),
+                grant.generation,
+                Arc::clone(&confirmation.confirmed),
+            );
+            if audio.start_crossfade(look.key.id.clone(), bytes, authority) {
+                look.started(PreviewPlayback {
+                    permit,
+                    confirmation,
+                });
+            }
+        }
+    }
+    fn keep_online_crossfade(
+        &mut self,
+        generation: Generation,
+        from: &Cursor,
+        to: &Cursor,
+    ) -> bool {
+        let Some(look) = self.online.lookahead.take() else {
+            return false;
+        };
+        if self.attached().is_none_or(|g| g.generation != generation)
+            || !self.crossfade_enabled.load(Ordering::Acquire)
+            || !look.key.matches_landing(generation, from, to)
+        {
+            return false;
+        }
+        let Some(playing) = look.into_playing() else {
+            return false;
+        };
+        let Some(audio) = &mut self.audio else {
+            return false;
+        };
+        if !audio.promote_crossfade() {
+            return false;
+        }
+        self.online.execution = Some(Execution {
+            cursor: to.clone(),
+            permit: playing.permit,
+            pending_crossfade: Some(playing.confirmation),
+            status: Status::Ok,
+            last_fact: None,
+        });
+        true
     }
     /// Publish actual native position to the transport even within transient
     /// grace. Facts are admitted only by the current attached generation.
@@ -602,7 +813,9 @@ impl Engine {
             playing: facts.playing,
             ..execution.cursor.clone()
         };
-        let _ = socket.observe_local(grant.generation, actual);
+        if execution.pending_crossfade.is_none() {
+            let _ = socket.observe_local(grant.generation, actual);
+        }
         let generation = grant.generation;
         if !grant.attached
             || self.link() != Link::Connected(generation)
@@ -611,6 +824,16 @@ impl Engine {
             || self.online.player_gap
             || self.online.advance.is_some()
         {
+            return false;
+        }
+        if allow_end && facts.ended && self.online.lookahead.is_some() && !socket.events.is_empty()
+        {
+            // A bounded drain can leave a queue correction pending. Don't
+            // turn the preview up or let it continue alone while we catch up.
+            // Retaining its attempted key prevents a restart of that intro.
+            if let Some(audio) = &mut self.audio {
+                audio.cancel_crossfade();
+            }
             return false;
         }
         let Some(execution) = &mut self.online.execution else {
@@ -648,14 +871,19 @@ impl Engine {
             (execution.status == Status::Blocked).then_some(FactError::Blocked),
         );
         if socket.fact(generation, report).is_err() {
+            if next.is_some() {
+                self.cancel_online_crossfade();
+            }
             return false;
         }
         execution.last_fact = Some(now);
         if let Some(to) = next {
             let from = execution.cursor.clone();
+            if !self.keep_online_crossfade(generation, &from, &to) {
+                self.stop();
+            }
             self.online.advance = Some(Advance { from, to });
             self.online.revision = self.online.revision.wrapping_add(1);
-            self.stop();
             return true;
         }
         false
@@ -794,6 +1022,42 @@ mod tests {
             desired: true,
             ..Cursor::default()
         }
+    }
+
+    #[test]
+    fn crossfade_promotion_is_bound_to_exact_run_occurrence_and_generation() {
+        let from = cursor(5, 2, 1);
+        let to = cursor(6, 3, 0);
+        let key = PreviewKey {
+            generation: 8,
+            from: from.clone(),
+            to: to.clone(),
+            id: "track".into(),
+        };
+        let fact = Cursor {
+            elapsed: 67.0,
+            playing: true,
+            ..from.clone()
+        };
+        assert!(key.matches_landing(8, &fact, &to));
+        assert!(!key.matches_landing(9, &fact, &to));
+        assert!(!key.matches_landing(
+            8,
+            &Cursor {
+                run: 2,
+                ..from.clone()
+            },
+            &to
+        ));
+        assert!(!key.matches_landing(
+            8,
+            &Cursor {
+                desired: false,
+                ..from.clone()
+            },
+            &to
+        ));
+        assert!(!key.matches_landing(8, &from, &Cursor { key: 7, ..to }));
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! Account-state.v1 controller, output executor, and independent saved queue.
+#[path = "engine_crossfade.rs"]
+mod crossfade;
 #[path = "engine_online.rs"]
 mod online;
 #[path = "engine_output.rs"]
@@ -142,7 +144,10 @@ struct Engine {
     audio: Option<Audio>,
     local: LocalQueue,
     local_store: Option<OfflineStore>,
+    crossfade_enabled: Arc<AtomicBool>,
+    local_lookahead: Option<crossfade::Lookahead<(u64, u64)>>,
     local_read_slot: Arc<Semaphore>,
+    local_preview_slot: Arc<Semaphore>,
     local_status: Status,
     socket: Option<socket::Socket>,
     online: Online,
@@ -668,6 +673,7 @@ impl Engine {
             }
             Change::Clear => {
                 self.cancel_work();
+                self.local_lookahead = None;
                 if let Some(audio) = &mut self.audio {
                     audio.clear();
                 }
@@ -723,33 +729,11 @@ impl Engine {
             return;
         };
         self.local_status = Status::Ok;
-        let (api, session, slot, results) = (
-            account.api.clone(),
-            account.session.clone(),
-            self.local_read_slot.clone(),
-            self.results.clone(),
-        );
+        let load = read_saved(account, store, self.local_read_slot.clone(), id);
+        let results = self.results.clone();
         let (epoch, operation) = (self.epoch, self.operation);
-        let stamp = *session.network_changes().borrow();
         self.media = Some(tokio::spawn(async move {
-            let Ok(permit) = slot.acquire_owned().await else {
-                return;
-            };
-            let input = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                if *session.network_changes().borrow() != stamp || !session.is_offline() {
-                    return None;
-                }
-                let input = store.read(&api, &session, &id).ok();
-                if *session.network_changes().borrow() == stamp {
-                    input
-                } else {
-                    None
-                }
-            })
-            .await
-            .ok()
-            .flatten();
+            let input = load.await;
             let _ = results
                 .send(Reply::OfflineMedia {
                     epoch,
@@ -758,6 +742,74 @@ impl Engine {
                 })
                 .await;
         }));
+    }
+    fn tick_saved_crossfade(&mut self) {
+        let target = if self.crossfade_enabled.load(Ordering::Acquire) {
+            self.local.current().zip(self.local.crossfade_successor())
+        } else {
+            None
+        };
+        let Some(audio) = &mut self.audio else { return };
+        if self
+            .local_lookahead
+            .as_ref()
+            .is_some_and(|look| target.is_none_or(|(from, to)| look.key != (from.key, to.key)))
+        {
+            self.local_lookahead = None;
+            audio.cancel_crossfade();
+        }
+        audio.maintain_crossfade();
+        let Some((from, to)) = target else { return };
+        let Some(remaining) = audio.crossfade_remaining() else {
+            return;
+        };
+        if remaining > crate::audio::CROSSFADE_SECONDS {
+            return;
+        }
+        // Read saved audio only as its fade window opens, so speculative
+        // verification doesn't hold a removed/replaced download for long.
+        if self.local_lookahead.is_none() {
+            let (Some(account), Some(store)) = (&self.account, self.local_store.clone()) else {
+                return;
+            };
+            let id = to.track.id.clone();
+            // A retired speculative read can still be inside blocking I/O;
+            // it must not occupy the slot needed to play, seek, or resume.
+            let load = read_saved(account, store, self.local_preview_slot.clone(), id.clone());
+            self.local_lookahead =
+                Some(crossfade::Lookahead::new((from.key, to.key), async move {
+                    let input = load.await?;
+                    (input.item.id == id
+                        && (1..=offline::MAX_TRACK_BYTES).contains(&input.bytes.len()))
+                    .then(|| input.bytes.into())
+                }));
+        }
+        if let Some(look) = &mut self.local_lookahead
+            && let Some(bytes) = look.take_bytes()
+            && audio.start_crossfade(to.track.id.clone(), bytes, Authority::offline())
+        {
+            look.started(());
+        }
+    }
+    fn finish_saved_track(&mut self) {
+        let overlap = self
+            .local_lookahead
+            .take()
+            .and_then(crossfade::Lookahead::into_playing);
+        let change = self.local.advance(true);
+        if change == Change::Start
+            && self.crossfade_enabled.load(Ordering::Acquire)
+            && overlap.is_some()
+            && let Some(audio) = &mut self.audio
+            && audio.promote_crossfade()
+        {
+            self.local.elapsed = audio.facts().elapsed;
+            self.local_revision = self.local_revision.wrapping_add(1);
+            self.local_status = Status::Ok;
+            self.action_status = "";
+        } else {
+            self.local_change(change);
+        }
     }
     fn prepare_login(&mut self, success: Success) {
         let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
@@ -929,6 +981,8 @@ impl Engine {
         self.online.work = None;
     }
     fn stop(&mut self) {
+        self.local_lookahead = None;
+        self.cancel_online_crossfade();
         self.online.execution = None;
         if let Some(audio) = &mut self.audio {
             audio.stop();
@@ -965,15 +1019,12 @@ impl Engine {
                 self.expire();
                 return;
             }
-            if self.local.desired
-                && self.media.is_none()
-                && let Some(audio) = &self.audio
-            {
-                let facts = audio.facts();
+            if self.local.desired && self.media.is_none() && self.audio.is_some() {
+                self.tick_saved_crossfade();
+                let facts = self.audio.as_ref().unwrap().facts();
                 self.local.elapsed = facts.elapsed;
                 if facts.ended {
-                    let change = self.local.advance(true);
-                    self.local_change(change);
+                    self.finish_saved_track();
                 }
             }
             return;
@@ -1260,6 +1311,34 @@ impl PlayerView {
         });
     }
 }
+fn read_saved(
+    account: &Account,
+    store: OfflineStore,
+    slot: Arc<Semaphore>,
+    id: String,
+) -> impl std::future::Future<Output = Option<PlaybackInput>> + use<> {
+    let (api, session) = (account.api.clone(), account.session.clone());
+    let stamp = *session.network_changes().borrow();
+    async move {
+        let permit = slot.acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if *session.network_changes().borrow() != stamp || !session.is_offline() {
+                return None;
+            }
+            let input = store.read(&api, &session, &id).ok();
+            if *session.network_changes().borrow() == stamp {
+                input
+            } else {
+                None
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
 async fn reconnect_attempts<F, Fut>(
     mode: &ModeControl,
     serial: u64,
@@ -1362,6 +1441,7 @@ pub fn start(
     mode: ModeControl,
     mut auth_intents: mpsc::UnboundedReceiver<AuthCommand>,
     auth_tx: mpsc::UnboundedSender<AuthCommand>,
+    crossfade_enabled: Arc<AtomicBool>,
 ) -> (mpsc::Sender<Command>, std::thread::JoinHandle<()>) {
     let (tx, mut commands) = mpsc::channel(32);
     let worker = std::thread::spawn(move || {
@@ -1405,7 +1485,10 @@ pub fn start(
                 local: LocalQueue::default(),
                 local_status: Status::Ok,
                 local_store: None,
+                crossfade_enabled,
+                local_lookahead: None,
                 local_read_slot: Arc::new(Semaphore::new(1)),
+                local_preview_slot: Arc::new(Semaphore::new(1)),
                 socket: None,
                 online: Online::default(),
                 personal: PersonalHub::default(),
@@ -1535,7 +1618,10 @@ mod tests {
             local_status: Status::Ok,
             socket: None,
             local_store: None,
+            crossfade_enabled: Arc::default(),
+            local_lookahead: None,
             local_read_slot: Arc::new(Semaphore::new(1)),
+            local_preview_slot: Arc::new(Semaphore::new(1)),
             online: Online::default(),
             personal: PersonalHub::default(),
             media: None,
@@ -1557,6 +1643,56 @@ mod tests {
         e.shared_epoch.store(8, Ordering::SeqCst);
         e.command(Command::Offline(false).scoped(7));
         assert!(e.offline);
+    }
+    #[tokio::test]
+    async fn manual_saved_next_does_not_wait_for_a_retired_preview_read() {
+        use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(
+            fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("spofify-crossfade-test-{}", uuid::Uuid::new_v4())),
+        );
+        fs::DirBuilder::new().mode(0o700).create(&dir.0).unwrap();
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        e.account = Some(Account { api, session });
+        e.command(Command::Offline(true).scoped(7));
+        e.local_store = Some(OfflineStore::open(&dir.0).unwrap());
+        let tracks = ["old", "new"]
+            .into_iter()
+            .map(|id| LocalTrack {
+                id: id.into(),
+                title: id.into(),
+                subtitle: String::new(),
+                album_name: String::new(),
+                duration: 25.0,
+            })
+            .collect();
+        assert_eq!(e.local.replace(tracks, 0, false), Change::Start);
+        let from = e.local.current().unwrap().key;
+        let to = e.local.crossfade_successor().unwrap().key;
+        e.local_lookahead = Some(crossfade::Lookahead::new(
+            (from, to),
+            std::future::pending(),
+        ));
+        // A blocking preview read can keep its permit after its receiver dies.
+        let _preview_read = e.local_preview_slot.clone().acquire_owned().await.unwrap();
+        let (results, mut replies) = mpsc::channel(1);
+        e.results = results;
+        e.action(Action::Next);
+        assert!(e.local_lookahead.is_none());
+        assert_eq!(e.local.current().unwrap().key, to);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), replies.recv()).await,
+            Ok(Some(Reply::OfflineMedia { input: None, .. }))
+        ));
     }
     #[tokio::test]
     async fn offline_mode_fences_shared_session_and_never_logs_out_on_the_wire() {
