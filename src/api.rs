@@ -32,6 +32,7 @@ pub(crate) mod preferences;
 mod reconnect;
 
 pub const PAGE_SIZE: u32 = 20;
+#[cfg(test)]
 const MAX_BODY: usize = 256 * 1024;
 const LOGIN_BODY: usize = 8 * 1024;
 const MAX_MEDIA: usize = 32 * 1024 * 1024;
@@ -209,6 +210,7 @@ impl Session {
     }
 
     /// A current HTTP 401, not local expiry or an explicit local logout.
+    #[cfg(test)]
     pub(crate) fn was_server_revoked(&self) -> bool {
         let lifetime = self.lifetime();
         lifetime.deadline.server_expires.is_some() && lifetime.revocation == Some(EXPIRED)
@@ -358,6 +360,7 @@ impl NetworkFence {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
     pub items: Vec<Item>,
@@ -438,6 +441,7 @@ impl Api {
         }
     }
 
+    #[cfg(test)]
     /// Bounded, explicit track search only. Empty input never contacts the server.
     pub async fn search(&self, session: &Session, query: &str) -> Result<Page, ApiError> {
         if query.len() > 1000 || query.chars().count() > 200 || query.chars().any(char::is_control)
@@ -1229,6 +1233,7 @@ fn extend_bounded(bytes: &mut Vec<u8>, chunk: &[u8], bound: usize) {
     bytes.extend_from_slice(chunk);
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct WirePage {
     items: Vec<WireItem>,
@@ -1237,6 +1242,7 @@ struct WirePage {
     limit: u32,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireItem {
@@ -1261,11 +1267,13 @@ struct WireItem {
     disc_number: u32,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct Artist {
     id: String,
     name: String,
 }
+#[cfg(test)]
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Coverage {
@@ -1273,6 +1281,7 @@ struct Coverage {
     in_library: u32,
 }
 
+#[cfg(test)]
 impl WireItem {
     fn into_item(self, kind: &str) -> Result<Item, ApiError> {
         if self.kind != kind

@@ -4,9 +4,8 @@
 mod wire;
 
 pub(crate) use wire::{
-    Artist, Command, Context, ContextKind, Cursor, Device, FIRST_PREVIEW_KEY, Fact, FactError,
-    Intent, MAX_SAFE_INTEGER, Outputs, PlayerDelta, QueueEdit, QueueEditKind, Repeat, Selection,
-    State, Track, TrackRef,
+    Artist, Command, Context, ContextKind, Cursor, Fact, FactError, Intent, MAX_SAFE_INTEGER,
+    Outputs, PlayerDelta, QueueEditKind, Repeat, Selection, State, Track, TrackRef,
 };
 
 use std::{
@@ -587,10 +586,19 @@ impl Connection {
         else {
             return Err(End::Protocol);
         };
-        let generation = GENERATIONS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| End::Closed)?
-            + 1;
+        let mut previous = GENERATIONS.load(Ordering::Relaxed);
+        let generation = loop {
+            let next = previous.checked_add(1).ok_or(End::Closed)?;
+            match GENERATIONS.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(current) => previous = current,
+            }
+        };
         let result = Self {
             generation,
             id: connection_id.clone(),

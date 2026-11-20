@@ -131,16 +131,6 @@ pub(crate) enum Selection {
 }
 
 impl Selection {
-    pub(crate) fn track(id: String) -> Self {
-        Self::Track {
-            track: TrackRef {
-                id,
-                ..TrackRef::default()
-            },
-            context: None,
-        }
-    }
-
     fn valid(&self) -> bool {
         match self {
             Self::Track { track, context } => {

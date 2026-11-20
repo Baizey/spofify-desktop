@@ -99,6 +99,7 @@ fn clear(ui: &AppWindow) {
 
 /// A textual fallback, never a network key. Use the kind glyph if there is no
 /// usable initial (e.g. an empty title or one consisting solely of symbols).
+#[cfg(test)]
 pub(crate) fn monogram(title: &str) -> String {
     title
         .split_whitespace()

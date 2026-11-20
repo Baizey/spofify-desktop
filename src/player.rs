@@ -72,14 +72,6 @@ impl Repeat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Placement {
-    Low,
-    High,
-    Next,
-}
-
 /// Catalog identity as exposed by the desk controller.
 #[derive(Clone, Serialize)]
 pub struct Context {
@@ -91,6 +83,7 @@ pub struct Context {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fence: Option<String>,
 }
+#[cfg(test)]
 impl Context {
     pub fn new(kind: impl Into<String>, id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -128,20 +121,8 @@ pub enum Selection {
     Collection {
         context: Context,
     },
-    Occurrence {
-        key: u64,
-    },
 }
 impl Selection {
-    pub fn track(id: impl Into<String>) -> Self {
-        Self::Track {
-            track: TrackRef {
-                id: id.into(),
-                ..TrackRef::default()
-            },
-            context: None,
-        }
-    }
     pub fn collection(context: Context) -> Self {
         Self::Collection { context }
     }
@@ -154,7 +135,6 @@ pub enum Action {
     },
     Enqueue {
         selection: Selection,
-        placement: Placement,
     },
     Pause,
     Resume,
@@ -203,7 +183,6 @@ impl Context {
 impl Selection {
     fn valid(&self) -> bool {
         match self {
-            Self::Occurrence { key: k } => key(*k),
             Self::Collection { context } => context.valid(),
             Self::Track { track, context } => {
                 id(&track.id, 512)
@@ -263,7 +242,6 @@ impl Selection {
             Self::Collection { context: source } => socket::Selection::Collection {
                 context: context(source),
             },
-            Self::Occurrence { .. } => unreachable!("occurrences are addressed by jump"),
         }
     }
 }
@@ -271,51 +249,21 @@ impl Action {
     pub fn depends_on_visible_queue(&self) -> bool {
         matches!(
             self,
-            Self::Seek(_)
-                | Self::Jump(_)
-                | Self::Remove(_)
-                | Self::Move { .. }
-                | Self::Clear
-                | Self::Play {
-                    selection: Selection::Occurrence { .. },
-                    ..
-                }
-                | Self::Enqueue {
-                    selection: Selection::Occurrence { .. },
-                    ..
-                }
+            Self::Seek(_) | Self::Jump(_) | Self::Remove(_) | Self::Move { .. } | Self::Clear
         )
     }
     pub(crate) fn wire(self, own_device: &str) -> Option<socket::Command> {
         use socket::{Command as C, Intent};
         Some(match self {
-            Self::Play {
-                selection: Selection::Occurrence { key: k },
-                ..
-            } => {
-                if !key(k) {
-                    return None;
-                }
-                C::Jump { key: k }
-            }
             Self::Play { selection, shuffle } if selection.valid() => C::Play {
                 selection: selection.into_wire(),
                 shuffle: Some(shuffle),
                 seed: None,
             },
-            Self::Enqueue {
-                selection,
-                placement,
-            } if selection.valid() && !matches!(selection, Selection::Occurrence { .. }) => {
-                C::Add {
-                    selection: selection.into_wire(),
-                    placement: match placement {
-                        Placement::Low => Intent::Low,
-                        Placement::High => Intent::High,
-                        Placement::Next => Intent::Next,
-                    },
-                }
-            }
+            Self::Enqueue { selection } if selection.valid() => C::Add {
+                selection: selection.into_wire(),
+                placement: Intent::Low,
+            },
             Self::Pause => C::Pause,
             Self::Resume => C::Resume,
             Self::Next => C::Next,

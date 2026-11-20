@@ -17,7 +17,7 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use crate::{
     api::{
         ApiError, Item, PAGE_SIZE,
-        catalog::{self, CatalogItem, CatalogKind, PageRequest, ReleaseGroup},
+        catalog::{self, CatalogItem, CatalogKind, PageRequest},
         library::{
             self, EvaluationState, PlaylistCapabilities, PlaylistKind, PlaylistSummary,
             RuleDefinition,
@@ -242,6 +242,7 @@ impl ContextKind {
 }
 
 impl PlaybackContext {
+    #[cfg(test)]
     pub fn info_route(&self) -> Route {
         match self.kind {
             ContextKind::Album => Route::Album(self.id.clone()),
@@ -303,6 +304,7 @@ pub enum PlaybackSelection {
 }
 
 impl PlaybackSelection {
+    #[cfg(test)]
     pub fn context(&self) -> Option<&PlaybackContext> {
         match self {
             Self::Track { context, .. } => context.as_deref(),
@@ -515,8 +517,7 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             let result = if album {
                 api.album_tracks(session, id, request).await?
             } else {
-                api.artist_albums(session, id, ReleaseGroup::All, request)
-                    .await?
+                api.artist_albums(session, id, request).await?
             };
             // Artist album cards play their own albums, never the entire artist.
             let context = if album {

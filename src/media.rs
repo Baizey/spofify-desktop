@@ -194,6 +194,7 @@ impl Lyrics {
     /// Last authored line at or before the observed native playback position.
     /// Suppress sync if actual playback duration is unknown or the text extends
     /// outside it. Plain lyrics and unverified audio never gain an active line.
+    #[cfg(test)]
     pub fn active_line(
         &self,
         position: Duration,

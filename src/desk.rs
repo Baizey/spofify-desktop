@@ -995,10 +995,7 @@ impl Browser {
     }
     fn playback(&mut self, c: Command) {
         if let Some(a) = &self.access
-            && self
-                .engine
-                .try_send(Command::Scoped(a.epoch, Box::new(c)))
-                .is_err()
+            && self.engine.try_send(c.scoped(a.epoch)).is_err()
         {
             self.message = "That action was not sent. Please try again.".into();
             self.render(false);
@@ -1175,10 +1172,7 @@ impl Browser {
                         shuffle: false,
                     }
                 } else {
-                    player::Action::Enqueue {
-                        selection,
-                        placement: player::Placement::Low,
-                    }
+                    player::Action::Enqueue { selection }
                 }));
             }
             return;

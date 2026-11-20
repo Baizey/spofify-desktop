@@ -426,6 +426,7 @@ impl Replica {
         self.cached(self.desired.as_deref()?).map(|d| &d.playlist)
     }
 
+    #[cfg(test)]
     pub fn ready(&self) -> bool {
         self.ready
     }
@@ -486,6 +487,7 @@ impl Replica {
         }
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         *self = Self::default();
     }

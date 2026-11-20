@@ -3,18 +3,18 @@
 //!
 //! Browser interface on `Api` (`&Session` first):
 //! `catalog_detail(kind, id)`, `album_tracks(id, page)`,
-//! `artist_albums(id, release_group, page)`, `unified_search(query, kind, limit)`,
+//! `artist_albums(id, page)`, `unified_search(query, kind, limit)`,
 //! `unified_search_next(cursor)`. `kind` is `CatalogKind`, except search takes
-//! `Option<CatalogKind>` (None = all). Owned Home/personal methods are in `library`.
+//! `Option<CatalogKind>` (None = all). Personal state uses the account socket.
 
 use std::collections::HashSet;
 
-use reqwest::{Method, Response, StatusCode, header};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use reqwest::{StatusCode, header};
+use serde::{Deserialize, de::DeserializeOwned};
 use url::Url;
 
 use super::{
-    Api, ApiError, INVALID_INPUT, INVALID_RESPONSE, Item, Session, decode, valid_id, valid_text,
+    Api, ApiError, INVALID_INPUT, INVALID_RESPONSE, Session, decode, valid_id, valid_text,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
@@ -39,26 +39,6 @@ impl CatalogKind {
             Self::Artist => "artists",
             Self::Album => "albums",
             Self::Track => "tracks",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReleaseGroup {
-    Albums,
-    Singles,
-    Appearances,
-    #[default]
-    All,
-}
-
-impl ReleaseGroup {
-    fn wire(self) -> &'static str {
-        match self {
-            Self::Albums => "albums",
-            Self::Singles => "singles",
-            Self::Appearances => "appearances",
-            Self::All => "all",
         }
     }
 }
@@ -138,35 +118,6 @@ pub struct SearchPage {
     pub expires_at: String,
 }
 
-impl CatalogPage {
-    pub fn has_more(&self) -> bool {
-        u64::from(self.offset) + (self.items.len() as u64) < self.total
-    }
-}
-
-impl CatalogItem {
-    /// Adapter for the existing single-track player. Do not turn an album or an
-    /// unavailable row into playback authority. Collection identity stays with the row.
-    pub fn playable_item(&self) -> Option<Item> {
-        (self.kind == CatalogKind::Track && self.has_audio).then(|| Item {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            kind: self.kind.singular().into(),
-            artists: self
-                .artists
-                .iter()
-                .map(|a| a.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            album_name: self.album_name.clone(),
-            duration_ms: self.duration_ms,
-            has_audio: true,
-            track_number: self.track_number,
-            disc_number: self.disc_number,
-        })
-    }
-}
-
 impl Api {
     pub async fn catalog_detail(
         &self,
@@ -203,16 +154,10 @@ impl Api {
         &self,
         session: &Session,
         id: &str,
-        release_group: ReleaseGroup,
         page: PageRequest,
     ) -> Result<CatalogPage, ApiError> {
-        self.catalog_page(
-            session,
-            CatalogKind::Album,
-            Parent::Artist(id, release_group),
-            page,
-        )
-        .await
+        self.catalog_page(session, CatalogKind::Album, Parent::Artist(id), page)
+            .await
     }
 
     async fn catalog_page(
@@ -236,8 +181,8 @@ impl Api {
         ];
         match parent {
             Parent::Album(id) if valid_id(id) => query.push(("albumId", id)),
-            Parent::Artist(id, group) if valid_id(id) => {
-                query.extend([("artistId", id), ("releaseGroup", group.wire())])
+            Parent::Artist(id) if valid_id(id) => {
+                query.extend([("artistId", id), ("releaseGroup", "all")])
             }
             _ => return Err(INVALID_INPUT),
         }
@@ -332,7 +277,7 @@ impl Api {
 
 enum Parent<'a> {
     Album(&'a str),
-    Artist(&'a str, ReleaseGroup),
+    Artist(&'a str),
 }
 
 #[derive(Deserialize)]
@@ -576,34 +521,9 @@ pub(super) enum Route<'a> {
     Catalog,
     Detail(CatalogKind, &'a str),
     Search,
-    History,
-    Playlists,
-    Playlist(&'a str),
-    Entries(&'a str),
-    Entry(&'a str, &'a str),
-    Order(&'a str),
-    Definition(&'a str),
-    Preview,
-    Sources,
-    Copy(&'a str),
 }
 
 impl Route<'_> {
-    fn allows(self, method: &Method) -> bool {
-        use Route::*;
-        match self {
-            Catalog | Detail(..) | Search | History | Sources => *method == Method::GET,
-            Definition(_) => *method == Method::GET || *method == Method::PUT,
-            Playlists | Entries(_) => *method == Method::GET || *method == Method::POST,
-            Playlist(_) => {
-                *method == Method::GET || *method == Method::PATCH || *method == Method::DELETE
-            }
-            Preview | Copy(_) => *method == Method::POST,
-            Entry(..) => *method == Method::DELETE,
-            Order(_) => *method == Method::PUT,
-        }
-    }
-
     fn url(self, api: &Api, query: &[(&str, &str)]) -> Result<Url, ApiError> {
         use Route::*;
         let mut url = api.origin.0.clone();
@@ -620,49 +540,6 @@ impl Route<'_> {
                 Detail(..) => return Err(INVALID_INPUT),
                 Search => {
                     path.push("search");
-                }
-                History => {
-                    path.extend(["api", "me", "history"]);
-                }
-                Playlists => {
-                    path.extend(["api", "me", "playlists"]);
-                }
-                Preview => {
-                    path.extend(["api", "me", "playlists", "preview"]);
-                }
-                Sources => {
-                    path.extend(["api", "me", "playlists", "sources"]);
-                }
-                Playlist(id)
-                | Entries(id)
-                | Entry(id, _)
-                | Order(id)
-                | Definition(id)
-                | Copy(id) => {
-                    if !segment_id(id) || matches!(id, "preview" | "sources") {
-                        return Err(INVALID_INPUT);
-                    }
-                    path.extend(["api", "me", "playlists", id]);
-                    match self {
-                        Entries(_) => {
-                            path.push("entries");
-                        }
-                        Entry(_, entry) if segment_id(entry) => {
-                            path.extend(["entries", entry]);
-                        }
-                        Entry(..) => return Err(INVALID_INPUT),
-                        Order(_) => {
-                            path.push("order");
-                        }
-                        Definition(_) if derived_id(id) => {
-                            path.push("definition");
-                        }
-                        Copy(_) if derived_id(id) => {
-                            path.push("copy");
-                        }
-                        Definition(_) | Copy(_) => return Err(INVALID_INPUT),
-                        _ => (),
-                    }
                 }
             }
         }
@@ -687,132 +564,28 @@ pub(super) fn derived_id(id: &str) -> bool {
 }
 
 const CATALOG_BODY: usize = 2 * 1024 * 1024;
-const PERSONAL_REQUEST: usize = 64 * 1024;
 
 impl Api {
-    pub(super) async fn catalog_get<T: DeserializeOwned>(
+    async fn catalog_get<T: DeserializeOwned>(
         &self,
         session: &Session,
         route: Route<'_>,
         query: &[(&str, &str)],
     ) -> Result<T, ApiError> {
         self.with_authenticated_network(session, async {
-            let response = self
-                .catalog_response(session, route, Method::GET, query, None, StatusCode::OK)
-                .await?;
-            self.catalog_decode(session, response).await
-        })
-        .await
-    }
-
-    pub(super) async fn catalog_write<T: DeserializeOwned>(
-        &self,
-        session: &Session,
-        route: Route<'_>,
-        method: Method,
-        body: impl Serialize,
-        status: StatusCode,
-    ) -> Result<T, ApiError> {
-        self.with_authenticated_network(session, async {
-            let response = self
-                .catalog_response(
-                    session,
-                    route,
-                    method,
-                    &[],
-                    Some(serialize_body(body)?),
-                    status,
-                )
-                .await?;
-            self.catalog_decode(session, response).await
-        })
-        .await
-    }
-
-    pub(super) async fn catalog_delete(
-        &self,
-        session: &Session,
-        route: Route<'_>,
-        body: impl Serialize,
-    ) -> Result<(), ApiError> {
-        self.with_authenticated_network(session, async {
-            self.catalog_response(
-                session,
-                route,
-                Method::DELETE,
-                &[],
-                Some(serialize_body(body)?),
-                StatusCode::NO_CONTENT,
-            )
-            .await?;
-            self.check_session(session)
-        })
-        .await
-    }
-
-    async fn catalog_decode<T: DeserializeOwned>(
-        &self,
-        session: &Session,
-        response: Response,
-    ) -> Result<T, ApiError> {
-        let value = decode(response, CATALOG_BODY).await?;
-        self.check_session(session)?;
-        Ok(value)
-    }
-
-    async fn catalog_response(
-        &self,
-        session: &Session,
-        route: Route<'_>,
-        method: Method,
-        query: &[(&str, &str)],
-        body: Option<Vec<u8>>,
-        status: StatusCode,
-    ) -> Result<Response, ApiError> {
-        self.check_session(session)?;
-        let expects_body = method != Method::GET;
-        if !route.allows(&method)
-            || expects_body != body.is_some()
-            || (expects_body && !query.is_empty())
-        {
-            return Err(INVALID_INPUT);
-        }
-        let mut request = self
-            .request_with_method(method, route.url(self, query)?)?
-            .header(header::COOKIE, session.secrets.cookie.clone());
-        if let Some(body) = body {
-            request = request
-                .header("X-CSRF-Token", session.secrets.csrf.clone())
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body);
-        }
-        let response = self.send(request, Some(session), false).await?;
-        if response.status() != status {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(response)
-    }
-}
-
-fn serialize_body(body: impl Serialize) -> Result<Vec<u8>, ApiError> {
-    // Prevent oversized allocations even when escaping turns a small input into
-    // a much larger JSON body. Paths never use a serialized mutation envelope.
-    struct Bounded(Vec<u8>);
-    impl std::io::Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > PERSONAL_REQUEST - self.0.len() {
-                return Err(std::io::Error::other("request exceeds body limit"));
+            let request = self
+                .request(route.url(self, query)?)?
+                .header(header::COOKIE, session.secrets.cookie.clone());
+            let response = self.send(request, Some(session), false).await?;
+            if response.status() != StatusCode::OK {
+                return Err(INVALID_RESPONSE);
             }
-            super::extend_bounded(&mut self.0, bytes, PERSONAL_REQUEST);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+            let value = decode(response, CATALOG_BODY).await?;
+            self.check_session(session)?;
+            Ok(value)
+        })
+        .await
     }
-    let mut output = Bounded(Vec::new());
-    serde_json::to_writer(&mut output, &body).map_err(|_| INVALID_INPUT)?;
-    Ok(output.0)
 }
 
 #[cfg(test)]
@@ -846,9 +619,6 @@ mod tests {
                     .is_err()
             );
         }
-        for id in ["preview", "sources"] {
-            assert!(Route::Playlist(id).url(&api, &[]).is_err());
-        }
         let url = Route::Search.url(&api, &[("cursor", "abc.+/_=&")]).unwrap();
         assert_eq!(url.path(), "/search");
         let pairs: Vec<_> = url
@@ -856,14 +626,6 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert_eq!(pairs, [("cursor".to_owned(), "abc.+/_=&".to_owned())]);
-
-        let history = Route::History
-            .url(&api, &[("limit", "20"), ("offset", "40")])
-            .unwrap();
-        assert_eq!(history.path(), "/api/me/history");
-        assert_eq!(history.query(), Some("limit=20&offset=40"));
-        assert!(Route::History.allows(&Method::GET));
-        assert!(!Route::History.allows(&Method::DELETE));
     }
 
     #[test]
@@ -883,7 +645,7 @@ mod tests {
         assert_eq!(item.album_id, "album-a");
         assert_eq!(item.artists[0].id, "artist-a");
         assert!(item.artists[1].id.is_empty());
-        assert!(item.playable_item().is_some());
+        assert!(item.has_audio);
         assert!(!format!("{item:?}").contains("fixtures/"));
     }
 
@@ -967,15 +729,5 @@ mod tests {
         assert!(read(&raw).project(None, None, Some("opaque-next")).is_err());
         raw["items"][1] = wire_item("artist", "same");
         assert!(read(&raw).project(Some(2), None, None).is_err());
-    }
-
-    #[test]
-    fn mutation_serializer_caps_escaped_json() {
-        let body = json!({"value": "\n".repeat(PERSONAL_REQUEST / 2)});
-        assert_eq!(serialize_body(body), Err(INVALID_INPUT));
-        assert_eq!(
-            serialize_body(json!({"liked":true})).unwrap(),
-            br#"{"liked":true}"#
-        );
     }
 }

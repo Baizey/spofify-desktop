@@ -49,7 +49,7 @@ fn send(tx: &mpsc::Sender<Command>, command: Command, ui: &AppWindow) {
     }
 }
 fn scope(epoch: &AtomicU64, c: Command) -> Command {
-    Command::Scoped(epoch.load(Ordering::SeqCst), Box::new(c))
+    c.scoped(epoch.load(Ordering::SeqCst))
 }
 fn clear(ui: &AppWindow) {
     ui.set_query("".into());

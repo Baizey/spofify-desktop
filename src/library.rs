@@ -1,15 +1,14 @@
-//! Account personal wire projections and the retained HTTP rule-source/preview routes.
+//! Account personal wire projections.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
-use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::{
-    CatalogItem, CatalogKind, PageRequest, Route, WireItem, derived_id, limit_ok, opaque_token,
-    page_matches, safe_timestamp,
+    CatalogItem, CatalogKind, WireItem, derived_id, opaque_token, safe_timestamp,
 };
-use super::{Api, ApiError, INVALID_INPUT, INVALID_RESPONSE, Session, valid_id};
+use super::{ApiError, INVALID_INPUT, INVALID_RESPONSE, valid_id};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,21 +64,6 @@ pub struct PlaylistSummary {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OffsetPage<T> {
-    pub items: Vec<T>,
-    pub total: u64,
-    pub offset: u32,
-    pub limit: u32,
-}
-
-impl<T> OffsetPage<T> {
-    pub fn has_more(&self) -> bool {
-        u64::from(self.offset) + (self.items.len() as u64) < self.total
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub id: String,
@@ -99,6 +83,7 @@ pub struct ManualEntry {
     pub track: CatalogItem,
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct DerivedEntry {
     pub occurrence_id: String,
@@ -108,6 +93,7 @@ pub struct DerivedEntry {
     pub track: CatalogItem,
 }
 
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct DerivedPage {
     pub items: Vec<DerivedEntry>,
@@ -238,127 +224,6 @@ pub enum RuleMembership {
     TrackedPlaylist { playlist_id: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrackedPlaylistSource {
-    pub id: String,
-    pub name: String,
-    pub state: SourceState,
-    pub track_count: Option<u64>,
-    pub saved_at: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SourceState {
-    Ready,
-    NotReady,
-}
-
-impl Api {
-    pub async fn tracked_playlist_sources(
-        &self,
-        session: &Session,
-        page: PageRequest,
-    ) -> Result<OffsetPage<TrackedPlaylistSource>, ApiError> {
-        let (limit, offset) = page_params(page)?;
-        let wire: OffsetPage<TrackedPlaylistSource> = self
-            .catalog_get(
-                session,
-                Route::Sources,
-                &[("limit", &limit), ("offset", &offset)],
-            )
-            .await?;
-        let result = wire.project(page, |row| {
-            let ready = row.state == SourceState::Ready;
-            if !valid_id(&row.id)
-                || !super::valid_text(&row.name, 1024)
-                || ready != row.track_count.is_some()
-                || ready != row.saved_at.is_some()
-                || row
-                    .saved_at
-                    .as_deref()
-                    .is_some_and(|s| !super::valid_text(s, 64))
-            {
-                return Err(INVALID_RESPONSE);
-            }
-            Ok(row)
-        })?;
-        unique(result.items.iter().map(|row| row.id.as_str()))?;
-        Ok(result)
-    }
-
-    /// Preview never confers playback selection tokens.
-    pub async fn preview_definition(
-        &self,
-        session: &Session,
-        definition: &RuleDefinition,
-        target: Option<(&str, u64)>,
-        limit: u32,
-        cursor: Option<&str>,
-    ) -> Result<DerivedPage, ApiError> {
-        check_rule_paging(limit, cursor)?;
-        if !definition.is_valid()
-            || target.is_some_and(|(id, revision)| !derived_id(id) || !revision_ok(revision))
-        {
-            return Err(INVALID_INPUT);
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request<'a> {
-            definition: &'a RuleDefinition,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            target_playlist_id: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            expected_revision: Option<u64>,
-            limit: u32,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            cursor: Option<&'a str>,
-        }
-        let target_playlist_id = target.map(|(id, _)| id);
-        let expected_revision = target.map(|(_, revision)| revision);
-        let request = Request {
-            definition,
-            target_playlist_id,
-            expected_revision,
-            limit,
-            cursor,
-        };
-        let wire: WireDerivedPage = self
-            .catalog_write(
-                session,
-                Route::Preview,
-                Method::POST,
-                request,
-                StatusCode::OK,
-            )
-            .await?;
-        wire.project(limit, cursor, DerivedMode::Preview(expected_revision))
-    }
-}
-
-impl<T> OffsetPage<T> {
-    fn project<U>(
-        self,
-        page: PageRequest,
-        project: impl FnMut(T) -> Result<U, ApiError>,
-    ) -> Result<OffsetPage<U>, ApiError> {
-        if !page_matches(page, self.limit, self.offset, self.items.len(), self.total) {
-            return Err(INVALID_RESPONSE);
-        }
-        Ok(OffsetPage {
-            items: self
-                .items
-                .into_iter()
-                .map(project)
-                .collect::<Result<Vec<_>, _>>()?,
-            total: self.total,
-            offset: self.offset,
-            limit: self.limit,
-        })
-    }
-}
-
 impl PlaylistSummary {
     pub(crate) fn checked(
         self,
@@ -459,6 +324,7 @@ impl WireManualEntry {
     }
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireDerivedEntry {
@@ -468,6 +334,7 @@ struct WireDerivedEntry {
     track: WireItem,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireDerivedPage {
@@ -483,12 +350,14 @@ struct WireDerivedPage {
     evaluation_error_code: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum DerivedMode {
     Saved,
     Preview(Option<u64>),
 }
 
+#[cfg(test)]
 impl WireDerivedPage {
     fn project(
         self,
@@ -563,24 +432,8 @@ impl WireDerivedPage {
     }
 }
 
+#[cfg(test)]
 impl RuleDefinition {
-    /// New likes-sourced recipe using a caller-owned stable slot ID (`s_`
-    /// followed by 32 lower-case hex digits).
-    pub fn from_likes(slot_id: String) -> Self {
-        Self {
-            version: 1,
-            sources: vec![RuleSource::Likes {
-                slot_id,
-                take: None,
-            }],
-            include: None,
-            exclude: None,
-            duplicates: RuleDuplicates::Unique,
-            sort: RuleSort::SourceOrder,
-            take: None,
-        }
-    }
-
     /// Local structural limits only. Go owns normalization, ownership checks,
     /// cycle detection, and publication admission.
     pub fn is_valid(&self) -> bool {
@@ -620,6 +473,7 @@ impl RuleDefinition {
     }
 }
 
+#[cfg(test)]
 impl RulePredicate {
     fn valid_at(&self, depth: u8, leaves: &mut u8) -> bool {
         if depth > 4 {
@@ -649,6 +503,7 @@ impl RulePredicate {
     }
 }
 
+#[cfg(test)]
 fn slot_ok(id: &str) -> bool {
     id.strip_prefix("s_").is_some_and(|rest| {
         rest.len() == 32
@@ -658,9 +513,11 @@ fn slot_ok(id: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn valid_rule_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 512 && id.trim() == id && !id.chars().any(char::is_control)
 }
+#[cfg(test)]
 fn take_ok(take: Option<RuleTake>) -> bool {
     take.is_none_or(|t| (1..=i32::MAX as u32).contains(&t.count))
 }
@@ -675,20 +532,6 @@ fn valid_error_code(code: Option<&str>) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
     })
-}
-
-fn page_params(page: PageRequest) -> Result<(String, String), ApiError> {
-    if !limit_ok(page.limit) || page.offset > 1_000_000 {
-        return Err(INVALID_INPUT);
-    }
-    Ok((page.limit.to_string(), page.offset.to_string()))
-}
-
-fn check_rule_paging(limit: u32, cursor: Option<&str>) -> Result<(), ApiError> {
-    if !limit_ok(limit) || cursor.is_some_and(|cursor| !opaque_token(cursor, 4096)) {
-        return Err(INVALID_INPUT);
-    }
-    Ok(())
 }
 
 fn metadata<'a>(name: &'a str, description: &str) -> Result<&'a str, ApiError> {
@@ -706,6 +549,7 @@ fn metadata<'a>(name: &'a str, description: &str) -> Result<&'a str, ApiError> {
     Ok(name)
 }
 
+#[cfg(test)]
 fn unique<'a>(ids: impl Iterator<Item = &'a str>) -> Result<(), ApiError> {
     let mut seen = HashSet::new();
     for id in ids {
@@ -736,7 +580,7 @@ mod tests {
         let row = wire.project().unwrap();
         assert_eq!(row.track.id, "retired-track");
         assert!(row.metadata_missing);
-        assert!(row.track.playable_item().is_none());
+        assert!(!row.track.has_audio);
     }
 
     #[test]
