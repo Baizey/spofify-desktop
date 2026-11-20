@@ -10,11 +10,24 @@ def release(tag, *, draft=False, prerelease=False):
 
 
 class ReleaseVersion(unittest.TestCase):
-    def test_initial_ignores_nonstable_versions(self):
-        pages = [[release("v1.0.0-beta.1", prerelease=True), release("v0.1.1", draft=True)]]
-        check_bump("0.1.0", "initial", pages)
-        with self.assertRaisesRegex(ValueError, "First stable release"):
-            check_bump("0.1.0", "minor", pages)
+    def test_first_exact_bumps_from_zero(self):
+        for bump, expected, wrong in [
+            ("major", "1.0.0", "0.1.0"),
+            ("minor", "0.1.0", "0.0.1"),
+            ("patch", "0.0.1", "0.1.0"),
+        ]:
+            with self.subTest(bump=bump):
+                check_bump(expected, bump, [[]])
+                with self.assertRaisesRegex(ValueError, rf"from 0\.0\.0 must be {expected}"):
+                    check_bump(wrong, bump, [[]])
+
+    def test_first_release_ignores_nonstable_versions(self):
+        pages = [[
+            release("v1.0.0", prerelease=True),
+            release("v0.1.1", draft=True),
+            release("v2.0.0-beta.1"),
+        ]]
+        check_bump("0.1.0", "minor", pages)
 
     def test_exact_bump_from_highest_stable_release_across_pages(self):
         pages = [[release("v1.9.9")], [release("v1.10.2"), release("v2.0.0", draft=True)]]

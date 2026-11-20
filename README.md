@@ -40,11 +40,11 @@ Ensure `$HOME/.local/bin` is on the desktop session's `PATH`. To remove the bina
 
 ## Install a GitHub release
 
-On Linux x86-64 (Ubuntu 24.04 or newer, or an equivalent desktop with glibc 2.39+, ALSA and fontconfig), extract the release tarball and run `bash install.sh`. Then open **Spofify** from the app menu. No Rust installation is needed. If you used `make install` before, use the app menu rather than an older `spofify-desktop` on your shell `PATH`.
+On Linux x86-64 (Ubuntu 24.04 or newer, or an equivalent desktop with glibc 2.39+, ALSA and fontconfig), download the installer archive from [official GitHub Releases](https://github.com/Baizey/spofify-desktop/releases), extract it, and run `bash install.sh`. Then open **Spofify** from the app menu. No Rust installation is needed. If you used `make install` before, use the app menu rather than an older `spofify-desktop` on your shell `PATH`.
 
-When a verified update is available, select **Update** at the top of the app. Quit and reopen Spofify when you’re ready to apply it. You can also rerun `install.sh` from **Releases**. Either way, your settings, sign-in and saved music stay in place.
+When an update is available, select **Update** at the top of the app. When it’s ready, quit and reopen Spofify to run the new version. To update manually, close Spofify and rerun `install.sh` from the latest official release. Either way, your settings, sign-in, and saved music stay in place.
 
-See [desktop releases](docs/desktop-release.md) to build or publish a package.
+See [desktop releases](docs/desktop-release.md) for how updates are verified or how to publish a package.
 
 ## Development
 

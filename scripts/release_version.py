@@ -7,7 +7,7 @@ import sys
 import tomllib
 
 MAX_COMPONENT = 2**32 - 1
-FIRST_VERSION = (0, 1, 0)
+EMPTY_BASELINE = (0, 0, 0)
 BUMPS = ("major", "minor", "patch")
 
 
@@ -49,13 +49,9 @@ def check_bump(version, bump, pages):
             except ValueError:
                 continue  # Not a stable desktop release tag.
 
-    if not previous:
-        if bump != "initial" or current != FIRST_VERSION:
-            raise ValueError("First stable release must use initial with version 0.1.0")
-        return
     if bump not in BUMPS:
-        raise ValueError("Choose major, minor, or patch after the first stable release")
-    base = max(previous)
+        raise ValueError("Choose major, minor, or patch")
+    base = max(previous, default=EMPTY_BASELINE)
     i = BUMPS.index(bump)
     expected = base[:i] + (base[i] + 1,) + (0,) * (2 - i)
     if expected[i] > MAX_COMPONENT:
@@ -67,12 +63,11 @@ def check_bump(version, bump, pages):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bump", nargs="?", choices=("initial", *BUMPS))
+    parser.add_argument("bump", choices=BUMPS)
     args = parser.parse_args()
     try:
         version = project_version(Path.cwd())
-        if args.bump:
-            check_bump(version, args.bump, json.load(sys.stdin))
+        check_bump(version, args.bump, json.load(sys.stdin))
         print(version)
     except (KeyError, OSError, ValueError) as error:
         parser.exit(1, f"Release version: {error}\n")

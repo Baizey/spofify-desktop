@@ -1,8 +1,9 @@
-//! Signed, user-local Linux releases. No updater runs in source builds or on
-//! distro-managed binaries. Installing a new image never restarts the player.
+//! User-local Linux releases verified against GitHub release metadata.
+//! Installing a new image never restarts the player.
 use crate::desk::Access;
-use reqwest::{Client, Response, Url, redirect::Policy};
-use ring::{digest, signature};
+use futures_util::{Stream, StreamExt};
+use reqwest::{Client, ClientBuilder, RequestBuilder, Response, StatusCode, Url, redirect::Policy};
+use ring::digest;
 use rustix::{
     fs::{FlockOperation, flock},
     process::geteuid,
@@ -19,9 +20,11 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
-const MANIFEST_ASSET: &str = "update-v1-linux-x86_64.json";
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/Baizey/spofify-desktop/releases/latest";
+const ASSET_BASE: &str = "https://github.com/Baizey/spofify-desktop/releases/download";
 const BINARY_ASSET: &str = "spofify-desktop-linux-x86_64";
-const MAX_MANIFEST: usize = 8 * 1024;
+const MAX_METADATA: usize = 1024 * 1024;
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -48,20 +51,28 @@ impl Version {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope {
-    manifest: String,
-    signature: String,
+struct Release {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<ReleaseAsset>,
 }
-#[derive(Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    schema: u8,
-    repository: String,
-    asset: String,
+
+#[derive(Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    state: String,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Update {
     version: String,
+    url: String,
     bytes: u64,
-    sha256: String,
+    sha256: [u8; 32],
 }
 
 fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
@@ -72,6 +83,7 @@ fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),
             b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
             _ => None,
         }
     }
@@ -82,89 +94,80 @@ fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(output)
 }
 
-struct Channel {
-    repository: &'static str,
-    key: [u8; 32],
-    running: Version,
-}
-impl Channel {
-    fn configured() -> Option<Self> {
-        if cfg!(debug_assertions) {
-            return None;
-        }
-        let repository = option_env!("SPOFIFY_UPDATE_REPO")?;
-        let (owner, name) = repository.split_once('/')?;
-        let safe_segment = |s: &str| {
-            !s.is_empty()
-                && s.len() <= 100
-                && s.as_bytes()[0].is_ascii_alphanumeric()
-                && s.bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
-        };
-        if !safe_segment(owner) || !safe_segment(name) {
-            return None;
-        }
-        Some(Self {
-            repository,
-            key: decode_hex(option_env!("SPOFIFY_UPDATE_PUBLIC_KEY")?)?,
-            running: Version::parse(env!("CARGO_PKG_VERSION"))?,
-        })
+fn available_update(body: &[u8], running: Version) -> Option<Update> {
+    let release: Release = serde_json::from_slice(body).ok()?;
+    let version = release.tag_name.strip_prefix('v')?;
+    if release.draft || release.prerelease || Version::parse(version)? <= running {
+        return None;
     }
-    fn manifest(&self, body: &[u8]) -> Option<Manifest> {
-        if body.len() > MAX_MANIFEST {
-            return None;
-        }
-        let signed: Envelope = serde_json::from_slice(body).ok()?;
-        let sig = decode_hex::<64>(&signed.signature)?;
-        signature::UnparsedPublicKey::new(&signature::ED25519, self.key)
-            .verify(signed.manifest.as_bytes(), &sig)
-            .ok()?;
-        let manifest: Manifest = serde_json::from_str(&signed.manifest).ok()?;
-        (manifest.schema == 1
-            && manifest.repository == self.repository
-            && manifest.asset == BINARY_ASSET
-            && (1..=MAX_BINARY).contains(&manifest.bytes)
-            && decode_hex::<32>(&manifest.sha256).is_some()
-            && Version::parse(&manifest.version)? > self.running)
-            .then_some(manifest)
+    let mut matching = release
+        .assets
+        .into_iter()
+        .filter(|a| a.name == BINARY_ASSET);
+    let asset = matching.next()?;
+    let url = format!("{ASSET_BASE}/{}/{BINARY_ASSET}", release.tag_name);
+    if matching.next().is_some()
+        || asset.state != "uploaded"
+        || asset.browser_download_url != url
+        || !(1..=MAX_BINARY).contains(&asset.size)
+    {
+        return None;
     }
-    fn url(&self, suffix: &str) -> String {
-        format!("https://github.com/{}/releases/{suffix}", self.repository)
-    }
+    Some(Update {
+        version: version.into(),
+        url,
+        bytes: asset.size,
+        sha256: decode_hex(asset.digest?.strip_prefix("sha256:")?)?,
+    })
 }
 
-fn allowed_url(url: &Url) -> bool {
-    url.scheme() == "https"
+fn allowed_asset_redirect(url: &Url, previous: usize) -> bool {
+    // The canonical GitHub download may send one redirect to GitHub's asset
+    // storage. Do not follow repository moves or aliases back through github.com.
+    previous == 1
+        && url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none()
+        && url.fragment().is_none()
         && matches!(
             url.host_str(),
-            Some(
-                "github.com"
-                    | "release-assets.githubusercontent.com"
-                    | "objects.githubusercontent.com"
-            )
+            Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com")
         )
+        && url.path().starts_with("/github-production-release-asset/")
 }
-fn client() -> Result<Client, reqwest::Error> {
+
+fn client() -> ClientBuilder {
     Client::builder()
         .https_only(true)
+        .no_proxy()
         .referer(false)
         .user_agent("Spofify Desktop updater")
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(90))
+}
+
+fn asset_client() -> Result<Client, reqwest::Error> {
+    client()
         .redirect(Policy::custom(|attempt| {
-            if attempt.previous().len() < 5 && allowed_url(attempt.url()) {
+            if allowed_asset_redirect(attempt.url(), attempt.previous().len()) {
                 attempt.follow()
             } else {
-                attempt.error("Unexpected release redirect")
+                attempt.error("Unexpected release asset redirect")
             }
         }))
         .build()
 }
-async fn fetch(http: &Client, url: String) -> Option<Response> {
-    http.get(url).send().await.ok()?.error_for_status().ok()
+
+fn release_request(http: &Client) -> RequestBuilder {
+    http.get(LATEST_RELEASE_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+}
+
+async fn fetch(request: RequestBuilder) -> Option<Response> {
+    let response = request.send().await.ok()?;
+    (response.status() == StatusCode::OK).then_some(response)
 }
 
 /// The managed package opts in by placing the executable in its dedicated
@@ -202,26 +205,35 @@ impl Drop for Staged {
     }
 }
 
-async fn check(http: &Client, channel: &Channel) -> Option<Option<Manifest>> {
-    let mut response = fetch(
-        http,
-        channel.url(&format!("latest/download/{MANIFEST_ASSET}")),
-    )
-    .await?;
+async fn check(http: &Client, running: Version) -> Option<Option<Update>> {
+    let response = fetch(release_request(http)).await?;
+    let body = bounded_metadata(response.content_length(), response.bytes_stream()).await?;
+    Some(available_update(&body, running))
+}
+
+async fn bounded_metadata<T: AsRef<[u8]>, E>(
+    content_length: Option<u64>,
+    chunks: impl Stream<Item = Result<T, E>>,
+) -> Option<Vec<u8>> {
+    if content_length.is_some_and(|n| n > MAX_METADATA as u64) {
+        return None;
+    }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if chunk.len() > MAX_MANIFEST - body.len() {
+    tokio::pin!(chunks);
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.ok()?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > MAX_METADATA - body.len() {
             return None;
         }
-        body.extend_from_slice(&chunk);
+        body.extend_from_slice(chunk);
     }
-    Some(channel.manifest(&body))
+    Some(body)
 }
 
 async fn download(
     http: &Client,
-    channel: &Channel,
-    manifest: &Manifest,
+    update: &Update,
     target: &Path,
     online: impl Fn() -> bool,
 ) -> Option<()> {
@@ -234,14 +246,14 @@ async fn download(
     {
         return None;
     }
-    let response = fetch(
-        http,
-        channel.url(&format!("download/v{}/{BINARY_ASSET}", manifest.version)),
+    let response = fetch(http.get(&update.url)).await?;
+    if !save_update(
+        response.content_length(),
+        response.bytes_stream(),
+        update,
+        target,
+        || online() && current_image(target).ok() == Some(true),
     )
-    .await?;
-    if !save_update(response, manifest, target, || {
-        online() && current_image(target).ok() == Some(true)
-    })
     .await?
     {
         return None;
@@ -250,30 +262,31 @@ async fn download(
     Some(())
 }
 
-async fn save_update(
-    mut response: Response,
-    manifest: &Manifest,
+async fn save_update<T: AsRef<[u8]>, E>(
+    content_length: Option<u64>,
+    chunks: impl Stream<Item = Result<T, E>>,
+    update: &Update,
     target: &Path,
     may_replace: impl FnOnce() -> bool,
 ) -> Option<bool> {
-    if response
-        .content_length()
-        .is_some_and(|n| n != manifest.bytes)
-    {
+    if content_length.is_some_and(|n| n != update.bytes) {
         return None;
     }
     let (stage, mut file) = Staged::create(target.parent()?).ok()?;
     let mut hash = digest::Context::new(&digest::SHA256);
     let mut bytes = 0;
-    while let Some(chunk) = response.chunk().await.ok()? {
-        bytes += chunk.len() as u64;
-        if bytes > manifest.bytes {
+    tokio::pin!(chunks);
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.ok()?;
+        let chunk = chunk.as_ref();
+        if chunk.len() as u64 > update.bytes - bytes {
             return None;
         }
-        hash.update(&chunk);
-        file.write_all(&chunk).ok()?;
+        bytes += chunk.len() as u64;
+        hash.update(chunk);
+        file.write_all(chunk).ok()?;
     }
-    if bytes != manifest.bytes || hash.finish().as_ref() != decode_hex::<32>(&manifest.sha256)? {
+    if bytes != update.bytes || hash.finish().as_ref() != update.sha256 {
         return None;
     }
     file.set_permissions(fs::Permissions::from_mode(0o755))
@@ -323,7 +336,10 @@ fn bind_action(ui: &crate::AppWindow, request: mpsc::Sender<Uuid>) {
 }
 
 pub fn start(ui: &crate::AppWindow, access: watch::Receiver<Option<Access>>) {
-    let Some(channel) = Channel::configured() else {
+    if cfg!(debug_assertions) || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let Some(running) = Version::parse(env!("CARGO_PKG_VERSION")) else {
         return;
     };
     let Some(home) = std::env::var_os("HOME")
@@ -348,18 +364,21 @@ pub fn start(ui: &crate::AppWindow, access: watch::Receiver<Option<Access>>) {
             else {
                 return;
             };
-            runtime.block_on(run_updates(channel, target, weak, access, requests));
+            runtime.block_on(run_updates(running, target, weak, access, requests));
         });
 }
 
 async fn run_updates(
-    channel: Channel,
+    running: Version,
     target: PathBuf,
     ui: slint::Weak<crate::AppWindow>,
     mut access: watch::Receiver<Option<Access>>,
     mut requests: mpsc::Receiver<Uuid>,
 ) {
-    let Ok(http) = client() else { return };
+    let Ok(api) = client().redirect(Policy::none()).build() else {
+        return;
+    };
+    let Ok(assets) = asset_client() else { return };
     let live_access = access.clone();
     'connection: loop {
         show(&ui, Notice::Hidden);
@@ -396,15 +415,15 @@ async fn run_updates(
         if !online() {
             continue;
         }
-        let mut offer: Option<(Manifest, Uuid)> = None;
+        let mut offer: Option<(Update, Uuid)> = None;
         let mut delay = Duration::ZERO;
         loop {
-            // Refresh the manifest without making the visible action unresponsive.
+            // Refresh the offer without making the visible action unresponsive.
             let wait = delay;
             let refresh = async {
                 tokio::time::sleep(wait).await;
                 if online() && current_image(&target).ok() == Some(true) {
-                    check(&http, &channel).await
+                    check(&api, running).await
                 } else {
                     None
                 }
@@ -417,7 +436,7 @@ async fn run_updates(
                     _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
                     request = requests.recv() => {
                         let Some(request) = request else { return };
-                        let Some((manifest, id)) = offer.as_mut().filter(|(_, id)| *id == request) else {
+                        let Some((update, id)) = offer.as_mut().filter(|(_, id)| *id == request) else {
                             continue;
                         };
                         show(&ui, Notice::Downloading);
@@ -425,7 +444,7 @@ async fn run_updates(
                             biased;
                             _ = mode.changed() => continue 'connection,
                             _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
-                            installed = download(&http, &channel, manifest, &target, online) => installed,
+                            installed = download(&assets, update, &target, online) => installed,
                         };
                         if installed.is_some() {
                             show(&ui, Notice::Ready);
@@ -449,10 +468,10 @@ async fn run_updates(
                         }
                         delay = if found.is_some() { CHECK_INTERVAL } else { RETRY_INTERVAL };
                         let found = found.flatten();
-                        if found.as_ref() != offer.as_ref().map(|(manifest, _)| manifest) {
-                            offer = found.map(|manifest| (manifest, Uuid::new_v4()));
-                            if let Some((manifest, id)) = &offer {
-                                show(&ui, Notice::Available(&manifest.version, *id));
+                        if found.as_ref() != offer.as_ref().map(|(update, _)| update) {
+                            offer = found.map(|update| (update, Uuid::new_v4()));
+                            if let Some((update, id)) = &offer {
+                                show(&ui, Notice::Available(&update.version, *id));
                             } else {
                                 show(&ui, Notice::Hidden);
                             }
@@ -551,8 +570,32 @@ mod tests {
         assert!(ui.get_playing());
         assert_eq!(ui.get_now_track_id(), "test-track");
     }
-    use ring::signature::{Ed25519KeyPair, KeyPair};
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn fixture_release(tag: &str, binary: &[u8]) -> Value {
+        let sha256: String = digest::digest(&digest::SHA256, binary)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        json!({
+            "tag_name": tag, "draft": false, "prerelease": false,
+            "body": "Release notes are not trusted for updater decisions.",
+            "assets": [{
+                "id": 123, "name": BINARY_ASSET, "state": "uploaded",
+                "size": binary.len(), "digest": format!("sha256:{sha256}"),
+                "browser_download_url": format!("{ASSET_BASE}/{tag}/{BINARY_ASSET}"),
+            }, {
+                "id": 456, "name": "spofify-desktop-1.0.1-linux-x86_64.tar.gz",
+                "state": "uploaded", "size": 1234, "digest": null,
+                "browser_download_url": format!("{ASSET_BASE}/{tag}/installer.tar.gz"),
+            }],
+        })
+    }
+
+    fn parse_fixture(release: &Value) -> Option<Update> {
+        available_update(&serde_json::to_vec(release).unwrap(), Version([1, 0, 0]))
+    }
 
     #[test]
     fn version_is_numeric_and_canonical() {
@@ -570,55 +613,132 @@ mod tests {
         }
     }
     #[test]
-    fn updates_require_exact_signature_channel_asset_and_newer_version() {
-        let key = Ed25519KeyPair::from_seed_unchecked(&[3; 32]).unwrap();
-        let channel = Channel {
-            repository: "owner/downloads",
-            key: key.public_key().as_ref().try_into().unwrap(),
-            running: Version([1, 0, 0]),
-        };
-        let envelope = |version, repo, asset, size, tamper| {
-            let manifest = json!({"schema":1,"repository":repo,"asset":asset,"version":version,"bytes":size,"sha256":"aa".repeat(32)}).to_string();
-            let sig: String = key
-                .sign(manifest.as_bytes())
-                .as_ref()
-                .iter()
-                .map(|n| format!("{n:02x}"))
-                .collect();
-            let manifest = if tamper {
-                format!("{manifest} ")
-            } else {
-                manifest
-            };
-            json!({"manifest":manifest,"signature":sig}).to_string()
-        };
-        let good = envelope("1.0.1", channel.repository, BINARY_ASSET, 1024, false);
-        assert_eq!(channel.manifest(good.as_bytes()).unwrap().version, "1.0.1");
-        for bad in [
-            envelope("1.0.0", channel.repository, BINARY_ASSET, 1024, false),
-            envelope("0.9.0", channel.repository, BINARY_ASSET, 1024, false),
-            envelope("1.0.1", "other/downloads", BINARY_ASSET, 1024, false),
-            envelope("1.0.1", channel.repository, "different-asset", 1024, false),
-            envelope(
-                "1.0.1",
-                channel.repository,
-                BINARY_ASSET,
-                MAX_BINARY + 1,
-                false,
-            ),
-            envelope("1.0.1", channel.repository, BINARY_ASSET, 1024, true),
+    fn api_request_uses_only_the_public_canonical_latest_endpoint() {
+        let api = client().redirect(Policy::none()).build().unwrap();
+        let req = release_request(&api).build().unwrap();
+        assert_eq!(req.method(), reqwest::Method::GET);
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.github.com/repos/Baizey/spofify-desktop/releases/latest"
+        );
+        assert_eq!(req.headers()["accept"], "application/vnd.github+json");
+        assert!(req.headers().contains_key("x-github-api-version"));
+        assert!(!req.headers().contains_key("authorization"));
+        assert!(!req.headers().contains_key("cookie"));
+    }
+
+    #[test]
+    fn release_must_be_stable_canonical_and_newer() {
+        let binary = b"test image";
+        let good = fixture_release("v1.0.1", binary);
+        let update = parse_fixture(&good).unwrap();
+        assert_eq!(update.version, "1.0.1");
+        assert_eq!(update.bytes, binary.len() as u64);
+        assert_eq!(
+            update.sha256,
+            digest::digest(&digest::SHA256, binary).as_ref()
+        );
+        for tag in [
+            "v1.0.0",
+            "v0.9.0",
+            "1.0.1",
+            "V1.0.1",
+            "v1.00.1",
+            "v1.0.1-rc.1",
+            "v1.0.1+build",
+            "v1.0.1/asset",
         ] {
-            assert!(channel.manifest(bad.as_bytes()).is_none());
+            assert!(
+                parse_fixture(&fixture_release(tag, binary)).is_none(),
+                "{tag}"
+            );
         }
+        for field in ["draft", "prerelease"] {
+            let mut bad = good.clone();
+            bad[field] = json!(true);
+            assert!(parse_fixture(&bad).is_none(), "{field}");
+            bad.as_object_mut().unwrap().remove(field);
+            assert!(parse_fixture(&bad).is_none(), "missing {field}");
+        }
+    }
+
+    #[test]
+    fn exact_uploaded_asset_requires_one_size_digest_and_canonical_url() {
+        let good = fixture_release("v1.0.1", b"test image");
+        let mut duplicate = good.clone();
+        duplicate["assets"]
+            .as_array_mut()
+            .unwrap()
+            .push(good["assets"][0].clone());
+        assert!(parse_fixture(&duplicate).is_none());
+        let mut missing = good.clone();
+        missing["assets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("digest");
+        assert!(parse_fixture(&missing).is_none());
+        for (field, value) in [
+            ("name", json!("different-asset")),
+            ("state", json!("starter")),
+            ("size", json!(0)),
+            ("size", json!(MAX_BINARY + 1)),
+            ("size", json!(-1)),
+            ("digest", Value::Null),
+            ("digest", json!(format!("sha512:{}", "00".repeat(32)))),
+            ("digest", json!(format!("sha256:{}", "zz".repeat(32)))),
+            ("digest", json!(format!("sha256:{}", "aa".repeat(31)))),
+        ] {
+            let mut bad = good.clone();
+            bad["assets"][0][field] = value;
+            assert!(parse_fixture(&bad).is_none(), "{bad}");
+        }
+        let canonical = good["assets"][0]["browser_download_url"].as_str().unwrap();
+        for url in [
+            canonical.replace("Baizey", "other-owner"),
+            canonical.replace("spofify-desktop/releases", "other-repo/releases"),
+            canonical.replace("v1.0.1", "v1.0.2"),
+            canonical.replace(BINARY_ASSET, "other-asset"),
+            canonical.replace("github.com", "github.com.evil.invalid"),
+            canonical.replace("https://", "http://"),
+            format!("{canonical}?raw=true"),
+            format!("{canonical}#file"),
+        ] {
+            let mut bad = good.clone();
+            bad["assets"][0]["browser_download_url"] = json!(url);
+            assert!(parse_fixture(&bad).is_none(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_metadata_before_and_during_streaming() {
+        use futures_util::stream;
+        let max = vec![0u8; MAX_METADATA];
+        let ok = [Ok::<_, ()>(max.as_slice())];
+        assert_eq!(
+            bounded_metadata(None, stream::iter(ok))
+                .await
+                .unwrap()
+                .len(),
+            MAX_METADATA
+        );
+        let over = [ok[0], Ok(b"x".as_slice())];
+        assert!(bounded_metadata(None, stream::iter(over)).await.is_none());
+        assert!(
+            bounded_metadata(Some(MAX_METADATA as u64 + 1), stream::iter(ok))
+                .await
+                .is_none()
+        );
+        assert!(
+            bounded_metadata(None, stream::iter([ok[0], Err(())]))
+                .await
+                .is_none()
+        );
     }
     #[tokio::test]
     async fn downloaded_bytes_replace_atomically_only_after_verification_and_admission() {
+        use futures_util::stream;
         use std::io::Read;
         use std::os::unix::fs::DirBuilderExt;
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::TcpListener,
-        };
         struct Fixture(PathBuf);
         impl Drop for Fixture {
             fn drop(&mut self) {
@@ -632,43 +752,24 @@ mod tests {
         fs::write(&target, b"old image").unwrap();
         let mut opened_before_upgrade = File::open(&target).unwrap();
         let next = b"new image";
-        let manifest = Manifest {
-            schema: 1,
-            repository: String::new(),
-            asset: BINARY_ASSET.into(),
-            version: "1.0.1".into(),
-            bytes: next.len() as u64,
-            sha256: digest::digest(&digest::SHA256, next)
-                .as_ref()
-                .iter()
-                .map(|n| format!("{n:02x}"))
-                .collect(),
-        };
-        let http = Client::builder().no_proxy().build().unwrap();
-        for (payload, admitted, succeeds) in [
-            (&b"bad image"[..], true, false),
-            (&b"short"[..], true, false),
-            (&next[..], false, true),
-            (&next[..], true, true),
+        let update = parse_fixture(&fixture_release("v1.0.1", next)).unwrap();
+        for (payload, length, interrupted, admitted, succeeds) in [
+            (&b"bad image"[..], None, false, true, false),
+            (&b"short"[..], None, false, true, false),
+            (&b"new image and extra"[..], None, false, true, false),
+            (&next[..], Some(1), false, true, false),
+            (&next[..], None, true, true, false),
+            (&next[..], None, false, false, true),
+            (&next[..], Some(update.bytes), false, true, true),
         ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                socket.read(&mut [0; 2048]).await.unwrap();
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    payload.len()
-                );
-                socket.write_all(header.as_bytes()).await.unwrap();
-                socket.write_all(payload).await.unwrap();
-            });
-            let response = fetch(&http, url).await.unwrap();
+            let chunks = payload
+                .chunks(3)
+                .map(Ok)
+                .chain(interrupted.then_some(Err(())));
             assert_eq!(
-                save_update(response, &manifest, &target, || admitted).await,
+                save_update(length, stream::iter(chunks), &update, &target, || admitted).await,
                 succeeds.then_some(admitted)
             );
-            server.await.unwrap();
             assert_eq!(
                 fs::read(&target).unwrap(),
                 if admitted && succeeds {
@@ -685,17 +786,32 @@ mod tests {
         assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o755);
     }
     #[test]
-    fn redirects_stay_on_exact_github_https_origins() {
-        assert!(allowed_url(
-            &Url::parse("https://release-assets.githubusercontent.com/file").unwrap()
-        ));
-        for bad in [
-            "http://github.com/file",
-            "https://github.com.evil.invalid/file",
-            "https://evil@github.com/file",
-            "https://github.com:444/file",
+    fn redirects_allow_only_one_hop_to_github_asset_storage() {
+        for host in [
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com",
         ] {
-            assert!(!allowed_url(&Url::parse(bad).unwrap()));
+            let allowed = Url::parse(&format!(
+                "https://{host}/github-production-release-asset/123/test?signature=example"
+            ))
+            .unwrap();
+            assert!(allowed_asset_redirect(&allowed, 1));
+            assert!(!allowed_asset_redirect(&allowed, 2));
+        }
+        for bad in [
+            "https://github.com/other/repo/releases/download/v1.0.1/file",
+            "https://api.github.com/repos/other/repo/releases/latest",
+            "http://release-assets.githubusercontent.com/github-production-release-asset/123/test",
+            "https://release-assets.githubusercontent.com.evil.invalid/github-production-release-asset/123/test",
+            "https://evil@release-assets.githubusercontent.com/github-production-release-asset/123/test",
+            "https://release-assets.githubusercontent.com:444/github-production-release-asset/123/test",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123/test#file",
+            "https://release-assets.githubusercontent.com/unexpected/file",
+        ] {
+            assert!(
+                !allowed_asset_redirect(&Url::parse(bad).unwrap(), 1),
+                "{bad}"
+            );
         }
     }
 }

@@ -4,13 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: Build only, or publish a release with this version change
+        description: Publish a release with this version change
         type: choice
         required: true
-        default: build-only
+        default: patch
         options:
-          - build-only
-          - initial
           - major
           - minor
           - patch
@@ -19,15 +17,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: spofify-desktop-release-${{ inputs.release != 'build-only' && github.ref == 'refs/heads/main' && 'publish' || format('check-{0}', github.ref) }}
+  group: spofify-desktop-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   package:
     runs-on: ubuntu-24.04
-    env:
-      SPOFIFY_UPDATE_REPO: ${{ github.repository }}
-      SPOFIFY_UPDATE_PUBLIC_KEY: ${{ vars.SPOFIFY_UPDATE_PUBLIC_KEY }}
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -41,17 +36,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
-          if [[ "$RELEASE" == build-only ]]; then
-            version=$(python3 scripts/release_version.py)
-          else
-            test "$GITHUB_REF" = refs/heads/main || { echo 'Publish only from main.' >&2; exit 1; }
-            version=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | python3 scripts/release_version.py "$RELEASE")
-            test "$(gh repo view "$GITHUB_REPOSITORY" --json visibility --jq .visibility)" = PUBLIC \
-              || { echo 'The update channel must be publicly readable.' >&2; exit 1; }
-            [[ "$SPOFIFY_UPDATE_PUBLIC_KEY" =~ ^[a-f0-9]{64}$ ]] \
-              || { echo 'Configure the SPOFIFY_UPDATE_PUBLIC_KEY repository variable.' >&2; exit 1; }
-          fi
+          test "$GITHUB_REPOSITORY" = Baizey/spofify-desktop && test "$GITHUB_REF" = refs/heads/main \
+            || { echo 'Publish only from Baizey/spofify-desktop on main.' >&2; exit 1; }
+          test "$(gh repo view "$GITHUB_REPOSITORY" --json visibility --jq .visibility)" = PUBLIC \
+            || { echo 'The update channel must be publicly readable.' >&2; exit 1; }
+          version=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            | python3 scripts/release_version.py "$RELEASE")
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Install Linux build requirements
         run: |
@@ -95,11 +85,11 @@ jobs:
           name: spofify-desktop-linux-x86_64
           path: |
             dist/spofify-desktop-linux-x86_64
-            dist/*.tar.gz
+            dist/spofify-desktop-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
           if-no-files-found: error
 
   publish:
-    if: ${{ inputs.release != 'build-only' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.repository == 'Baizey/spofify-desktop' && github.ref == 'refs/heads/main' }}
     needs: package
     runs-on: ubuntu-24.04
     environment: desktop-release
@@ -108,8 +98,6 @@ jobs:
     env:
       VERSION: ${{ needs.package.outputs.version }}
       RELEASE: ${{ inputs.release }}
-      SPOFIFY_UPDATE_REPO: ${{ github.repository }}
-      SPOFIFY_UPDATE_PUBLIC_KEY: ${{ vars.SPOFIFY_UPDATE_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -118,26 +106,30 @@ jobs:
         with:
           name: spofify-desktop-linux-x86_64
           path: dist
-      - name: Sign the update manifest
-        env:
-          SPOFIFY_RELEASE_SIGNING_KEY: ${{ secrets.SPOFIFY_RELEASE_SIGNING_KEY }}
-        run: python3 scripts/sign-release.py dist "$VERSION"
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
+          test "$GITHUB_REPOSITORY" = Baizey/spofify-desktop && test "$GITHUB_REF" = refs/heads/main \
+            || { echo 'Publish only from Baizey/spofify-desktop on main.' >&2; exit 1; }
+          test "$(gh repo view "$GITHUB_REPOSITORY" --json visibility --jq .visibility)" = PUBLIC \
+            || { echo 'The update channel must be publicly readable.' >&2; exit 1; }
           resolved=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             | python3 scripts/release_version.py "$RELEASE")
           test "$resolved" = "$VERSION" || { echo 'Package version changed before publishing.' >&2; exit 1; }
-          test "$(gh repo view "$GITHUB_REPOSITORY" --json visibility --jq .visibility)" = PUBLIC \
-            || { echo 'The update channel must be publicly readable.' >&2; exit 1; }
+          installer="dist/spofify-desktop-$VERSION-linux-x86_64.tar.gz"
+          binary=dist/spofify-desktop-linux-x86_64
+          test -s "$installer" || { echo 'Release installer is missing or empty.' >&2; exit 1; }
+          bytes=$(stat -c '%s' "$binary")
+          # Match the updater's 64 MiB download limit.
+          (( bytes > 0 && bytes <= 64 * 1024 * 1024 )) \
+            || { echo 'Release executable must be nonempty and at most 64 MiB.' >&2; exit 1; }
           tag="v$VERSION"
           # Create-only: a concurrent/existing tag must not be reused.
           target=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
             -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA" --jq .object.sha)
           test "$target" = "$GITHUB_SHA" || { echo 'Release tag does not match the packaged commit.' >&2; exit 1; }
-          gh release create "$tag" "dist/spofify-desktop-$VERSION-linux-x86_64.tar.gz" \
-            dist/spofify-desktop-linux-x86_64 dist/update-v1-linux-x86_64.json \
+          gh release create "$tag" "$installer" "$binary" \
             --repo "$GITHUB_REPOSITORY" --verify-tag --latest --generate-notes \
             --title "Spofify Desktop $VERSION"

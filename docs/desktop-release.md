@@ -1,40 +1,32 @@
 # Desktop releases
 
-Run **Actions → Desktop release → Run workflow** on `main`. Choose `build-only` to test the installer without publishing or configuring signing. Choose `initial` for the first release (`v0.1.0`). Published installers appear under **Releases** on this repository. Configure signing once before the first publish. Normal pushes run CI and do not publish releases.
+## Publish
 
-For later releases, update the desktop package version in `Cargo.toml` and `Cargo.lock` together, merge to `main`, then choose:
+On [Baizey/spofify-desktop](https://github.com/Baizey/spofify-desktop), update the desktop package version in `Cargo.toml` and `Cargo.lock` together, then merge to `main`. Run **Actions → Desktop release → Run workflow** on `main` and choose the matching bump. Normal pushes run Native Linux CI and do not publish releases.
 
-| Choice | Use for | Example from `1.2.3` |
-| --- | --- | --- |
-| `major` | Breaking changes | `2.0.0` |
-| `minor` | Backward-compatible features | `1.3.0` |
-| `patch` | Backward-compatible fixes | `1.2.4` |
+| Choice | Use for | From `1.2.3` | First release |
+| --- | --- | --- | --- |
+| `major` | Breaking changes | `2.0.0` | `1.0.0` |
+| `minor` | Backward-compatible features | `1.3.0` | `0.1.0` |
+| `patch` | Backward-compatible fixes | `1.2.4` | `0.0.1` |
 
-The workflow checks the exact bump against the highest stable published `vX.Y.Z` tag, ignores drafts and prereleases as baselines, and refuses existing tags. Use the workflow rather than creating releases or release tags manually. The installer targets Linux x86-64 and is built and smoke-tested on Ubuntu 24.04.
+The workflow checks the exact bump against the highest stable published `vX.Y.Z` tag, or `0.0.0` if there is none. Drafts and prereleases do not set the baseline. For a first release at `0.1.0`, select `minor`. Existing tags cannot be reused. Use the workflow rather than creating tags or releases manually.
 
-If a failed publish leaves a tag or draft, confirm that it belongs to the failed run and that the release was never made public. Then delete that draft (if present) and its exact tag before rerunning. Never reuse a publicly released version.
+The workflow builds and smoke-tests the Linux x86-64 installer on Ubuntu 24.04. It uploads exactly two assets to the same release: `spofify-desktop-VERSION-linux-x86_64.tar.gz` for installation and `spofify-desktop-linux-x86_64` for in-app updates.
 
-## Configure release signing once
+## Protect the release channel
 
-The repository must be public so the updater can fetch release assets without an account. Generate an Ed25519 key on a trusted machine and keep the PEM outside the repository:
+The canonical repository must be public so users can fetch updates without an account. The workflow checks that it is on `main` in that repository and uses the built-in GitHub Actions token to publish; no PAT, extra repository, or custom signing setup is needed.
 
-```sh
-umask 077
-openssl genpkey -algorithm ED25519 -out spofify-release.pem
-openssl pkey -in spofify-release.pem -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n'
-```
+1. In **Settings → Environments**, create `desktop-release`. Under **Deployment branches and tags**, select **Selected branches and tags** and allow only the `main` branch. Add required reviewers for an approval before publishing.
+2. In **Settings → Rules → Rulesets**, create an active tag ruleset targeting `v*`. Enable **Restrict updates** and **Restrict deletions**, but leave creation unrestricted so the workflow can reserve tags. Limit any bypass to trusted maintainers recovering a failed, never-public release.
 
-1. In **Settings → Secrets and variables → Actions → Variables**, add a repository variable named `SPOFIFY_UPDATE_PUBLIC_KEY` with the printed hex value.
-2. In **Settings → Environments**, create `desktop-release`. Under **Deployment branches and tags**, select **Selected branches and tags** and add `main` as a branch. Add required reviewers if you want an additional approval before publishing.
-3. In that environment’s **Environment secrets**, add `SPOFIFY_RELEASE_SIGNING_KEY` with the complete PEM contents, including the header and footer. Back up the key offline. Do not commit it or share it with users.
-4. In **Settings → Rules → Rulesets**, create an active tag ruleset targeting `v*`. Enable **Restrict updates** and **Restrict deletions**, but leave creation unrestricted so the workflow can reserve tags. Limit any bypass to trusted maintainers recovering a failed, never-public release.
+If publishing fails after a tag or draft is created, confirm that it belongs to the failed run and the release was never public. Delete that draft (if present) and its exact tag before rerunning. Never reuse a publicly released version. If a release needs to be replaced, publish a corrected build with a higher version; in-app updates do not roll back.
 
-The workflow uses its own GitHub token to create the release tag and publish. No PAT or additional repository is needed.
+## Install and update
 
-The application embeds the public key. The workflow publishes the installer, executable, and signed manifest in the **same** GitHub Release. For a first install, download the archive from this repository’s GitHub Releases page. The signed manifest verifies subsequent in-app binary updates, not the installer archive itself.
+For a first install or a manual update, download the installer archive from the [official GitHub Releases page](https://github.com/Baizey/spofify-desktop/releases), extract it, and run `bash install.sh` in the extracted directory. Open **Spofify** from the app menu. No root access or Rust installation is needed.
 
-## Installing updates
+The updater is enabled for optimized Linux x86-64 builds running from the release installer’s managed location, not debug builds or ordinary system installations. The installed app checks for a newer release after sign-in and periodically while online. Select **Update** to download it. When the update is ready, quit and reopen Spofify to run the new version; the app does not restart itself or interrupt playback. If the download fails, use **Retry**. If no update appears, retrying does not help, or your version predates GitHub digest updates, close Spofify and rerun the installer from the official Releases page. Your settings, sign-in, and saved music stay in place.
 
-Spofify checks after sign-in and every four hours while online. A verified newer version shows **Update** at the top. The app downloads after you click and applies the update on your next launch. It never interrupts playback or restarts itself. You can also rerun `install.sh` from the latest release. Either way, settings and downloads remain in place.
-
-The updater only offers strictly newer versions. If a release must be withdrawn, publish a corrected build with a higher version. If the signing key changes, existing users must reinstall from the trusted release page.
+The updater trusts the publisher of `Baizey/spofify-desktop` and GitHub. It reads release metadata over HTTPS and checks the downloaded executable against the SHA-256 digest GitHub reports for that asset. This detects a mismatch with the published asset; it is not an independent signature and does not protect against a compromised publisher or GitHub. The app does not verify the installer archive.
