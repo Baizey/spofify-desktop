@@ -1,0 +1,9 @@
+[Unit]
+Description=Build and install the published Spofify Desktop release
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/opt/rustup/bin
+ExecStart=/bin/bash %h/repos/spofify-desktop/scripts/deploy-local.sh
+TimeoutStartSec=30min
+Nice=5

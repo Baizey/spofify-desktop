@@ -38,6 +38,23 @@ make install PREFIX="$HOME/.local"
 
 Ensure `$HOME/.local/bin` is on the desktop session's `PATH`. To remove the binary and launcher, use `make uninstall PREFIX="$HOME/.local"`. This does not delete personal data. Distributors can stage the same files with `DESTDIR`; `BINARY` can point to an already-built executable. No root access or user service is required for a per-user install.
 
+## Keep this PC up to date
+
+For a local clone at `~/repos/spofify-desktop`, the user timer checks `origin/main` every five minutes while logged in. A successful push to that branch is picked up automatically, including pushes from another machine. It builds the exact published revision and installs or replaces **Spofify** in the app menu (binary: `~/.local/bin/spofify-desktop`). No root, server, or release tag. A running player keeps its old version until you quit and reopen it. Failed builds leave the previous binary in place. Settings, sign-in, and downloads are not changed.
+
+From the clone, with the build requirements above plus `desktop-file-utils` and `flock`:
+
+```sh
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+install -m644 packaging/systemd/spofify-desktop-deploy.{service,timer} \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now spofify-desktop-deploy.timer
+systemctl --user start spofify-desktop-deploy.service
+```
+
+To check the latest build, run `journalctl --user -u spofify-desktop-deploy.service -n 40`. Use `bash scripts/deploy-local.sh` for a one-off update without systemd. Stop automatic updates with `systemctl --user disable --now spofify-desktop-deploy.timer`.
+
 ## Development
 
 ```sh

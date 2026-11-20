@@ -18,6 +18,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libasound2-dev libfontconfig1-dev desktop-file-utils
           rustup update stable --no-self-update
           rustup component add --toolchain stable rustfmt
+      - name: Test the local desktop deployment pipeline
+        run: bash scripts/test-local-deploy.sh
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
       - name: Test the locked application
