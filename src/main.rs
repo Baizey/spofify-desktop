@@ -128,7 +128,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let _media = presentation::install(&ui, access.clone());
     let _prefs = preferences::install(&ui, access.clone());
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    update::start(access);
+    update::start(&ui, access);
     bind_auth(&ui, &auth_tx, &epoch);
     for op in ["previous", "next", "toggle"] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());

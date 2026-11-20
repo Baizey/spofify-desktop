@@ -8,6 +8,7 @@ use rustix::{
     process::geteuid,
 };
 use serde::Deserialize;
+use slint::ComponentHandle;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -15,7 +16,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
 
 const MANIFEST_ASSET: &str = "update-v1-linux-x86_64.json";
 const BINARY_ASSET: &str = "spofify-desktop-linux-x86_64";
@@ -51,7 +53,7 @@ struct Envelope {
     manifest: String,
     signature: String,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema: u8,
@@ -185,7 +187,7 @@ fn current_image(path: &Path) -> io::Result<bool> {
 struct Staged(PathBuf);
 impl Staged {
     fn create(parent: &Path) -> io::Result<(Self, File)> {
-        let path = parent.join(format!(".spofify-update-{}", uuid::Uuid::new_v4()));
+        let path = parent.join(format!(".spofify-update-{}", Uuid::new_v4()));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -200,22 +202,7 @@ impl Drop for Staged {
     }
 }
 
-async fn check(
-    http: &Client,
-    channel: &Channel,
-    target: &Path,
-    online: impl Fn() -> bool,
-) -> Option<()> {
-    if !online() || !current_image(target).ok()? {
-        return Some(());
-    }
-    let parent = target.parent()?;
-    let lock = File::open(parent).ok()?;
-    if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err()
-        || !current_image(target).ok()?
-    {
-        return Some(());
-    }
+async fn check(http: &Client, channel: &Channel) -> Option<Option<Manifest>> {
     let mut response = fetch(
         http,
         channel.url(&format!("latest/download/{MANIFEST_ASSET}")),
@@ -228,18 +215,37 @@ async fn check(
         }
         body.extend_from_slice(&chunk);
     }
-    let Some(manifest) = channel.manifest(&body) else {
-        return Some(());
-    };
+    Some(channel.manifest(&body))
+}
+
+async fn download(
+    http: &Client,
+    channel: &Channel,
+    manifest: &Manifest,
+    target: &Path,
+    online: impl Fn() -> bool,
+) -> Option<()> {
+    if !online() || !current_image(target).ok()? {
+        return None;
+    }
+    let lock = File::open(target.parent()?).ok()?;
+    if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_err()
+        || !current_image(target).ok()?
+    {
+        return None;
+    }
     let response = fetch(
         http,
         channel.url(&format!("download/v{}/{BINARY_ASSET}", manifest.version)),
     )
     .await?;
-    save_update(response, &manifest, target, || {
+    if !save_update(response, manifest, target, || {
         online() && current_image(target).ok() == Some(true)
     })
-    .await?;
+    .await?
+    {
+        return None;
+    }
     let _ = lock.sync_all();
     Some(())
 }
@@ -249,7 +255,7 @@ async fn save_update(
     manifest: &Manifest,
     target: &Path,
     may_replace: impl FnOnce() -> bool,
-) -> Option<()> {
+) -> Option<bool> {
     if response
         .content_length()
         .is_some_and(|n| n != manifest.bytes)
@@ -273,13 +279,50 @@ async fn save_update(
     file.set_permissions(fs::Permissions::from_mode(0o755))
         .ok()?;
     file.sync_all().ok()?;
-    if may_replace() {
-        fs::rename(&stage.0, target).ok()?;
+    if !may_replace() {
+        return Some(false);
     }
-    Some(())
+    fs::rename(&stage.0, target).ok()?;
+    Some(true)
 }
 
-pub fn start(mut access: watch::Receiver<Option<Access>>) {
+enum Notice<'a> {
+    Hidden,
+    Available(&'a str, Uuid),
+    Downloading,
+    Failed(Uuid),
+    Ready,
+}
+
+fn show(ui: &slint::Weak<crate::AppWindow>, notice: Notice<'_>) {
+    let (message, button, action) = match notice {
+        Notice::Hidden => (String::new(), "", None),
+        Notice::Available(v, id) => (format!("Spofify {v} is available"), "Update", Some(id)),
+        Notice::Downloading => ("Downloading update…".into(), "", None),
+        Notice::Failed(id) => ("Couldn’t download update".into(), "Retry", Some(id)),
+        Notice::Ready => ("Update ready. Reopen Spofify to apply it.".into(), "", None),
+    };
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_update_notice(message.into());
+        ui.set_update_action(action.map_or_else(String::new, |id| id.to_string()).into());
+        ui.set_update_button(button.into());
+    });
+}
+
+fn bind_action(ui: &crate::AppWindow, request: mpsc::Sender<Uuid>) {
+    let weak = ui.as_weak();
+    ui.on_download_update(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if let Ok(id) = Uuid::parse_str(&ui.get_update_action())
+            && request.try_send(id).is_ok()
+        {
+            // Consume the offer before another input event can replay the click.
+            ui.set_update_action(Default::default());
+        }
+    });
+}
+
+pub fn start(ui: &crate::AppWindow, access: watch::Receiver<Option<Access>>) {
     let Some(channel) = Channel::configured() else {
         return;
     };
@@ -293,35 +336,221 @@ pub fn start(mut access: watch::Receiver<Option<Access>>) {
     if current_image(&target).ok() != Some(true) {
         return;
     }
-    let _ = std::thread::Builder::new().name("spofify-updates".into()).spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-        runtime.block_on(async move {
-            let Ok(http) = client() else { return };
-            loop {
-                if access.wait_for(|a| a.as_ref().is_some_and(|a| !a.offline && !a.session.is_offline())).await.is_err() { return; }
-                let Some(session) = access.borrow().as_ref().map(|a| a.session.clone()) else { continue };
-                let mut mode = session.network_changes();
-                let generation = *mode.borrow_and_update();
-                if generation & 1 != 0 || session.is_offline() { continue; }
-                let current = session.network_changes();
-                let online = || *current.borrow() == generation && session.can_access_local();
-                let interval = tokio::select! {
-                    biased;
-                    _ = mode.changed() => continue,
-                    _ = access.changed() => continue,
-                    result = check(&http, &channel, &target, online) => if result.is_some() { CHECK_INTERVAL } else { RETRY_INTERVAL },
-                };
-                // In-place rename made this instance old. Only the new image may update again.
-                if current_image(&target).ok() != Some(true) { return; }
-                tokio::time::sleep(interval).await;
-            }
+    let (request, requests) = mpsc::channel(1);
+    let weak = ui.as_weak();
+    bind_action(ui, request);
+    let _ = std::thread::Builder::new()
+        .name("spofify-updates".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(run_updates(channel, target, weak, access, requests));
         });
-    });
+}
+
+async fn run_updates(
+    channel: Channel,
+    target: PathBuf,
+    ui: slint::Weak<crate::AppWindow>,
+    mut access: watch::Receiver<Option<Access>>,
+    mut requests: mpsc::Receiver<Uuid>,
+) {
+    let Ok(http) = client() else { return };
+    let live_access = access.clone();
+    'connection: loop {
+        show(&ui, Notice::Hidden);
+        if access.has_changed().is_err() {
+            return;
+        }
+        let (epoch, session) = match access
+            .wait_for(|a| {
+                a.as_ref().is_some_and(|a| {
+                    !a.offline && !a.session.is_offline() && !a.session.is_expired()
+                })
+            })
+            .await
+        {
+            Ok(access) => {
+                let a = access.as_ref().expect("online access");
+                (a.epoch, a.session.clone())
+            }
+            Err(_) => return,
+        };
+        let mut mode = session.network_changes();
+        let generation = *mode.borrow_and_update();
+        let current = session.network_changes();
+        // Recent-list updates also publish Access; they must not restart the updater.
+        let disconnected =
+            |a: &Option<Access>| a.as_ref().is_none_or(|a| a.epoch != epoch || a.offline);
+        let online = || {
+            generation & 1 == 0
+                && *current.borrow() == generation
+                && !session.is_expired()
+                && live_access.has_changed().is_ok()
+                && !disconnected(&live_access.borrow())
+        };
+        if !online() {
+            continue;
+        }
+        let mut offer: Option<(Manifest, Uuid)> = None;
+        let mut delay = Duration::ZERO;
+        loop {
+            // Refresh the manifest without making the visible action unresponsive.
+            let wait = delay;
+            let refresh = async {
+                tokio::time::sleep(wait).await;
+                if online() && current_image(&target).ok() == Some(true) {
+                    check(&http, &channel).await
+                } else {
+                    None
+                }
+            };
+            tokio::pin!(refresh);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = mode.changed() => continue 'connection,
+                    _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
+                    request = requests.recv() => {
+                        let Some(request) = request else { return };
+                        let Some((manifest, id)) = offer.as_mut().filter(|(_, id)| *id == request) else {
+                            continue;
+                        };
+                        show(&ui, Notice::Downloading);
+                        let installed = tokio::select! {
+                            biased;
+                            _ = mode.changed() => continue 'connection,
+                            _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
+                            installed = download(&http, &channel, manifest, &target, online) => installed,
+                        };
+                        if installed.is_some() {
+                            show(&ui, Notice::Ready);
+                            return;
+                        }
+                        if current_image(&target).ok() != Some(true) {
+                            show(&ui, Notice::Hidden);
+                            return;
+                        }
+                        *id = Uuid::new_v4();
+                        show(&ui, Notice::Failed(*id));
+                        delay = RETRY_INTERVAL;
+                    }
+                    found = &mut refresh => {
+                        if current_image(&target).ok() != Some(true) {
+                            show(&ui, Notice::Hidden);
+                            return;
+                        }
+                        if !online() {
+                            continue 'connection;
+                        }
+                        delay = if found.is_some() { CHECK_INTERVAL } else { RETRY_INTERVAL };
+                        let found = found.flatten();
+                        if found.as_ref() != offer.as_ref().map(|(manifest, _)| manifest) {
+                            offer = found.map(|manifest| (manifest, Uuid::new_v4()));
+                            if let Some((manifest, id)) = &offer {
+                                show(&ui, Notice::Available(&manifest.version, *id));
+                            } else {
+                                show(&ui, Notice::Hidden);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banner_requires_a_fresh_click_for_each_attempt() {
+        use slint::{
+            LogicalPosition, PhysicalSize, PlatformError,
+            platform::{
+                Platform, PointerEventButton, WindowAdapter, WindowEvent,
+                software_renderer::{MinimalSoftwareWindow, Rgb565Pixel},
+            },
+        };
+        use std::rc::Rc;
+
+        struct TestWindow(Rc<MinimalSoftwareWindow>);
+        impl Platform for TestWindow {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+                Ok(self.0.clone())
+            }
+        }
+        let window = MinimalSoftwareWindow::new(Default::default());
+        slint::platform::set_platform(Box::new(TestWindow(window.clone()))).unwrap();
+        let ui = crate::AppWindow::new().unwrap();
+        ui.set_signed_in(true);
+        ui.set_playing(true);
+        ui.set_now_track_id("test-track".into());
+        ui.show().unwrap();
+        ui.window().set_size(PhysicalSize::new(480, 440));
+        let mut pixels = vec![Rgb565Pixel::default(); 480 * 440];
+        let mut render = || {
+            window.draw_if_needed(|renderer| {
+                renderer.render(&mut pixels, 480);
+            });
+        };
+        let position = LogicalPosition::new(448.0, 20.0);
+        let button = PointerEventButton::Left;
+        let press = || {
+            ui.window()
+                .dispatch_event(WindowEvent::PointerPressed { position, button })
+        };
+        let release = || {
+            ui.window()
+                .dispatch_event(WindowEvent::PointerReleased { position, button })
+        };
+        let click = || {
+            press();
+            release();
+        };
+        let (sender, mut requests) = mpsc::channel(1);
+        bind_action(&ui, sender);
+        let offer = Uuid::new_v4();
+        ui.set_update_notice("Spofify 0.2.0 is available".into());
+        ui.set_update_button("Update".into());
+        ui.set_update_action(offer.to_string().into());
+        render();
+        assert!(requests.try_recv().is_err());
+        press();
+        let refreshed = Uuid::new_v4();
+        ui.set_update_notice("Spofify 0.3.0 is available".into());
+        ui.set_update_action(refreshed.to_string().into());
+        render();
+        release();
+        assert!(requests.try_recv().is_err());
+        click();
+        assert_eq!(requests.try_recv().unwrap(), refreshed);
+        click();
+        assert!(requests.try_recv().is_err());
+        ui.set_update_notice("Downloading update…".into());
+        ui.set_update_button("".into());
+        render();
+        click();
+        assert!(requests.try_recv().is_err());
+        let retry = Uuid::new_v4();
+        ui.set_update_notice("Couldn’t download update".into());
+        ui.set_update_button("Retry".into());
+        ui.set_update_action(retry.to_string().into());
+        render();
+        click();
+        assert_eq!(requests.try_recv().unwrap(), retry);
+        ui.set_update_notice("Update ready. Reopen Spofify to apply it.".into());
+        ui.set_update_button("".into());
+        render();
+        assert!(ui.get_playing());
+        assert_eq!(ui.get_now_track_id(), "test-track");
+    }
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::json;
 
@@ -436,10 +665,8 @@ mod tests {
             });
             let response = fetch(&http, url).await.unwrap();
             assert_eq!(
-                save_update(response, &manifest, &target, || admitted)
-                    .await
-                    .is_some(),
-                succeeds
+                save_update(response, &manifest, &target, || admitted).await,
+                succeeds.then_some(admitted)
             );
             server.await.unwrap();
             assert_eq!(

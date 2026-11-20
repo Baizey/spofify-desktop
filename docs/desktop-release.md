@@ -1,20 +1,40 @@
 # Desktop releases
 
-Run **Actions → Desktop release → Run workflow** with `publish` off to get a Linux x86-64 installer artifact. Normal pushes do not release the app. Publish from `main` only; bump `Cargo.toml` and `Cargo.lock` together before the next release. The workflow builds on Ubuntu 24.04. The installer needs Bash, coreutils and `flock`; the application uses the desktop system libraries.
+Run **Actions → Desktop release → Run workflow** on `main`. Choose `build-only` to test the installer without publishing or configuring signing. Choose `initial` for the first release (`v0.1.0`). Published installers appear under **Releases** on this repository. Configure signing once before the first publish. Normal pushes run CI and do not publish releases.
 
-## Enable the release channel
+For later releases, update the desktop package version in `Cargo.toml` and `Cargo.lock` together, merge to `main`, then choose:
 
-The source repository can stay private. The built-in updater downloads without a GitHub login, so the destination must be a **public, binary-only** GitHub repository. This does make the downloads accessible to anyone with the link. Do not create or make a destination public unless that visibility is acceptable. With no public channel, leave the variables unset and distribute Actions artifacts manually to authorized users.
+| Choice | Use for | Example from `1.2.3` |
+| --- | --- | --- |
+| `major` | Breaking changes | `2.0.0` |
+| `minor` | Backward-compatible features | `1.3.0` |
+| `patch` | Backward-compatible fixes | `1.2.4` |
 
-1. Initialize the destination repository (a README is enough). Then set source repository variables `SPOFIFY_UPDATE_REPO` to the exact `owner/repository` of the release destination and `SPOFIFY_UPDATE_PUBLIC_KEY` to the raw 32-byte Ed25519 public key in lowercase hex. To generate a key on a trusted machine:
+The workflow checks the exact bump against the highest stable published `vX.Y.Z` tag, ignores drafts and prereleases as baselines, and refuses existing tags. Use the workflow rather than creating releases or release tags manually. The installer targets Linux x86-64 and is built and smoke-tested on Ubuntu 24.04.
 
-   ```sh
-   umask 077
-   openssl genpkey -algorithm ED25519 -out spofify-release.pem
-   openssl pkey -in spofify-release.pem -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n'
-   ```
+If a failed publish leaves a tag or draft, confirm that it belongs to the failed run and that the release was never made public. Then delete that draft (if present) and its exact tag before rerunning. Never reuse a publicly released version.
 
-2. In the source repository, configure the `desktop-release` Actions environment for `main` and restrict approval to release maintainers. Set its secrets `SPOFIFY_RELEASE_SIGNING_KEY` (the PEM) and `SPOFIFY_RELEASE_PUBLISH_TOKEN` (a fine-grained token with Contents read/write on the destination repository only). Keep an offline backup of the signing key. Do not check it into Git or grant the token to installed clients.
-3. Run the workflow from `main` with `publish` on. Only the tarball, executable and signed manifest are uploaded to the destination Releases. The first installer bootstraps the verification key: obtain it from the trusted release page, not an arbitrary mirror.
+## Configure release signing once
 
-The app accepts only a newer stable version, binds its manifest to the configured repository and asset, and verifies the exact executable before atomically replacing it. The GUI and the old process are left alone. No GitHub credentials or Spofify sign-in details go to the updater. A signing-key change requires distributing a fresh installer; clients already installed trust the previous key. If a release must be withdrawn, publish a corrected build at a higher version. Re-running `install.sh` is also the manual recovery path. The auto-updater changes only the executable; rerun the installer if launcher or icon files need updating.
+The repository must be public so the updater can fetch release assets without an account. Generate an Ed25519 key on a trusted machine and keep the PEM outside the repository:
+
+```sh
+umask 077
+openssl genpkey -algorithm ED25519 -out spofify-release.pem
+openssl pkey -in spofify-release.pem -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n'
+```
+
+1. In **Settings → Secrets and variables → Actions → Variables**, add a repository variable named `SPOFIFY_UPDATE_PUBLIC_KEY` with the printed hex value.
+2. In **Settings → Environments**, create `desktop-release`. Under **Deployment branches and tags**, select **Selected branches and tags** and add `main` as a branch. Add required reviewers if you want an additional approval before publishing.
+3. In that environment’s **Environment secrets**, add `SPOFIFY_RELEASE_SIGNING_KEY` with the complete PEM contents, including the header and footer. Back up the key offline. Do not commit it or share it with users.
+4. In **Settings → Rules → Rulesets**, create an active tag ruleset targeting `v*`. Enable **Restrict updates** and **Restrict deletions**, but leave creation unrestricted so the workflow can reserve tags. Limit any bypass to trusted maintainers recovering a failed, never-public release.
+
+The workflow uses its own GitHub token to create the release tag and publish. No PAT or additional repository is needed.
+
+The application embeds the public key. The workflow publishes the installer, executable, and signed manifest in the **same** GitHub Release. For a first install, download the archive from this repository’s GitHub Releases page. The signed manifest verifies subsequent in-app binary updates, not the installer archive itself.
+
+## Installing updates
+
+Spofify checks after sign-in and every four hours while online. A verified newer version shows **Update** at the top. The app downloads after you click and applies the update on your next launch. It never interrupts playback or restarts itself. You can also rerun `install.sh` from the latest release. Either way, settings and downloads remain in place.
+
+The updater only offers strictly newer versions. If a release must be withdrawn, publish a corrected build with a higher version. If the signing key changes, existing users must reinstall from the trusted release page.

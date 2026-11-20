@@ -52,6 +52,9 @@ export component Action inherits Rectangle {
     in property <bool> danger;
     in property <bool> leading;
     in property <bool> round;
+    // An action whose target can change while the pointer is down can supply an identity.
+    in property <string> click-scope;
+    property <string> pressed-scope;
     // Composite controls such as a popup menu can own keyboard focus themselves.
     in property <bool> keyboard-focusable: true;
     out property <bool> has-focus: key.has-focus;
@@ -89,7 +92,17 @@ export component Action inherits Rectangle {
     pointer := TouchArea {
         enabled: root.enabled;
         mouse-cursor: MouseCursor.pointer;
-        clicked => { if root.keyboard-focusable { key.focus(); } root.clicked(); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.pressed-scope = root.click-scope;
+            }
+        }
+        clicked => {
+            if root.pressed-scope == root.click-scope {
+                if root.keyboard-focusable { key.focus(); }
+                root.clicked();
+            }
+        }
     }
     key := FocusScope {
         enabled: root.enabled && root.keyboard-focusable;

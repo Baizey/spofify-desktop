@@ -18,6 +18,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends libasound2-dev libfontconfig1-dev desktop-file-utils
           rustup update stable --no-self-update
           rustup component add --toolchain stable rustfmt
+      - name: Check release version policy
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_release_version.py
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
       - name: Cache Cargo dependencies

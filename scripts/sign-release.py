@@ -9,19 +9,12 @@ import re
 import subprocess
 import tempfile
 
+from release_version import version_tuple
+
 ASSET = "spofify-desktop-linux-x86_64"
 MANIFEST = "update-v1-linux-x86_64.json"
 LIMIT = 64 * 1024 * 1024
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
-
-
-def version_tuple(version):
-    if not re.fullmatch(r"(?:0|[1-9][0-9]{0,9})(?:\.(?:0|[1-9][0-9]{0,9})){2}", version):
-        raise ValueError("Expected a stable Cargo version, e.g. 0.1.0")
-    parts = tuple(map(int, version.split(".")))
-    if any(x > 2**32 - 1 for x in parts):
-        raise ValueError("Version component outside supported range")
-    return parts
 
 
 def sign(directory, repo, version, public_key, private_key):

@@ -42,7 +42,7 @@ Ensure `$HOME/.local/bin` is on the desktop session's `PATH`. To remove the bina
 
 On Linux x86-64 (Ubuntu 24.04 or newer, or an equivalent desktop with glibc 2.39+, ALSA and fontconfig), extract the release tarball and run `bash install.sh`. Then open **Spofify** from the app menu. No Rust installation is needed. If you used `make install` before, use the app menu rather than an older `spofify-desktop` on your shell `PATH`.
 
-Release installs with a configured update channel check for signed updates while signed in and online. The new executable takes effect the next time you quit and reopen Spofify. Your settings, sign-in and saved music stay in place. Source builds and workflow artifacts without a configured channel do not auto-update.
+When a verified update is available, select **Update** at the top of the app. Quit and reopen Spofify when you’re ready to apply it. You can also rerun `install.sh` from **Releases**. Either way, your settings, sign-in and saved music stay in place.
 
 See [desktop releases](docs/desktop-release.md) to build or publish a package.
 
