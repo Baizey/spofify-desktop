@@ -24,6 +24,7 @@ use rustix::{
     process::geteuid,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::{
     api::{Api, ApiError, Item, Session},
@@ -102,6 +103,71 @@ pub struct PlaybackInput {
     pub bytes: Vec<u8>,
 }
 
+pub(crate) struct OnlineMedia {
+    pub bytes: Arc<[u8]>,
+    /// Do not add a second, RAM-backed copy to the online stream cache.
+    pub downloaded: bool,
+}
+
+/// Choose bytes only after the caller has admitted online local output. This
+/// does not interpret queue or output state. The caller must still fence the
+/// result by account epoch, occurrence, and coordinator authority.
+pub(crate) async fn online_media(
+    api: &Arc<Api>,
+    session: &Session,
+    slot: Arc<Semaphore>,
+    id: &str,
+    cached: Option<Arc<[u8]>>,
+) -> Result<OnlineMedia, ApiError> {
+    online_media_with_store(api, session, slot, id, cached, OfflineStore::open_existing).await
+}
+
+async fn online_media_with_store(
+    api: &Arc<Api>,
+    session: &Session,
+    slot: Arc<Semaphore>,
+    id: &str,
+    cached: Option<Arc<[u8]>>,
+    open: impl FnOnce() -> Result<Option<OfflineStore>, Error> + Send + 'static,
+) -> Result<OnlineMedia, ApiError> {
+    let network = session.network_changes();
+    let stamp = *network.borrow();
+    api.with_authenticated_network(session, async {
+        let permit = slot.acquire_owned().await.ok();
+        if let Some(permit) = permit {
+            let (api, session, id) = (api.clone(), session.clone(), id.to_owned());
+            let local = tokio::task::spawn_blocking(move || {
+                // Hold the same worker slot as Saved playback, even if the
+                // awaiting online task is dropped or the occurrence changes.
+                let _permit = permit;
+                if *network.borrow() != stamp || stamp & 1 != 0 || session.is_expired() {
+                    return None;
+                }
+                let input = open().ok()??.read(&api, &session, &id).ok()?;
+                Some(Arc::from(input.bytes))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(bytes) = local {
+                return Ok(OnlineMedia {
+                    bytes,
+                    downloaded: true,
+                });
+            }
+        }
+        let bytes = match cached {
+            Some(bytes) => bytes,
+            None => api.media(session, id).await?.into(),
+        };
+        Ok(OnlineMedia {
+            bytes,
+            downloaded: false,
+        })
+    })
+    .await
+}
+
 #[derive(Clone)]
 pub struct OfflineStore {
     root: Arc<OwnedFd>,
@@ -114,6 +180,16 @@ impl OfflineStore {
         Ok(Self {
             root: Arc::new(storage(local_storage::open_default(ROOT_DIR))?),
         })
+    }
+
+    pub(crate) fn open_existing() -> Result<Option<Self>, Error> {
+        match local_storage::open_default_existing(ROOT_DIR) {
+            Ok(root) => Ok(Some(Self {
+                root: Arc::new(root),
+            })),
+            Err(Errno::NOENT) => Ok(None),
+            Err(_) => Err(Error::Storage),
+        }
     }
 
     /// Open a private fixture by explicit path, without any alias resolution.
@@ -809,6 +885,39 @@ mod tests {
     ) -> Result<Download, Error> {
         let _guard = store.admit(&scope.name(id)?)?;
         store.commit(scope, track(id), data, || Ok(()))
+    }
+
+    #[tokio::test]
+    async fn verified_download_wins_over_stream_reuse_while_online() {
+        let fixture = Fixture::new();
+        let api = Arc::new(api("https://one.invalid"));
+        let session = api.test_session();
+        let store = fixture.store();
+        let own = Scope::new(&api, &session).unwrap();
+        let foreign = Scope::from_parts("https://one.invalid", "other-account");
+        install(&store, &own, "saved", b"verified local bytes").unwrap();
+        install(&store, &foreign, "foreign", b"other user data").unwrap();
+        let read = |id: &'static str| {
+            let store = store.clone();
+            online_media_with_store(
+                &api,
+                &session,
+                Arc::new(Semaphore::new(1)),
+                id,
+                Some(Arc::from(&b"reusable stream"[..])),
+                move || Ok(Some(store)),
+            )
+        };
+        let chosen = read("saved").await.unwrap();
+        assert!(chosen.downloaded);
+        assert_eq!(&*chosen.bytes, b"verified local bytes");
+        for id in ["foreign", "missing"] {
+            let chosen = read(id).await.unwrap();
+            assert!(!chosen.downloaded);
+            assert_eq!(&*chosen.bytes, b"reusable stream");
+        }
+        session.set_offline(true);
+        assert!(read("saved").await.is_err());
     }
 
     #[test]

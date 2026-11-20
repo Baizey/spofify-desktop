@@ -117,6 +117,7 @@ enum Update {
     Read(Result<Page, ApiError>, bool), // true when the task will retry
     ReadGap,
     SearchDownloads(Result<Page, ApiError>),
+    Storage(Result<String, ApiError>),
     Changed(Result<Option<Route>, ApiError>),
     Local(Result<Command, ApiError>),
     CollectionSaved(Result<crate::collections::SaveSummary, ApiError>),
@@ -476,7 +477,7 @@ impl Browser {
                                 detail: r.detail.as_str().into(),
                                 playable: r.playable
                                     && personal_actions
-                                    && offline == local_playback,
+                                    && (!offline || local_playback),
                                 credits: artist_credits(&r.music, offline),
                                 album_id: album_id.into(),
                                 album_name: album_name.into(),
@@ -488,8 +489,7 @@ impl Browser {
                 if kind == "saved-collection" {
                     actions.push("remove");
                 }
-                if offline
-                    && matches!(kind.as_str(), "saved-collection" | "offline")
+                if matches!(kind.as_str(), "saved-collection" | "offline")
                     && p.rows.iter().any(|r| r.playable)
                 {
                     actions.push("play");
@@ -909,10 +909,19 @@ impl Browser {
             self.render(true);
             return;
         }
-        if matches!(
-            next,
-            Route::Now | Route::Queue | Route::Devices | Route::Appearance
-        ) || matches!(&next, Route::Search(q) if q.is_empty())
+        if next == Route::Appearance {
+            self.scoped_ui(|ui| ui.set_music_storage("Checking downloads…".into()));
+            let tx = self.results.clone();
+            let serial = self.serial;
+            self.task = Some(tokio::spawn(async move {
+                let result = Update::Storage(saved::storage_summary(&a).await);
+                let _ = tx.send(Delivery { serial, result }).await;
+            }));
+            self.render(true);
+            return;
+        }
+        if matches!(next, Route::Now | Route::Queue | Route::Devices)
+            || matches!(&next, Route::Search(q) if q.is_empty())
         {
             self.render(true);
             return;
@@ -1109,7 +1118,7 @@ impl Browser {
             return;
         }
         let saved_page = saved_route(&route);
-        let local_results = a.offline && (saved_page || matches!(route, Route::Search(_)));
+        let local_results = saved_page || a.offline && matches!(route, Route::Search(_));
         if op == "open" && !matches!(route, Route::Picker(_)) {
             let target = row.as_ref().and_then(|r| {
                 r.route.clone().or_else(|| {
@@ -1146,11 +1155,6 @@ impl Browser {
             return;
         }
         let local_play = local_results && op == "play";
-        if saved_page && !a.offline && op == "play" {
-            self.message = "Choose Work offline to play the saved queue on this computer.".into();
-            self.render(false);
-            return;
-        }
         if matches!(op.as_str(), "play" | "queue") && !local_play {
             if a.offline {
                 return;
@@ -1278,6 +1282,10 @@ impl Browser {
                 self.page = Arc::new(page);
                 self.cache.put(self.route.clone(), self.page.clone());
                 self.render(changed);
+            }
+            Update::Storage(result) => {
+                let summary = result.unwrap_or_else(|_| "Storage unavailable".into());
+                self.scoped_ui(move |ui| ui.set_music_storage(summary.into()));
             }
             Update::SearchDownloads(result) => match result {
                 Ok(downloads) => {

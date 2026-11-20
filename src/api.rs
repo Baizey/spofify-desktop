@@ -887,9 +887,9 @@ impl Api {
             .await
     }
 
-    /// Covers an entire operation, including response body consumption. Do not wrap only send:
-    /// an offline→online transition must cancel work begun on the previous network generation.
-    async fn with_authenticated_network<T>(
+    /// Covers an entire operation, including response body consumption or a local-first
+    /// online media lookup. An offline→online transition must cancel older work.
+    pub(crate) async fn with_authenticated_network<T>(
         &self,
         session: &Session,
         operation: impl Future<Output = Result<T, ApiError>>,

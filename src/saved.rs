@@ -52,6 +52,38 @@ fn error(err: offline::Error) -> ApiError {
     }
 }
 
+pub async fn storage_summary(access: &Access) -> Result<String, ApiError> {
+    let (api, session) = (access.api.clone(), access.session.clone());
+    let (count, bytes) = tokio::task::spawn_blocking(move || {
+        let rows = match OfflineStore::open_existing().map_err(error)? {
+            Some(store) => store.list(&api, &session).map_err(error)?,
+            None => Vec::new(),
+        };
+        Ok::<_, ApiError>((rows.len(), rows.iter().map(|row| row.bytes).sum::<u64>()))
+    })
+    .await
+    .map_err(|_| STORAGE)??;
+    Ok(storage_label(count, bytes))
+}
+
+fn storage_label(count: usize, bytes: u64) -> String {
+    let size = if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    };
+    format!(
+        "{size} · {count} {}",
+        if count == 1 {
+            "downloaded song"
+        } else {
+            "downloaded songs"
+        }
+    )
+}
+
 pub async fn page(access: &Access) -> Result<Page, ApiError> {
     let api = access.api.clone();
     let session = access.session.clone();
@@ -122,15 +154,9 @@ pub async fn remove(access: &Access, row: &Row) -> Result<(), ApiError> {
 }
 
 pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command, ApiError> {
-    if !access.offline || !access.session.is_offline() {
-        return Err(ApiError {
-            message: "Go offline to play this saved queue.",
-            expired: false,
-            status: 0,
-        });
-    }
     access.api.authenticated_account(&access.session)?;
     let network = access.session.network_changes();
+    let mode_stamp = *network.borrow();
     let (mut queue, index) = queue_selection(page, index)?;
     let track_id = queue[index].id.clone();
     let api = access.api.clone();
@@ -144,7 +170,7 @@ pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command,
     .map_err(|_| STORAGE)?
     .map_err(error)?;
     access.api.authenticated_account(&access.session)?;
-    if network.has_changed().unwrap_or(true) || !access.session.is_offline() {
+    if *network.borrow() != mode_stamp || access.offline != access.session.is_offline() {
         return Err(ApiError {
             message: "The playback mode changed.",
             expired: false,
@@ -154,7 +180,8 @@ pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command,
     // Prefer the presentation metadata paired with the verified local bytes.
     // Other occurrences carry only identities/labels and load lazily in the engine.
     queue[index] = input.item.clone();
-    Ok(Command::PlayOffline {
+    Ok(Command::PlaySaved {
+        mode_stamp,
         queue,
         index,
         input,
@@ -211,6 +238,16 @@ mod tests {
             }),
             ..Row::default()
         }
+    }
+
+    #[test]
+    fn storage_label_reports_only_downloads() {
+        assert_eq!(storage_label(0, 0), "0 B · 0 downloaded songs");
+        assert_eq!(storage_label(1, 2048), "2.0 KiB · 1 downloaded song");
+        assert_eq!(
+            storage_label(3, 2 * 1024 * 1024),
+            "2.0 MiB · 3 downloaded songs"
+        );
     }
 
     #[test]

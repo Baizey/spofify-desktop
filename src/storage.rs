@@ -23,21 +23,28 @@ pub(crate) const DIR_FLAGS: OFlags = OFlags::RDONLY
 const PRIVATE_DIR: Mode = Mode::RWXU;
 
 pub(crate) fn open_default(app_dir: &str) -> Result<OwnedFd> {
+    open_data_dir(&default_base()?, app_dir, true)
+}
+
+pub(crate) fn open_default_existing(app_dir: &str) -> Result<OwnedFd> {
+    open_data_dir(&default_base()?, app_dir, false)
+}
+
+fn default_base() -> Result<PathBuf> {
     let absolute = |name: &str| {
         env::var_os(name)
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    let base = absolute("XDG_DATA_HOME")
+    absolute("XDG_DATA_HOME")
         .or_else(|| absolute("HOME").map(|home| home.join(".local/share")))
-        .ok_or(Errno::INVAL)?;
-    open_data_dir(&base, app_dir)
+        .ok_or(Errno::INVAL)
 }
 
 /// Only `base` is trusted for symlink resolution (e.g. /home -> var/home).
 /// Resolve its nearest existing ancestor, then reopen that path without
 /// following symlinks. Walk the missing suffix and app leaf by descriptor.
-fn open_data_dir(base: &Path, app_dir: &str) -> Result<OwnedFd> {
+fn open_data_dir(base: &Path, app_dir: &str, create: bool) -> Result<OwnedFd> {
     let _ = absolute_parts(base)?;
     let mut parts = Path::new(app_dir).components();
     let (Some(Component::Normal(leaf)), None) = (parts.next(), parts.next()) else {
@@ -52,6 +59,9 @@ fn open_data_dir(base: &Path, app_dir: &str) -> Result<OwnedFd> {
         match stdfs::canonicalize(ancestor) {
             Ok(path) => break path,
             Err(e) if e.kind() == ErrorKind::NotFound => {
+                if !create {
+                    return Err(Errno::NOENT);
+                }
                 missing.push(ancestor.file_name().ok_or(Errno::INVAL)?);
                 ancestor = ancestor.parent().ok_or(Errno::INVAL)?;
             }
@@ -65,7 +75,7 @@ fn open_data_dir(base: &Path, app_dir: &str) -> Result<OwnedFd> {
     for name in missing.into_iter().rev() {
         dir = open_child(&dir, name, true)?;
     }
-    let dir = open_child(&dir, leaf, true)?;
+    let dir = open_child(&dir, leaf, create)?;
     private_dir(&dir)?;
     Ok(dir)
 }
@@ -163,8 +173,15 @@ mod tests {
         symlink("var/home", fixture.0.join("home")).unwrap();
         let base = fixture.0.join("home/listener/.local/share");
         let real_base = real_home.join(".local/share");
-        // Missing .local/share is created only after resolving the fixture alias.
-        let opened = open_data_dir(&base, "spofify-downloads-v1").unwrap();
+        // Playback lookups don't create a data tree. Explicit saves may create
+        // missing .local/share, but only after resolving the fixture alias.
+        assert!(matches!(
+            open_data_dir(&base, "spofify-downloads-v1", false),
+            Err(Errno::NOENT)
+        ));
+        assert!(!real_home.join(".local").exists());
+        let opened = open_data_dir(&base, "spofify-downloads-v1", true).unwrap();
+        assert!(open_data_dir(&base, "spofify-downloads-v1", false).is_ok());
         let app = real_base.join("spofify-downloads-v1");
         let reopened = open_private(&app).unwrap();
         assert_eq!(
@@ -183,7 +200,8 @@ mod tests {
         symlink(&target, &app).unwrap();
         symlink(&target, real_base.join("spofify-collections-v1")).unwrap();
         for name in ["spofify-downloads-v1", "spofify-collections-v1"] {
-            assert!(open_data_dir(&base, name).is_err());
+            assert!(open_data_dir(&base, name, true).is_err());
+            assert!(open_data_dir(&base, name, false).is_err());
         }
         assert_eq!(stdfs::read(target.join("sentinel")).unwrap(), b"fixture");
     }
@@ -194,12 +212,12 @@ mod tests {
         let shared = fixture.0.join("shared");
         stdfs::create_dir(&shared).unwrap();
         stdfs::set_permissions(&shared, stdfs::Permissions::from_mode(0o777)).unwrap();
-        assert!(open_data_dir(&shared.join("missing/data"), "app").is_err());
+        assert!(open_data_dir(&shared.join("missing/data"), "app", true).is_err());
         assert!(!shared.join("missing").exists());
 
         let alias = fixture.0.join("alias");
         symlink("not-there", &alias).unwrap();
-        assert!(open_data_dir(&alias.join("data"), "app").is_err());
+        assert!(open_data_dir(&alias.join("data"), "app", true).is_err());
         assert!(!fixture.0.join("not-there").exists());
     }
 }

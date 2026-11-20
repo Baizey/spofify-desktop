@@ -114,7 +114,8 @@ export component AppWindow inherits Window {
     in property <string> account-label;
     in property <bool> manual-offline;
     in property <bool> reconnecting;
-    in property <bool> offline-playback;
+    in property <bool> local-playback;
+    in property <string> music-storage;
     in property <bool> crossfade-enabled;
     in property <string> crossfade-status;
     callback crossfade-changed(bool);
@@ -189,8 +190,8 @@ export component AppWindow inherits Window {
     property <bool> is-now: page-kind == "now";
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
     property <bool> local-mode: manual-offline || reconnecting;
-    property <bool> can-play-local: manual-offline && (root.saved-view || root.is-search);
-    property <bool> queue-controls: local-mode ? offline-playback && can-control : !offline-playback && remote-controls;
+    property <bool> can-play-local: root.saved-view || (root.manual-offline && root.is-search);
+    property <bool> queue-controls: local-mode ? local-playback && can-control : remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
     property <string> form-return;
@@ -442,8 +443,8 @@ export component AppWindow inherits Window {
                         context-kind: root.now-context-kind; context-id: root.local-mode ? "" : root.now-context-id;
                         context-name: root.local-mode ? "" : root.now-context-name;
                         artwork: root.cover-art; lyrics-text: root.lyrics-text; waveform: root.waveform; elapsed: root.elapsed; duration: root.duration;
-                        playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.offline-playback); can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
-                        can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
+                        playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.local-playback); can-toggle: root.can-control && (!root.local-mode || root.local-playback);
+                        can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
                         shuffle: root.shuffle; repeat-mode: root.repeat-mode; can-change-modes: root.queue-controls;
                         previous => { root.previous(); } toggle => { root.toggle-play(); } next => { root.next(); } seek(v) => { root.seek(v); }
                         page-action(op, id) => { shell.entity(op, id); } queue-action(op, key) => { root.queue-action(op, key); }
@@ -525,6 +526,8 @@ export component AppWindow inherits Window {
                             if root.is-settings: Settings {
                                 account: root.account-label; offline: root.local-mode; reconnecting: root.reconnecting;
                                 crossfade-enabled: root.crossfade-enabled; crossfade-status: root.crossfade-status;
+                                music-storage: root.music-storage;
+                                open-downloads => { shell.route("offline"); }
                                 crossfade-changed(enabled) => { root.crossfade-changed(enabled); }
                                 mode: root.appearance-mode; scale: root.appearance-scale;
                                 palettes: root.palettes; palette-id: root.palette-id; palette-status: root.palette-status; palette-enabled: root.palette-enabled;
@@ -608,7 +611,7 @@ export component AppWindow inherits Window {
                                         credits: row.credits; metadata-enabled: !root.local-mode && root.page-kind != "picker";
                                         album-id: row.album-id;
                                         album-name: root.page-kind == "album" || root.page-kind == "picker" || row.kind != "track" ? "" : row.album-name;
-                                        playable: row.playable && (root.local-mode ? root.can-play-local : !root.saved-view) && root.page-kind != "picker";
+                                        playable: row.playable && (!root.local-mode || root.can-play-local) && root.page-kind != "picker";
                                         can-open: !root.local-mode || root.saved-view || (root.is-search && self.playable);
                                         compact: main.width < 435px;
                                         window-height: root.height;
@@ -718,10 +721,10 @@ export component AppWindow inherits Window {
             album-id: root.now-album-id; album-name: root.now-album-name;
             status: root.playback-status;
             artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
-            can-seek: root.can-seek && (!root.local-mode || root.offline-playback);
-            playing: root.playing; can-toggle: root.can-control && (!root.local-mode || root.offline-playback);
-            can-skip: root.local-mode ? root.offline-playback && root.can-control : root.remote-controls;
-            page: root.page-kind; queue-open: root.queue-shown; offline: root.local-mode || root.offline-playback;
+            can-seek: root.can-seek && (!root.local-mode || root.local-playback);
+            playing: root.playing; can-toggle: root.can-control && (!root.local-mode || root.local-playback);
+            can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
+            page: root.page-kind; queue-open: root.queue-shown; offline: root.local-mode || root.local-playback;
             previous => { root.previous(); } next => { root.next(); } toggle => { root.toggle-play(); }
             seek(v) => { root.seek(v); } navigate(page) => { shell.route(page); }
             page-action(op, id) => { shell.entity(op, id); }

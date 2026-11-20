@@ -66,7 +66,8 @@ pub enum Command {
     Guarded(String, Action),
     #[cfg(test)]
     Offline(bool),
-    PlayOffline {
+    PlaySaved {
+        mode_stamp: u64,
         queue: Vec<Item>,
         index: usize,
         input: PlaybackInput,
@@ -114,7 +115,7 @@ enum Reply {
     Media {
         epoch: u64,
         operation: u64,
-        result: Result<Vec<u8>, ApiError>,
+        result: Result<offline::OnlineMedia, ApiError>,
     },
     OfflineMedia {
         epoch: u64,
@@ -166,11 +167,11 @@ impl Engine {
         if !self.current() {
             return None;
         }
-        if self.offline {
+        if self.offline || self.local_store.is_some() {
             return self
                 .account
                 .as_ref()
-                .filter(|a| a.session.is_offline())
+                .filter(|a| a.session.can_access_local())
                 .map(|_| format!("local:{}:{}", self.room_incarnation, self.local_revision));
         }
         self.online_generation()?;
@@ -581,12 +582,19 @@ impl Engine {
         match command {
             #[cfg(test)]
             Command::Offline(true) => self.set_offline(true),
-            Command::PlayOffline {
+            Command::PlaySaved {
+                mode_stamp,
                 queue,
                 index,
                 input,
                 store,
-            } if self.offline && self.audio.is_some() => {
+            } if self.audio.is_some()
+                && self.account.as_ref().is_some_and(|a| {
+                    *a.session.network_changes().borrow() == mode_stamp
+                        && a.session.is_offline() == self.offline
+                        && a.session.can_access_local()
+                }) =>
+            {
                 if !queue
                     .get(index)
                     .is_some_and(|item| item.id == input.item.id)
@@ -608,6 +616,9 @@ impl Engine {
                         duration: item.duration_ms as f64 / 1000.0,
                     })
                     .collect();
+                if !self.offline && !self.pause_room_for_saved() {
+                    return;
+                }
                 if self.local.replace(tracks, index, false) == Change::Start {
                     self.cancel_work();
                     self.stop();
@@ -623,7 +634,7 @@ impl Engine {
             }
             Command::Playback(action) if !action.depends_on_visible_queue() => self.action(action),
             Command::Toggle => {
-                let desired = if self.offline {
+                let desired = if self.offline || self.local_store.is_some() {
                     self.local.desired
                 } else {
                     self.online.wants_pause()
@@ -643,7 +654,21 @@ impl Engine {
         }
     }
     fn action(&mut self, action: Action) {
-        if self.offline {
+        if !self.offline {
+            match action {
+                Action::Play { .. } | Action::SelectDevice(_) | Action::DeselectDevice => {
+                    self.leave_saved_queue();
+                    self.online_action(action);
+                    return;
+                }
+                Action::Enqueue { .. } | Action::RenameDevice { .. } => {
+                    self.online_action(action);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.offline || self.local_store.is_some() {
             if self.local.desired
                 && self.local.current().is_some()
                 && let Some(audio) = &self.audio
@@ -655,6 +680,22 @@ impl Engine {
             return;
         }
         self.online_action(action);
+    }
+    fn leave_saved_queue(&mut self) {
+        if self.local_store.is_some() {
+            self.local_change(Change::Clear);
+            self.local = LocalQueue::default();
+        }
+    }
+    fn tick_saved(&mut self) {
+        if self.local.desired && self.media.is_none() && self.audio.is_some() {
+            self.tick_saved_crossfade();
+            let facts = self.audio.as_ref().unwrap().facts();
+            self.local.elapsed = facts.elapsed;
+            if facts.ended {
+                self.finish_saved_track();
+            }
+        }
     }
     fn local_change(&mut self, change: Change) {
         if change != Change::Invalid {
@@ -803,6 +844,7 @@ impl Engine {
             && let Some(audio) = &mut self.audio
             && audio.promote_crossfade()
         {
+            audio.discard_cache();
             self.local.elapsed = audio.facts().elapsed;
             self.local_revision = self.local_revision.wrapping_add(1);
             self.local_status = Status::Ok;
@@ -942,7 +984,7 @@ impl Engine {
                 input,
             } if self.epoch == epoch
                 && self.operation == operation
-                && self.offline
+                && self.local_store.is_some()
                 && self.local.desired =>
             {
                 self.media = None;
@@ -1019,14 +1061,7 @@ impl Engine {
                 self.expire();
                 return;
             }
-            if self.local.desired && self.media.is_none() && self.audio.is_some() {
-                self.tick_saved_crossfade();
-                let facts = self.audio.as_ref().unwrap().facts();
-                self.local.elapsed = facts.elapsed;
-                if facts.ended {
-                    self.finish_saved_track();
-                }
-            }
+            self.tick_saved();
             return;
         }
         if self
@@ -1048,13 +1083,27 @@ impl Engine {
     fn publish(&self) {
         let mut p = PlayerView {
             offline: self.offline,
+            local_playback: self.offline || self.local_store.is_some(),
             reconnecting: self.reconnect.is_some(),
             status: self.action_status,
             room_token: self.room_token().unwrap_or_default(),
             ..PlayerView::default()
         };
-        if self.offline {
-            p.output = "This desktop · Offline".into();
+        if !self.offline {
+            self.project_online(&mut p);
+        }
+        if p.local_playback {
+            p.output = if self.offline {
+                "This desktop · Offline"
+            } else {
+                "This desktop · Saved"
+            }
+            .into();
+            p.status = self.action_status;
+            p.playing = false;
+            p.album.clear();
+            p.credits.clear();
+            p.context_id.clear();
             p.shuffle = self.local.shuffle;
             p.repeat = self.local.repeat.wire();
             p.elapsed = self.local.elapsed;
@@ -1100,8 +1149,6 @@ impl Engine {
                     ..QueueEntryView::default()
                 })
                 .collect();
-        } else {
-            self.project_online(&mut p);
         }
         p.publish(self.window.clone(), self.shared_epoch.clone(), self.epoch);
     }
@@ -1179,6 +1226,7 @@ impl QueueEntryView {
 #[derive(Default)]
 struct PlayerView {
     offline: bool,
+    local_playback: bool,
     reconnecting: bool,
     shuffle: bool,
     repeat: &'static str,
@@ -1211,7 +1259,7 @@ impl PlayerView {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            ui.set_offline_playback(self.offline);
+            ui.set_local_playback(self.local_playback);
             ui.set_reconnecting(self.reconnecting);
             ui.set_room_token(self.room_token.into());
             ui.set_shuffle(self.shuffle);
@@ -1323,7 +1371,7 @@ fn read_saved(
         let permit = slot.acquire_owned().await.ok()?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            if *session.network_changes().borrow() != stamp || !session.is_offline() {
+            if *session.network_changes().borrow() != stamp {
                 return None;
             }
             let input = store.read(&api, &session, &id).ok();
@@ -1643,6 +1691,69 @@ mod tests {
         e.shared_epoch.store(8, Ordering::SeqCst);
         e.command(Command::Offline(false).scoped(7));
         assert!(e.offline);
+    }
+    #[tokio::test]
+    async fn saved_queue_is_admitted_online_only_for_the_current_mode_generation() {
+        let dir = std::env::temp_dir().join(format!("spofify-saved-test-{}", uuid::Uuid::new_v4()));
+        use std::{fs, os::unix::fs::DirBuilderExt};
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(dir);
+        let store = OfflineStore::open(&fixture.0).unwrap();
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        e.audio = Some(Audio::new(
+            Some(session.clone()),
+            false,
+            e.shared_epoch.clone(),
+            e.epoch,
+        ));
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
+        });
+        let item = Item {
+            id: "saved".into(),
+            name: "Saved fixture".into(),
+            kind: "track".into(),
+            artists: String::new(),
+            album_name: String::new(),
+            duration_ms: 10000,
+            has_audio: true,
+            track_number: 1,
+            disc_number: 1,
+        };
+        let command = |mode_stamp| {
+            Command::PlaySaved {
+                mode_stamp,
+                queue: vec![item.clone()],
+                index: 0,
+                // Intentionally cannot open an audio device. This test checks queue admission.
+                input: PlaybackInput {
+                    item: item.clone(),
+                    bytes: vec![1],
+                },
+                store: store.clone(),
+            }
+            .scoped(7)
+        };
+        let stamp = *session.network_changes().borrow();
+        e.command(command(stamp.wrapping_add(2)));
+        assert!(e.local.current().is_none());
+        e.command(command(stamp));
+        assert!(e.network_allowed());
+        assert_eq!(e.local.current().unwrap().track.id, "saved");
+        assert!(e.room_token().unwrap().starts_with("local:"));
+        assert_eq!(e.local_status, Status::Media);
+        e.action(Action::Close);
+        assert!(e.local_store.is_none());
+        assert!(e.network_allowed());
     }
     #[tokio::test]
     async fn manual_saved_next_does_not_wait_for_a_retired_preview_read() {

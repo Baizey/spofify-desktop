@@ -9,6 +9,7 @@ use crate::{
     DeviceRow,
     api::ApiError,
     audio::CROSSFADE_SECONDS,
+    offline::{self, OnlineMedia},
     personal::{Command as PersonalCommand, Update as PersonalUpdate},
     player::{Action, Status},
     socket::{
@@ -204,8 +205,10 @@ impl Engine {
         self.online.player_gap = true;
         self.online.advance = None;
         self.online.revision = self.online.revision.wrapping_add(1);
-        self.cancel_work();
-        self.stop();
+        if self.local_store.is_none() {
+            self.cancel_work();
+            self.stop();
+        }
         self.action_status = "Playback state is out of sync.";
         self.repair(generation);
     }
@@ -213,8 +216,10 @@ impl Engine {
         let retiring = self.online.is_owner() && outputs.owner.is_empty();
         self.online.outputs = outputs;
         if retiring {
-            self.cancel_work();
-            self.stop();
+            if self.local_store.is_none() {
+                self.cancel_work();
+                self.stop();
+            }
             self.online.advance = None;
             if let Some(socket) = &self.socket {
                 let _ = socket.command(generation, socket::Command::Release);
@@ -335,11 +340,39 @@ impl Engine {
         if self.output_promotion.is_some() {
             return;
         }
+        if self.local_store.is_some() {
+            let room_needs_output = self.attached().is_some()
+                && self
+                    .online
+                    .cursor()
+                    .is_some_and(|c| c.desired && !self.online.stop_for(c));
+            if !room_needs_output {
+                self.tick_saved();
+                return;
+            }
+            self.leave_saved_queue();
+        }
         self.reconcile_online();
         self.tick_online_crossfade();
         if self.sample_online(true, false) {
             self.reconcile_online();
         }
+    }
+    pub(super) fn pause_room_for_saved(&mut self) -> bool {
+        if self.output_promotion.is_some() {
+            self.action_status = "Connecting this output…";
+            return false;
+        }
+        if self.online.is_owner()
+            && self
+                .online
+                .cursor()
+                .is_some_and(|c| c.desired && !self.online.stop_for(c))
+        {
+            self.online_action(Action::Pause);
+            return self.action_status.is_empty();
+        }
+        true
     }
     pub(super) fn online_action(&mut self, action: Action) {
         if !self.network_allowed() {
@@ -579,26 +612,27 @@ impl Engine {
         self.cancel_work();
         self.online.work = Some(work);
         let work = self.online.work.as_ref().expect("just installed");
-        if let Some(bytes) = self.audio.as_ref().and_then(|audio| audio.cached(&work.id)) {
-            if let Some(work) = self.online.work.take() {
-                self.start_online(work, Ok(bytes));
-            }
-        } else if let Some(account) = &self.account {
-            let (api, session, replies, id) = (
+        if let Some(account) = &self.account {
+            let (api, session, slot, replies, id) = (
                 account.api.clone(),
                 account.session.clone(),
+                self.local_read_slot.clone(),
                 self.results.clone(),
                 work.id.clone(),
             );
+            let cached = self.audio.as_ref().and_then(|audio| audio.cached(&id));
             let (epoch, operation) = (self.epoch, self.operation);
             self.media = Some(tokio::spawn(async move {
-                let result = tokio::time::timeout(LOAD_BUDGET, api.media(&session, &id))
-                    .await
-                    .unwrap_or(Err(ApiError {
-                        message: "Media could not be loaded in time.",
-                        expired: false,
-                        status: 0,
-                    }));
+                let result = tokio::time::timeout(
+                    LOAD_BUDGET,
+                    offline::online_media(&api, &session, slot, &id, cached),
+                )
+                .await
+                .unwrap_or(Err(ApiError {
+                    message: "Media could not be loaded in time.",
+                    expired: false,
+                    status: 0,
+                }));
                 let _ = replies
                     .send(Reply::Media {
                         epoch,
@@ -609,20 +643,17 @@ impl Engine {
             }));
         }
     }
-    pub(super) fn complete_online(&mut self, result: Result<Vec<u8>, ApiError>) {
+    pub(super) fn complete_online(&mut self, result: Result<OnlineMedia, ApiError>) {
         self.drain_online_events(None);
         if let Some(work) = self.online.work.take() {
             if result.as_ref().is_err_and(|e| e.expired) {
                 self.expire();
                 return;
             }
-            self.start_online(
-                work,
-                result.map(|bytes| bytes.into()).map_err(|_| Status::Media),
-            );
+            self.start_online(work, result.map_err(|_| Status::Media));
         }
     }
-    fn start_online(&mut self, work: Work, bytes: Result<Arc<[u8]>, Status>) {
+    fn start_online(&mut self, work: Work, media: Result<OnlineMedia, Status>) {
         let Some(grant) = self.attached().filter(|g| g.generation == work.generation) else {
             return;
         };
@@ -639,14 +670,21 @@ impl Engine {
         };
         let permit = output::RunPermit::new(socket.authority.clone(), grant);
         audio.anchor(work.cursor.elapsed, work.duration);
-        let status = match bytes {
-            Ok(bytes) => audio.play(
-                work.id,
-                bytes,
-                work.cursor.elapsed,
-                work.duration,
-                permit.source(socket.link.clone(), grant.generation),
-            ),
+        let status = match media {
+            Ok(OnlineMedia { bytes, downloaded }) => {
+                let status = audio.play(
+                    work.id,
+                    bytes,
+                    work.cursor.elapsed,
+                    work.duration,
+                    permit.source(socket.link.clone(), grant.generation),
+                );
+                if downloaded {
+                    // A later admission must re-verify the file in case it was removed.
+                    audio.discard_cache();
+                }
+                status
+            }
             Err(status) => status,
         };
         if status != Status::Rejected {
@@ -722,6 +760,8 @@ impl Engine {
             let Some(account) = &self.account else { return };
             let (api, session, media_id) =
                 (account.api.clone(), account.session.clone(), id.clone());
+            let slot = self.local_preview_slot.clone();
+            let cached = audio.cached(&media_id);
             let key = PreviewKey {
                 generation: grant.generation,
                 from: from.clone(),
@@ -729,11 +769,14 @@ impl Engine {
                 id: id.clone(),
             };
             self.online.lookahead = Some(crossfade::Lookahead::new(key, async move {
-                let bytes = tokio::time::timeout(LOAD_BUDGET, api.media(&session, &media_id))
-                    .await
-                    .ok()?
-                    .ok()?;
-                Some(bytes.into())
+                let media = tokio::time::timeout(
+                    LOAD_BUDGET,
+                    offline::online_media(&api, &session, slot, &media_id, cached),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                Some(media.bytes)
             }));
         }
         if remaining <= CROSSFADE_SECONDS
@@ -782,6 +825,8 @@ impl Engine {
         if !audio.promote_crossfade() {
             return false;
         }
+        // A preview can be disk-backed; revalidate on the next admission.
+        audio.discard_cache();
         self.online.execution = Some(Execution {
             cursor: to.clone(),
             permit: playing.permit,
