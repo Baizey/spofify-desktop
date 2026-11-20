@@ -1,4 +1,4 @@
-import { Action, Caption, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+import { Action, Caption, Divider, Notice, Theme } from "theme.slint";
 
 export struct PaletteRow { id: string, title: string, primary: color, on-primary: color, secondary: color, tertiary: color }
 
@@ -18,7 +18,38 @@ export component SettingCard inherits Rectangle {
     }
 }
 
-export component Settings inherits VerticalLayout {
+component SettingsLabel inherits Text {
+    color: Theme.text;
+    font-size: 14px * Theme.density;
+    font-weight: 700;
+    vertical-alignment: center;
+}
+
+component SettingsAction inherits Action {
+    callback focused(length, length);
+    height: 34px;
+    property <float> density: Theme.density;
+    function reveal-focus() {
+        if root.has-focus { root.focused(root.absolute-position.y, root.height); }
+    }
+    changed has-focus => { root.reveal-focus(); }
+    // Changing density can wrap rows and move the active control below the fold.
+    changed density => { root.reveal-focus(); }
+}
+
+component DisplayChoice inherits SettingsAction {
+    accessible-checkable: true;
+    accessible-checked: self.selected;
+}
+
+component SettingsSection inherits VerticalLayout {
+    spacing: 6px;
+    padding-bottom: 6px;
+    Divider { }
+    @children
+}
+
+export component Settings inherits Rectangle {
     in property <string> account;
     in property <bool> offline;
     in property <bool> reconnecting;
@@ -38,87 +69,165 @@ export component Settings inherits VerticalLayout {
     callback appearance(int, float);
     callback select-palette(string);
     callback reset();
-    spacing: 11px;
-    alignment: start;
-    SettingCard {
-        title: "Connection";
-        detail: root.reconnecting ? "Reconnecting. You can keep listening to music in Saved offline."
-            : root.offline ? "Offline mode is on. Only music saved on this device is available for playback."
-            : "You’re online. Work offline to disconnect and listen to music saved on this device.";
-        HorizontalLayout {
-            Action { text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline"; primary: root.offline; clicked => { root.toggle-offline(); } }
-            Rectangle { horizontal-stretch: 1; }
-        }
-    }
-    SettingCard {
-        title: "Playback";
-        detail: "Blend up to 5 seconds between tracks on this desktop.";
-        HorizontalLayout {
-            Action {
-                text: root.crossfade-enabled ? "Crossfade: On" : "Crossfade: Off";
-                selected: root.crossfade-enabled;
-                accessible-label: "Crossfade";
-                accessible-checkable: true;
-                accessible-checked: root.crossfade-enabled;
-                clicked => { root.crossfade-changed(!root.crossfade-enabled); }
+    callback focused(length, length);
+    min-height: content.preferred-height;
+    vertical-stretch: 0;
+
+    content := VerticalLayout {
+        x: 0px; y: 0px; width: min(parent.width, 680px);
+        spacing: 4px;
+        alignment: start;
+
+        SettingsSection {
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    min-width: 0px; horizontal-stretch: 1;
+                    alignment: center;
+                    SettingsLabel { text: "Connection"; }
+                    Caption {
+                        text: root.reconnecting ? "Reconnecting…" : root.offline ? "Offline" : "Online";
+                    }
+                    if root.offline: Caption { text: "Downloaded music only"; wrap: word-wrap; }
+                }
+                SettingsAction {
+                    text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline";
+                    primary: root.offline;
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.toggle-offline(); }
+                }
             }
-            Rectangle { horizontal-stretch: 1; }
         }
-        if root.crossfade-status != "": Notice { text: root.crossfade-status; error: true; }
-    }
-    SettingCard {
-        title: "Music storage";
-        detail: root.music-storage;
-        HorizontalLayout {
-            Action { text: "Manage downloads"; clicked => { root.open-downloads(); } }
-            Rectangle { horizontal-stretch: 1; }
-        }
-    }
-    SettingCard {
-        title: "Appearance on this device";
-        detail: "";
-        HorizontalLayout {
-            spacing: 7px;
-            Action { text: "Dark"; selected: root.mode == 0; clicked => { root.appearance(0, root.scale); } }
-            Action { text: "Light"; selected: root.mode == 1; clicked => { root.appearance(1, root.scale); } }
-            Rectangle { horizontal-stretch: 1; }
-        }
-        HorizontalLayout {
-            spacing: 7px;
-            Action { text: "Compact"; selected: root.scale < 0.95; clicked => { root.appearance(root.mode, 0.85); } }
-            Action { text: "Standard"; selected: root.scale >= 0.95 && root.scale < 1.10; clicked => { root.appearance(root.mode, 1.0); } }
-            Action { text: "Large"; selected: root.scale >= 1.10; clicked => { root.appearance(root.mode, 1.2); } }
-            Rectangle { horizontal-stretch: 1; }
-        }
-        HorizontalLayout {
-            Action { text: "Reset display defaults"; quiet: true; clicked => { root.reset(); } }
-            Rectangle { horizontal-stretch: 1; }
-        }
-    }
-    SettingCard {
-        title: "Account colors";
-        detail: root.reconnecting ? "Account colors will be available once you’re connected." : root.offline ? "Go online to choose an account palette." : "";
-        if root.palette-status != "": Notice { text: root.palette-status; }
-        for palette in root.palettes: HorizontalLayout {
-            spacing: 9px;
-            Action {
-                text: palette.title; leading: true; quiet: true; min-width: 0px; horizontal-stretch: 1;
-                selected: palette.id == root.palette-id; enabled: root.palette-enabled && !root.offline;
-                accessible-label: palette.title + (self.selected ? ", selected palette" : ", choose palette");
-                clicked => { root.select-palette(palette.id); }
+        SettingsSection {
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    min-width: 0px; horizontal-stretch: 1;
+                    alignment: center;
+                    SettingsLabel { text: "Crossfade"; }
+                    Caption { text: "Up to 5 seconds · This device"; wrap: word-wrap; }
+                }
+                SettingsAction {
+                    text: root.crossfade-enabled ? "On" : "Off";
+                    min-width: 58px;
+                    selected: root.crossfade-enabled;
+                    accessible-label: "Crossfade";
+                    accessible-checkable: true;
+                    accessible-checked: root.crossfade-enabled;
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.crossfade-changed(!root.crossfade-enabled); }
+                }
             }
-            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.primary; border-width: 1px; border-color: Theme.line; } }
-            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.secondary; border-width: 1px; border-color: Theme.line; } }
-            Rectangle { width: 17px; Rectangle { y: (parent.height - 14px) / 2; width: 14px; height: 14px; border-radius: 7px; background: palette.tertiary; border-width: 1px; border-color: Theme.line; } }
+            if root.crossfade-status != "": Notice { text: root.crossfade-status; error: true; }
         }
-        if root.palette-status == "" && root.palettes.length == 0 && !root.offline: Caption { text: "No palettes are available yet."; }
-    }
-    SettingCard {
-        title: "Account";
-        detail: root.account == "" ? "Your current listening session." : "Signed in as " + root.account;
-        HorizontalLayout {
-            Action { text: "Sign out"; clicked => { root.sign-out(); } }
-            Rectangle { horizontal-stretch: 1; }
+        SettingsSection {
+            FlexboxLayout {
+                flex-wrap: wrap; alignment: space-between; cross-axis-alignment: center; spacing: 8px;
+                VerticalLayout {
+                    min-width: storage-title.preferred-width;
+                    preferred-width: parent.width - downloads.min-width - 8px >= self.min-width
+                        ? parent.width - downloads.min-width - 8px : parent.width;
+                    storage-title := SettingsLabel { text: "Music storage"; }
+                    if root.music-storage != "": Caption { text: root.music-storage; wrap: word-wrap; }
+                }
+                downloads := SettingsAction {
+                    text: "Manage downloads";
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.open-downloads(); }
+                }
+            }
+        }
+        SettingsSection {
+            SettingsLabel { text: "Appearance on this device"; }
+            FlexboxLayout {
+                flex-wrap: wrap; alignment: space-between; cross-axis-alignment: center; spacing: 4px;
+                Caption { text: "Theme"; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    DisplayChoice {
+                        text: "Dark"; selected: root.mode == 0;
+                        focused(y, h) => { root.focused(y, h); }
+                        clicked => { root.appearance(0, root.scale); }
+                    }
+                    DisplayChoice {
+                        text: "Light"; selected: root.mode == 1;
+                        focused(y, h) => { root.focused(y, h); }
+                        clicked => { root.appearance(1, root.scale); }
+                    }
+                }
+            }
+            FlexboxLayout {
+                flex-wrap: wrap; alignment: space-between; cross-axis-alignment: center; spacing: 4px;
+                Caption { text: "Density"; }
+                HorizontalLayout {
+                    spacing: 4px;
+                    DisplayChoice {
+                        text: "Compact"; selected: root.scale < 0.95;
+                        focused(y, h) => { root.focused(y, h); }
+                        clicked => { root.appearance(root.mode, 0.85); }
+                    }
+                    DisplayChoice {
+                        text: "Standard"; selected: root.scale >= 0.95 && root.scale < 1.10;
+                        focused(y, h) => { root.focused(y, h); }
+                        clicked => { root.appearance(root.mode, 1.0); }
+                    }
+                    DisplayChoice {
+                        text: "Large"; selected: root.scale >= 1.10;
+                        focused(y, h) => { root.focused(y, h); }
+                        clicked => { root.appearance(root.mode, 1.2); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: end;
+                SettingsAction {
+                    text: "Reset display defaults"; quiet: true;
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.reset(); }
+                }
+            }
+        }
+        SettingsSection {
+            SettingsLabel { text: "Account colors"; }
+            if root.offline: Caption {
+                text: root.reconnecting ? "Available after reconnecting" : "Go online to change colors";
+                wrap: word-wrap;
+            }
+            if !root.offline && root.palette-status != "": Notice { text: root.palette-status; }
+            for palette in root.palettes: HorizontalLayout {
+                spacing: 6px;
+                SettingsAction {
+                    text: palette.title; leading: true; quiet: true; min-width: 0px; horizontal-stretch: 1;
+                    selected: palette.id == root.palette-id; enabled: root.palette-enabled && !root.offline;
+                    accessible-label: palette.title + (self.selected ? ", selected palette" : ", choose palette");
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.select-palette(palette.id); }
+                }
+                for swatch in [palette.primary, palette.secondary, palette.tertiary]: Rectangle {
+                    width: 17px;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2; width: 14px; height: 14px; border-radius: 7px;
+                        background: swatch; border-width: 1px; border-color: Theme.line;
+                    }
+                }
+            }
+            if !root.offline && root.palette-status == "" && root.palettes.length == 0: Caption { text: "No colors available"; }
+        }
+        SettingsSection {
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    min-width: 0px; horizontal-stretch: 1;
+                    alignment: center;
+                    SettingsLabel { text: "Account"; }
+                    if root.account != "": Caption { text: root.account; wrap: word-wrap; }
+                }
+                SettingsAction {
+                    text: "Sign out";
+                    focused(y, h) => { root.focused(y, h); }
+                    clicked => { root.sign-out(); }
+                }
+            }
         }
     }
 }

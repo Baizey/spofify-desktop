@@ -534,6 +534,7 @@ export component AppWindow inherits Window {
                                 sign-out => { root.sign-out(); } toggle-offline => { root.flip-offline(); }
                                 appearance(mode, scale) => { root.appearance-changed(mode, scale, root.appearance-accent); }
                                 select-palette(id) => { root.palette-selected(id); } reset => { root.reset-appearance(); }
+                                focused(y, h) => { catalog-scroll.reveal(catalog.y + self.y + y - self.absolute-position.y, h); }
                             }
                             if root.page-kind == "devices" && root.device-rows.length > 0 && root.device-status != "": Notice { text: root.device-status; }
                             if root.page-kind == "devices" && root.device-rows.length == 0: EmptyState {
