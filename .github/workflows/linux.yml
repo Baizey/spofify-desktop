@@ -20,6 +20,12 @@ jobs:
           rustup component add --toolchain stable rustfmt
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ubuntu-24.04
+          cache-bin: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Test the locked application
         run: cargo +stable test --locked
       - name: Exercise OS media keys on a private bus
