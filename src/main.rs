@@ -22,6 +22,8 @@ mod replica;
 mod saved;
 mod socket;
 mod storage;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod update;
 slint::include_modules!();
 use engine::{AuthCommand, Command};
 use slint::{ComponentHandle, Model};
@@ -76,6 +78,13 @@ fn clear(ui: &AppWindow) {
     ui.set_manual_offline(false);
 }
 fn main() -> Result<(), slint::PlatformError> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version")
+    {
+        println!("Spofify Desktop {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if !cfg!(debug_assertions)
         && (std::env::var_os("SLINT_MCP_PORT").is_some()
             || std::env::var_os("SLINT_TEST_SERVER").is_some())
@@ -118,6 +127,8 @@ fn main() -> Result<(), slint::PlatformError> {
     desk.bind(&ui, mode, access.clone());
     let _media = presentation::install(&ui, access.clone());
     let _prefs = preferences::install(&ui, access.clone());
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    update::start(access);
     bind_auth(&ui, &auth_tx, &epoch);
     for op in ["previous", "next", "toggle"] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());

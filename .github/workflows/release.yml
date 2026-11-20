@@ -1,0 +1,128 @@
+name: Desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to the configured GitHub release repository
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spofify-desktop-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    env:
+      SPOFIFY_UPDATE_REPO: ${{ vars.SPOFIFY_UPDATE_REPO }}
+      SPOFIFY_UPDATE_PUBLIC_KEY: ${{ vars.SPOFIFY_UPDATE_PUBLIC_KEY }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve the release version
+        id: version
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          python3 - <<'PY'
+          import os, re, tomllib
+          with open('Cargo.toml', 'rb') as config:
+              version = tomllib.load(config)['package']['version']
+          if not re.fullmatch(r'(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}', version):
+              raise SystemExit('Cargo.toml must specify a stable X.Y.Z version')
+          if os.environ['PUBLISH'] == 'true':
+              if os.environ['GITHUB_REF'] != 'refs/heads/main':
+                  raise SystemExit('Publish only from main')
+              if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', os.environ['SPOFIFY_UPDATE_REPO']):
+                  raise SystemExit('Set the SPOFIFY_UPDATE_REPO repository variable')
+              if not re.fullmatch(r'[a-f0-9]{64}', os.environ['SPOFIFY_UPDATE_PUBLIC_KEY']):
+                  raise SystemExit('Set the SPOFIFY_UPDATE_PUBLIC_KEY repository variable')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('version=' + version, file=output)
+          PY
+      - name: Install Linux build requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libfontconfig1-dev desktop-file-utils
+          rustup update stable --no-self-update
+      - name: Test and build the release application
+        run: |
+          cargo +stable test --locked
+          dbus-run-session -- cargo +stable test --locked mpris::tests::desktop_controller_round_trip -- --ignored
+          cargo +stable build --locked --release
+      - name: Package and smoke-test the installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist/package
+          install -m755 target/release/spofify-desktop dist/spofify-desktop-linux-x86_64
+          install -m755 target/release/spofify-desktop dist/package/spofify-desktop
+          install -m755 packaging/install-release.sh dist/package/install.sh
+          install -m644 packaging/spofify-desktop.desktop assets/JetBrainsMono-OFL.txt dist/package/
+          install -m644 assets/spofify-logo.svg dist/package/spofify-desktop.svg
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          env -u XDG_DATA_HOME HOME="$scratch" bash dist/package/install.sh
+          desktop-file-validate "$scratch/.local/share/applications/spofify-desktop.desktop"
+          cmp dist/spofify-desktop-linux-x86_64 "$scratch/.local/lib/spofify-desktop/spofify-desktop"
+          test "$("$scratch/.local/lib/spofify-desktop/spofify-desktop" --version)" = "Spofify Desktop $VERSION"
+          tar -czf "dist/spofify-desktop-$VERSION-linux-x86_64.tar.gz" --transform="s,^package,spofify-desktop-$VERSION," -C dist package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spofify-desktop-linux-x86_64
+          path: |
+            dist/spofify-desktop-linux-x86_64
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: desktop-release
+    env:
+      VERSION: ${{ needs.package.outputs.version }}
+      SPOFIFY_UPDATE_REPO: ${{ vars.SPOFIFY_UPDATE_REPO }}
+      SPOFIFY_UPDATE_PUBLIC_KEY: ${{ vars.SPOFIFY_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: spofify-desktop-linux-x86_64
+          path: dist
+      - name: Sign the release manifest
+        env:
+          SPOFIFY_RELEASE_SIGNING_KEY: ${{ secrets.SPOFIFY_RELEASE_SIGNING_KEY }}
+        run: python3 scripts/sign-release.py dist "$VERSION"
+      - name: Publish the signed release
+        env:
+          GH_TOKEN: ${{ secrets.SPOFIFY_RELEASE_PUBLISH_TOKEN }}
+        run: |
+          visibility=$(gh repo view "$SPOFIFY_UPDATE_REPO" --json visibility --jq .visibility)
+          test "$visibility" = PUBLIC || { echo 'The tokenless updater requires publicly readable release assets.' >&2; exit 1; }
+          LATEST=$(gh release list --repo "$SPOFIFY_UPDATE_REPO" --limit 100 --json isLatest,tagName --jq '.[] | select(.isLatest) | .tagName')
+          export LATEST
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from importlib import import_module
+          version_tuple = import_module('sign-release').version_tuple
+          latest = os.environ['LATEST']
+          if latest and (not latest.startswith('v') or version_tuple(os.environ['VERSION']) <= version_tuple(latest[1:])):
+              raise SystemExit('Bump the Cargo version before publishing')
+          PY
+          gh release create "v$VERSION" \
+            "dist/spofify-desktop-$VERSION-linux-x86_64.tar.gz" \
+            dist/spofify-desktop-linux-x86_64 dist/update-v1-linux-x86_64.json \
+            --repo "$SPOFIFY_UPDATE_REPO" --latest --title "Spofify Desktop $VERSION" \
+            --notes "Linux x86-64. Built from source revision ${GITHUB_SHA}."

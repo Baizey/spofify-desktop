@@ -1,9 +1,0 @@
-[Unit]
-Description=Check for published Spofify Desktop updates
-
-[Timer]
-OnBootSec=1min
-OnUnitInactiveSec=5min
-
-[Install]
-WantedBy=timers.target
