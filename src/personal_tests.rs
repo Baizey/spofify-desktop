@@ -11,6 +11,17 @@ fn raw_summary(id: &str, count: usize, revision: u64) -> Value {
         "revision":revision,"createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z"})
 }
 
+fn raw_derived_summary(id: &str, count: usize, revision: u64) -> Value {
+    let mut p = raw_summary(id, count, revision);
+    p["kind"] = json!("derived");
+    p["evaluationState"] = json!("ready");
+    p
+}
+
+fn raw_definition() -> Value {
+    json!({"version":1,"sources":[{"kind":"allSaved","slotId":"source"}],"duplicates":"keep","sort":"sourceOrder"})
+}
+
 fn raw_track() -> Value {
     json!({"kind":"track","id":"song","name":"Song","artists":[{"id":"","name":"Credit"}],
         "hasAudio":true,"coverage":{"tracks":1,"inLibrary":1,"albums":1}})
@@ -100,6 +111,41 @@ fn initial_and_parts_are_atomic_and_direct() {
     assert_eq!(row_ids(&r), ["e1", "e2"]);
     assert_eq!(r.playlist().unwrap().rows[1].track.id, "song");
     assert!(!r.accepts_sync(next.as_ref().unwrap()));
+}
+
+#[test]
+fn a_changed_probe_keeps_cached_rows_visible_but_stale_until_the_last_part() {
+    let mut r = Replica::default();
+    initial(&mut r, 2);
+    watch(&mut r, "p");
+    let p = raw_summary("p", 2, 1);
+    part(
+        &mut r,
+        p.clone(),
+        "old",
+        0,
+        vec![raw_entry("e1", 2), raw_entry("e2", 5)],
+        false,
+    );
+    r.watch(None);
+    assert_eq!(watch(&mut r, "p"), sync("p", Some("old"), 0));
+    assert!(!r.playlist().unwrap().stale);
+    assert_eq!(
+        part(
+            &mut r,
+            p.clone(),
+            "new",
+            0,
+            vec![raw_entry("fresh1", 2)],
+            true
+        ),
+        sync("p", Some("new"), 1)
+    );
+    assert!(r.playlist().unwrap().stale);
+    assert_eq!(row_ids(&r), ["e1", "e2"]);
+    part(&mut r, p, "new", 1, vec![raw_entry("fresh2", 5)], false);
+    assert!(!r.playlist().unwrap().stale);
+    assert_eq!(row_ids(&r), ["fresh1", "fresh2"]);
 }
 
 #[test]
@@ -205,6 +251,7 @@ fn malformed_part_gets_at_most_one_repair_and_never_publishes() {
         vec![raw_entry("dup", 0)],
         true,
     );
+    r.staged.as_mut().unwrap().bytes = DETAIL_CACHE_BYTES;
     assert_eq!(
         part(
             &mut r,
@@ -232,40 +279,227 @@ fn malformed_part_gets_at_most_one_repair_and_never_publishes() {
 }
 
 #[test]
-fn bounds_stop_staging_without_truncated_rows_or_retry_loop() {
+fn manual_nonterminal_parts_cannot_reach_or_exceed_declared_total() {
+    for rows in [
+        vec![raw_entry("e2", 1)],
+        vec![raw_entry("e2", 1), raw_entry("e3", 2)],
+    ] {
+        let mut r = Replica::default();
+        initial(&mut r, 2);
+        watch(&mut r, "p");
+        let p = raw_summary("p", 2, 1);
+        let next = part(&mut r, p.clone(), "v", 0, vec![raw_entry("e1", 0)], true).unwrap();
+        let repair = part(&mut r, p, "v", 1, rows, true);
+        assert_eq!(repair, sync("p", None, 0));
+        assert!(!r.accepts_sync(&next));
+        assert!(r.staged.is_none());
+        assert!(r.playlist().is_none());
+        assert_eq!(
+            r.receive(Update::Part(Part {
+                summary: summary("p", 2, 1),
+                definition: None,
+                token: "v".into(),
+                offset: 0,
+                rows: vec![entry("e1", 0), entry("e2", 1)],
+                more: true,
+            })),
+            Err(PersonalError)
+        );
+    }
+}
+
+#[test]
+fn empty_terminal_parts_work_for_empty_manual_and_derived_count_drift() {
     let mut r = Replica::default();
-    initial(&mut r, 2);
+    initial(&mut r, 0);
     watch(&mut r, "p");
-    part(
-        &mut r,
-        raw_summary("p", 2, 1),
-        "v",
-        0,
-        vec![raw_entry("e1", 0)],
-        true,
-    );
-    r.staged.as_mut().unwrap().bytes = MAX_ROW_BYTES;
     assert_eq!(
-        part(
-            &mut r,
-            raw_summary("p", 2, 1),
-            "v",
-            1,
-            vec![raw_entry("e2", 1)],
-            false
-        ),
+        part(&mut r, raw_summary("p", 0, 1), "v", 0, vec![], false),
         None
     );
-    assert!(r.playlist_limited());
-    assert!(r.staged.is_none());
-    assert!(r.playlist().is_none());
+    assert!(r.playlist().unwrap().rows.is_empty());
+
+    watch(&mut r, "d");
+    let mut p = raw_derived_summary("d", 0, 1);
+    p["countState"] = json!("stale");
+    let definition = raw_definition();
     assert_eq!(
         send(
             &mut r,
-            json!({"change":{"playlist":raw_summary("p", 2, 2),"rowsInvalid":true}})
+            json!({"part":{"summary":p,"definition":definition,
+            "token":"v","offset":0,"rows":[raw_entry("o1_row", 0)],"more":true}})
+        ),
+        sync("d", Some("v"), 1)
+    );
+    assert_eq!(
+        send(
+            &mut r,
+            json!({"part":{"summary":p,"definition":definition,
+            "token":"v","offset":1,"rows":[],"more":false}})
         ),
         None
     );
+    assert_eq!(row_ids(&r), ["o1_row"]);
+}
+
+#[test]
+fn large_manual_and_derived_parts_install_all_rows_atomically() {
+    const TOTAL: usize = 1301;
+    const PART_ROWS: usize = 64;
+    for derived in [false, true] {
+        let mut r = Replica::default();
+        let (p, definition) = if derived {
+            (raw_derived_summary("p", TOTAL, 1), raw_definition())
+        } else {
+            (raw_summary("p", TOTAL, 1), Value::Null)
+        };
+        send(&mut r, json!({"snapshot":{"playlists":[p],"recent":[]}}));
+        assert_eq!(watch(&mut r, "p"), sync("p", None, 0));
+        let id = |i| format!("{}{i}", if derived { "o1_" } else { "e" });
+        for offset in (0..TOTAL).step_by(PART_ROWS) {
+            let end = (offset + PART_ROWS).min(TOTAL);
+            let rows: Vec<_> = (offset..end)
+                .map(|i| raw_entry(&id(i), 2 * i as u64))
+                .collect();
+            let more = end < TOTAL;
+            let next = send(
+                &mut r,
+                json!({"part":{"summary":p,"definition":definition,
+                "token":"v","offset":offset,"rows":rows,"more":more}}),
+            );
+            if more {
+                assert_eq!(next, sync("p", Some("v"), end));
+                let next = next.unwrap();
+                assert!(next.valid());
+                assert!(r.accepts_sync(&next));
+                assert!(r.playlist().is_none());
+            } else {
+                assert_eq!(next, None);
+            }
+        }
+        let detail = r.playlist().unwrap();
+        assert_eq!(detail.rows.len(), TOTAL);
+        assert_eq!(detail.definition.is_some(), derived);
+        for (i, row) in detail.rows.iter().enumerate() {
+            assert_eq!(row.id, id(i));
+            assert_eq!(row.position, 2 * i as u64);
+        }
+    }
+}
+
+#[test]
+fn continuation_offset_is_not_bounded_by_cache_budget() {
+    let offset = DETAIL_CACHE_BYTES / size_of::<ManualEntry>() + 1;
+    assert!(sync("p", Some("v"), offset).unwrap().valid());
+    assert!(!sync("p", None, offset).unwrap().valid());
+    assert!(!sync("p", Some("invalid token"), offset).unwrap().valid());
+    assert!(!sync("", Some("v"), offset).unwrap().valid());
+}
+
+#[test]
+fn oversized_multipart_remains_complete_while_watched_and_evicts_inactive_details() {
+    let mut r = Replica::default();
+    let p = raw_summary("p", 3, 1);
+    let old = raw_summary("old", 1, 1);
+    send(
+        &mut r,
+        json!({"snapshot":{"playlists":[p,old],"recent":[]}}),
+    );
+    watch(&mut r, "old");
+    part(&mut r, old, "old", 0, vec![raw_entry("old", 0)], false);
+    watch(&mut r, "p");
+    part(&mut r, p.clone(), "v", 0, vec![raw_entry("e1", 0)], true);
+    // Simulate an expensive first part without allocating it in the test.
+    r.staged.as_mut().unwrap().bytes = DETAIL_CACHE_BYTES;
+    assert_eq!(
+        part(&mut r, p.clone(), "v", 1, vec![raw_entry("e2", 1)], true),
+        sync("p", Some("v"), 2)
+    );
+    assert!(r.playlist().is_none());
+    assert_eq!(
+        part(&mut r, p, "v", 2, vec![raw_entry("e3", 2)], false),
+        None
+    );
+    assert_eq!(row_ids(&r), ["e1", "e2", "e3"]);
+    assert!(!r.playlist().unwrap().stale);
+    assert!(r.cached("old").is_none());
+    assert!(r.cached("p").unwrap().bytes > DETAIL_CACHE_BYTES);
+    assert_eq!(
+        send(
+            &mut r,
+            json!({"change":{"playlist":raw_summary("p", 3, 2),"rowsInvalid":true}})
+        ),
+        sync("p", None, 0)
+    );
+    assert_eq!(row_ids(&r), ["e1", "e2", "e3"]);
+    assert!(r.playlist().unwrap().stale);
+    r.watch(None);
+    assert!(r.cached("p").is_none());
+}
+
+#[test]
+fn live_add_evicts_inactive_details_instead_of_triggering_repair() {
+    let mut r = Replica::default();
+    let p = raw_summary("p", 1, 1);
+    let old = raw_summary("old", 1, 1);
+    send(
+        &mut r,
+        json!({"snapshot":{"playlists":[p,old],"recent":[]}}),
+    );
+    watch(&mut r, "old");
+    part(&mut r, old, "old", 0, vec![raw_entry("old", 0)], false);
+    watch(&mut r, "p");
+    part(&mut r, p, "v", 0, vec![raw_entry("e1", 0)], false);
+    let old_i = r.cache_index("old").unwrap();
+    r.details[old_i].bytes = DETAIL_CACHE_BYTES - r.cached("p").unwrap().bytes;
+    assert_eq!(
+        send(
+            &mut r,
+            json!({"change":{"playlist":raw_summary("p", 2, 2),"entries":{"added":raw_entry("e2", 1)}}})
+        ),
+        None
+    );
+    assert!(r.cached("old").is_none());
+    assert_eq!(row_ids(&r), ["e1", "e2"]);
+    assert!(!r.playlist().unwrap().stale);
+}
+
+#[test]
+fn row_byte_accounting_saturates_without_rejecting_live_updates() {
+    let mut r = Replica::default();
+    let p = raw_summary("p", 1, 1);
+    let old = raw_summary("old", 1, 1);
+    send(
+        &mut r,
+        json!({"snapshot":{"playlists":[p,old],"recent":[]}}),
+    );
+    watch(&mut r, "old");
+    part(&mut r, old, "old", 0, vec![raw_entry("old", 0)], false);
+    watch(&mut r, "p");
+    part(&mut r, p, "v", 0, vec![raw_entry("e1", 0)], false);
+    let p_i = r.cache_index("p").unwrap();
+    r.details[p_i].bytes = usize::MAX;
+    assert_eq!(
+        send(
+            &mut r,
+            json!({"change":{"playlist":raw_summary("p", 2, 2),"entries":{"added":raw_entry("e2", 1)}}})
+        ),
+        None
+    );
+    assert!(r.cached("old").is_none());
+    assert_eq!(r.cached("p").unwrap().bytes, usize::MAX);
+    assert_eq!(row_ids(&r), ["e1", "e2"]);
+    r.details[0].bytes = 0;
+    assert_eq!(
+        send(
+            &mut r,
+            json!({"change":{"playlist":raw_summary("p", 1, 3),"entries":{"removed":"e1"}}})
+        ),
+        None
+    );
+    assert_eq!(r.details[0].bytes, 0);
+    assert_eq!(row_ids(&r), ["e2"]);
+    assert!(!r.playlist().unwrap().stale);
 }
 
 #[test]
@@ -494,11 +728,9 @@ fn wire_fields_are_exact_and_derived_ids_are_not_manual_ids() {
         .is_err()
     );
     assert!(serde_json::from_value::<Update>(json!({})).is_err());
-    let mut p = raw_summary("d", 1, 1);
-    p["kind"] = json!("derived");
-    p["evaluationState"] = json!("ready");
+    let p = raw_derived_summary("d", 1, 1);
     let id = format!("o1_{}", "a".repeat(1000));
-    let definition = json!({"version":1,"sources":[{"kind":"allSaved","slotId":"source"}],"duplicates":"keep","sort":"sourceOrder"});
+    let definition = raw_definition();
     let mut r = Replica::default();
     send(&mut r, json!({"snapshot":{"playlists":[p],"recent":[]}}));
     watch(&mut r, "d");

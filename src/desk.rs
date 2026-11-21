@@ -864,20 +864,18 @@ impl Browser {
             return;
         };
         let route = self.route.clone();
-        let (status, next, detail_live, unavailable, limited) =
-            a.personal.read(|status, replica| {
-                let detail_live = replica.playlist().is_some_and(|p| !p.stale);
-                let page = (status.epoch == a.epoch)
-                    .then(|| pages::personal_projection(&route, replica))
-                    .flatten();
-                (
-                    status,
-                    page,
-                    detail_live,
-                    matches!(route, Route::Playlist(_)) && replica.playlist_unavailable(),
-                    matches!(route, Route::Playlist(_)) && replica.playlist_limited(),
-                )
-            });
+        let (status, next, detail_live, unavailable) = a.personal.read(|status, replica| {
+            let detail_live = replica.playlist().is_some_and(|p| !p.stale);
+            let page = (status.epoch == a.epoch)
+                .then(|| pages::personal_projection(&route, replica))
+                .flatten();
+            (
+                status,
+                page,
+                detail_live,
+                matches!(route, Route::Playlist(_)) && replica.playlist_unavailable(),
+            )
+        });
         let prior = self.personal_view.replace(status);
         let online = !a.offline && !a.session.is_offline();
         let prior_ready = self.personal_ready;
@@ -951,22 +949,19 @@ impl Browser {
         let waiting = online
             && matches!(status.link, Link::Waiting | Link::Ready)
             && !self.personal_ready
-            && !unavailable
-            && !limited;
+            && !unavailable;
+        // Time out a stalled part, not a long playlist making progress.
+        let progressing = matches!(route, Route::Playlist(_))
+            && prior.is_some_and(|old| old.playlist_progress != status.playlist_progress);
         if !waiting || refused || (visiting && self.error) {
             self.personal_due = None;
-        } else if transitioned || visiting {
+        } else if transitioned || visiting || progressing {
             self.personal_due = Some(tokio::time::Instant::now() + PERSONAL_READ_TIMEOUT);
         }
         self.busy = self.personal_due.is_some() && self.page.rows.is_empty();
         if !(visiting && self.error) {
             let (message, error) = if !online {
                 ("Work online to refresh your account library.", false)
-            } else if limited {
-                (
-                    "This playlist is too large to load here. Previously loaded songs may still be shown.",
-                    true,
-                )
             } else if unavailable {
                 (
                     "This playlist could not be opened. It may have been removed.",

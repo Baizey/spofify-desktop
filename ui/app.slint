@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
-import { Copy, EmptyState, Hero, MediaLine } from "catalog.slint";
+import { Copy, EmptyState, Hero, MediaLine, PlaylistPager } from "catalog.slint";
 import { OverflowMenu } from "overflow-menu.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
@@ -239,6 +239,22 @@ export component AppWindow inherits Window {
         property <length> search-return-y;
         property <string> playlist-return-key;
         property <length> playlist-return-y;
+        property <int> playlist-return-page;
+        // Only the mounted row widgets are paged; browse-rows and callback
+        // indices refer to the complete, ordered playlist snapshot.
+        property <int> playlist-page-size: 100;
+        property <int> playlist-page;
+        property <int> pager-focus-serial;
+        property <bool> pager-focus-backward;
+        property <int> playlist-rows: root.is-playlist ? root.browse-rows.length : 0;
+        property <int> playlist-last-page: self.playlist-rows > 0
+            ? (self.playlist-rows - 1) / self.playlist-page-size : 0;
+        changed playlist-rows => {
+            if self.playlist-rows > 0 { self.playlist-page = min(self.playlist-page, self.playlist-last-page); }
+        }
+        property <int> browse-start: min(self.playlist-page, self.playlist-last-page) * self.playlist-page-size;
+        property <int> browse-count: root.is-playlist
+            ? min(self.playlist-page-size, root.browse-rows.length - self.browse-start) : root.browse-rows.length;
         property <bool> returning;
         property <string> restoring-key;
         property <length> restoring-y;
@@ -250,6 +266,7 @@ export component AppWindow inherits Window {
         changed account-scope => {
             self.search-return-key = "";
             self.playlist-return-key = "";
+            self.playlist-page = 0;
             self.restoring-key = "";
             self.returning = false;
         }
@@ -260,7 +277,14 @@ export component AppWindow inherits Window {
             } else if root.is-playlist {
                 self.playlist-return-key = catalog-scroll.scroll-key;
                 self.playlist-return-y = catalog-scroll.content-y;
+                self.playlist-return-page = min(self.playlist-page, self.playlist-last-page);
             }
+        }
+        function turn-playlist-page(page: int) {
+            self.pager-focus-backward = page < min(self.playlist-page, self.playlist-last-page);
+            self.playlist-page = clamp(page, 0, self.playlist-last-page);
+            self.restoring-key = "";
+            self.pager-focus-serial += 1;
         }
         function browse(op: string, index: int) {
             if op == "open" || op == "add" { self.remember-scroll(); }
@@ -280,6 +304,7 @@ export component AppWindow inherits Window {
         }
         function destination-scrolled() {
             self.restoring-key = "";
+            self.playlist-page = 0;
             catalog-scroll.content-y = 0px;
             if self.returning {
                 self.returning = false;
@@ -287,6 +312,7 @@ export component AppWindow inherits Window {
                     self.restoring-key = self.search-return-key;
                     self.restoring-y = self.search-return-y;
                 } else if root.is-playlist && catalog-scroll.scroll-key == self.playlist-return-key {
+                    self.playlist-page = self.playlist-return-page;
                     self.restoring-key = self.playlist-return-key;
                     self.restoring-y = self.playlist-return-y;
                 }
@@ -336,8 +362,8 @@ export component AppWindow inherits Window {
             if target == "queue" {
                 self.toggle-queue(false);
             } else {
-                self.remember-scroll();
                 self.returning = target == "back";
+                if !self.returning { self.remember-scroll(); }
                 self.restoring-key = "";
                 root.compact-queue-open = false;
                 // Retire the outgoing page's focus even on Back between two pages of the same kind.
@@ -495,7 +521,11 @@ export component AppWindow inherits Window {
                         property <string> scroll-key: root.is-search ? "search|" + root.query
                             : root.page-key != "" ? root.page-key : root.page-kind + "|" + root.catalog-title;
                         changed scroll-key => { shell.destination-scrolled(); }
-                        changed content-height => { shell.apply-return-scroll(); }
+                        changed content-height => {
+                            if root.is-playlist { self.content-y = clamp(self.content-y, min(0px, self.visible-height - self.content-height), 0px); }
+                            shell.apply-return-scroll();
+                        }
+                        scrolled => { if root.is-playlist { shell.restoring-key = ""; } }
                         function reveal(y: length, h: length) {
                             if y < -self.content-y { self.content-y = -y; }
                             else if y + h > -self.content-y + self.visible-height { self.content-y = min(0px, self.visible-height - y - h); }
@@ -628,34 +658,64 @@ export component AppWindow inherits Window {
                                     : root.page-kind == "album" || root.is-playlist ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
                                     : root.saved-view ? "DOWNLOADED MUSIC" : "";
                             }
+                            if shell.playlist-last-page > 0: playlist-pager := PlaylistPager {
+                                property <int> focus-serial: shell.pager-focus-serial;
+                                changed focus-serial => {
+                                    self.focus-page-controls(shell.pager-focus-backward);
+                                    catalog-scroll.reveal(catalog.y + self.y, self.height);
+                                }
+                                page: min(shell.playlist-page, shell.playlist-last-page); last-page: shell.playlist-last-page;
+                                first-track: shell.browse-start + 1; last-track: shell.browse-start + shell.browse-count;
+                                track-count: shell.playlist-rows; announce: true;
+                                click-scope: root.page-key + "|" + root.browse-model-key + "|" + self.page;
+                                turned(page) => { shell.turn-playlist-page(page); }
+                                focused => { catalog-scroll.reveal(catalog.y + self.y, self.height); }
+                            }
                             catalog-list := VerticalLayout {
-                                spacing: 2px;
-                                for row[i] in root.browse-rows: shelf-row := VerticalLayout {
-                                    spacing: 4px;
-                                    if row.section != "": Eyebrow { text: row.section; height: 27px; }
-                                    MediaLine {
-                                        title: row.title; subtitle: row.subtitle; detail: row.detail; kind: row.kind;
-                                        search-result: root.is-search;
-                                        sequence: root.page-kind == "album" || root.is-playlist ? i + 1 : 0;
-                                        artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
-                                        credits: row.credits; metadata-enabled: !root.local-mode && root.page-kind != "picker";
-                                        album-id: row.album-id;
-                                        album-name: root.page-kind == "album" || root.page-kind == "picker" || row.kind != "track" ? "" : row.album-name;
-                                        playable: row.playable && (!root.local-mode || root.can-play-local) && root.page-kind != "picker";
-                                        can-open: row.can-open && (!root.local-mode || row.kind == "saved-collection");
-                                        open-label: root.page-kind == "picker" ? "Add to " + row.title : "Open " + row.title;
-                                        selectable: row.kind == "track";
-                                        current-track: row.track-id != "" && row.track-id == root.now-track-id;
-                                        playing-track: self.current-track && root.playing;
-                                        compact: main.width < 435px;
-                                        window-height: root.height;
-                                        menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
-                                        actions: root.page-kind == "picker" ? [] : !root.local-mode || root.page-kind == "offline" ? row.actions : [];
-                                        focused => { catalog-scroll.reveal(catalog.y + catalog-list.y + shelf-row.y + self.y, self.height); }
-                                        action(op) => { shell.browse(op, i); }
-                                        page-action(op, id) => { shell.entity(op, id); }
+                                // Change the repeater model on a page turn so a pressed control
+                                // from the outgoing window cannot release onto another song.
+                                for start in [shell.browse-start]: row-window := VerticalLayout {
+                                    spacing: 2px;
+                                    for i in shell.browse-count: shelf-row := VerticalLayout {
+                                        property <int> index: start + i;
+                                        property <BrowseRow> entry: root.browse-rows[self.index];
+                                        spacing: 4px;
+                                        if shelf-row.entry.section != "": Eyebrow { text: shelf-row.entry.section; height: 27px; }
+                                        MediaLine {
+                                            property <BrowseRow> entry: shelf-row.entry;
+                                            property <int> index: shelf-row.index;
+                                            title: self.entry.title; subtitle: self.entry.subtitle; detail: self.entry.detail; kind: self.entry.kind;
+                                            search-result: root.is-search;
+                                            sequence: root.page-kind == "album" || root.is-playlist ? self.index + 1 : 0;
+                                            occurrence-description: root.is-playlist ? "Song " + self.sequence : "";
+                                            artwork: self.index < root.browse-artwork.length ? root.browse-artwork[self.index] : root.no-artwork;
+                                            credits: self.entry.credits; metadata-enabled: !root.local-mode && root.page-kind != "picker";
+                                            album-id: self.entry.album-id;
+                                            album-name: root.page-kind == "album" || root.page-kind == "picker" || self.entry.kind != "track" ? "" : self.entry.album-name;
+                                            playable: self.entry.playable && (!root.local-mode || root.can-play-local) && root.page-kind != "picker";
+                                            can-open: self.entry.can-open && (!root.local-mode || self.entry.kind == "saved-collection");
+                                            open-label: root.page-kind == "picker" ? "Add to " + self.entry.title : "Open " + self.entry.title;
+                                            selectable: self.entry.kind == "track";
+                                            current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
+                                            playing-track: self.current-track && root.playing;
+                                            compact: main.width < 435px;
+                                            window-height: root.height;
+                                            menu-key: root.page-key + "|" + root.browse-model-key + "|" + self.index;
+                                            actions: root.page-kind == "picker" ? [] : !root.local-mode || root.page-kind == "offline" ? self.entry.actions : [];
+                                            focused => { catalog-scroll.reveal(catalog.y + catalog-list.y + row-window.y + shelf-row.y + self.y, self.height); }
+                                            action(op) => { shell.browse(op, self.index); }
+                                            page-action(op, id) => { shell.entity(op, id); }
+                                        }
                                     }
                                 }
+                            }
+                            if shell.playlist-last-page > 0: PlaylistPager {
+                                page: min(shell.playlist-page, shell.playlist-last-page); last-page: shell.playlist-last-page;
+                                first-track: shell.browse-start + 1; last-track: shell.browse-start + shell.browse-count;
+                                track-count: shell.playlist-rows;
+                                click-scope: root.page-key + "|" + root.browse-model-key + "|" + self.page;
+                                turned(page) => { shell.turn-playlist-page(page); }
+                                focused => { catalog-scroll.reveal(catalog.y + self.y, self.height); }
                             }
                             if root.has-more: HorizontalLayout {
                                 Action { text: "Load more"; enabled: !root.page-busy; clicked => { root.page-action("more", ""); } }

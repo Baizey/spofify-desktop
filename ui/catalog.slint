@@ -93,6 +93,62 @@ export component EmptyState inherits Rectangle {
     }
 }
 
+export component PlaylistPager inherits FlexboxLayout {
+    in property <int> page;
+    in property <int> last-page;
+    in property <int> first-track;
+    in property <int> last-track;
+    in property <int> track-count;
+    in property <bool> announce;
+    in property <string> click-scope;
+    callback turned(int);
+    callback focused();
+    public function focus-page-controls(backward: bool) {
+        if root.page > 0 && (backward || root.page == root.last-page) { previous.take-focus(); }
+        else if root.page < root.last-page { next.take-focus(); }
+    }
+    spacing: 4px;
+    flex-wrap: wrap;
+    cross-axis-alignment: center;
+    vertical-stretch: 0;
+    Caption {
+        text: root.first-track + "–" + root.last-track + " of " + root.track-count;
+        accessible-role: text;
+        accessible-label: "Songs " + self.text;
+        accessible-live-region: root.announce ? polite : off;
+        min-width: self.preferred-width;
+        horizontal-stretch: 1;
+    }
+    HorizontalLayout {
+        spacing: 4px;
+        horizontal-stretch: 0;
+        Action {
+            text: "«"; accessible-label: "First page";
+            enabled: root.page > 0; click-scope: root.click-scope;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.turned(0); }
+        }
+        previous := Action {
+            text: "‹"; accessible-label: "Previous page";
+            enabled: root.page > 0; click-scope: root.click-scope;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.turned(root.page - 1); }
+        }
+        next := Action {
+            text: "›"; accessible-label: "Next page";
+            enabled: root.page < root.last-page; click-scope: root.click-scope;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.turned(root.page + 1); }
+        }
+        Action {
+            text: "»"; accessible-label: "Last page";
+            enabled: root.page < root.last-page; click-scope: root.click-scope;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.turned(root.last-page); }
+        }
+    }
+}
+
 component TrackState inherits Rectangle {
     in property <bool> playing;
     width: 16px; height: self.width;
@@ -145,8 +201,10 @@ export component MediaLine inherits Rectangle {
     property <bool> body-actionable: root.can-open || root.play-on-activate;
     property <bool> body-focusable: root.can-open || root.selectable;
     property <string> pressed-row-key;
-    property <string> track-state-label: !root.current-track ? ""
-        : root.playing-track ? "Playing" : "Current track";
+    in property <string> occurrence-description;
+    property <string> track-state-label: !root.current-track ? root.occurrence-description
+        : (root.occurrence-description == "" ? "" : root.occurrence-description + ", ")
+            + (root.playing-track ? "Playing" : "Current track");
     function activate-row() {
         if root.can-open { root.action("open"); }
         else if root.play-on-activate { root.action("play"); }

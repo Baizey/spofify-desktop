@@ -201,7 +201,7 @@ pub struct Page {
     pub definition: Option<RuleDefinition>,
     pub playlist: Option<PlaylistMetadata>,
     pub playback: Option<PlaybackSelection>,
-    /// Local status for unavailable rule evaluation or the cap.
+    /// Local status for unavailable evaluation or incomplete views.
     pub status: String,
     pub total: Option<u64>,
     pub music: MusicMetadata,
@@ -667,16 +667,10 @@ pub fn personal_projection(route: &Route, replica: &personal::Replica) -> Option
         Route::Playlists | Route::Picker(_) => replica
             .snapshot()
             .map(|s| personal_list(route, &s.playlists)),
-        Route::Playlist(id) => replica.playlist().filter(|p| &p.summary.id == id).map(|p| {
-            personal_playlist(
-                &p.summary,
-                p.definition.as_ref(),
-                &p.rows,
-                p.summary
-                    .track_count
-                    .is_some_and(|count| count > p.rows.len() as u64),
-            )
-        }),
+        Route::Playlist(id) => replica
+            .playlist()
+            .filter(|p| &p.summary.id == id)
+            .map(|p| personal_playlist(&p.summary, p.definition.as_ref(), &p.rows)),
         _ => None,
     }
 }
@@ -738,7 +732,6 @@ pub fn personal_playlist(
     summary: &PlaylistSummary,
     definition: Option<&RuleDefinition>,
     entries: &[library::ManualEntry],
-    truncated: bool,
 ) -> Page {
     let mut page = Page::default();
     let metadata = apply_playlist_summary(&mut page, summary);
@@ -751,7 +744,6 @@ pub fn personal_playlist(
     page.playback = playlist_selection(summary, &context);
     page.rows = entries
         .iter()
-        .take(MAX_ROWS)
         .cloned()
         .map(|entry| {
             if derived {
@@ -771,8 +763,6 @@ pub fn personal_playlist(
         page.status = "Playback isn’t available for this playlist.".into();
     } else if summary.available_count == Some(0) && summary.track_count.is_some_and(|n| n > 0) {
         page.status = "No songs have available audio.".into();
-    } else if truncated || entries.len() > MAX_ROWS {
-        page.status = "Showing the first 500 songs.".into();
     }
     page
 }
@@ -1351,8 +1341,9 @@ mod tests {
             summary.evaluation_state =
                 (kind == PlaylistKind::Derived).then_some(EvaluationState::Ready);
             let list = personal_list(&Route::Playlists, &[summary.clone()]);
-            let detail = personal_playlist(&summary, None, &entries, false);
+            let detail = personal_playlist(&summary, None, &entries);
             assert_eq!(detail.total, Some(1161));
+            assert_eq!(detail.rows.len(), 1161);
             assert!(list.rows[0].playable);
             assert_eq!(list.rows[0].playback, detail.playback);
             assert_eq!(
@@ -1373,11 +1364,7 @@ mod tests {
                 blocked.capabilities.play = permitted;
                 let row = playlist_row(blocked.clone());
                 assert!(!row.playable && row.playback.is_none());
-                assert!(
-                    personal_playlist(&blocked, None, &[], false)
-                        .playback
-                        .is_none()
-                );
+                assert!(personal_playlist(&blocked, None, &[]).playback.is_none());
             }
         }
         for state in [
@@ -1388,7 +1375,7 @@ mod tests {
             summary.evaluation_state = state;
             assert!(!playlist_row(summary.clone()).playable);
             assert!(
-                personal_playlist(&summary, None, &entries, false)
+                personal_playlist(&summary, None, &entries)
                     .playback
                     .is_none()
             );
@@ -1418,7 +1405,7 @@ mod tests {
             position: 0,
             track: track(),
         }];
-        let page = personal_playlist(&summary, None, &entries, false);
+        let page = personal_playlist(&summary, None, &entries);
         assert!(page.rows[0].route.is_none());
         assert_eq!(
             selection(&page.rows[0]),
@@ -1429,10 +1416,118 @@ mod tests {
         let context = page.playback.as_ref().unwrap().context().unwrap();
         assert_eq!(context.info_route(), Route::Playlist("mix".into()));
         summary.evaluation_state = Some(EvaluationState::Stale);
-        let stale = personal_playlist(&summary, None, &entries, false);
+        let stale = personal_playlist(&summary, None, &entries);
         assert!(stale.playback.is_none());
         assert!(!stale.rows[0].playable);
         assert!(stale.rows[0].playback.is_none());
+    }
+
+    #[test]
+    fn large_playlist_detail_keeps_play_and_edit_identity_across_view_pages() {
+        const SONGS: u64 = 1163;
+        let metadata = rule_metadata();
+        let mut summary = PlaylistSummary {
+            id: metadata.id,
+            name: "Mix".into(),
+            description: String::new(),
+            kind: PlaylistKind::Manual,
+            count_state: library::CountState::Exact,
+            evaluation_state: None,
+            evaluation_error_code: None,
+            track_count: Some(SONGS),
+            available_count: Some(SONGS),
+            capabilities: metadata.capabilities,
+            revision: metadata.revision,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        summary.capabilities.edit_entries = true;
+        let route = Route::Playlist("mix".into());
+        let entries = (0..SONGS)
+            .map(|i| library::ManualEntry {
+                id: format!("occurrence-{i}"),
+                // Hidden rows can leave gaps in Go's stored slots.
+                position: 2 * i,
+                track: track(),
+            })
+            .collect::<Vec<_>>();
+        for (kind, wire_kind) in [
+            (PlaylistKind::Manual, "playlist"),
+            (PlaylistKind::Derived, "derived"),
+        ] {
+            summary.kind = kind;
+            summary.evaluation_state =
+                (kind == PlaylistKind::Derived).then_some(EvaluationState::Ready);
+            let page = personal_playlist(&summary, None, &entries);
+            assert_eq!(page.total, Some(SONGS));
+            assert_eq!(page.rows.len(), SONGS as usize);
+            assert!(!page.more && page.status.is_empty());
+            for (row, entry) in page.rows.iter().zip(&entries) {
+                assert_eq!(row.position, Some(entry.position));
+                assert!(row.playable && row.route.is_none());
+                let (key, track_fields) = if kind == PlaylistKind::Manual {
+                    (
+                        RowKey::ManualEntry {
+                            playlist_id: "mix".into(),
+                            entry_id: entry.id.clone(),
+                        },
+                        json!({"id":"track%2F音", "entryId":entry.id}),
+                    )
+                } else {
+                    (
+                        RowKey::DerivedOccurrence {
+                            playlist_id: "mix".into(),
+                            occurrence_id: entry.id.clone(),
+                        },
+                        json!({"id":"track%2F音", "targetId":"mix", "occurrenceId":entry.id}),
+                    )
+                };
+                assert_eq!(row.key, key);
+                assert_eq!(
+                    selection(row),
+                    json!({"kind":"track", "track":track_fields,
+                    "context":{"kind":wire_kind, "id":"mix", "name":"Mix"}})
+                );
+            }
+            assert_eq!(
+                page.playback
+                    .as_ref()
+                    .unwrap()
+                    .context()
+                    .unwrap()
+                    .info_route(),
+                route
+            );
+            if kind == PlaylistKind::Manual {
+                for (op, index, anchor) in [
+                    ("down", 1099, "occurrence-1100"),
+                    ("up", 1100, "occurrence-1098"),
+                    ("down", 1161, "occurrence-1162"),
+                ] {
+                    let change =
+                        crate::actions::mutation(&route, &page, op, Some(index), "").unwrap();
+                    assert_eq!(
+                        change.command,
+                        personal::Command::MoveEntry {
+                            playlist_id: "mix".into(),
+                            entry_id: entries[index].id.clone(),
+                            after: anchor.into(),
+                        }
+                    );
+                }
+                let change =
+                    crate::actions::mutation(&route, &page, "remove", Some(1162), "").unwrap();
+                assert_eq!(
+                    change.command,
+                    personal::Command::RemoveEntry {
+                        playlist_id: "mix".into(),
+                        entry_id: "occurrence-1162".into(),
+                    }
+                );
+            } else {
+                assert!(crate::actions::mutation(&route, &page, "remove", Some(1162), "").is_err());
+            }
+        }
     }
 
     #[test]

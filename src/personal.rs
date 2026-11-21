@@ -20,9 +20,9 @@ use crate::api::{
 const MAX_PLAYLISTS: usize = 100;
 const MAX_RECENT: usize = 40;
 const MAX_DETAILS: usize = 8;
-// Each pool has a separate bound so a replacement can stage beside the last
-// good detail. These estimate retained row memory, not serialized frame size.
-const MAX_ROW_BYTES: usize = 64 * 1024 * 1024;
+// Estimated row memory for cache eviction only. Staging and the watched
+// detail can exceed this budget without truncating rows.
+const DETAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Inner payload of `{"type":"personal","command":…}`. No account, client
 /// revision, request ID or ACK. `MoveEntry.after == ""` explicitly means first.
@@ -114,7 +114,6 @@ impl Command {
                 id_ok(playlist_id)
                     && known.as_deref().is_none_or(token_ok)
                     && (*offset == 0 || known.is_some())
-                    && *offset <= MAX_ROW_BYTES / size_of::<ManualEntry>()
             }
             Self::CreatePlaylist {
                 name,
@@ -414,7 +413,6 @@ pub struct Replica {
     pull: Pull,
     expected_sync: Option<Command>,
     repairing: bool,
-    limited: bool,
 }
 
 impl Replica {
@@ -435,12 +433,6 @@ impl Replica {
     /// or a newer continuation may already have superseded it.
     pub fn accepts_sync(&self, command: &Command) -> bool {
         self.ready && self.expected_sync.as_ref() == Some(command)
-    }
-
-    /// The watched detail exceeded this client's staging budget. No truncated
-    /// detail was installed and no automatic retry loop was scheduled.
-    pub fn playlist_limited(&self) -> bool {
-        self.limited
     }
 
     /// The watched playlist was deleted, or the transport ended while an
@@ -469,6 +461,7 @@ impl Replica {
             let retained = self.details.remove(i).expect("located detail");
             self.details.push_back(retained);
         }
+        self.evict_details();
         self.start_watch()
     }
 
@@ -538,7 +531,6 @@ impl Replica {
         self.pull = Pull::Idle;
         self.expected_sync = None;
         self.repairing = false;
-        self.limited = false;
     }
 
     fn summary(&self, id: &str) -> Option<&PlaylistSummary> {
@@ -556,6 +548,26 @@ impl Replica {
     }
     fn cached(&self, id: &str) -> Option<&Retained> {
         self.details.get(self.cache_index(id)?)
+    }
+
+    fn evict_details(&mut self) {
+        while self.details.len() > MAX_DETAILS
+            || self
+                .details
+                .iter()
+                .map(|d| d.bytes)
+                .fold(0, usize::saturating_add)
+                > DETAIL_CACHE_BYTES
+        {
+            let Some(i) = self
+                .details
+                .iter()
+                .position(|d| self.desired.as_deref() != Some(d.playlist.summary.id.as_str()))
+            else {
+                break;
+            };
+            self.details.remove(i);
+        }
     }
 
     fn install_snapshot(&mut self, mut s: Snapshot) -> Result<Option<Command>, PersonalError> {
@@ -673,21 +685,30 @@ impl Replica {
         {
             return self.repair_part(id);
         }
-        let bytes = p
+        // The manual summary counts the complete visible row set exactly.
+        // Derived evaluation can have a different live count.
+        let end = stage.playlist.rows.len().saturating_add(p.rows.len()) as u64;
+        if stage.playlist.summary.kind == PlaylistKind::Manual
+            && stage
+                .playlist
+                .summary
+                .track_count
+                .is_some_and(|total| end > total || p.more && end == total)
+        {
+            return self.repair_part(id);
+        }
+        stage.bytes = p
             .rows
             .iter()
-            .fold(stage.bytes, |used, row| used.saturating_add(row_bytes(row)));
-        if bytes > MAX_ROW_BYTES {
-            self.reset_pull();
-            self.limited = true;
-            self.mark_stale(&id);
-            return Ok(None);
-        }
-        stage.bytes = bytes;
+            .map(row_bytes)
+            .fold(stage.bytes, usize::saturating_add);
         stage.playlist.rows.extend(p.rows);
         if p.more {
             let next_offset = stage.playlist.rows.len();
             let token = stage.playlist.token.clone();
+            // A reply to a cache probe means the server has different rows.
+            // Keep last-good rows visible but non-actionable until commit.
+            self.mark_stale(&id);
             self.staged = Some(stage);
             return Ok(Some(self.sync(id, Some(token), next_offset)));
         }
@@ -704,11 +725,7 @@ impl Replica {
             self.details.remove(i);
         }
         self.details.push_back(stage);
-        while self.details.len() > MAX_DETAILS
-            || self.details.iter().map(|d| d.bytes).sum::<usize>() > MAX_ROW_BYTES
-        {
-            self.details.pop_front();
-        }
+        self.evict_details();
         Ok(None)
     }
 
@@ -777,20 +794,14 @@ impl Replica {
         let id = p.id.clone();
         let mut repair = true;
         if let Some(i) = self.cache_index(&id) {
-            let other_bytes = self
-                .details
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, d)| d.bytes)
-                .sum::<usize>();
             let previous = &mut self.details[i];
             repair = d.rows_invalid
                 || previous.playlist.stale
-                || !apply_entries(previous, &p, d.entries, MAX_ROW_BYTES - other_bytes);
+                || !apply_entries(previous, &p, d.entries);
             previous.playlist.summary = p;
             previous.playlist.token.clear();
             previous.playlist.stale = repair;
+            self.evict_details();
         }
         if self.desired.as_deref() != Some(&id) {
             return Ok(None);
@@ -799,7 +810,7 @@ impl Replica {
         // request is now refused by accepts_sync; an already sent reply may
         // either restart at zero (Go's token changed) or be ignored above.
         let interrupted = self.staged.take().is_some();
-        if (interrupted || repair && self.pull != Pull::Required) && !self.limited {
+        if interrupted || repair && self.pull != Pull::Required {
             self.repairing = false;
             return Ok(Some(self.sync(id, None, 0)));
         }
@@ -887,12 +898,7 @@ fn visible_count_matches(summary: &PlaylistSummary, len: usize) -> bool {
     summary.kind == PlaylistKind::Derived || summary.track_count == Some(len as u64)
 }
 
-fn apply_entries(
-    d: &mut Retained,
-    p: &PlaylistSummary,
-    edit: Option<EntryChange>,
-    max_bytes: usize,
-) -> bool {
+fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange>) -> bool {
     let rows = &mut d.playlist.rows;
     let Some(e) = edit else {
         // Summary-only deltas can rename a playlist; a changed visible count
@@ -908,15 +914,13 @@ fn apply_entries(
         e.after.as_deref().filter(|s| !s.is_empty()),
     ) {
         (Some(row), None, None, None) => {
-            let bytes = d.bytes.saturating_add(row_bytes(&row));
-            if bytes > max_bytes
-                || !visible_count_matches(p, rows.len() + 1)
+            if !visible_count_matches(p, rows.len() + 1)
                 || rows.iter().any(|r| r.id == row.id)
                 || rows.last().is_some_and(|r| r.position >= row.position)
             {
                 return false;
             }
-            d.bytes = bytes;
+            d.bytes = d.bytes.saturating_add(row_bytes(&row));
             rows.push(row);
         }
         (None, Some(id), None, None) => {
@@ -926,8 +930,8 @@ fn apply_entries(
             if !visible_count_matches(p, rows.len() - 1) {
                 return false;
             }
-            d.bytes -= row_bytes(&rows.remove(i));
-            if rows.capacity() > rows.len() * 2 {
+            d.bytes = d.bytes.saturating_sub(row_bytes(&rows.remove(i)));
+            if rows.capacity() > rows.len().saturating_mul(2) {
                 rows.shrink_to_fit();
             }
         }
@@ -967,22 +971,29 @@ fn row_bytes(row: &ManualEntry) -> usize {
     let t = &row.track;
     // Vec growth can reserve spare inline slots. Account for that headroom
     // while using the actual allocated capacities for nested metadata.
-    2 * size_of::<ManualEntry>()
-        + row.id.capacity()
-        + t.id.capacity()
-        + t.name.capacity()
-        + t.album_id.capacity()
-        + t.album_name.capacity()
-        + t.album_type.capacity()
-        + t.release_date.capacity()
-        + t.relation.capacity()
-        + t.artists.capacity() * size_of::<ArtistCredit>()
-        + t.artists
+    [
+        size_of::<ManualEntry>().saturating_mul(2),
+        row.id.capacity(),
+        t.id.capacity(),
+        t.name.capacity(),
+        t.album_id.capacity(),
+        t.album_name.capacity(),
+        t.album_type.capacity(),
+        t.release_date.capacity(),
+        t.relation.capacity(),
+        t.artists
+            .capacity()
+            .saturating_mul(size_of::<ArtistCredit>()),
+        t.genres.capacity().saturating_mul(size_of::<String>()),
+    ]
+    .into_iter()
+    .chain(
+        t.artists
             .iter()
-            .map(|a| a.id.capacity() + a.name.capacity())
-            .sum::<usize>()
-        + t.genres.capacity() * size_of::<String>()
-        + t.genres.iter().map(String::capacity).sum::<usize>()
+            .flat_map(|a| [a.id.capacity(), a.name.capacity()]),
+    )
+    .chain(t.genres.iter().map(String::capacity))
+    .fold(0, usize::saturating_add)
 }
 
 #[cfg(test)]

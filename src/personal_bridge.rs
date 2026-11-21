@@ -83,6 +83,8 @@ pub(crate) struct Status {
     pub link: Link,
     pub refused: u64,
     pub interruption: u64,
+    /// Changes only when a validated playlist part advances the scoped pull.
+    pub playlist_progress: u64,
     sequence: u64,
 }
 
@@ -113,6 +115,7 @@ impl Default for State {
                 link: Link::Disconnected,
                 refused: 0,
                 interruption: 0,
+                playlist_progress: 0,
                 sequence: 0,
             },
             replica: Replica::default(),
@@ -371,6 +374,10 @@ impl PersonalHub {
                 if snapshot {
                     state.status.link = Link::Ready;
                 }
+                if matches!(command, Some(PersonalCommand::SyncPlaylist { offset, .. }) if offset > 0)
+                {
+                    state.status.playlist_progress = state.status.playlist_progress.wrapping_add(1);
+                }
                 if let Some(observation) = observation {
                     state.status.sequence = observation.sequence;
                     if state.observations.len() >= 32 {
@@ -443,6 +450,40 @@ mod tests {
         hub.receive(7, 12, empty()).unwrap();
         assert!(access.read(|_, r| r.snapshot().is_none()));
         assert!(!hub.authorizes(7, 12, &command));
+    }
+
+    #[test]
+    fn only_accepted_continuations_signal_playlist_progress() {
+        let hub = PersonalHub::default();
+        hub.begin(1, 3);
+        hub.receive(1, 3, empty()).unwrap();
+        let access = hub.access();
+        assert!(access.watch_playlist(1, Some("large".into())).is_some());
+        let progress = || access.read(|status, _| status.playlist_progress);
+        let part = || {
+            serde_json::from_value(json!({"part": {
+                "summary": {"id":"large", "name":"Large", "description":"", "kind":"manual",
+                    "countState":"exact", "trackCount":2, "availableCount":2, "revision":1,
+                    "createdAt":"2026-08-03T00:00:00Z", "updatedAt":"2026-08-03T00:00:00Z",
+                    "capabilities":{"editMetadata":true,"editEntries":true,"editDefinition":false,
+                        "play":true,"copyToManual":false,"delete":true,"addTracks":true}},
+                "token":"t", "offset":0, "more":true, "rows":[{"id":"entry", "position":1,
+                    "track":{"kind":"track","id":"song","name":"Song","artists":[],
+                        "hasAudio":true,"coverage":{"tracks":1,"inLibrary":1,"albums":1}}}]
+            }}))
+            .unwrap()
+        };
+        hub.receive(1, 2, part()).unwrap();
+        assert_eq!(progress(), 0);
+        assert!(matches!(
+            hub.receive(1, 3, part()).unwrap(),
+            Some(PersonalCommand::SyncPlaylist { offset: 1, .. })
+        ));
+        assert_eq!(progress(), 1);
+        assert_eq!(hub.receive(1, 3, part()).unwrap(), None);
+        hub.receive(1, 3, serde_json::from_value(json!({"change":{}})).unwrap())
+            .unwrap();
+        assert_eq!(progress(), 1);
     }
 
     #[test]
