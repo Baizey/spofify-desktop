@@ -73,6 +73,8 @@ export component ReorderList inherits Rectangle {
     in property <bool> line-variant;
     in property <bool> reduced-motion;
     in property <bool> writable: true;
+    // True only while the adapter is waiting for this scope's move result.
+    in property <bool> commit-pending;
     // Index in the complete model, read on mount or when an inactive scope
     // becomes active. This also supports adapters that keep the viewport mounted.
     in property <int> initial-index;
@@ -148,6 +150,9 @@ export component ReorderList inherits Rectangle {
 
     init => { root.select-row(root.initial-index, false); }
     changed scope-key => { root.sync-scope(); }
+    changed commit-pending => {
+        if !root.commit-pending { root.finish-settling(); }
+    }
     changed can-write => { if !root.can-write && root.grab != Grab.settling { root.cancel-grab(); } }
     changed rows => {
         // A replacement model may only update display text. The adapters
@@ -346,14 +351,18 @@ export component ReorderList inherits Rectangle {
             }
         }
     }
+    function finish-settling() {
+        if root.grab != Grab.settling { return; }
+        root.refresh-selection();
+        if keys.has-focus { root.reveal(root.selection); }
+    }
+
     Timer {
+        // Covers a drop that was never admitted. An admitted drop uses the
+        // adapter's result or timeout instead of snapping to the old order.
         interval: 400ms;
-        running: root.grab == Grab.settling;
-        triggered => {
-            if root.grab != Grab.settling { return; }
-            root.cancel-grab();
-            if keys.has-focus { root.reveal(root.selection); }
-        }
+        running: root.grab == Grab.settling && !root.commit-pending;
+        triggered => { if !root.commit-pending { root.finish-settling(); } }
     }
     Timer {
         interval: 1ms;
@@ -510,7 +519,7 @@ export component ReorderList inherits Rectangle {
                 }
             }
         }
-        if root.preview: ReorderCard {
+        if root.preview: carried-card := ReorderCard {
             x: root.card-left + (root.has-sections ? 4px : root.line-variant ? 5px : 8px);
             y: clamp(root.carried-top + scroll.content-y, 1px, max(1px, scroll.visible-height - self.height - 1px));
             visible: root.grab == Grab.pointer || root.slot-in-view;

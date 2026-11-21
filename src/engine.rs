@@ -1297,6 +1297,9 @@ impl Engine {
         }
         p.queue_order_writable = !p.queue_order_token.is_empty()
             && (p.local_playback || !self.online.queue_order_pending());
+        p.queue_order_awaiting_echo = !p.queue_order_token.is_empty()
+            && !p.local_playback
+            && self.online.queue_order_awaiting_echo();
         p.publish(self.window.clone(), self.shared_epoch.clone(), self.epoch);
     }
 }
@@ -1431,6 +1434,7 @@ struct PlayerView {
     room_token: String,
     queue_order_token: String,
     queue_order_writable: bool,
+    queue_order_awaiting_echo: bool,
     media_track_token: String,
     playing: bool,
     control: bool,
@@ -1548,6 +1552,7 @@ impl PlayerView {
             }
             ui.set_queue_order_token(self.queue_order_token.into());
             ui.set_queue_order_writable(self.queue_order_writable);
+            ui.set_queue_order_awaiting_echo(self.queue_order_awaiting_echo);
             let devices = ui.get_device_rows();
             if devices.row_count() != self.devices.len()
                 || self.devices.iter().enumerate().any(|(i, row)| {

@@ -4,6 +4,7 @@
 From the worktree root, after coordinating the inspector build:
   SLINT_EMIT_DEBUG_INFO=1 cargo build --offline --locked --features slint/mcp
   python3 -B scripts/acceptance/reorder.py target/debug/spofify-desktop
+  # Or add --delayed-echo to test order continuity across a 1.9 s readback.
 
 Run on a host that permits worker-local IPv4 loopback. The default output is
 .tmp/reorder-review/; on reruns use --output reorder-review-2 (must be new).
@@ -71,7 +72,7 @@ def moved(rows, key, after, *, id_field, fixed):
 
 
 @contextmanager
-def account(output):
+def account(output, readback_delay=READBACK_DELAY):
     summary = dict(wire_ui.SUMMARY, id=PLAYLIST_ID, name=PLAYLIST, description="",
                    trackCount=COUNT, availableCount=COUNT)
     entries = [dict(id=entry_id(i), position=i, addedAt=wire_ui.DATE, track=track(i)) for i in range(COUNT)]
@@ -106,7 +107,7 @@ def account(output):
                 if kind == "move":
                     check(set(msg) == {"type", "key", "after"}, "unexpected queue move fields")
                     queue[:] = moved(queue, msg["key"], msg["after"] or None, id_field="key", fixed=CURRENT + 1)
-                    sleep(READBACK_DELAY)
+                    sleep(readback_delay)
                     self.note_readback()
                     self.send(dict(type="player", player=dict(source=self.connection,
                                    queue=dict(kind="order", keys=[row["key"] for row in queue]))))
@@ -116,7 +117,7 @@ def account(output):
                     order = moved(entries, command["entryId"], command["after"] or None, id_field="id", fixed=0)
                     entries[:] = [dict(e, position=i) for i, e in enumerate(order)]
                     summary["revision"] += 1
-                    sleep(READBACK_DELAY)
+                    sleep(readback_delay)
                     self.note_readback()
                     self.personal(change=dict(playlist=summary,
                                               entries=dict(moved=command["entryId"], after=command["after"])))
@@ -454,6 +455,34 @@ class Review:
         if cancel:
             key_trace(events, ESCAPE)
 
+    def delayed_echo(self):
+        before = len(self.commands())
+        start = self.row(DUPLICATE, 1)
+        anchor = self.row(7)
+        point = self.grab_point(start)
+        expected = self.command(5, 7)
+        with recording(self.window, self.output, f"{self.surface}-slow-echo") as events:
+            with self.hold(point):
+                sleep(.32)
+                self.after(anchor, point[0])
+                sleep(.17)
+            wait("exactly one emitted move", lambda: self.commands()[before:] == [expected], timeout=1)
+            self.frame("slow-echo-01-release")
+            sleep(.53)  # Clear the former 400 ms snap-back threshold.
+            self.window.key(" ")  # A pending drop cannot lift/place a second row.
+            carried = element_id(self.tree(self.editor), "carried-card")
+            check(carried and carried.get("visible", True), "preview snapped back before the delayed echo")
+            self.frame("slow-echo-02-pending", {"carried": bounds(carried)})
+            check(not (self.output / "readback.jsonl").exists(), "pending frame was not captured before echo")
+            self.expect_adjacent(DUPLICATE, 7, occurrence=1)
+            check(not element_id(self.tree(self.editor), "carried-card"), "preview survived the echo")
+            check(abs(center(carried)[1] - center(self.row(DUPLICATE, 1))[1]) <= 2,
+                  "the authoritative occurrence jumped to a different slot")
+            self.frame("slow-echo-03-authoritative", self.layout())
+            self.expect(before, expected)
+        pointer_trace(events, point)
+        key_trace(events, " ")
+
     def keyboard(self):
         before = len(self.commands())
         name = "04-keyboard"
@@ -553,6 +582,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("desktop", type=Path, help="prebuilt debug binary with the reorder editor and Slint MCP")
     parser.add_argument("--output", default="reorder-review", help="new directory name under worktree .tmp/")
+    parser.add_argument("--delayed-echo", action="store_true", help="only verify slow readback on queue and playlist")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     check(Path.cwd() == repo, "run this script from the desktop worktree root")
@@ -565,7 +595,7 @@ def main():
     binary = args.desktop.resolve(strict=True)
     print(f"Native evidence: {output}", flush=True)
     failures = []
-    for variant in ("soft-slot", "line-cue"):
+    for variant in (("soft-slot",) if args.delayed_echo else ("soft-slot", "line-cue")):
         for surface in ("queue", "playlist"):
             captures = output / variant / surface
             captures.mkdir(mode=0o700, parents=True)
@@ -580,7 +610,8 @@ def main():
                     if variant == "line-cue":
                         env["SPOFIFY_INSPECT_REORDER_LINE"] = "1"
                     try:
-                        with account(captures) as (ready, commands), desktop(binary, root, env, multisize=True) as window:
+                        delay = 1.9 if args.delayed_echo else READBACK_DELAY
+                        with account(captures, delay) as (ready, commands), desktop(binary, root, env, multisize=True) as window:
                             if window.window_properties()["size"]["width"] == WIDE[0]:
                                 window.resize_output(WIDE)  # May already be Cage's default mode.
                             else:
@@ -594,12 +625,15 @@ def main():
                             with pointer(root / "runtime", window, captures) as device:
                                 review = Review(window, device, captures, commands)
                                 review.open(surface)
-                                if surface == "queue":
-                                    review.fixed_current()
-                                review.pointer_gesture(cancel=True)
-                                review.pointer_gesture()
-                                review.keyboard()
-                                review.edge_gesture()
+                                if args.delayed_echo:
+                                    review.delayed_echo()
+                                else:
+                                    if surface == "queue":
+                                        review.fixed_current()
+                                    review.pointer_gesture(cancel=True)
+                                    review.pointer_gesture()
+                                    review.keyboard()
+                                    review.edge_gesture()
                                 window.click_element(review.control("Done"))
                                 review.control("Edit order")
                                 review.frame("06-done")
@@ -612,7 +646,8 @@ def main():
             else:
                 print(f"PASS {variant}/{surface}: native events and wire commands", flush=True)
     check(not failures, f"{len(failures)} native scenario(s) failed; evidence in {output}")
-    print("Visual review still required: compare aligned edges, text baselines and grip centers across the two frame sequences.")
+    if not args.delayed_echo:
+        print("Visual review still required: compare aligned edges, text baselines and grip centers across the two frame sequences.")
 
 
 if __name__ == "__main__":

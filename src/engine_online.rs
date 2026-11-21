@@ -157,6 +157,14 @@ impl Online {
         self.order_echo.is_some()
     }
 
+    pub(super) fn queue_order_awaiting_echo(&self) -> bool {
+        // The timeout ends the UI preview. Keep the write fence until an
+        // authoritative order or the existing read-only recovery resolves it.
+        self.order_echo
+            .as_ref()
+            .is_some_and(|echo| echo.refresh_attempts == 0)
+    }
+
     pub(super) fn has_provisional_cursor(&self) -> bool {
         self.advance.is_some()
     }

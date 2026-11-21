@@ -756,6 +756,10 @@ impl Browser {
             saved_route(&self.route) || offline && matches!(self.route, Route::Search(_));
         let personal_actions = !self.route.personal() || self.personal_ready;
         let write = self.writing;
+        let order_pending = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.effect, Effect::Move { .. }));
         let art = self.art.clone();
         let route = self.route.clone();
         let request = self.access.as_ref().map(|a| crate::artwork::Request {
@@ -870,6 +874,9 @@ impl Browser {
                 }
                 ui.set_playlist_order_scope(order.scope.into());
             }
+            // Keep the preview until the confirmed rows and scope are published,
+            // not until a separate form-completion callback clears form-busy.
+            ui.set_playlist_order_pending(order_pending);
         });
     }
     fn pins_changed(&mut self, view: playlist_pins::View) {

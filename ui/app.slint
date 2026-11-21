@@ -102,6 +102,7 @@ export component AppWindow inherits Window {
     in property <PlaylistActions> playlist-actions;
     in property <[ReorderRow]> playlist-order-rows;
     in property <string> playlist-order-scope;
+    in property <bool> playlist-order-pending;
     callback playlist-order-drop(string, string, string);
     in property <int> saved-pin-focus-serial;
     callback navigate(string);
@@ -153,6 +154,7 @@ export component AppWindow inherits Window {
     in property <[ReorderRow]> queue-order-rows;
     in property <string> queue-order-token;
     in property <bool> queue-order-writable;
+    in property <bool> queue-order-awaiting-echo;
     callback queue-order-drop(string, string, string);
     in property <[DeviceRow]> device-rows;
     in property <string> queue-status;
@@ -865,6 +867,7 @@ export component AppWindow inherits Window {
                             initial-index: shell.browse-start;
                             scope-key: playlist-order-pane.visible && !root.compact-queue-open ? root.playlist-order-scope : "";
                             writable: !root.form-busy;
+                            commit-pending: root.playlist-order-pending;
                             line-variant: root.inspection-reorder-line;
                             reduced-motion: root.reduced-motion;
                             placed(key, after) => {
@@ -935,6 +938,7 @@ export component AppWindow inherits Window {
                         rows: root.queue-order-rows;
                         initial-index: 1;
                         writable: root.queue-order-writable;
+                        commit-pending: root.queue-order-awaiting-echo;
                         scope-key: self.visible && root.queue-shown ? root.queue-order-token : "";
                         line-variant: root.inspection-reorder-line;
                         reduced-motion: root.reduced-motion;
