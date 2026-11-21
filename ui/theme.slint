@@ -66,6 +66,7 @@ export component Action inherits Rectangle {
     out property <bool> pointer-focused;
     out property <bool> focus-visible: root.enabled && key.has-focus && (root.pointer-focus-visible || !root.pointer-focused);
     callback clicked();
+    callback keyboard-focus-changed(bool);
     public function take-focus() { root.pointer-focused = false; key.focus(); }
     public function take-pointer-focus() { root.pointer-focused = true; key.focus(); }
     forward-focus: key;
@@ -142,6 +143,10 @@ export component Action inherits Rectangle {
         focus-on-click: false;
         focus-gained(reason) => {
             if reason == FocusReason.tab-navigation { root.pointer-focused = false; }
+            if reason != FocusReason.window-activation { root.keyboard-focus-changed(true); }
+        }
+        focus-lost(reason) => {
+            if reason != FocusReason.window-activation { root.keyboard-focus-changed(false); }
         }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
@@ -219,6 +224,7 @@ export component TextTarget inherits Rectangle {
     in property <int> font-weight: 600;
     callback activated();
     callback focused();
+    callback keyboard-focus-changed(bool);
     min-width: 0px;
     horizontal-stretch: 1;
     height: max(20px, font-size + 7px);
@@ -250,7 +256,13 @@ export component TextTarget inherits Rectangle {
             init => { if self.restoring { self.focus(); } }
             changed restoring => { if self.restoring { self.focus(); } }
             focus-on-click: false;
-            focus-gained(_) => { root.focused(); }
+            focus-gained(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(true); }
+                root.focused();
+            }
+            focus-lost(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(false); }
+            }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == Key.Space {
                     if !event.repeat { root.activated(); }
