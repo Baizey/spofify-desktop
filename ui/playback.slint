@@ -192,12 +192,19 @@ export component PlayerBar inherits Rectangle {
     property <length> pad: max(clamp(root.width * 0.03, 14px, 34px), (root.width - 1220px) / 2);
     property <length> center-width: root.layered ? min(root.width - 2 * root.pad, 480px) : clamp(root.width * 0.36, 214px, 480px);
     property <length> top-height: root.layered ? (root.status == "" ? 58px : 72px) : root.height;
+    property <bool> title-repaint-phase;
+    changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
     vertical-stretch: 0; background: Theme.panel;
     Divider { y: 0px; }
     track-info := Rectangle {
         x: root.pad; y: 0px;
         width: max(0px, (root.layered ? output-tools.x : (root.width - root.center-width) / 2) - root.pad - 10px);
         height: root.top-height;
+        // Damage the whole metadata area on title changes, rather than relying
+        // on a partial software repaint of the old and new glyphs.
+        // The transparent border affects neither layout nor progress-only damage.
+        border-color: transparent;
+        border-width: root.title-repaint-phase ? 1px : 0px;
         property <bool> show-cover: self.width >= 150px;
         Cover {
             visible: parent.show-cover;
