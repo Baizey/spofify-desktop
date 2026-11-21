@@ -634,7 +634,9 @@ impl Engine {
             Command::Guarded(token, action) => {
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
                     match action {
-                        Action::Pause if !self.wants_pause() => (),
+                        Action::Pause if !self.wants_pause() && !self.online.starting_locally() => {
+                            ()
+                        }
                         Action::Resume if self.wants_pause() => (),
                         _ => self.action(action),
                     }
@@ -664,7 +666,7 @@ impl Engine {
         }
     }
     fn toggle(&mut self) {
-        self.action(if self.wants_pause() {
+        self.action(if self.wants_pause() || self.online.starting_locally() {
             Action::Pause
         } else {
             Action::Resume
@@ -1025,7 +1027,7 @@ impl Engine {
                 result,
             } if self.epoch == epoch && self.operation == operation && !self.offline => {
                 self.media = None;
-                self.complete_online(result);
+                self.complete_online(operation, result);
             }
             _ => {}
         }
@@ -1050,6 +1052,7 @@ impl Engine {
         self.local_lookahead = None;
         self.cancel_online_crossfade();
         self.online.execution = None;
+        self.online.clear_local_start();
         if let Some(audio) = &mut self.audio {
             audio.stop();
         }

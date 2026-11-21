@@ -110,9 +110,9 @@ pub(crate) struct OnlineMedia {
     pub downloaded: bool,
 }
 
-/// Choose bytes only after the caller has admitted online local output. This
-/// does not interpret queue or output state. The caller must still fence the
-/// result by account epoch, occurrence, and coordinator authority.
+/// Choose authenticated account media; this does not interpret queue, output,
+/// or grant state. The caller must fence the result by account epoch and the
+/// exact native operation, whether awaiting Go confirmation or committed.
 pub(crate) async fn online_media(
     api: &Arc<Api>,
     session: &Session,

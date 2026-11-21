@@ -390,7 +390,7 @@ def full_player(window, title, name, width, failures):
 
 
 @contextmanager
-def desktop(binary, root, env, pixels=None, *, multisize=False):
+def desktop(binary, root, env, pixels=None, *, multisize=False, mcp_port=0):
     cage = shutil.which("cage")
     check(cage, "native acceptance needs cage (headless Wayland only)")
     randr = shutil.which("wlr-randr") if multisize else None
@@ -398,7 +398,11 @@ def desktop(binary, root, env, pixels=None, *, multisize=False):
     # The reserved port is closed just before launch. Only connect to the spawned
     # debug process while it is alive, and run this in a private worker if available.
     with socket.socket() as reserved:
-        reserved.bind(("127.0.0.1", 0))
+        if mcp_port:
+            # A previous case can leave local MCP connections in TIME_WAIT.
+            reserved.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reserved.bind(("127.0.0.1", mcp_port))
+        reserved.listen(1)
         port = reserved.getsockname()[1]
     env = dict(env, WLR_BACKENDS="headless", WLR_RENDERER="pixman", WLR_HEADLESS_OUTPUTS="1",
                SLINT_BACKEND="winit-software", SLINT_MCP_PORT=str(port))

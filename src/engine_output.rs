@@ -369,6 +369,7 @@ mod tests {
             generation: 7,
             deadline: now + Duration::from_secs(4),
             attached: true,
+            resume_through: 0,
         };
         let (grants, rx) = watch::channel(Some(first));
         let (links, link) = watch::channel(Link::Connected(7));
@@ -386,6 +387,7 @@ mod tests {
             generation: 8,
             deadline: now + Duration::from_secs(8),
             attached: true,
+            resume_through: 0,
         };
         links.send_replace(Link::Connected(8));
         grants.send_replace(Some(reattached));
@@ -406,6 +408,7 @@ mod tests {
             generation: 4,
             deadline: Instant::now() + Duration::from_secs(5),
             attached: true,
+            resume_through: 0,
         };
         let (grants, rx) = watch::channel(Some(grant));
         let (links, link) = watch::channel(Link::Connected(4));
@@ -434,11 +437,13 @@ mod tests {
             generation: 1,
             deadline: now,
             attached: false,
+            resume_through: 0,
         };
         let next = OutputAuthority {
             generation: 2,
             deadline: now + Duration::from_secs(8),
             attached: true,
+            resume_through: 0,
         };
         let (_grants, rx) = watch::channel(Some(next));
         let permit = RunPermit::new(rx, old);
