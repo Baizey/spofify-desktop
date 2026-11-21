@@ -114,6 +114,18 @@ component TrackState inherits Rectangle {
     }
 }
 
+component TrackCover inherits Cover {
+    in property <bool> current-track;
+    in property <bool> playing-track;
+    width: 39px; height: self.width;
+    Rectangle {
+        visible: root.current-track;
+        x: parent.width - self.width; y: parent.height - self.height;
+        width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
+        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
+    }
+}
+
 export component MediaLine inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -129,7 +141,8 @@ export component MediaLine inherits Rectangle {
     in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
     in property <bool> compact;
-    in property <bool> queue-columns;
+    in property <bool> queue-row;
+    property <bool> queue-cover: root.queue-row && root.artwork.width > 0;
     in property <bool> search-result;
     in property <bool> selected;
     in property <length> paint-left;
@@ -232,7 +245,7 @@ export component MediaLine inherits Rectangle {
 
         HorizontalLayout {
             padding-top: 6px; padding-bottom: 6px;
-            spacing: !root.queue-columns && root.compact && root.kind == "track" ? 6px : 8px;
+            spacing: !root.queue-row && root.compact && root.kind == "track" ? 6px : 8px;
             if root.sequence > 0: Rectangle {
                 width: root.compact ? 26px : 33px;
                 Caption {
@@ -244,20 +257,15 @@ export component MediaLine inherits Rectangle {
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }
             }
-            // Queue rows share the current row's cover column even when there is no art.
-            if root.sequence == 0 && (!root.compact || root.queue-columns): Rectangle {
+            if root.sequence == 0 && !root.compact && !root.queue-row: Rectangle {
                 width: 39px;
-                if !root.compact: Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
+                TrackCover {
+                    y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
-                    Rectangle {
-                        visible: root.current-track;
-                        x: parent.width - self.width; y: parent.height - self.height;
-                        width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
-                        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
-                    }
+                    current-track: root.current-track; playing-track: root.playing-track;
                 }
             }
-            if root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-columns: Rectangle {
+            if root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-row: Rectangle {
                 width: 16px;
                 TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
             }
@@ -292,7 +300,7 @@ export component MediaLine inherits Rectangle {
                     height: artist-line.preferred-height;
                     artist-line := CreditLine {
                         // Credit names already have a 2px text inset; the fallback has none.
-                        x: root.queue-columns || root.playlist-track-row ? (root.credits.length > 0 ? 2px : 4px) : 0px;
+                        x: root.queue-row || root.playlist-track-row ? (root.credits.length > 0 ? 2px : 4px) : 0px;
                         width: max(0px, parent.width - 2 * self.x); height: parent.height;
                         credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
                         restore-control: root.restore-control;
@@ -311,6 +319,19 @@ export component MediaLine inherits Rectangle {
                     restore-focus: root.restore-control == "album:" + root.album-id;
                     activated => { root.page-action("album", root.album-id); }
                     focused => { root.focused(); }
+                }
+            }
+            // Queue text stays on the same edge even as the current cover loads.
+            // Other occurrences do not reserve either the cover or state slot.
+            if root.queue-row && root.current-track: Rectangle {
+                width: root.queue-cover ? 39px : 37px;
+                if root.queue-cover: TrackCover {
+                    y: (parent.height - self.height) / 2;
+                    artwork: root.artwork; current-track: true; playing-track: root.playing-track;
+                }
+                if !root.queue-cover: TrackState {
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    playing: root.playing-track;
                 }
             }
             if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
