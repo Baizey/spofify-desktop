@@ -1,5 +1,8 @@
 //! Track-level adapter for the Saved screen; disk operations run off the desk actor.
 
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
+
 use crate::{
     api::ApiError,
     desk::Access,
@@ -13,6 +16,13 @@ const STORAGE: ApiError = ApiError {
     expired: false,
     status: 0,
 };
+const MODE_CHANGED: ApiError = ApiError {
+    message: "The playback mode changed.",
+    expired: false,
+    status: 0,
+};
+static SELECTED_READ_SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
 const INVALID_TRACK: ApiError = ApiError {
     message: "This item is not a saved track.",
     expired: false,
@@ -43,7 +53,6 @@ fn error(err: offline::Error) -> ApiError {
             Damaged => "The downloaded file or store layout is invalid.",
             UnsupportedAudio => "This audio cannot be played on this device.",
             InvalidMedia => "Unable to verify this track’s download.",
-            TrackTooLarge => "This track exceeds the 32 MiB download limit.",
             Offline => "Downloads are unavailable while offline.",
             Cancelled => "The download was cancelled.",
         },
@@ -124,16 +133,21 @@ pub async fn save(access: &Access, row: &Row) -> Result<(), ApiError> {
         .as_ref()
         .filter(|item| item.id == row.id)
         .ok_or(INVALID_TRACK)?;
-    if access.offline || access.session.is_offline() {
+    let mut network = access.session.network_changes();
+    if access.offline || *network.borrow_and_update() & 1 != 0 {
         return Err(error(offline::Error::Offline));
     }
-    let store = tokio::task::spawn_blocking(OfflineStore::open_default)
-        .await
-        .map_err(|_| STORAGE)?
-        .map_err(error)?;
-    match store.download(&access.api, &access.session, item).await {
-        Ok(_) | Err(offline::Error::AlreadyDownloaded) => Ok(()),
-        Err(err) => Err(error(err)),
+    access.api.authenticated_account(&access.session)?;
+    tokio::select! {
+        biased;
+        _ = network.changed() => Err(error(offline::Error::Offline)),
+        result = async {
+            let store = OfflineStore::open_for_download(OfflineStore::open_default).await.map_err(error)?;
+            match store.download(&access.api, &access.session, item).await {
+                Ok(_) | Err(offline::Error::AlreadyDownloaded) => Ok(()),
+                Err(err) => Err(error(err)),
+            }
+        } => result,
     }
 }
 
@@ -155,27 +169,21 @@ pub async fn remove(access: &Access, row: &Row) -> Result<(), ApiError> {
 
 pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command, ApiError> {
     access.api.authenticated_account(&access.session)?;
-    let network = access.session.network_changes();
-    let mode_stamp = *network.borrow();
+    let mut network = access.session.network_changes();
+    let mode_stamp = *network.borrow_and_update();
     let (mut queue, index) = queue_selection(page, index)?;
     let track_id = queue[index].id.clone();
-    let api = access.api.clone();
-    let session = access.session.clone();
-    let (store, input) = tokio::task::spawn_blocking(move || {
-        let store = OfflineStore::open_default()?;
-        let input = store.read(&api, &session, &track_id)?;
-        Ok::<_, offline::Error>((store, input))
-    })
-    .await
-    .map_err(|_| STORAGE)?
-    .map_err(error)?;
+    let slot = SELECTED_READ_SLOT
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone();
+    let (store, input) = tokio::select! {
+        biased;
+        _ = network.changed() => return Err(MODE_CHANGED),
+        result = offline::read_verified(access.api.clone(), access.session.clone(), slot, track_id, OfflineStore::open_default) => result.map_err(error)?,
+    };
     access.api.authenticated_account(&access.session)?;
     if *network.borrow() != mode_stamp || access.offline != access.session.is_offline() {
-        return Err(ApiError {
-            message: "The playback mode changed.",
-            expired: false,
-            status: 0,
-        });
+        return Err(MODE_CHANGED);
     }
     // Prefer the presentation metadata paired with the verified local bytes.
     // Other occurrences carry only identities/labels and load lazily in the engine.

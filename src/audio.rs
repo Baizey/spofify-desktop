@@ -1,17 +1,19 @@
-//! Native output. The decoder checks its exact operation capability, session
-//! and account/mode epoch at the sample boundary, outside the actor's scheduler.
+//! Native output. PCM reaches the mixer only through an exact operation
+//! capability, session, and account/mode epoch checked at the sample boundary.
+#[path = "audio_pcm.rs"]
+mod pcm;
+
 use crate::{
     api::Session,
+    audio_input::AudioInput,
     player::{Authority, Status},
 };
-use rodio::{
-    Decoder, OutputStream, OutputStreamBuilder, Sink, Source, mixer::Mixer, source::SeekError,
-};
+use pcm::{Format, NativeSinkOutput, Pcm, State};
+use rodio::{OutputStream, OutputStreamBuilder, Sink, mixer::Mixer};
 use std::{
-    io::Cursor,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -61,41 +63,46 @@ pub struct Facts {
 pub struct Audio {
     stream: Option<OutputStream>,
     #[cfg(test)]
-    test_mixer: Option<Mixer>,
+    test_mixer: Option<(Mixer, Format)>,
+    #[cfg(test)]
+    test_eager: bool,
     primary: Option<Run>,
     crossfade: Option<Crossfade>,
     master_gain: MasterGain,
-    cached: Option<(String, Arc<[u8]>)>,
-    session: Option<Session>,
-    network: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
-    offline: bool,
-    epoch: Arc<AtomicU64>,
-    expected: u64,
+    cached: Option<(String, AudioInput)>,
+    scope: OutputScope,
     elapsed: f64,
     duration: f64,
 }
 struct Run {
     sink: Sink,
     authority: Authority,
-    started: Arc<AtomicBool>,
-    exhausted: Arc<AtomicBool>,
-    fenced_out: Arc<AtomicBool>,
-    decoded_duration: Option<Duration>,
+    pcm: Arc<State>,
+    #[cfg(test)]
+    duration_override: Option<Option<Duration>>,
 }
 impl Run {
+    fn duration(&self) -> Option<Duration> {
+        #[cfg(test)]
+        if let Some(duration) = self.duration_override {
+            return duration;
+        }
+        self.pcm.duration()
+    }
     fn has_started(&self) -> bool {
-        self.started.load(Ordering::Acquire)
+        self.pcm.started.load(Ordering::Acquire)
     }
     fn was_fenced(&self) -> bool {
-        self.fenced_out.load(Ordering::Acquire)
+        self.pcm.fenced_out.load(Ordering::Acquire)
     }
     fn ended(&self) -> bool {
-        self.sink.empty() && self.exhausted.load(Ordering::Acquire)
+        self.sink.empty() && self.pcm.exhausted.load(Ordering::Acquire)
     }
     fn can_continue(&self) -> bool {
         self.authority.is_valid()
             && !self.was_fenced()
-            && !self.exhausted.load(Ordering::Acquire)
+            && self.pcm.failure().is_none()
+            && !self.pcm.exhausted.load(Ordering::Acquire)
             && !self.sink.empty()
             && !self.sink.is_paused()
     }
@@ -109,7 +116,7 @@ impl Drop for Run {
 
 struct Crossfade {
     incoming: Run,
-    cached: (String, Arc<[u8]>),
+    cached: (String, AudioInput),
     overlap: f64,
     attenuation: f32,
     incoming_gain: f32,
@@ -124,38 +131,45 @@ impl Audio {
         expected: u64,
         master_gain: MasterGain,
     ) -> Self {
-        let network = session.as_ref().map(|s| {
-            let changes = s.network_changes();
-            let stamp = *changes.borrow();
-            (changes, stamp)
-        });
+        let network = session.as_ref().map(Session::network_changes);
         Self {
             stream: None,
             #[cfg(test)]
             test_mixer: None,
+            #[cfg(test)]
+            test_eager: false,
             primary: None,
             crossfade: None,
             master_gain,
             cached: None,
-            session,
-            network,
-            offline,
-            epoch,
-            expected,
+            scope: OutputScope {
+                session,
+                network,
+                offline,
+                epoch,
+                expected,
+            },
             elapsed: 0.0,
             duration: 0.0,
         }
     }
     #[cfg(test)]
     pub(crate) fn use_test_output(&mut self, mixer: Mixer, id: String, bytes: Arc<[u8]>) {
-        self.test_mixer = Some(mixer);
-        self.cached = Some((id, bytes));
+        // The headless engine PCM fixtures both encode and mix at 8 kHz mono.
+        self.use_test_streaming_output(mixer, 1, 8000);
+        self.test_eager = true;
+        self.cached = Some((id, bytes.into()));
     }
-    pub fn cached(&self, id: &str) -> Option<Arc<[u8]>> {
+    #[cfg(test)]
+    pub(crate) fn use_test_streaming_output(&mut self, mixer: Mixer, channels: u16, rate: u32) {
+        self.test_mixer = Some((mixer, Format { channels, rate }));
+        self.test_eager = false;
+    }
+    pub fn cached(&self, id: &str) -> Option<AudioInput> {
         self.cached
             .as_ref()
             .filter(|(loaded, _)| loaded == id)
-            .map(|(_, bytes)| bytes.clone())
+            .map(|(_, source)| source.clone())
     }
     pub fn discard_cache(&mut self) {
         self.cached = None;
@@ -169,18 +183,26 @@ impl Audio {
         }
         Ok(())
     }
-    fn playback_mixer(&mut self) -> Result<&Mixer, Status> {
+    fn playback_mixer(&self) -> Option<(Mixer, Format)> {
         #[cfg(test)]
-        if self.test_mixer.is_some() {
-            return Ok(self.test_mixer.as_ref().unwrap());
+        if let Some(output) = &self.test_mixer {
+            return Some(output.clone());
         }
-        self.output()?;
-        Ok(self.stream.as_ref().expect("output initialized").mixer())
+        self.stream.as_ref().map(|stream| {
+            let config = stream.config();
+            (
+                stream.mixer().clone(),
+                Format {
+                    channels: config.channel_count(),
+                    rate: config.sample_rate(),
+                },
+            )
+        })
     }
     pub fn play(
         &mut self,
         id: String,
-        bytes: Arc<[u8]>,
+        source: impl Into<AudioInput>,
         elapsed: f64,
         duration: f64,
         authority: Authority,
@@ -190,66 +212,69 @@ impl Audio {
         if !self.current() || !authority.may_start() {
             return Status::Rejected;
         }
-        let source = match decoder(bytes.clone(), self.elapsed) {
-            Ok(source) => source,
+        if self.playback_mixer().is_none()
+            && let Err(e) = self.output()
+        {
+            return e;
+        }
+        let output = self.playback_mixer().expect("output initialized");
+        let source = source.into();
+        let run = match self.attach(&output, source.clone(), self.elapsed, authority, false) {
+            Ok(run) => run,
             Err(e) => return e,
         };
-        if let Some(duration) = source.total_duration() {
-            self.duration = duration.as_secs_f64().min(MAX_SECONDS);
-            self.elapsed = self.elapsed.min(self.duration);
-        }
-        self.cached = Some((id, bytes));
-        let mixer = match self.playback_mixer() {
-            Ok(mixer) => mixer.clone(),
-            Err(e) => return e,
-        };
-        if !self.current() || !authority.may_start() {
-            return Status::Rejected;
-        }
-        let run = self.attach(&mixer, source, authority, UNITY);
-        if self.current() && run.authority.is_valid() {
-            run.sink.play();
-            self.primary = Some(run);
-            Status::Ok
-        } else {
-            Status::Rejected
-        }
+        self.cached = Some((id, source));
+        self.primary = Some(run);
+        Status::Ok
     }
-    fn attach<S: Source<Item = f32> + Send + 'static>(
+    fn attach(
         &self,
-        mixer: &Mixer,
-        source: S,
+        (mixer, format): &(Mixer, Format),
+        input: AudioInput,
+        elapsed: f64,
         authority: Authority,
-        envelope: f32,
-    ) -> Run {
-        let decoded_duration = source.total_duration();
-        let sink = Sink::connect_new(mixer);
-        sink.pause();
-        sink.set_volume(envelope);
-        let started = Arc::new(AtomicBool::new(false));
-        let exhausted = Arc::new(AtomicBool::new(false));
-        let fenced_out = Arc::new(AtomicBool::new(false));
-        sink.append(Fenced {
-            inner: source,
-            master_gain: self.master_gain.clone(),
-            started: started.clone(),
-            exhausted: exhausted.clone(),
-            fenced_out: fenced_out.clone(),
+        fade: bool,
+    ) -> Result<Run, Status> {
+        if !self.current() || !authority.may_start() {
+            return Err(Status::Rejected);
+        }
+        let pcm = Arc::new(State::new(*format));
+        let fence = Fence {
+            scope: self.scope.clone(),
             authority: authority.clone(),
-            session: self.session.clone(),
-            network: self.network.clone(),
-            offline: self.offline,
-            epoch: self.epoch.clone(),
-            expected: self.expected,
-        });
-        Run {
+        };
+        // Only old deterministic headless tests opt into eager in-memory PCM.
+        #[cfg(test)]
+        let spawn = !(self.test_eager && input.cacheable());
+        #[cfg(test)]
+        if !spawn {
+            pcm.decode(input.clone(), elapsed, fade, fence.clone(), false);
+            if let Some(e) = pcm.failure() {
+                authority.revoke();
+                return Err(e);
+            }
+        }
+        #[cfg(not(test))]
+        let spawn = true;
+        if spawn {
+            pcm.spawn(input.decoder_input(), elapsed, fade, fence.clone())?;
+        }
+        let (sink, output) = Sink::new();
+        sink.set_volume(if fade { 0.0 } else { UNITY });
+        let run = Run {
             sink,
             authority,
-            started,
-            exhausted,
-            fenced_out,
-            decoded_duration,
+            pcm: pcm.clone(),
+            #[cfg(test)]
+            duration_override: None,
+        };
+        if !self.current() || !run.authority.may_start() {
+            return Err(Status::Rejected);
         }
+        run.sink
+            .append(Pcm::new(pcm, fence, self.master_gain.clone()));
+        mixer.add(NativeSinkOutput(output, *format));
+        Ok(run)
     }
     pub fn anchor(&mut self, elapsed: f64, duration: f64) {
         self.elapsed = if duration > 0.0 {
@@ -260,10 +285,17 @@ impl Audio {
         self.duration = duration;
     }
     pub fn stop(&mut self) {
-        let elapsed = self.facts().elapsed;
+        let facts = self.facts();
         self.primary = None;
         self.crossfade = None;
-        self.elapsed = elapsed;
+        self.anchor(facts.elapsed, facts.duration);
+        if self
+            .cached
+            .as_ref()
+            .is_some_and(|(_, source)| !source.cacheable())
+        {
+            self.discard_cache();
+        }
     }
     pub fn clear(&mut self) {
         self.stop();
@@ -272,12 +304,10 @@ impl Audio {
         self.anchor(0.0, 0.0);
     }
     fn current(&self) -> bool {
-        self.epoch.load(Ordering::SeqCst) == self.expected
-            && network_current(&self.network)
-            && self
-                .session
-                .as_ref()
-                .is_none_or(|s| session_allows_output(s, self.offline))
+        self.scope.current()
+    }
+    pub fn failure(&self) -> Option<Status> {
+        self.primary.as_ref().and_then(|run| run.pcm.failure())
     }
     pub fn has_started(&self) -> bool {
         self.primary.as_ref().is_some_and(Run::has_started)
@@ -296,17 +326,22 @@ impl Audio {
         if let Some(run) = &self.primary {
             let allowed = self.current() && run.authority.is_valid() && !run.was_fenced();
             let started = run.has_started();
-            facts.ended = allowed && run.ended();
-            let elapsed = (self.elapsed + run.sink.get_pos().as_secs_f64()).min(MAX_SECONDS);
-            facts.elapsed = if self.duration > 0.0 && facts.ended {
-                self.duration
-            } else if self.duration > 0.0 {
-                elapsed.min(self.duration)
+            let active = allowed && run.pcm.failure().is_none() && !run.sink.is_paused();
+            let buffering = run.pcm.buffering();
+            facts.ended = active && run.ended();
+            facts.duration = run
+                .duration()
+                .map_or(self.duration, |d| d.as_secs_f64().min(MAX_SECONDS));
+            let elapsed = (self.elapsed + run.pcm.position().as_secs_f64()).min(MAX_SECONDS);
+            facts.elapsed = if facts.duration > 0.0 && facts.ended {
+                facts.duration
+            } else if facts.duration > 0.0 {
+                elapsed.min(facts.duration)
             } else {
                 elapsed
             };
-            facts.playing = allowed && started && !facts.ended && !run.sink.is_paused();
-            facts.loading = allowed && !started && !facts.ended;
+            facts.playing = active && started && !buffering && !facts.ended;
+            facts.loading = active && (!started || buffering) && !facts.ended;
         }
         facts
     }
@@ -315,55 +350,37 @@ impl Audio {
     /// still useful to display normal playback and never trigger mixing.
     pub fn crossfade_remaining(&self) -> Option<f64> {
         let run = self.primary.as_ref()?;
-        let duration = fade_duration(run.decoded_duration)?;
-        if !self.current() || !run.can_continue() || !run.has_started() {
+        let duration = fade_duration(run.duration())?;
+        if !self.current() || !run.can_continue() || !run.has_started() || run.pcm.buffering() {
             return None;
         }
-        let remaining = duration - (self.elapsed + run.sink.get_pos().as_secs_f64());
+        let remaining = duration - (self.elapsed + run.pcm.position().as_secs_f64());
         (remaining > 0.0).then_some(remaining)
     }
 
     /// Admit a separate run; `authority` must not be shared with the primary.
     /// Once admitted, cancellation permanently revokes the incoming capability.
-    pub fn start_crossfade(&mut self, id: String, bytes: Arc<[u8]>, authority: Authority) -> bool {
-        let Some(mixer) = self.stream.as_ref().map(|stream| stream.mixer().clone()) else {
-            return false;
-        };
-        self.start_crossfade_on(&mixer, id, bytes, authority)
-    }
-    fn start_crossfade_on(
+    pub fn start_crossfade(
         &mut self,
-        mixer: &Mixer,
         id: String,
-        bytes: Arc<[u8]>,
+        source: impl Into<AudioInput>,
         authority: Authority,
     ) -> bool {
-        if self.crossfade.is_some() || !authority.may_start() || self.overlap().is_none() {
+        if self.crossfade.is_some() || !authority.may_start() {
             return false;
         }
-        let Ok(source) = decoder(bytes.clone(), 0.0) else {
+        let (Some(output), Some(overlap)) = (self.playback_mixer(), self.overlap()) else {
             return false;
         };
-        if fade_duration(source.total_duration()).is_none()
-            || source.current_span_len() == Some(0)
-            || source.channels() == 0
-            || source.sample_rate() == 0
-        {
-            return false;
-        }
-        // Loading a decoder can take time. Recheck both sides before making
-        // the incoming run available to the mixer, initially silent.
-        let Some(overlap) = self.overlap() else {
+        let source = source.into();
+        let Ok(incoming) = self.attach(&output, source.clone(), 0.0, authority, true) else {
             return false;
         };
-        if !authority.may_start() {
-            return false;
-        }
-        let incoming = self.attach(mixer, source, authority, 0.0);
-        incoming.sink.play();
+        // Pending decoder runs are silent; actual consumption, not admission
+        // or even successful probing, opens the fade envelope.
         self.crossfade = Some(Crossfade {
             incoming,
-            cached: (id, bytes),
+            cached: (id, source),
             overlap,
             attenuation: 0.0,
             incoming_gain: 0.0,
@@ -385,18 +402,26 @@ impl Audio {
             || !outgoing.authority.is_valid()
             || outgoing.was_fenced()
             || outgoing.sink.is_paused()
+            || outgoing.pcm.failure().is_some()
             || !fade.incoming.can_continue()
+            || (fade.attenuation > 0.0 && fade.incoming.pcm.buffering())
             || (fade.incoming_gain == 0.0 && !fade.incoming.authority.may_start())
         {
             self.cancel_crossfade();
             return;
         }
-        let position = outgoing.sink.get_pos();
+        let position = outgoing.pcm.position();
         // Natural EOF is a handoff point, not a failure of the overlap.
-        if outgoing.exhausted.load(Ordering::Acquire) {
+        if outgoing.pcm.exhausted.load(Ordering::Acquire) {
             return;
         }
-        let duration = fade_duration(outgoing.decoded_duration).expect("overlap has a duration");
+        if outgoing.pcm.buffering() {
+            // A stalled primary cannot settle its envelope or hold the incoming
+            // song near the canonical transition. Resume the primary alone.
+            self.cancel_crossfade();
+            return;
+        }
+        let duration = fade_duration(outgoing.duration()).expect("overlap has a duration");
         let remaining = duration - (self.elapsed + position.as_secs_f64());
         // Decoders may estimate duration (e.g. MP3 without a seek table). Keep
         // an audible tail through modest errors; don't let an early estimate
@@ -406,7 +431,8 @@ impl Audio {
             return;
         }
         if !fade.incoming.has_started()
-            || fade.incoming.sink.get_pos().is_zero()
+            || fade.incoming.pcm.buffering()
+            || fade.incoming.pcm.position().is_zero()
             || position.saturating_sub(fade.position_at_update) < GAIN_SETTLE
         {
             return;
@@ -431,7 +457,7 @@ impl Audio {
             fade.incoming_gain = incoming_gain;
             // Sample after publishing the gains, so time spent preempted
             // before the set_volume calls cannot count as settling time.
-            fade.position_at_update = outgoing.sink.get_pos();
+            fade.position_at_update = outgoing.pcm.position();
         }
     }
 
@@ -440,7 +466,10 @@ impl Audio {
             return false;
         }
         let fade = self.crossfade.as_ref().unwrap();
-        if fade.incoming_gain == 0.0 || !fade.incoming.can_continue() {
+        if fade.incoming_gain == 0.0
+            || !fade.incoming.can_continue()
+            || fade.incoming.pcm.buffering()
+        {
             // A run whose envelope never opened should start from zero
             // through ordinary playback, not inherit pre-roll samples.
             self.cancel_crossfade();
@@ -449,7 +478,7 @@ impl Audio {
         let fade = self.crossfade.take().unwrap();
         self.primary = None;
         fade.incoming.sink.set_volume(UNITY);
-        self.duration = fade.incoming.decoded_duration.unwrap().as_secs_f64();
+        self.duration = fade.incoming.duration().unwrap().as_secs_f64();
         self.elapsed = 0.0;
         self.cached = Some(fade.cached);
         self.primary = Some(fade.incoming);
@@ -477,102 +506,50 @@ fn fade_duration(duration: Option<Duration>) -> Option<f64> {
         .filter(|d| *d > CROSSFADE_SECONDS && *d <= MAX_SECONDS)
 }
 
-fn network_current(network: &Option<(tokio::sync::watch::Receiver<u64>, u64)>) -> bool {
-    network
-        .as_ref()
-        .is_none_or(|(changes, stamp)| *changes.borrow() == *stamp)
-}
-
-fn session_allows_output(session: &Session, offline: bool) -> bool {
-    // Offline is an explicit local grant; cookie time is irrelevant until
-    // Go Online. Account/mode retirement revokes the per-output capability.
-    session.is_offline() == offline && session.can_access_local()
-}
-
-fn decoder(bytes: Arc<[u8]>, elapsed: f64) -> Result<Decoder<Cursor<Arc<[u8]>>>, Status> {
-    // Cursor::try_from does not set the length/seekability required by
-    // Symphonia. Encoded bytes are complete, so advertise both explicitly.
-    let byte_len = bytes.len() as u64;
-    let mut source = Decoder::builder()
-        .with_data(Cursor::new(bytes))
-        .with_byte_len(byte_len)
-        .with_seekable(true)
-        .build()
-        .map_err(|_| Status::Media)?;
-    if elapsed > 0.0 {
-        let seek = Duration::from_secs_f64(elapsed);
-        source
-            .try_seek(
-                source
-                    .total_duration()
-                    .map_or(seek, |duration| duration.min(seek)),
-            )
-            .map_err(|_| Status::Media)?;
-    }
-    Ok(source)
-}
-struct Fenced<S> {
-    inner: S,
-    master_gain: MasterGain,
-    started: Arc<AtomicBool>,
-    exhausted: Arc<AtomicBool>,
-    fenced_out: Arc<AtomicBool>,
-    authority: Authority,
+#[derive(Clone)]
+struct OutputScope {
     session: Option<Session>,
-    network: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
+    network: Option<tokio::sync::watch::Receiver<u64>>,
     offline: bool,
     epoch: Arc<AtomicU64>,
     expected: u64,
 }
-impl<S: Source<Item = f32>> Iterator for Fenced<S> {
-    type Item = f32;
-    fn next(&mut self) -> Option<f32> {
-        if self.fenced_out.load(Ordering::Acquire) || self.exhausted.load(Ordering::Acquire) {
-            return None;
-        }
-        if self.epoch.load(Ordering::SeqCst) != self.expected
-            || !self.authority.is_valid()
-            || (!self.started.load(Ordering::Acquire) && !self.authority.may_start())
-            || !network_current(&self.network)
-            || self
-                .session
+impl OutputScope {
+    fn current(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.expected
+            && self
+                .network
                 .as_ref()
-                .is_some_and(|s| !session_allows_output(s, self.offline))
-        {
-            self.fenced_out.store(true, Ordering::Release);
-            None
-        } else {
-            let sample = self.inner.next();
-            if sample.is_none() {
-                self.exhausted.store(true, Ordering::Release);
-            } else if !self.started.load(Ordering::Relaxed) {
-                self.started.store(true, Ordering::Release);
-            }
-            // Keep consuming samples at zero gain: mute must not change
-            // transport, authority, or natural EOF. The separate Sink
-            // envelope still controls the crossfade and its gain settling.
-            sample.map(|value| {
-                let gain = self.master_gain.get();
-                if gain == 0.0 { 0.0 } else { value * gain }
+                .is_none_or(|mode| matches!(mode.has_changed(), Ok(false)))
+            && self.session.as_ref().is_none_or(|session| {
+                // Offline is an explicit local grant; cookie time is irrelevant
+                // until Go Online. A mode round trip still retires this scope.
+                session.is_offline() == self.offline && session.can_access_local()
             })
-        }
     }
 }
-impl<S: Source<Item = f32>> Source for Fenced<S> {
-    fn current_span_len(&self) -> Option<usize> {
-        self.inner.current_span_len()
-    }
-    fn channels(&self) -> u16 {
-        self.inner.channels()
-    }
-    fn sample_rate(&self) -> u32 {
-        self.inner.sample_rate()
-    }
-    fn total_duration(&self) -> Option<Duration> {
-        self.inner.total_duration()
-    }
-    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
-        self.inner.try_seek(pos)
+
+#[derive(Clone)]
+struct Fence {
+    scope: OutputScope,
+    authority: Authority,
+}
+impl Fence {
+    fn live(&self, state: &State) -> bool {
+        if state.fenced_out.load(Ordering::Acquire) {
+            return false;
+        }
+        let live = self.scope.current()
+            && self.authority.is_valid()
+            && (state.started.load(Ordering::Acquire)
+                || self.authority.may_start()
+                // The worker and mixer can cross the admission boundary at
+                // the same time. Already-consumed PCM may use ordinary grace.
+                || state.started.load(Ordering::Acquire));
+        if !live {
+            state.fenced_out.store(true, Ordering::Release);
+        }
+        live
     }
 }
 
@@ -580,15 +557,16 @@ impl<S: Source<Item = f32>> Source for Fenced<S> {
 mod tests {
     use super::*;
     use rodio::mixer::{MixerSource, mixer};
-    use std::time::Instant;
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{Seek, SeekFrom, Write},
+        thread,
+        time::Instant,
+    };
 
     const RATE: u32 = 8000;
 
-    fn wav() -> Arc<[u8]> {
-        wav_samples(100, 1000)
-    }
-
-    fn wav_samples(samples: u32, amplitude: i16) -> Arc<[u8]> {
+    fn wav_header(samples: u32) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend(b"RIFF");
         b.extend((36 + 2 * samples).to_le_bytes());
@@ -602,6 +580,11 @@ mod tests {
         b.extend(16u16.to_le_bytes());
         b.extend(b"data");
         b.extend((2 * samples).to_le_bytes());
+        b
+    }
+
+    fn wav_samples(samples: u32, amplitude: i16) -> Arc<[u8]> {
+        let mut b = wav_header(samples);
         for _ in 0..samples {
             b.extend(amplitude.to_le_bytes());
         }
@@ -617,19 +600,29 @@ mod tests {
             } else {
                 Authority::offline()
             };
-            let mut source = Fenced {
-                inner: decoder(wav(), 0.004).unwrap(),
-                master_gain: MasterGain::default(),
-                started: Arc::new(AtomicBool::new(false)),
-                exhausted: Arc::new(AtomicBool::new(false)),
-                fenced_out: Arc::new(AtomicBool::new(false)),
-                authority: grant.clone(),
+            let scope = OutputScope {
                 session: None,
                 network: None,
                 offline: !online,
                 epoch: epoch.clone(),
                 expected: 1,
             };
+            let fence = Fence {
+                scope,
+                authority: grant.clone(),
+            };
+            let state = Arc::new(State::new(Format {
+                channels: 1,
+                rate: RATE,
+            }));
+            state.decode(
+                wav_samples(100, 1000).into(),
+                0.004,
+                false,
+                fence.clone(),
+                false,
+            );
+            let mut source = Pcm::new(state, fence, MasterGain::default());
             assert!(source.next().unwrap() > 0.0);
             if online {
                 grant.revoke();
@@ -641,25 +634,28 @@ mod tests {
     }
     #[test]
     fn an_unstarted_decoder_cannot_use_grace_and_fencing_is_not_natural_end() {
-        let attached = Arc::new(AtomicBool::new(false));
+        let attached = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let start = attached.clone();
         let grant = Authority::online(|| true, move || start.load(Ordering::Acquire));
-        let mut source = Fenced {
-            inner: decoder(wav(), 0.0).unwrap(),
-            master_gain: MasterGain::default(),
-            started: Arc::default(),
-            exhausted: Arc::default(),
-            fenced_out: Arc::default(),
-            authority: grant,
+        let scope = OutputScope {
             session: None,
             network: None,
             offline: false,
             epoch: Arc::new(AtomicU64::new(1)),
             expected: 1,
         };
+        let fence = Fence {
+            scope,
+            authority: grant,
+        };
+        let state = Arc::new(State::new(Format {
+            channels: 1,
+            rate: RATE,
+        }));
+        let mut source = Pcm::new(state.clone(), fence, MasterGain::default());
         assert!(source.next().is_none());
-        assert!(source.fenced_out.load(Ordering::Acquire));
-        assert!(!source.exhausted.load(Ordering::Acquire));
+        assert!(state.fenced_out.load(Ordering::Acquire));
+        assert!(!state.exhausted.load(Ordering::Acquire));
         attached.store(true, Ordering::Release);
         assert!(
             source.next().is_none(),
@@ -690,22 +686,17 @@ mod tests {
         );
         let authority = Authority::offline();
         let bytes = wav_samples(9 * RATE, amplitude);
-        let run = audio.attach(
-            &mixer,
-            decoder(bytes.clone(), elapsed).unwrap(),
-            authority.clone(),
-            UNITY,
+        audio.use_test_output(mixer.clone(), "old".into(), bytes.clone());
+        assert_eq!(
+            audio.play("old".into(), bytes, elapsed, 9.0, authority.clone()),
+            Status::Ok
         );
-        audio.anchor(elapsed, 9.0);
-        run.sink.play();
-        audio.primary = Some(run);
-        audio.cached = Some(("old".into(), bytes));
         assert!((pump(&mut output, 100) - f32::from(amplitude) / 32768.0).abs() < 1e-5);
         (audio, mixer, output, authority)
     }
 
-    fn begin(audio: &mut Audio, mixer: &Mixer, authority: Authority) -> bool {
-        audio.start_crossfade_on(mixer, "new".into(), wav_samples(7 * RATE, 16384), authority)
+    fn begin(audio: &mut Audio, _mixer: &Mixer, authority: Authority) -> bool {
+        audio.start_crossfade("new".into(), wav_samples(7 * RATE, 16384), authority)
     }
 
     #[test]
@@ -713,10 +704,10 @@ mod tests {
         let (mut audio, mixer, _, _) = playing(6.0);
         assert!((2.8..3.0).contains(&audio.crossfade_remaining().unwrap()));
         for duration in [None, Some(Duration::ZERO), Some(Duration::from_secs(5))] {
-            audio.primary.as_mut().unwrap().decoded_duration = duration;
+            audio.primary.as_mut().unwrap().duration_override = Some(duration);
             assert!(audio.crossfade_remaining().is_none());
         }
-        audio.primary.as_mut().unwrap().decoded_duration = Some(Duration::from_secs(9));
+        audio.primary.as_mut().unwrap().duration_override = None;
         audio.primary.as_ref().unwrap().sink.pause();
         assert!(audio.crossfade_remaining().is_none());
 
@@ -764,7 +755,7 @@ mod tests {
             }
         }
         assert!(audio.facts().ended);
-        let pos = audio.crossfade.as_ref().unwrap().incoming.sink.get_pos();
+        let pos = audio.crossfade.as_ref().unwrap().incoming.pcm.position();
         assert!(pos > Duration::from_secs(2));
         assert!(audio.promote_crossfade());
         assert!(!old.is_valid() && new.is_valid());
@@ -805,7 +796,7 @@ mod tests {
                 break;
             }
         }
-        let pos = audio.crossfade.as_ref().unwrap().incoming.sink.get_pos();
+        let pos = audio.crossfade.as_ref().unwrap().incoming.pcm.position();
         assert!(audio.promote_crossfade());
         assert_eq!(audio.facts().elapsed, pos.as_secs_f64());
         assert!(!old.is_valid() && new.is_valid());
@@ -831,34 +822,32 @@ mod tests {
         assert!(!old.is_valid());
         for offline in [false, true] {
             let (mixer, mut output) = rodio::mixer::mixer(1, RATE);
-            let audio = Audio::new(None, offline, Arc::new(AtomicU64::new(2)), 2, gain.clone());
+            let mut audio = Audio::new(None, offline, Arc::new(AtomicU64::new(2)), 2, gain.clone());
             let grant = if offline {
                 Authority::offline()
             } else {
                 Authority::online(|| true, || true)
             };
-            let source = decoder(wav_samples(RATE, 16384), 0.0).unwrap();
-            let run = audio.attach(&mixer, source, grant, UNITY);
-            run.sink.play();
+            let source = wav_samples(RATE, 16384);
+            audio.use_test_output(mixer, "tone".into(), source.clone());
+            assert_eq!(
+                audio.play("tone".into(), source, 0.0, 1.0, grant),
+                Status::Ok
+            );
             assert!((pump(&mut output, 20) - 0.15).abs() < 1e-5);
         }
     }
 
     #[test]
     fn underestimated_end_keeps_a_primary_tail_then_abandons_the_fade() {
-        let (mut audio, mixer, mut output, old) = playing(5.0);
+        let (mut audio, _, mut output, old) = playing(5.0);
         // The WAV actually runs to nine seconds: simulate a decoder estimate
         // that put EOF a full second early, using a silent incoming fixture
         // so any output below is really the primary.
-        audio.primary.as_mut().unwrap().decoded_duration = Some(Duration::from_secs(8));
+        audio.primary.as_mut().unwrap().duration_override = Some(Some(Duration::from_secs(8)));
         audio.anchor(5.0, 8.0);
         let new = Authority::offline();
-        assert!(audio.start_crossfade_on(
-            &mixer,
-            "new".into(),
-            wav_samples(7 * RATE, 0),
-            new.clone()
-        ));
+        assert!(audio.start_crossfade("new".into(), wav_samples(7 * RATE, 0), new.clone()));
         let mut saw_overrun = false;
         for _ in 0..170 {
             let sample = pump(&mut output, 20);
@@ -888,10 +877,9 @@ mod tests {
     #[test]
     fn staggered_sink_gain_polls_do_not_clip_full_scale_correlated_samples() {
         for offset in 1..=5 {
-            let (mut audio, mixer, mut output, _) = playing_with_amplitude(7.5, i16::MIN);
+            let (mut audio, _, mut output, _) = playing_with_amplitude(7.5, i16::MIN);
             pump(&mut output, offset);
-            assert!(audio.start_crossfade_on(
-                &mixer,
+            assert!(audio.start_crossfade(
                 "new".into(),
                 wav_samples(7 * RATE, i16::MIN),
                 Authority::offline(),
@@ -918,15 +906,15 @@ mod tests {
 
     #[test]
     fn invalid_or_too_short_incoming_does_not_duck_primary() {
-        let (mut audio, mixer, mut output, old) = playing(6.0);
+        let (mut audio, _, mut output, old) = playing(6.0);
         for bytes in [Arc::from([1u8]), wav_samples(5 * RATE, 16384)] {
-            assert!(!audio.start_crossfade_on(&mixer, "new".into(), bytes, Authority::offline()));
+            assert!(!audio.start_crossfade("new".into(), bytes, Authority::offline()));
         }
         // The declared length passes header validation, but no samples decode.
         let valid = wav_samples(7 * RATE, 16384);
-        let truncated = Arc::from(&valid[..44]);
+        let truncated = Arc::<[u8]>::from(&valid[..44]);
         let new = Authority::offline();
-        if audio.start_crossfade_on(&mixer, "new".into(), truncated, new.clone()) {
+        if audio.start_crossfade("new".into(), truncated, new.clone()) {
             audio.maintain_crossfade();
             assert_eq!(audio.primary.as_ref().unwrap().sink.volume(), UNITY);
             assert!((pump(&mut output, 100) - 0.25).abs() < 1e-5);
@@ -938,19 +926,18 @@ mod tests {
     }
 
     #[test]
-    fn incoming_eof_before_its_declared_duration_restores_primary() {
-        let (mut audio, mixer, mut output, _) = playing(6.0);
+    fn corrupt_incoming_eof_before_its_declared_duration_never_ducks_primary() {
+        let (mut audio, _, mut output, _) = playing(6.0);
         let bytes = wav_samples(7 * RATE, 16384);
-        // Enough payload to become audible, but much shorter than its header.
-        let truncated = Arc::from(&bytes[..44 + RATE as usize]);
+        // This is a complete representation with a lying RIFF header, not
+        // a short transfer. The worker can decode some PCM before noticing.
+        let truncated = Arc::<[u8]>::from(&bytes[..44 + RATE as usize / 2]);
+        audio.test_eager = false;
         let new = Authority::offline();
-        assert!(audio.start_crossfade_on(&mixer, "new".into(), truncated, new.clone()));
-        pump(&mut output, 100);
-        audio.maintain_crossfade();
-        pump(&mut output, 20);
-        audio.maintain_crossfade();
-        assert!(audio.crossfade.as_ref().unwrap().incoming_gain > 0.0);
-        pump(&mut output, 600);
+        assert!(audio.start_crossfade("new".into(), truncated, new.clone()));
+        wait_until(|| {
+            audio.crossfade.as_ref().unwrap().incoming.pcm.failure() == Some(Status::Media)
+        });
         audio.maintain_crossfade();
         assert!(audio.crossfade.is_none() && !new.is_valid());
         assert!(audio.facts().playing);
@@ -985,7 +972,7 @@ mod tests {
         assert_eq!(
             audio.play(
                 "bad".into(),
-                Arc::from([1u8]),
+                Arc::<[u8]>::from([1u8]),
                 0.0,
                 0.0,
                 Authority::offline()
@@ -1007,7 +994,7 @@ mod tests {
         assert!(audio.crossfade.as_ref().unwrap().incoming_gain > 0.0);
         assert!(pump(&mut output, 20) > 0.25);
 
-        audio.epoch.store(2, Ordering::SeqCst);
+        audio.scope.epoch.store(2, Ordering::SeqCst);
         assert_eq!(pump(&mut output, 20), 0.0);
         assert!(audio.was_fenced());
         assert!(audio.crossfade.as_ref().unwrap().incoming.was_fenced());
@@ -1016,25 +1003,158 @@ mod tests {
         assert!(audio.crossfade.is_none());
     }
 
-    #[test]
-    fn malformed_media_never_opens_an_output() {
-        let mut a = Audio::new(
+    fn async_output(channels: u16) -> (Audio, MixerSource) {
+        let (mixer, output) = mixer(channels, RATE);
+        let mut audio = Audio::new(
             None,
-            false,
+            true,
             Arc::new(AtomicU64::new(1)),
             1,
             MasterGain::default(),
         );
+        audio.use_test_streaming_output(mixer, channels, RATE);
+        (audio, output)
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < until,
+                "timed out waiting for decoder worker"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn fixture_file() -> File {
+        let path = std::env::temp_dir().join(format!("spofify-pcm-{}.wav", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        file
+    }
+
+    #[test]
+    fn file_over_32_mib_starts_seeks_and_ends_with_bounded_backpressure() {
+        let frames = 32 * 1024 * 1024 / 2 + RATE;
+        let len = 44 + u64::from(frames) * 2;
+        let mut file = fixture_file();
+        file.write_all(&wav_header(frames)).unwrap();
+        let intro = vec![8192i16; 8192];
+        let intro = intro
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        file.write_all(&intro).unwrap();
+        file.set_len(len).unwrap(); // sparse silence is valid PCM
+        file.seek(SeekFrom::End(-800)).unwrap();
+        file.write_all(&16384i16.to_le_bytes().repeat(400)).unwrap();
+        let source = AudioInput::file(file, 0, len);
+        assert!(source.len() > 32 * 1024 * 1024);
+
+        let (mut audio, mut output) = async_output(1);
+        let first = Authority::offline();
         assert_eq!(
-            a.play(
+            audio.play("large".into(), source.clone(), 0.0, 0.0, first.clone()),
+            Status::Ok
+        );
+        let retired = audio.primary.as_ref().unwrap().pcm.clone();
+        wait_until(|| retired.queued_frames() == State::queue_limit_frames());
+        assert!(!audio.has_started() && audio.facts().elapsed == 0.0 && audio.facts().loading);
+        assert!(
+            !retired.worker_exited.load(Ordering::Acquire),
+            "producer is backpressured"
+        );
+        assert_eq!(pump(&mut output, 20), 0.25);
+        assert_eq!(audio.facts().elapsed, 0.020);
+        wait_until(|| retired.queued_frames() == State::queue_limit_frames());
+
+        let duration = f64::from(frames) / f64::from(RATE);
+        let target = duration - 0.025;
+        assert_eq!(
+            audio.play(
+                "large".into(),
+                source,
+                target,
+                duration,
+                Authority::offline()
+            ),
+            Status::Ok
+        );
+        assert!(!first.is_valid());
+        let run = &audio.primary.as_ref().unwrap().pcm;
+        wait_until(|| run.worker_exited.load(Ordering::Acquire));
+        wait_until(|| retired.worker_exited.load(Ordering::Acquire));
+        assert!(
+            retired.fenced_out.load(Ordering::Acquire),
+            "retired backpressured worker checked its fence without mixer help"
+        );
+        assert!(!audio.has_started() && !audio.facts().ended);
+        assert_eq!(audio.facts().elapsed, target);
+        assert_eq!(pump(&mut output, 10), 0.5, "only new seek PCM is audible");
+        assert!((audio.facts().elapsed - target - 0.010).abs() < 1e-8);
+        pump(&mut output, 100);
+        assert_eq!(audio.failure(), None);
+        assert!(audio.facts().ended && audio.has_started());
+        assert_eq!(audio.facts().elapsed, duration);
+    }
+
+    #[test]
+    fn backing_file_read_failure_is_not_natural_eof() {
+        let mut file = fixture_file();
+        let frames = RATE * 2;
+        file.write_all(&wav_header(frames)).unwrap();
+        file.write_all(&8192i16.to_le_bytes().repeat(2000)).unwrap();
+        let (mut audio, mut output) = async_output(1);
+        let source = AudioInput::file(file, 0, 44 + u64::from(frames) * 2);
+        assert_eq!(
+            audio.play("short".into(), source, 0.0, 2.0, Authority::offline()),
+            Status::Ok
+        );
+        wait_until(|| audio.failure() == Some(Status::Load));
+        pump(&mut output, 100);
+        let facts = audio.facts();
+        assert!(!facts.ended && !facts.loading && !facts.playing);
+    }
+
+    #[test]
+    fn complete_representation_with_a_truncated_wav_payload_is_media_not_eof() {
+        let mut file = fixture_file();
+        file.write_all(&wav_header(RATE * 3)).unwrap();
+        file.write_all(&8192i16.to_le_bytes().repeat(2000)).unwrap();
+        let (mut audio, mut output) = async_output(1);
+        // Actual input length is known and satisfied; only RIFF claims more.
+        let source = AudioInput::file(file, 0, 44 + 4000);
+        assert_eq!(
+            audio.play("bad".into(), source, 0.0, 3.0, Authority::offline()),
+            Status::Ok
+        );
+        wait_until(|| audio.failure() == Some(Status::Media));
+        pump(&mut output, 100);
+        assert!(!audio.facts().ended && !audio.facts().loading);
+    }
+
+    #[test]
+    fn malformed_media_fails_asynchronously_without_starting_or_ending() {
+        let (mut audio, mut output) = async_output(1);
+        assert_eq!(
+            audio.play(
                 "bad".into(),
-                Arc::from([1u8]),
+                Arc::<[u8]>::from([1]),
                 0.0,
                 0.0,
                 Authority::offline()
             ),
-            Status::Media
+            Status::Ok
         );
-        assert!(a.stream.is_none());
+        wait_until(|| audio.failure() == Some(Status::Media));
+        assert_eq!(pump(&mut output, 20), 0.0);
+        assert!(!audio.has_started());
+        assert!(!audio.facts().ended && !audio.facts().loading);
     }
 }

@@ -51,6 +51,7 @@ impl Authority {
 pub enum Status {
     Ok,
     Blocked,
+    Load,
     Media,
     Rejected,
 }

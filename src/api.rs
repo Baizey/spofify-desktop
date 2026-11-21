@@ -1,4 +1,4 @@
-//! Bounded, in-memory native transport for authenticated library and playback APIs.
+//! Authenticated native transport: bounded metadata and streamed audio.
 //! No arbitrary request URLs, cookie jar, persistence, redirects, proxies or retries.
 
 use std::{
@@ -35,8 +35,11 @@ pub const PAGE_SIZE: u32 = 20;
 #[cfg(test)]
 const MAX_BODY: usize = 256 * 1024;
 const LOGIN_BODY: usize = 8 * 1024;
-const MAX_MEDIA: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const BODY_STALL: Duration = Duration::from_secs(5);
+// Both v1 track endpoints hash on Go before sending headers, with a 30s
+// server budget. That prep is not a stalled client body or a track deadline.
+const OFFLINE_PREP_TIMEOUT: Duration = Duration::from_secs(35);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(4);
 const TICKET_BODY: usize = 1024;
 const OFFLINE_MEDIA_BODY: usize = 16 * 1024;
@@ -404,32 +407,109 @@ pub struct Item {
     pub disc_number: u32,
 }
 
+/// One full response from a single opened server representation. The length
+/// is an integrity check, never a buffer size. Never resume this body by range.
+pub(crate) struct AudioBody {
+    response: Response,
+    session: Session,
+    changes: watch::Receiver<u64>,
+    generation: u64,
+    remaining: u64,
+    len: u64,
+}
+
+impl AudioBody {
+    #[cfg(test)]
+    pub(crate) fn test_stream(
+        session: &Session,
+        len: u64,
+        chunks: impl futures_util::Stream<Item = Result<hyper::body::Bytes, std::io::Error>>
+        + Send
+        + 'static,
+    ) -> Self {
+        let response = hyper::Response::new(reqwest::Body::wrap_stream(chunks)).into();
+        let mut changes = session.network_changes();
+        let generation = *changes.borrow_and_update();
+        Self {
+            response,
+            session: session.clone(),
+            changes,
+            generation,
+            remaining: len,
+            len,
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn live(&self) -> Result<(), ApiError> {
+        if *self.changes.borrow() != self.generation {
+            return Err(OFFLINE);
+        }
+        self.session.lifetime().check_live()
+    }
+
+    pub(crate) async fn chunk(&mut self) -> Result<Option<hyper::body::Bytes>, ApiError> {
+        self.live()?;
+        let chunk = tokio::select! {
+            biased;
+            _ = self.changes.changed() => return Err(OFFLINE),
+            chunk = tokio::time::timeout(BODY_STALL, self.response.chunk()) => {
+                chunk.map_err(|_| NETWORK)?.map_err(network_error)?
+            },
+        };
+        self.live()?;
+        match chunk.as_ref() {
+            Some(bytes) => {
+                self.remaining = self
+                    .remaining
+                    .checked_sub(bytes.len() as u64)
+                    .ok_or(INVALID_RESPONSE)?;
+            }
+            None if self.remaining != 0 => return Err(INVALID_RESPONSE),
+            None => (),
+        }
+        Ok(chunk)
+    }
+}
+
 pub struct Api {
     origin: Origin,
     client: Client,
+    audio_client: Client,
     identity: Arc<()>,
 }
 
 impl Api {
     pub fn new(origin: Origin) -> Result<Self, ApiError> {
-        let client = Client::builder()
-            .use_rustls_tls()
-            .https_only(origin.0.scheme() == "https")
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .http1_only()
-            .read_timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(5))
+        let builder = || {
+            Client::builder()
+                .use_rustls_tls()
+                .https_only(origin.0.scheme() == "https")
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .http1_only()
+                .connect_timeout(Duration::from_secs(5))
+                // Disable reuse too: hyper can otherwise replay a request rejected by a
+                // stale pooled HTTP/1 connection below reqwest's retry-policy layer.
+                .pool_max_idle_per_host(0)
+        };
+        let init = |_| error("Unable to initialize secure networking.");
+        let client = builder()
+            .read_timeout(BODY_STALL)
             .timeout(REQUEST_TIMEOUT)
-            // Disable reuse too: hyper can otherwise replay a request rejected by a
-            // stale pooled HTTP/1 connection below reqwest's retry-policy layer.
-            .pool_max_idle_per_host(0)
             .build()
-            .map_err(|_| error("Unable to initialize secure networking."))?;
+            .map_err(init)?;
+        // Audio has a header deadline and body idle deadline instead of a
+        // total deadline, so continuous progress never expires the transfer.
+        let audio_client = builder().build().map_err(init)?;
         Ok(Self {
             origin,
             client,
+            audio_client,
             identity: Arc::new(()),
         })
     }
@@ -590,38 +670,78 @@ impl Api {
         .await
     }
 
-    /// Fetch one original-format audio file into bounded ephemeral memory. The caller
-    /// must obtain coordinator authority before calling and stop audio on session expiry.
-    pub async fn media(&self, session: &Session, id: &str) -> Result<Vec<u8>, ApiError> {
-        self.with_authenticated_network(session, async {
-            let request = self
-                .track_request(session, id, "audio", "audio/*, application/octet-stream")?
-                .timeout(Duration::from_secs(45));
-            let response = self.send(request, Some(session), false).await?;
-            if response.status() != 200 {
-                return Err(INVALID_RESPONSE);
-            }
-            let media = content_type(&response)?;
-            if !(media.starts_with("audio/") && media.len() > "audio/".len())
-                && media != "application/octet-stream"
-            {
-                return Err(error("The server returned an unsupported audio response."));
-            }
-            let bytes = self
-                .resource_bytes(
-                    session,
+    /// Go pins the descriptor for this GET; Last-Modified is not an identity
+    /// suitable for stitching ranges from multiple requests.
+    pub(crate) async fn media(&self, session: &Session, id: &str) -> Result<AudioBody, ApiError> {
+        let url = self.track_url(id, "audio")?;
+        let body = self
+            .open_audio(
+                session,
+                url,
+                "audio/*, application/octet-stream",
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        let media = content_type(&body.response)?;
+        if !(media.starts_with("audio/") && media.len() > "audio/".len())
+            && media != "application/octet-stream"
+        {
+            return Err(error("The server returned an unsupported audio response."));
+        }
+        Ok(body)
+    }
+
+    async fn open_audio(
+        &self,
+        session: &Session,
+        url: Url,
+        accept: &str,
+        header_budget: Duration,
+    ) -> Result<AudioBody, ApiError> {
+        let fence = NetworkFence::new(session)?;
+        let (changes, generation) = (fence.changes.clone(), fence.generation);
+        fence
+            .run(async {
+                let response = self
+                    .send_audio_headers(session, url, accept, header_budget)
+                    .await?;
+                let headers = response.headers();
+                if response.status() != 200
+                    || headers.contains_key(header::CONTENT_ENCODING)
+                    || headers.contains_key(header::TRANSFER_ENCODING)
+                    || headers.contains_key(header::CONTENT_RANGE)
+                {
+                    return Err(INVALID_RESPONSE);
+                }
+                let len = single_header(headers, header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                    .filter(|n| *n != 0)
+                    .ok_or(INVALID_RESPONSE)?;
+                Ok(AudioBody {
                     response,
-                    MAX_MEDIA,
-                    error("This track exceeds the 32 MiB in-memory playback limit."),
-                    network_error,
-                )
-                .await?;
-            if bytes.is_empty() {
-                return Err(error("The server returned an empty audio response."));
-            }
-            Ok(bytes)
-        })
-        .await
+                    session: session.clone(),
+                    changes,
+                    generation,
+                    remaining: len,
+                    len,
+                })
+            })
+            .await
+    }
+
+    async fn send_audio_headers(
+        &self,
+        session: &Session,
+        url: Url,
+        accept: &str,
+        budget: Duration,
+    ) -> Result<Response, ApiError> {
+        let request = self
+            .request_via(&self.audio_client, reqwest::Method::GET, url, accept)?
+            .header(header::COOKIE, session.secrets.cookie.clone());
+        tokio::time::timeout(budget, self.send(request, Some(session), false))
+            .await
+            .map_err(|_| NETWORK)?
     }
 
     /// Account identity for local data, not permission to send credentials. The
@@ -726,8 +846,15 @@ impl Api {
     ) -> Result<Vec<u8>, ApiError> {
         self.with_authenticated_network(session, async {
             let url = self.offline_track_url(track_id, "media")?;
-            self.offline_json_bytes(session, url, OFFLINE_MEDIA_BODY)
-                .await
+            let response = self
+                .send_audio_headers(session, url, "application/json", OFFLINE_PREP_TIMEOUT)
+                .await?;
+            tokio::time::timeout(
+                BODY_STALL,
+                self.offline_json_body(session, response, OFFLINE_MEDIA_BODY),
+            )
+            .await
+            .map_err(|_| NETWORK)?
         })
         .await
     }
@@ -776,52 +903,33 @@ impl Api {
         id: &str,
         version: &str,
         content_type: &str,
-        byte_length: usize,
-    ) -> Result<Vec<u8>, ApiError> {
+        byte_length: u64,
+    ) -> Result<AudioBody, ApiError> {
         self.with_authenticated_network(session, async {
             if !version
                 .strip_prefix("sha256:")
                 .is_some_and(valid_lower_hex_32)
                 || !OFFLINE_AUDIO_TYPES.contains(&content_type)
-                || !(1..=MAX_MEDIA).contains(&byte_length)
+                || byte_length == 0
             {
                 return Err(INVALID_INPUT);
             }
             let mut url = self.offline_track_url(id, "audio")?;
             url.query_pairs_mut().append_pair("version", version);
-            let request = self
-                .request_with_accept(reqwest::Method::GET, url, content_type)?
-                .header(header::COOKIE, session.secrets.cookie.clone())
-                .timeout(Duration::from_secs(45));
-            let response = self.send(request, Some(session), false).await?;
-            let headers = response.headers();
+            let body = self
+                .open_audio(session, url, content_type, OFFLINE_PREP_TIMEOUT)
+                .await?;
+            let headers = body.response.headers();
             let etag = format!("\"{version}\"");
-            if response.status() != 200
+            if body.len() != byte_length
                 || single_header(headers, header::CONTENT_TYPE).map(HeaderValue::as_bytes)
                     != Some(content_type.as_bytes())
                 || single_header(headers, header::ETAG).map(HeaderValue::as_bytes)
                     != Some(etag.as_bytes())
-                || single_header(headers, header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
-                    != Some(byte_length)
-                || headers.contains_key(header::CONTENT_ENCODING)
-                || headers.contains_key(header::TRANSFER_ENCODING)
             {
                 return Err(INVALID_RESPONSE);
             }
-            let bytes = self
-                .resource_bytes(
-                    session,
-                    response,
-                    byte_length,
-                    INVALID_RESPONSE,
-                    network_error,
-                )
-                .await?;
-            if bytes.len() != byte_length {
-                return Err(INVALID_RESPONSE);
-            }
-            Ok(bytes)
+            Ok(body)
         })
         .await
     }
@@ -844,6 +952,15 @@ impl Api {
             .request_with_method(reqwest::Method::GET, url)?
             .header(header::COOKIE, session.secrets.cookie.clone());
         let response = self.send(request, Some(session), false).await?;
+        self.offline_json_body(session, response, bound).await
+    }
+
+    async fn offline_json_body(
+        &self,
+        session: &Session,
+        response: Response,
+        bound: usize,
+    ) -> Result<Vec<u8>, ApiError> {
         if response.status() != 200 || content_type(&response)? != "application/json" {
             return Err(INVALID_RESPONSE);
         }
@@ -864,15 +981,18 @@ impl Api {
         accept: &'static str,
     ) -> Result<RequestBuilder, ApiError> {
         self.check_session(session)?;
-        if !valid_id(id) {
-            return Err(INVALID_INPUT);
-        }
-        let url = self
-            .origin
-            .endpoint_segments(&["api", "library", "tracks", id, suffix])?;
+        let url = self.track_url(id, suffix)?;
         Ok(self
             .request_with_accept(reqwest::Method::GET, url, accept)?
             .header(header::COOKIE, session.secrets.cookie.clone()))
+    }
+
+    fn track_url(&self, id: &str, suffix: &'static str) -> Result<Url, ApiError> {
+        if !valid_id(id) {
+            return Err(INVALID_INPUT);
+        }
+        self.origin
+            .endpoint_segments(&["api", "library", "tracks", id, suffix])
     }
 
     async fn resource_bytes(
@@ -992,14 +1112,23 @@ impl Api {
         url: Url,
         accept: &str,
     ) -> Result<RequestBuilder, ApiError> {
+        self.request_via(&self.client, method, url, accept)
+    }
+
+    fn request_via(
+        &self,
+        client: &Client,
+        method: reqwest::Method,
+        url: Url,
+        accept: &str,
+    ) -> Result<RequestBuilder, ApiError> {
         if url.origin() != self.origin.0.origin()
             || !url.username().is_empty()
             || url.password().is_some()
         {
             return Err(error("Off-origin requests are not allowed."));
         }
-        Ok(self
-            .client
+        Ok(client
             .request(method, url)
             .header(header::ORIGIN, self.origin.as_str())
             .header(header::ACCEPT, accept))
@@ -2006,6 +2135,15 @@ mod tests {
         assert_eq!(requests[2].header("accept"), Some("image/png, image/jpeg"));
     }
 
+    async fn fixture_audio(mut body: AudioBody) -> Vec<u8> {
+        assert!(body.len() < 1024);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.chunk().await.unwrap() {
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
+    }
+
     #[tokio::test]
     async fn offline_audio_is_pinned_to_exact_origin_version_and_representation() {
         let version = format!("sha256:{}", "0".repeat(64));
@@ -2046,9 +2184,12 @@ mod tests {
             br#"{"version":1}"#
         );
         assert_eq!(
-            api.offline_audio(&session, id, &version, "audio/flac", 4)
-                .await
-                .unwrap(),
+            fixture_audio(
+                api.offline_audio(&session, id, &version, "audio/flac", 4)
+                    .await
+                    .unwrap()
+            )
+            .await,
             b"beep"
         );
         for _ in 0..3 {
@@ -2077,7 +2218,7 @@ mod tests {
         );
         assert_eq!(
             failure(
-                api.offline_audio(&session, id, &version, "audio/flac", MAX_MEDIA + 1)
+                api.offline_audio(&session, id, &version, "audio/flac", 0)
                     .await
             ),
             INVALID_INPUT
@@ -2641,8 +2782,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_is_encoded_once_authenticated_and_mime_body_bounded() {
-        let oversized = format!("HTTP/1.1 200 Test\r\nContent-Length: {}\r\nContent-Type: audio/flac\r\nConnection: close\r\n\r\n", MAX_MEDIA + 1).into_bytes();
+    async fn media_is_encoded_once_authenticated_and_rejects_partial_or_short_response() {
+        let declared = 36 * 1024 * 1024;
+        let short = format!("HTTP/1.1 200 Test\r\nContent-Length: {declared}\r\nContent-Type: audio/flac\r\nConnection: close\r\n\r\n").into_bytes();
         let wire = Wire::new(vec![
             login_reply(),
             reply(200, &[("Content-Type", "audio/flac")], "synthetic-audio"),
@@ -2652,27 +2794,39 @@ mod tests {
                 "synthetic-audio",
             ),
             reply(200, &[("Content-Type", "text/html")], "secret"),
-            oversized,
+            short,
+            reply(
+                206,
+                &[
+                    ("Content-Type", "audio/flac"),
+                    ("Content-Range", "bytes 0-1/4"),
+                ],
+                "ab",
+            ),
             reply(200, &[("Content-Type", "audio/flac")], ""),
             reply(401, &[], "secret"),
         ]);
         let api = wire.api();
         let session = api.login("listener", "password").await.unwrap();
         assert_eq!(
-            api.media(&session, "a/b%2Fc ?#").await.unwrap(),
+            fixture_audio(api.media(&session, "a/b%2Fc ?#").await.unwrap()).await,
             b"synthetic-audio"
         );
         assert_eq!(
-            api.media(&session, "track").await.unwrap(),
+            fixture_audio(api.media(&session, "track").await.unwrap()).await,
             b"synthetic-audio"
         );
-        for _ in 0..3 {
+        assert!(api.media(&session, "track").await.is_err()); // MIME
+        let mut body = api.media(&session, "track").await.unwrap();
+        assert_eq!(body.len(), declared);
+        assert!(body.chunk().await.is_err()); // short HTTP body
+        for _ in 0..2 {
             assert!(api.media(&session, "track").await.is_err());
         }
         assert!(failure(api.media(&session, "track").await).expired);
         assert!(failure(api.media(&session, "track").await).expired);
         let requests = wire.recorded();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 8);
         assert_eq!(
             requests[1].first_line,
             "GET /api/library/tracks/a%2Fb%252Fc%20%3F%23/audio HTTP/1.1"

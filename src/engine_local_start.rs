@@ -4,7 +4,7 @@
 mod tests;
 use crate::{
     offline::OnlineMedia,
-    player::Authority,
+    player::{Authority, Status},
     socket::{
         Command, Context, Cursor, DirectStartFence, Generation, Link, OutputAuthority, PlayerDelta,
         QueueEditKind, Selection, State, Track, TrackRef,
@@ -196,7 +196,7 @@ pub(super) struct Start {
     pub duration: f64,
     pub permit: Permit,
     pub canonical: Option<Cursor>,
-    pub ready: Option<OnlineMedia>,
+    pub ready: Option<Result<OnlineMedia, Status>>,
     pub started: bool,
     base: Cursor,
     // Go publishes SetOutput's run bump immediately before the Outputs update.

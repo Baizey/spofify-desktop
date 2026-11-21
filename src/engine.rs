@@ -89,7 +89,6 @@ impl Command {
 }
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
-const LOAD_BUDGET: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(25);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
@@ -696,8 +695,7 @@ impl Engine {
                 if !queue
                     .get(index)
                     .is_some_and(|item| item.id == input.item.id)
-                    || input.bytes.is_empty()
-                    || input.bytes.len() > offline::MAX_TRACK_BYTES
+                    || input.source.len() == 0
                     || queue
                         .iter()
                         .any(|item| item.kind != "track" || !item.has_audio)
@@ -814,6 +812,14 @@ impl Engine {
     }
     fn tick_saved(&mut self) {
         if self.local.desired && self.media.is_none() && self.audio.is_some() {
+            let audio = self.audio.as_mut().unwrap();
+            if let Some(status) = audio.failure() {
+                self.local.elapsed = audio.facts().elapsed;
+                self.local.desired = false;
+                self.local_status = status;
+                self.stop();
+                return;
+            }
             self.tick_saved_crossfade();
             let facts = self.audio.as_ref().unwrap().facts();
             self.local.elapsed = facts.elapsed;
@@ -864,10 +870,7 @@ impl Engine {
         };
         audio.anchor(self.local.elapsed, duration);
         if let Some(input) = input {
-            if input.item.id != id
-                || input.bytes.is_empty()
-                || input.bytes.len() > offline::MAX_TRACK_BYTES
-            {
+            if input.item.id != id || input.source.len() == 0 {
                 self.local_status = Status::Media;
                 self.local.desired = false;
                 return;
@@ -875,7 +878,7 @@ impl Engine {
             audio.discard_cache();
             self.local_status = audio.play(
                 id,
-                input.bytes.into(),
+                input.source,
                 self.local.elapsed,
                 duration,
                 Authority::offline(),
@@ -945,14 +948,12 @@ impl Engine {
             self.local_lookahead =
                 Some(crossfade::Lookahead::new((from.key, to.key), async move {
                     let input = load.await?;
-                    (input.item.id == id
-                        && (1..=offline::MAX_TRACK_BYTES).contains(&input.bytes.len()))
-                    .then(|| input.bytes.into())
+                    (input.item.id == id && input.source.len() != 0).then_some(input.source)
                 }));
         }
         if let Some(look) = &mut self.local_lookahead
-            && let Some(bytes) = look.take_bytes()
-            && audio.start_crossfade(to.track.id.clone(), bytes, Authority::offline())
+            && let Some(source) = look.take_source()
+            && audio.start_crossfade(to.track.id.clone(), source, Authority::offline())
         {
             look.started(());
         }
@@ -1124,7 +1125,7 @@ impl Engine {
                     self.start_saved(Some(input));
                 } else {
                     self.local.desired = false;
-                    self.local_status = Status::Media;
+                    self.local_status = Status::Load;
                 }
             }
             Reply::Media {
@@ -1158,6 +1159,7 @@ impl Engine {
         self.local_lookahead = None;
         self.cancel_online_crossfade();
         self.online.execution = None;
+        self.online.clear_handoff();
         self.online.clear_local_start();
         if let Some(audio) = &mut self.audio {
             audio.stop();
@@ -1274,7 +1276,8 @@ impl Engine {
                 p.playing = facts.playing;
             }
             p.status = match self.local_status {
-                Status::Media => "Saved audio could not be played.",
+                Status::Load => "Saved audio could not be loaded.",
+                Status::Media => "This desktop could not decode or seek the saved audio.",
                 Status::Blocked => "Audio output is unavailable on this desktop.",
                 _ => p.status,
             };
@@ -1580,24 +1583,11 @@ fn read_saved(
     id: String,
 ) -> impl std::future::Future<Output = Option<PlaybackInput>> + use<> {
     let (api, session) = (account.api.clone(), account.session.clone());
-    let stamp = *session.network_changes().borrow();
     async move {
-        let permit = slot.acquire_owned().await.ok()?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            if *session.network_changes().borrow() != stamp {
-                return None;
-            }
-            let input = store.read(&api, &session, &id).ok();
-            if *session.network_changes().borrow() == stamp {
-                input
-            } else {
-                None
-            }
-        })
-        .await
-        .ok()
-        .flatten()
+        let (_, input) = offline::read_verified(api, session, slot, id, move || Ok(store))
+            .await
+            .ok()?;
+        Some(input)
     }
 }
 
@@ -2040,6 +2030,11 @@ mod tests {
             e.epoch,
             e.master_gain.clone(),
         ));
+        let (mixer, _samples) = rodio::mixer::mixer(1, 8000);
+        e.audio
+            .as_mut()
+            .unwrap()
+            .use_test_streaming_output(mixer, 1, 8000);
         e.account = Some(Account {
             api,
             session: session.clone(),
@@ -2060,10 +2055,10 @@ mod tests {
                 mode_stamp,
                 queue: vec![item.clone()],
                 index: 0,
-                // Intentionally cannot open an audio device. This test checks queue admission.
+                // Invalid audio still admits the selected queue, then fails decoding.
                 input: PlaybackInput {
                     item: item.clone(),
-                    bytes: vec![1],
+                    source: crate::audio_input::AudioInput::from(Arc::from([1])),
                 },
                 store: store.clone(),
             }
@@ -2076,6 +2071,14 @@ mod tests {
         assert!(e.network_allowed());
         assert_eq!(e.local.current().unwrap().track.id, "saved");
         assert!(e.room_token().unwrap().starts_with("local:"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while e.local_status == Status::Ok {
+                e.tick_saved();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(e.local_status, Status::Media);
         e.action(Action::Close);
         assert!(e.local_store.is_none());
