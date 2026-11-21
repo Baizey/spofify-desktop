@@ -1,6 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 import { Copy, EmptyState, Hero, MediaLine } from "catalog.slint";
+import { PlaylistDetailHeader } from "playlist-detail.slint";
 import { ReorderList, ReorderRow } from "reorder.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
@@ -25,6 +26,8 @@ export struct PlaylistActions {
     play: bool, queue: bool, offline-action: string, rename: bool, rules: bool, remove-action: string,
 }
 
+export struct PlaylistOfflineState { saved: bool, feedback: string }
+
 struct RowRange { start: int, end: int }
 
 component BrowseLine inherits MediaLine {
@@ -48,12 +51,6 @@ component BrowseLine inherits MediaLine {
     actions: page-kind == "picker" ? []
         : !local-mode || page-kind == "offline" ? entry.actions
         : page-kind == "playlists" && entry.playlist-pinned ? ["unpin-playlist"] : [];
-}
-
-component PlaylistAction inherits Action {
-    in property <int> resume;
-    in property <bool> restore;
-    changed resume => { if self.restore { self.take-focus(); } }
 }
 
 export component AppWindow inherits Window {
@@ -128,6 +125,9 @@ export component AppWindow inherits Window {
     in property <bool> can-back;
     in property <[string]> page-actions;
     in property <PlaylistActions> playlist-actions;
+    in property <string> playlist-metadata;
+    in property <string> playlist-description;
+    in property <PlaylistOfflineState> playlist-offline-state;
     in property <[ReorderRow]> playlist-order-rows;
     in property <string> playlist-order-scope;
     in property <bool> playlist-order-pending;
@@ -230,6 +230,7 @@ export component AppWindow inherits Window {
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
     in-out property <string> form-return;
     property <string> saved-removal-key;
+    property <string> confirmation-title;
     property <int> form-focus-serial;
     changed wide => { root.compact-queue-open = false; }
     changed signed-in => {
@@ -252,6 +253,7 @@ export component AppWindow inherits Window {
     public function show-playlist-editor(key: string, mode: string, name: string, description: string, rules: string, help: string) {
         if root.page-key == key && root.is-playlist && !root.editor-open && !root.compact-queue-open && !root.local-mode {
             root.form-return = mode;
+            root.confirmation-title = mode == "delete" ? root.catalog-title : "";
             root.form-name = name;
             root.form-description = description;
             root.form-value = rules;
@@ -264,6 +266,7 @@ export component AppWindow inherits Window {
         root.edit-form("remove-saved");
         root.form-return = action;
         root.saved-removal-key = root.page-key;
+        root.confirmation-title = root.playlist-detail ? root.catalog-title : "";
         root.form-error = "";
     }
     function cancel-form() {
@@ -322,7 +325,6 @@ export component AppWindow inherits Window {
         property <bool> restore-lyrics-focus;
         property <bool> queue-order-edit;
         property <bool> playlist-order-edit;
-        property <int> restore-order-focus;
         property <bool> queue-visible: root.queue-shown;
         property <bool> local-mode: root.local-mode;
         property <bool> local-playback: root.local-playback;
@@ -563,10 +565,30 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                // Page navigation and Edit order stay reachable while the catalog scrolls.
+                property <bool> can-edit-order: root.is-playlist && root.playlist-order-scope != "";
+                // Only one Edit order target is shown. Keep the established deep-scroll
+                // shortcut and restore to it without revealing the header on Done.
+                property <bool> sticky-order: self.can-edit-order
+                    && -catalog-scroll.content-y > header-slot.y + playlist-header.order-top;
+                changed sticky-order => {
+                    if !self.can-edit-order || !catalog-scroll.visible || !history-pane.visible { return; }
+                    if self.sticky-order && playlist-header.order-has-focus && edit-playlist-order.enabled {
+                        edit-playlist-order.take-focus();
+                    } else if !self.sticky-order && edit-playlist-order.has-focus {
+                        playlist-header.focus-order();
+                    }
+                }
+                function begin-playlist-order() {
+                    if !self.can-edit-order || root.editor-open { return; }
+                    queue-order.cancel-grab();
+                    shell.queue-order-edit = false;
+                    shell.playlist-order-start = catalog-list.first-visible;
+                    shell.playlist-order-edit = true;
+                    playlist-order.focus-list();
+                }
                 back-row := Rectangle {
                     x: main.inset; y: root.toolbar-height; width: parent.width - 2 * main.inset;
-                    visible: (root.can-back || edit-playlist-order.visible || shell.playlist-order-edit)
+                    visible: (root.can-back || main.can-edit-order || shell.playlist-order-edit)
                         && !root.editor-open && !root.compact-queue-open;
                     height: self.visible ? 46px : 0px;
                     back-button := Action {
@@ -578,18 +600,11 @@ export component AppWindow inherits Window {
                     edit-playlist-order := Action {
                         x: parent.width - self.width; y: 8px; width: self.min-width;
                         text: "Edit order";
-                        visible: root.is-playlist && root.playlist-order-scope != "" && !shell.playlist-order-edit;
+                        quiet: true; secondary-ink: Theme.muted;
+                        visible: main.sticky-order && !shell.playlist-order-edit;
                         enabled: self.visible && back-row.visible;
                         click-scope: root.playlist-order-scope;
-                        property <int> return-focus: shell.restore-order-focus;
-                        changed return-focus => { if self.enabled { self.take-focus(); } }
-                        clicked => {
-                            queue-order.cancel-grab();
-                            shell.queue-order-edit = false;
-                            shell.playlist-order-start = catalog-list.first-visible;
-                            shell.playlist-order-edit = true;
-                            playlist-order.focus-list();
-                        }
+                        clicked => { main.begin-playlist-order(); }
                     }
                 }
                 history-pane := FocusScope {
@@ -650,24 +665,53 @@ export component AppWindow inherits Window {
                             padding-left: main.inset; padding-right: main.inset;
                             padding-top: main.narrow ? 14px : 23px; padding-bottom: 24px;
                             spacing: 8px; alignment: start;
-                            detail-hero := Rectangle {
-                                property <bool> with-art: root.is-playlist || root.page-kind == "album" || root.page-kind == "artist";
-                                border-radius: Theme.container-radius;
-                                background: self.with-art ? Theme.panel : transparent;
-                                border-width: self.with-art ? 1px : 0px;
-                                border-color: Theme.line;
-                                min-height: hero-layout.preferred-height; vertical-stretch: 0;
-                                hero-layout := VerticalLayout {
-                                    padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;
-                                    Hero {
-                                        title: root.is-settings ? "Settings" : root.catalog-title;
-                                        subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
-                                        section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : root.is-playlist ? "PLAYLIST" : "";
-                                        glyph: Copy.mark(root.page-kind);
-                                        artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
-                                        credits: root.page-credits; metadata-enabled: !root.local-mode;
-                                        focused(y, h) => { catalog-scroll.reveal(catalog.y + detail-hero.y + self.y + y, h); }
-                                        page-action(op, id) => { shell.entity(op, id, -1); }
+                            header-slot := Rectangle {
+                                min-height: root.playlist-detail ? playlist-header.min-height : hero-layout.preferred-height;
+                                vertical-stretch: 0;
+                                detail-hero := Rectangle {
+                                    visible: !root.playlist-detail;
+                                    property <bool> with-art: root.page-kind == "album" || root.page-kind == "artist";
+                                    border-radius: Theme.container-radius;
+                                    background: self.with-art ? Theme.panel : transparent;
+                                    border-width: self.with-art ? 1px : 0px;
+                                    border-color: Theme.line;
+                                    hero-layout := VerticalLayout {
+                                        padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;
+                                        Hero {
+                                            title: root.is-settings ? "Settings" : root.catalog-title;
+                                            subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
+                                            section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : "";
+                                            glyph: Copy.mark(root.page-kind);
+                                            artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
+                                            credits: root.page-credits; metadata-enabled: !root.local-mode;
+                                            focused(y, h) => { catalog-scroll.reveal(catalog.y + header-slot.y + self.y + y, h); }
+                                            page-action(op, id) => { shell.entity(op, id, -1); }
+                                        }
+                                    }
+                                }
+                                playlist-header := PlaylistDetailHeader {
+                                    visible: root.playlist-detail;
+                                    active: self.visible && !root.editor-open && !shell.playlist-order-edit && !root.compact-queue-open;
+                                    compact: main.narrow;
+                                    title: root.catalog-title; metadata: root.playlist-metadata; description: root.playlist-description;
+                                    artwork: root.page-artwork;
+                                    play: self.visible && root.playlist-actions.play && (!root.local-mode || root.page-kind == "saved-collection");
+                                    queue: self.visible && root.playlist-actions.queue && !root.local-mode;
+                                    rename: self.visible && root.playlist-actions.rename && !root.local-mode;
+                                    rules: self.visible && root.playlist-actions.rules && !root.local-mode;
+                                    edit-order: main.can-edit-order; sticky-order: main.sticky-order;
+                                    offline-action: self.visible && (root.playlist-actions.offline-action == "unpin-playlist" || !root.local-mode) ? root.playlist-actions.offline-action : "";
+                                    remove-action: self.visible && (!root.local-mode || root.page-kind == "saved-collection") ? root.playlist-actions.remove-action : "";
+                                    saved: root.playlist-offline-state.saved; offline-feedback: root.playlist-offline-state.feedback;
+                                    status: root.page-status; error: root.page-error; loading: root.page-busy;
+                                    click-scope: root.page-key + "|" + root.browse-model-key;
+                                    order-scope: root.playlist-order-scope;
+                                    form-return: root.form-return; form-resume: root.form-focus-serial;
+                                    focused(y, h) => { catalog-scroll.reveal(catalog.y + header-slot.y + y, h); }
+                                    command(op) => {
+                                        if op == "order" { main.begin-playlist-order(); }
+                                        else if op == "remove" || op == "unpin-playlist" { root.confirm-saved-removal(op); }
+                                        else { root.page-action(op, ""); }
                                     }
                                 }
                             }
@@ -681,76 +725,8 @@ export component AppWindow inherits Window {
                                     clicked => { root.catalog-action(action); }
                                 }
                             }
-                            if root.playlist-detail: playlist-tools := FlexboxLayout {
-                                flex-wrap: wrap; spacing: 8px;
-                                property <bool> online: !root.local-mode;
-                                property <string> scope: root.page-key + "|" + root.browse-model-key;
-                                property <bool> play: root.playlist-actions.play && (self.online || root.page-kind == "saved-collection");
-                                property <bool> queue: root.playlist-actions.queue && self.online;
-                                property <bool> rename: root.playlist-actions.rename && self.online;
-                                property <bool> rules: root.playlist-actions.rules && self.online;
-                                property <string> offline-action: root.playlist-actions.offline-action == "unpin-playlist" || self.online ? root.playlist-actions.offline-action : "";
-                                property <string> remove-action: self.online || root.page-kind == "saved-collection" ? root.playlist-actions.remove-action : "";
-                                visible: self.play || self.queue || self.rename || self.rules || self.offline-action != "" || self.remove-action != "";
-                                if playlist-tools.play: Action {
-                                    text: "Play"; icon: "▶"; primary: true;
-                                    click-scope: playlist-tools.scope;
-                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
-                                    clicked => { root.page-action("play", ""); }
-                                }
-                                if playlist-tools.queue: Action {
-                                    text: "Add to queue";
-                                    click-scope: playlist-tools.scope;
-                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
-                                    clicked => { root.page-action("queue", ""); }
-                                }
-                                if playlist-tools.offline-action != "": PlaylistAction {
-                                    text: Copy.action-label(playlist-tools.offline-action);
-                                    accessible-checkable: true;
-                                    accessible-checked: playlist-tools.offline-action == "unpin-playlist";
-                                    click-scope: playlist-tools.scope + "|" + playlist-tools.offline-action;
-                                    resume: root.form-focus-serial;
-                                    restore: root.form-return == "unpin-playlist";
-                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
-                                    clicked => {
-                                        if playlist-tools.offline-action == "unpin-playlist" { root.confirm-saved-removal("unpin-playlist"); }
-                                        else { root.page-action("pin-playlist", ""); }
-                                    }
-                                }
-                                if playlist-tools.rename || playlist-tools.rules: management := HorizontalLayout {
-                                    spacing: 8px; alignment: start; horizontal-stretch: 0;
-                                    if playlist-tools.rename: PlaylistAction {
-                                        text: "Rename"; click-scope: playlist-tools.scope;
-                                        resume: root.form-focus-serial; restore: root.form-return == "rename";
-                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + management.y + self.y, self.height); } }
-                                        clicked => { root.page-action("edit-rename", ""); }
-                                    }
-                                    if playlist-tools.rules: PlaylistAction {
-                                        text: "Edit rules"; click-scope: playlist-tools.scope;
-                                        resume: root.form-focus-serial; restore: root.form-return == "rules";
-                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + management.y + self.y, self.height); } }
-                                        clicked => { root.page-action("edit-rules", ""); }
-                                    }
-                                }
-                                if playlist-tools.remove-action != "": destructive := HorizontalLayout {
-                                    spacing: 8px; horizontal-stretch: 0;
-                                    if playlist-tools.play || playlist-tools.queue || playlist-tools.offline-action != "" || playlist-tools.rename || playlist-tools.rules: Rectangle {
-                                        width: 1px; background: Theme.line; accessible-role: none;
-                                    }
-                                    PlaylistAction {
-                                        text: playlist-tools.remove-action == "remove" ? "Remove from Saved" : Copy.action-label(playlist-tools.remove-action);
-                                        quiet: true; click-scope: playlist-tools.scope + "|" + playlist-tools.remove-action;
-                                        resume: root.form-focus-serial; restore: root.form-return == playlist-tools.remove-action;
-                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + destructive.y + self.y, self.height); } }
-                                        clicked => {
-                                            if playlist-tools.remove-action == "delete" { root.page-action("edit-delete", ""); }
-                                            else { root.confirm-saved-removal(playlist-tools.remove-action); }
-                                        }
-                                    }
-                                }
-                            }
-                            if root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
-                            if root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
+                            if !root.playlist-detail && root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
+                            if !root.playlist-detail && root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
                             if root.is-settings: Settings {
                                 account: root.account-label; offline: root.local-mode; reconnecting: root.reconnecting;
                                 crossfade-enabled: root.crossfade-enabled; crossfade-status: root.crossfade-status;
@@ -773,7 +749,8 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
+                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error
+                                && !(root.page-kind == "saved-collection" && !root.playlist-offline-state.saved && root.playlist-offline-state.feedback != ""):
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
                                     title: root.is-search && root.query == "" ? (root.local-mode ? "Search your downloads" : "What would you like to hear?")
@@ -793,10 +770,10 @@ export component AppWindow inherits Window {
                                     clicked => { root.query = root.catalog-title; shell.edited-search(); search.take-focus(); }
                                 }
                             }
-                            if root.browse-rows.length > 0 && root.page-kind != "playlists": Eyebrow {
+                            if root.browse-rows.length > 0 && root.page-kind != "playlists" && !root.playlist-detail: Eyebrow {
                                 height: 30px; color: Theme.muted;
                                 text: root.is-search ? "RESULTS" : root.is-history ? "RECENTLY PLAYED" : root.page-kind == "artist" ? "DISCOGRAPHY"
-                                    : root.page-kind == "album" || root.is-playlist ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
+                                    : root.page-kind == "album" ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
                                     : root.saved-view ? "DOWNLOADED MUSIC" : "";
                             }
                             catalog-list := FocusScope {
@@ -949,7 +926,8 @@ export component AppWindow inherits Window {
                                 clicked => {
                                     playlist-order.cancel-grab();
                                     shell.playlist-order-edit = false;
-                                    shell.restore-order-focus += 1;
+                                    if edit-playlist-order.enabled { edit-playlist-order.take-focus(); }
+                                    else { playlist-header.focus-order(); }
                                 }
                             }
                         }
@@ -972,6 +950,8 @@ export component AppWindow inherits Window {
                 }
                 if root.editor-open: Editor {
                     x: 0px; y: root.toolbar-height; width: parent.width; height: parent.height - self.y;
+                    confirm-subject: root.confirmation-title;
+                    remove-offline-save: root.form-return == "unpin-playlist";
                     mode: root.form-mode; name <=> root.form-name; description <=> root.form-description; definition <=> root.form-value;
                     error: root.form-error; help: root.form-help; busy: root.form-busy;
                     cancel => { root.cancel-form(); } save => { root.submit-form(); }

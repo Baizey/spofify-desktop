@@ -107,6 +107,8 @@ component RulesField inherits Rectangle {
 
 export component Editor inherits Rectangle {
     in property <string> mode;
+    in property <string> confirm-subject;
+    in property <bool> remove-offline-save;
     in property <string> help;
     in property <string> error;
     in property <bool> busy;
@@ -140,14 +142,21 @@ export component Editor inherits Rectangle {
                     background: Theme.panel; border-radius: Theme.container-radius; border-width: 1px; border-color: Theme.line;
                     editor-form := VerticalLayout {
                         padding: 15px; spacing: 10px;
-                        Eyebrow { text: root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
+                        if !root.deleting || root.confirm-subject == "": Eyebrow { text: root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
                         Text {
-                            text: root.mode == "remove-saved" ? "Remove this saved collection?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
+                            text: root.deleting && root.confirm-subject != ""
+                                ? (root.mode == "delete" ? "Delete “" : root.remove-offline-save ? "Remove offline save for “" : "Remove from Saved: “") + root.confirm-subject + "”?"
+                                : root.mode == "remove-saved" ? "Remove this saved collection?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
                                 : root.mode == "rules" ? "Edit playlist rules" : root.mode == "new-rules" ? "New rules playlist"
                                 : "New playlist";
                             color: Theme.text; font-weight: 700; font-size: 25px; wrap: word-wrap;
                         }
-                        if root.deleting: Caption { text: root.mode == "remove-saved" ? "This removes the collection from Saved offline. Its audio files stay on this computer." : "The playlist will be deleted. Tracks in your library won’t be affected."; wrap: word-wrap; }
+                        if root.deleting: Caption {
+                            text: root.mode == "remove-saved"
+                                ? root.confirm-subject != "" ? "Audio files stay on this computer." : "This removes the collection from Saved offline. Its audio files stay on this computer."
+                                : root.confirm-subject != "" ? "Tracks in your library won’t be affected." : "The playlist will be deleted. Tracks in your library won’t be affected.";
+                            wrap: word-wrap;
+                        }
                         if root.editing-name: Caption { text: "Playlist name"; color: Theme.text; }
                         if root.editing-name: Field {
                             text <=> root.name;
@@ -176,7 +185,7 @@ export component Editor inherits Rectangle {
                             }
                             Rectangle { horizontal-stretch: 1; }
                             Action {
-                                text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove from Saved" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
+                                text: root.busy ? "Working…" : root.mode == "remove-saved" ? (root.remove-offline-save && root.confirm-subject != "" ? "Remove offline save" : "Remove from Saved") : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
                                 enabled: root.ready; primary: !root.deleting;
                                 clicked => { root.save(); }
                             }

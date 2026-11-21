@@ -87,6 +87,36 @@ impl Status {
         }
     }
 
+    /// Detail represents committed audio on the control itself. Keep only
+    /// actionable state information beside it; list-row copy stays unchanged.
+    pub(crate) fn detail_feedback(&self) -> String {
+        match (self.phase, self.has_committed) {
+            (Phase::Saved, _) => String::new(),
+            (Phase::Pending, true) => "Refresh pending".into(),
+            (Phase::Pending, false) => "Waiting to download".into(),
+            (Phase::Retry, committed) => self
+                .hint
+                .unwrap_or(if committed {
+                    "Refresh pending"
+                } else {
+                    "Waiting to retry"
+                })
+                .into(),
+            (Phase::Downloading { verified, total }, committed) => {
+                let verb = if committed {
+                    "Refreshing"
+                } else {
+                    "Downloading"
+                };
+                if total == 0 {
+                    verb.into()
+                } else {
+                    format!("{verb} {verified} of {total}")
+                }
+            }
+        }
+    }
+
     fn same_row(&self, other: &Self) -> bool {
         self.target == other.target
             && self.key == other.key
@@ -944,6 +974,41 @@ mod tests {
         rows.reset_retries(None, false);
         assert_eq!(rows.ready(now).as_deref(), Some("a"));
         assert_eq!(rows.entries["b"].status.phase, Phase::Saved);
+    }
+
+    #[test]
+    fn detail_feedback_tracks_typed_phase_without_repeating_saved_state() {
+        let mut rows = Rows::default();
+        rows.put(pending_record("a").into());
+        let status = &mut rows.entries.get_mut("a").unwrap().status;
+        assert_eq!(status.detail_feedback(), "Waiting to download");
+        status.phase = Phase::Downloading {
+            verified: 2,
+            total: 4,
+        };
+        assert_eq!(status.detail_feedback(), "Downloading 2 of 4");
+        status.phase = Phase::Retry;
+        status.hint = Some("The library is temporarily unavailable.");
+        assert_eq!(
+            status.detail_feedback(),
+            "The library is temporarily unavailable."
+        );
+        status.has_committed = true;
+        status.phase = Phase::Saved;
+        assert_eq!(status.detail_feedback(), "");
+        assert_eq!(status.label(), "Saved on this device");
+        status.phase = Phase::Pending;
+        assert_eq!(status.detail_feedback(), "Refresh pending");
+        status.phase = Phase::Downloading {
+            verified: 0,
+            total: 0,
+        };
+        assert_eq!(status.detail_feedback(), "Refreshing");
+        status.phase = Phase::Downloading {
+            verified: 2,
+            total: 4,
+        };
+        assert_eq!(status.detail_feedback(), "Refreshing 2 of 4");
     }
 
     #[test]

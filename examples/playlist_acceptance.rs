@@ -137,10 +137,15 @@ fn show(ui: &AppWindow, page: Page, has_parent: bool, generation: usize) {
     ui.set_page_kind(page.kind().into());
     ui.set_page_key(page.kind().into());
     ui.set_page_title(page.title().into());
-    ui.set_page_subtitle(if page.is_detail() {
-        format!("{COUNT} songs").into()
-    } else {
-        "".into()
+    ui.set_playlist_metadata(match page {
+        Page::Manual => format!("{COUNT} songs").into(),
+        Page::Rules => format!("Rule playlist · {COUNT} songs").into(),
+        Page::Saved => format!("Playlist · {COUNT} songs").into(),
+        _ => Default::default(),
+    });
+    ui.set_playlist_offline_state(PlaylistOfflineState {
+        saved: page == Page::Saved,
+        ..Default::default()
     });
     ui.set_can_back(has_parent);
     ui.set_page_busy(false);
@@ -171,6 +176,12 @@ fn show(ui: &AppWindow, page: Page, has_parent: bool, generation: usize) {
         queue: matches!(page, Page::Manual | Page::Rules),
         rename: page == Page::Manual,
         rules: page == Page::Rules,
+        remove_action: if page == Page::Saved {
+            "unpin-playlist"
+        } else {
+            ""
+        }
+        .into(),
         ..PlaylistActions::default()
     });
     ui.set_playlist_order_scope(
@@ -188,7 +199,8 @@ fn show_manual_loading(ui: &AppWindow, generation: usize) {
     ui.set_page_kind("playlist".into());
     ui.set_page_key(Page::Manual.kind().into());
     ui.set_page_title("Playlist".into());
-    ui.set_page_subtitle("".into());
+    ui.set_playlist_metadata(Default::default());
+    ui.set_playlist_offline_state(Default::default());
     ui.set_can_back(true);
     ui.set_page_busy(true);
     ui.set_browse_model_key(generation.to_string().into());

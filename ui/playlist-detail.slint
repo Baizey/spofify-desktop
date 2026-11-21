@@ -1,0 +1,235 @@
+import { Action, Caption, Cover, Divider, Theme } from "theme.slint";
+
+component DetailCommand inherits Action {
+    in property <string> return-key;
+    in property <string> form-return;
+    in property <int> resume;
+    changed resume => {
+        if self.enabled && self.return-key != "" && self.return-key == self.form-return { self.take-focus(); }
+    }
+}
+
+// A short, input-transparent label for the one icon-only command. Unlike a
+// pointer-position tooltip, it stays under its own control for keyboard and hover.
+component OfflineActionHint inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <length> guide-left;
+    in property <length> guide-right;
+    in property <length> anchor-width;
+    in property <length> anchor-height;
+    property <bool> ready;
+    changed active => { self.ready = false; }
+    changed text => { self.ready = false; }
+    Timer {
+        interval: 550ms;
+        running: root.active && !root.ready;
+        triggered => { root.ready = true; }
+    }
+    x: clamp((root.anchor-width - self.width) / 2, root.guide-left, max(root.guide-left, root.guide-right - self.width));
+    y: root.anchor-height + 5px;
+    width: label.preferred-width + 16px;
+    height: 26px;
+    visible: root.active && root.ready;
+    background: Theme.raised;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: Theme.line;
+    accessible-role: none;
+    label := Caption { x: 8px; width: parent.width - 16px; height: parent.height; text: root.text; color: Theme.text; }
+}
+
+export component PlaylistDetailHeader inherits Rectangle {
+    in property <bool> compact;
+    in property <bool> active: true;
+    in property <string> title;
+    in property <string> metadata;
+    in property <string> description;
+    in property <image> artwork;
+    in property <bool> play;
+    in property <bool> queue;
+    in property <bool> rename;
+    in property <bool> rules;
+    in property <bool> edit-order;
+    in property <bool> sticky-order;
+    out property <length> order-top: stack.y + toolbar.y + manage.y + order-slot.y;
+    out property <bool> order-has-focus: order.has-focus;
+    public function focus-order() { if order.enabled { order.take-focus(); } }
+    in property <string> offline-action;
+    in property <string> remove-action;
+    in property <bool> saved;
+    in property <string> offline-feedback;
+    in property <string> status;
+    in property <bool> error;
+    in property <bool> loading;
+    in property <string> click-scope;
+    in property <string> order-scope;
+    in property <string> form-return;
+    in property <int> form-resume;
+    callback command(string);
+    callback focused(length, length);
+
+    property <string> save-command: offline-action != "" ? offline-action : remove-action == "unpin-playlist" || remove-action == "remove" ? remove-action : "";
+    property <string> save-name: save-command == "remove" ? "Remove from Saved" : save-command == "unpin-playlist" ? "Remove offline save" : "Save offline";
+    property <bool> listening: play || queue || save-command != "";
+    property <bool> editing: rename || rules || edit-order || remove-action == "delete";
+    property <bool> tight: self.width < 315px * Theme.density;
+    property <length> title-size: (self.compact ? 29px : 35px) * Theme.density;
+    // Size the inline lane for pending and progress, not each changing count.
+    // A longer exceptional notice still gets the full width instead of elision.
+    property <bool> inline-feedback: offline-feedback != "" && save-command != "" && self.width
+        >= listens.preferred-width + manage.preferred-width
+            + max(measure-routine.preferred-width, measure-feedback.preferred-width) + 24px;
+    min-width: 0px;
+    min-height: stack.preferred-height;
+    vertical-stretch: 0;
+
+    stack := VerticalLayout {
+        spacing: 11px;
+        HorizontalLayout {
+            spacing: 12px;
+            min-width: 0px;
+            if root.artwork.width > 0: Cover { width: 62px; height: 62px; artwork: root.artwork; }
+            VerticalLayout {
+                spacing: 4px;
+                min-width: 0px;
+                Rectangle {
+                    min-width: 0px;
+                    height: min(name.preferred-height, root.title-size * 2.75);
+                    clip: true;
+                    name := Text {
+                        width: parent.width; height: parent.height;
+                        text: root.title; color: Theme.text; font-weight: 700;
+                        font-size: root.title-size;
+                        letter-spacing: -0.8px; overflow: elide; wrap: word-wrap;
+                        accessible-role: text; accessible-label: self.text;
+                    }
+                }
+                if root.metadata != "": Caption { text: root.metadata; font-size: 13px * Theme.density; }
+                if root.description != "": Rectangle {
+                    min-width: 0px;
+                    height: min(description-copy.preferred-height, 40px * Theme.density);
+                    clip: true;
+                    description-copy := Caption {
+                        width: parent.width; height: parent.height;
+                        text: root.description; color: Theme.text; font-size: 13px * Theme.density;
+                        vertical-alignment: top; wrap: word-wrap;
+                    }
+                }
+            }
+        }
+        toolbar := FlexboxLayout {
+            // Groups wrap together instead of moving isolated buttons as the pane shrinks.
+            visible: root.listening || root.editing;
+            height: self.visible ? self.preferred-height : 0px;
+            spacing: 12px;
+            flex-wrap: wrap;
+            cross-axis-alignment: center;
+            alignment: space-between;
+            cluster := HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: 10px;
+                listens := HorizontalLayout {
+                    horizontal-stretch: 0;
+                    spacing: root.tight ? 3px : 5px;
+                    if root.play: DetailCommand {
+                        width: max(84px, self.min-width); height: 42px;
+                        text: "Play"; icon: "▶"; primary: true; round: true;
+                        click-scope: root.click-scope;
+                        changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); } }
+                        clicked => { root.command("play"); }
+                    }
+                    if root.queue: DetailCommand {
+                        text: "Add to queue"; icon: root.tight ? "" : "queue-add"; quiet: true; height: 42px;
+                        label-min-inset: root.tight ? 17px : 23px;
+                        click-scope: root.click-scope;
+                        changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); } }
+                        clicked => { root.command("queue"); }
+                    }
+                    if root.save-command != "": offline := DetailCommand {
+                        icon: root.saved ? "downloaded" : "↓";
+                        width: 44px; height: 42px;
+                        selected: root.saved; quiet: true;
+                        accessible-label: root.save-name;
+                        accessible-description: root.saved ? "Saved on this device" : "";
+                        accessible-checkable: root.save-command != "remove";
+                        accessible-checked: root.saved;
+                        click-scope: root.click-scope + "|" + root.save-command;
+                        return-key: root.save-command; resume: root.form-resume; form-return: root.form-return;
+                        changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); } }
+                        clicked => { root.command(root.save-command); }
+                        OfflineActionHint {
+                            text: root.save-name;
+                            active: root.active && (offline.has-hover || (offline.focus-visible && !offline.pointer-focused));
+                            guide-left: -(toolbar.x + cluster.x + listens.x + offline.x);
+                            guide-right: root.width + self.guide-left;
+                            anchor-width: offline.width; anchor-height: offline.height;
+                        }
+                    }
+                }
+                if root.inline-feedback: Caption {
+                    text: root.offline-feedback; font-size: 13px * Theme.density;
+                    min-width: self.preferred-width;
+                    accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
+                }
+            }
+            manage := HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: root.tight ? 0px : 2px;
+                if root.rename: DetailCommand {
+                    text: "Rename"; quiet: true; secondary-ink: Theme.muted;
+                    label-min-inset: root.tight ? 17px : 23px;
+                    click-scope: root.click-scope;
+                    return-key: "rename"; resume: root.form-resume; form-return: root.form-return;
+                    changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + manage.y + self.y, self.height); } }
+                    clicked => { root.command("edit-rename"); }
+                }
+                if root.rules: DetailCommand {
+                    text: "Edit rules"; quiet: true; secondary-ink: Theme.muted;
+                    label-min-inset: root.tight ? 17px : 23px;
+                    click-scope: root.click-scope;
+                    return-key: "rules"; resume: root.form-resume; form-return: root.form-return;
+                    changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + manage.y + self.y, self.height); } }
+                    clicked => { root.command("edit-rules"); }
+                }
+                order-slot := Rectangle {
+                    // Preserve toolbar geometry when the sticky proxy takes over.
+                    width: root.edit-order ? order.min-width : 0px;
+                    height: root.edit-order ? order.height : 0px;
+                    order := Action {
+                        text: "Edit order"; quiet: true; secondary-ink: Theme.muted;
+                        visible: root.edit-order && !root.sticky-order;
+                        enabled: self.visible && root.active;
+                        width: parent.width;
+                        label-min-inset: root.tight ? 17px : 23px;
+                        click-scope: root.click-scope + "|" + root.order-scope;
+                        changed has-focus => { if self.has-focus { root.focused(root.order-top, self.height); } }
+                        clicked => { root.command("order"); }
+                    }
+                }
+                if root.remove-action == "delete": DetailCommand {
+                    text: "Delete"; quiet: true; secondary-ink: Theme.muted;
+                    label-min-inset: root.tight ? 17px : 23px;
+                    click-scope: root.click-scope + "|delete";
+                    return-key: "delete"; resume: root.form-resume; form-return: root.form-return;
+                    changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + manage.y + self.y, self.height); } }
+                    clicked => { root.command("edit-delete"); }
+                }
+            }
+        }
+        if root.offline-feedback != "" && !root.inline-feedback: Caption {
+            text: root.offline-feedback; font-size: 13px * Theme.density; wrap: word-wrap;
+            accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
+        }
+        if root.status != "" || root.loading: Caption {
+            text: root.status != "" ? root.status : "Loading…";
+            color: root.error ? Theme.error : Theme.muted;
+            font-size: 13px * Theme.density; wrap: word-wrap;
+            accessible-role: text; accessible-label: self.text;
+            accessible-live-region: root.error ? assertive : polite;
+        }
+        Divider { }
+    }
+    measure-routine := Caption { text: "Waiting to download"; font-size: 13px * Theme.density; visible: false; }
+    measure-feedback := Caption { text: root.offline-feedback; font-size: 13px * Theme.density; visible: false; }
+}

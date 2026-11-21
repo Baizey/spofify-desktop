@@ -74,7 +74,8 @@ export component Action inherits Rectangle {
     accessible-enabled: enabled;
     accessible-action-default => { if root.enabled { root.pointer-focused = false; root.clicked(); } }
     height: 38px;
-    min-width: text == "" ? 36px : max(40px, words.preferred-width + (icon == "" ? 23px : 43px));
+    in property <length> label-min-inset: 23px;
+    min-width: text == "" ? 36px : max(40px, words.preferred-width + (icon == "" ? label-min-inset : 43px));
     horizontal-stretch: 0;
     vertical-stretch: 0;
     border-radius: round ? self.height / 2 : Theme.control-radius;
@@ -90,7 +91,8 @@ export component Action inherits Rectangle {
         border-width: 2px; border-color: Theme.bg; border-radius: max(0px, parent.border-radius - 2px);
         accessible-role: none;
     }
-    property <color> ink: primary && enabled ? Theme.on-primary : selected ? Theme.primary : Theme.text;
+    in property <color> secondary-ink: Theme.text;
+    property <color> ink: primary && enabled ? Theme.on-primary : selected ? Theme.primary : secondary-ink;
     property <length> glyph-size: root.icon == "" ? 0px : 18px;
     property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
     // An empty Text still has a preferred width. An icon-only button has no label to reserve room for.
