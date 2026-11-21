@@ -259,7 +259,7 @@ fn parse_lyrics(body: &[u8], id: &str) -> Result<Lyrics, ApiError> {
     if wire.version != 1
         || wire.track_id != id
         || !identity(&wire.recording_version)
-        || wire.source_generation != "local-v1"
+        || !valid_lyric_generation(&wire.source_generation)
         || wire.offline_transfer_allowed
         || wire.lines.len() > 2048
     {
@@ -278,9 +278,10 @@ fn parse_lyrics(body: &[u8], id: &str) -> Result<Lyrics, ApiError> {
         {
             ()
         }
+        // Go includes a plain transcription alongside timed LRC/embedded rows.
+        // Validate both; the timed reader renders only the authored rows.
         LyricsState::Timed
-            if text.is_empty()
-                && wire.lines.iter().map(|line| line.text.len()).sum::<usize>() <= 64 * 1024
+            if wire.lines.iter().map(|line| line.text.len()).sum::<usize>() <= 64 * 1024
                 && wire
                     .lines
                     .windows(2)
@@ -332,6 +333,14 @@ fn parse_lyrics(body: &[u8], id: &str) -> Result<Lyrics, ApiError> {
         provenance: wire.provenance,
         attribution: wire.attribution,
     })
+}
+
+// This is opaque response metadata, not a schema version or a source allowlist.
+fn valid_lyric_generation(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
 }
 
 fn lyric_text(text: &str, max: usize) -> bool {
@@ -531,7 +540,7 @@ mod tests {
 
     fn timed() -> Value {
         json!({"version":1,"trackId":"track","recordingVersion":"recording","sourceGeneration":"local-v1",
-            "state":"timed","lines":[{"startMs":250,"text":"first"},{"startMs":250,"text":"second"},
+            "state":"timed","plainText":"first\nsecond", "lines":[{"startMs":250,"text":"first"},{"startMs":250,"text":"second"},
             {"startMs":900,"text":""}],"offlineTransferAllowed":false,"provenance":"local_lrc",
             "attribution":{"name":"Fixture","ownership":"library","url":"https://credit.invalid/"}})
     }
@@ -541,6 +550,7 @@ mod tests {
         let data = timed();
         let body = serde_json::to_vec(&data).unwrap();
         let model = parse_lyrics(&body, "track").unwrap();
+        assert_eq!(model.plain_text.as_deref(), Some("first\nsecond"));
         let active = |position, duration| {
             active_lyric_line(
                 model.lines.len(),
@@ -567,6 +577,35 @@ mod tests {
         assert!(parse_lyrics(&serde_json::to_vec(&invalid).unwrap(), "track").is_err());
         invalid["lines"][2]["startMs"] = 86_400_001.into();
         assert!(parse_lyrics(&serde_json::to_vec(&invalid).unwrap(), "track").is_err());
+    }
+
+    #[test]
+    fn lyrics_accept_opaque_generation_without_relaxing_v1_validation() {
+        let mut data = timed();
+        data["sourceGeneration"] = "lrclib-signature-v2".into();
+        let parse = |data: &Value| parse_lyrics(&serde_json::to_vec(data).unwrap(), "track");
+        assert_eq!(
+            parse(&data).unwrap().source_generation,
+            "lrclib-signature-v2"
+        );
+        for (key, value) in [
+            ("sourceGeneration", json!("")),
+            ("sourceGeneration", json!("source\nnext")),
+            ("sourceGeneration", json!("x".repeat(513))),
+            ("version", json!(2)),
+            ("trackId", json!("different")),
+            ("offlineTransferAllowed", json!(true)),
+            ("plainText", json!("x".repeat(64 * 1024 + 1))),
+            ("plainText", json!("control\u{0000}")),
+            ("lines", json!([])),
+            ("state", json!("not_found")),
+            ("provenance", json!("unknown")),
+            ("attribution", Value::Null),
+        ] {
+            let mut bad = data.clone();
+            bad[key] = value;
+            assert!(parse(&bad).is_err(), "accepted invalid {key}");
+        }
     }
 
     #[test]

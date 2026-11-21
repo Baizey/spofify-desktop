@@ -170,43 +170,67 @@ pub(crate) struct Presentation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Demand {
     track: String,
-    occurrence: String,
     visible: bool,
     display_revision: u64,
 }
 
-impl Demand {
-    fn replace(&mut self, next: Self, lyrics_settled: bool) -> bool {
-        let same_view = self.track == next.track
-            && self.display_revision == next.display_revision
-            && self.visible == next.visible;
-        let notify = !same_view || (!lyrics_settled && self.occurrence != next.occurrence);
-        *self = next;
-        notify
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LyricDemand {
+    view: Demand,
+    occurrence: String,
+    // Increments when the reader opens or Retry lyrics is activated.
+    generation: i32,
+    available: bool,
+}
+
+impl LyricDemand {
+    fn from_ui(ui: &AppWindow, view: Demand) -> Self {
+        let available = ui.get_lyrics_available() && ui.get_lyrics_track_id() == view.track;
+        Self {
+            view,
+            occurrence: ui.get_media_track_token().to_string(),
+            generation: ui.get_lyrics_request_generation(),
+            available,
+        }
     }
 
-    fn lyrics_settled(&self, lyrics_track: &str, settled: bool) -> bool {
-        settled && !self.track.is_empty() && self.track == lyrics_track
+    fn needs_read(&self) -> bool {
+        self.view.visible && !self.view.track.is_empty() && !self.available
+    }
+
+    fn matches(&self, ui: &AppWindow) -> bool {
+        ui.get_media_track_token() == self.occurrence
+            && ui.get_lyrics_request_generation() == self.generation
     }
 }
 
 fn demand(ui: &AppWindow, display_revision: u64) -> Demand {
     Demand {
         track: ui.get_now_track_id().to_string(),
-        occurrence: ui.get_media_track_token().to_string(),
         visible: ui.get_page_kind() == "now",
         display_revision,
     }
 }
 
-fn clear(ui: &AppWindow) {
+fn update_demand<T: PartialEq>(tx: &watch::Sender<T>, next: T) -> bool {
+    tx.send_if_modified(|current| {
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    })
+}
+
+pub(crate) fn clear(ui: &AppWindow) {
     ui.set_cover_art(Default::default());
     ui.set_lyrics_track_id(Default::default());
     ui.set_lyrics_text(Default::default());
     ui.set_lyrics_lines(Default::default());
     ui.set_lyrics_attribution(Default::default());
     ui.set_lyrics_status(Default::default());
-    ui.set_lyrics_settled(false);
+    ui.set_lyrics_available(false);
+    ui.set_lyrics_retryable(false);
     ui.set_waveform(Default::default());
     ui.set_media_status(Default::default());
 }
@@ -219,6 +243,7 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     ui.on_resolve_active_lyric(displayed_lyric_line);
     let initial = demand(ui, 0);
     let (tx, rx) = watch::channel(initial.clone());
+    let (lyrics_tx, lyrics_rx) = watch::channel(LyricDemand::from_ui(ui, initial.clone()));
     let weak = ui.as_weak();
     let observer = Timer::default();
     let shown = Arc::new(Mutex::new(DisplayedScope {
@@ -233,15 +258,22 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
             let mut next = demand(&ui, 0);
             next.display_revision =
                 bind_display(&ui, &shown, Account::current(&access), &next.track);
-            let lyrics_settled =
-                next.lyrics_settled(&ui.get_lyrics_track_id(), ui.get_lyrics_settled());
-            // Always record the live occurrence, but a repeat doesn't need to
-            // restart the worker if settled lyrics already published independently.
-            tx.send_if_modified(|current| current.replace(next, lyrics_settled));
+            let lyrics = LyricDemand::from_ui(&ui, next.clone());
+            let reading = lyrics.needs_read();
+            if update_demand(&lyrics_tx, lyrics) && reading {
+                ui.set_lyrics_retryable(false);
+                ui.set_lyrics_status(Default::default());
+            }
+            update_demand(&tx, next);
         });
     }
     let weak = ui.as_weak();
-    let worker = Worker::start("desktop-presentation", move || run(weak, access, rx, shown));
+    let worker = Worker::start("desktop-presentation", move || async move {
+        tokio::join!(
+            run_media(weak.clone(), access.clone(), rx, shown.clone()),
+            run_lyrics(weak, access, lyrics_rx, shown),
+        );
+    });
     Presentation {
         _observer: observer,
         _worker: worker,
@@ -258,12 +290,12 @@ type DisplayBinding = Arc<Mutex<DisplayedScope>>;
 
 impl DisplayedScope {
     fn rebind(&mut self, account: Option<Account>, track: &str) -> bool {
-        let same_account = match (&self.account, &account) {
-            (Some(a), Some(b)) => a.same(b),
+        let same_scope = match (&self.account, &account) {
+            (Some(a), Some(b)) => a.same_network(b),
             (None, None) => true,
             _ => false,
         };
-        if same_account && self.track == track {
+        if same_scope && self.track == track {
             return false;
         }
         self.account = account;
@@ -271,6 +303,17 @@ impl DisplayedScope {
         self.revision = self.revision.wrapping_add(1);
         true
     }
+}
+
+// A worker waking on Access must not start reads under a new scope using
+// demand that the UI published for the preceding account or network.
+fn demand_is_bound(shown: &DisplayBinding, request: &Demand, account: &Account) -> bool {
+    let shown = shown.lock().unwrap();
+    shown.revision == request.display_revision
+        && shown
+            .account
+            .as_ref()
+            .is_some_and(|a| a.same_network(account))
 }
 
 fn bind_display(
@@ -296,12 +339,7 @@ struct Projection {
     settled: bool,
 }
 
-async fn load(
-    account: &Account,
-    id: &str,
-    expanded: bool,
-    deliver_lyrics: impl FnOnce(LyricProjection),
-) -> Projection {
+async fn load_media(account: &Account, id: &str, expanded: bool) -> Projection {
     if !expanded {
         let art =
             read_with_backoff(async || media::artwork(&account.api, &account.session, id).await)
@@ -313,24 +351,11 @@ async fn load(
             status: "",
         };
     }
-    let (art, (lyrics_settled, lyrics_usable), waveform) = tokio::join!(
+    let (art, waveform) = tokio::join!(
         read_with_backoff(async || media::artwork(&account.api, &account.session, id).await),
-        async {
-            let lyrics =
-                read_with_backoff(async || media::lyrics(&account.api, &account.session, id).await)
-                    .await;
-            let projected = project_lyrics(lyrics.ok());
-            let result = (
-                projected.settled,
-                projected.text.is_some() || !projected.lines.is_empty(),
-            );
-            deliver_lyrics(projected);
-            result
-        },
         read_with_backoff(async || media::waveform(&account.api, &account.session, id).await),
     );
     let settled = art.is_ok()
-        && lyrics_settled
         && waveform.as_ref().is_ok_and(|v| {
             !matches!(
                 v.state,
@@ -344,13 +369,13 @@ async fn load(
         });
     let art = art.ok().flatten();
     let waveform = waveform.ok().and_then(|v| v.envelope);
-    let usable = art.is_some() as usize + lyrics_usable as usize + waveform.is_some() as usize;
+    let usable = art.is_some() as usize + waveform.is_some() as usize;
     Projection {
         art,
         waveform,
         status: match usable {
-            3 => "",
-            0 if settled => "No cover art, lyrics, or waveform are available.",
+            2 => "",
+            0 if settled => "No cover art or waveform is available.",
             0 => "Now Playing media is unavailable.",
             _ => "Some Now Playing media is unavailable.",
         },
@@ -364,20 +389,18 @@ struct LyricProjection {
     lines: Vec<media::LyricLine>,
     attribution: String,
     status: &'static str,
-    settled: bool,
 }
 
-fn project_lyrics(lyrics: Option<media::Lyrics>) -> LyricProjection {
+fn project_lyrics(result: Result<media::Lyrics, ApiError>) -> LyricProjection {
     use media::LyricsState::*;
     let mut projected = LyricProjection::default();
-    projected.status = match lyrics.as_ref().map(|lyrics| lyrics.state) {
-        Some(NotFound) => "No lyrics for this track.",
-        Some(Pending) => "Lyrics aren’t ready.",
-        Some(Plain | Timed | Instrumental) => "",
-        Some(Unavailable | Error) | None => "Lyrics unavailable.",
+    projected.status = match result.as_ref().map(|lyrics| lyrics.state) {
+        Ok(NotFound) | Err(ApiError { status: 404, .. }) => "No lyrics for this track.",
+        Ok(Pending) => "Lyrics aren’t ready.",
+        Ok(Plain | Timed | Instrumental) => "",
+        Ok(Unavailable | Error) | Err(_) => "Lyrics unavailable.",
     };
-    if let Some(lyrics) = lyrics {
-        projected.settled = !matches!(lyrics.state, Pending | Error);
+    if let Ok(lyrics) = result {
         match lyrics.state {
             Timed => projected.lines = lyrics.lines,
             Plain => projected.text = lyrics.plain_text,
@@ -420,22 +443,59 @@ fn displayed_lyric_line(lines: ModelRc<TimedLyricLine>, elapsed: f32, duration: 
     .map_or(-1, |i| i as i32)
 }
 
-async fn run(
+async fn run_lyrics(
+    ui: slint::Weak<AppWindow>,
+    mut access: AccessRx,
+    mut wanted: watch::Receiver<LyricDemand>,
+    shown: DisplayBinding,
+) {
+    loop {
+        access.mark_unchanged();
+        let account = Account::current(&access);
+        let request = wanted.borrow_and_update().clone();
+        if let Some(account) = account.as_ref().filter(|a| {
+            !a.offline && request.needs_read() && demand_is_bound(&shown, &request.view, a)
+        }) {
+            let result = tokio::select! {
+                biased;
+                change = scope_changed(&mut access, Some(account)) => { if !change { break } continue; }
+                change = wanted.changed() => { if change.is_err() { break } continue; }
+                result = tokio::time::timeout(
+                    Duration::from_secs(5), media::lyrics(&account.api, &account.session, &request.view.track),
+                ) => result.unwrap_or(Err(TIMEOUT)),
+            };
+            Delivery {
+                ui: ui.clone(),
+                access: access.clone(),
+                account: account.clone(),
+                shown: shown.clone(),
+            }
+            .lyrics(request, project_lyrics(result));
+        }
+        // One GET per demand. Only a new occurrence, reopening, or explicit
+        // retry can revalidate a negative result while playback stays online.
+        tokio::select! {
+            change = scope_changed(&mut access, account.as_ref()) => { if !change { break } }
+            change = wanted.changed() => { if change.is_err() { break } }
+        }
+    }
+}
+
+async fn run_media(
     ui: slint::Weak<AppWindow>,
     mut access: AccessRx,
     mut wanted: watch::Receiver<Demand>,
     shown: DisplayBinding,
 ) {
-    // Keep the last complete/missing response for this displayed track while
-    // the pane is hidden or the same track repeats. In-flight receipts still
-    // match the exact occurrence. No catalog-wide or on-disk cache exists here.
+    // Keep the last complete artwork/waveform response for the current display.
+    // Lyrics have their own demand and can publish or retry independently.
     let mut satisfied: Option<(Account, Demand, &'static str, Arc<AtomicBool>)> = None;
     loop {
         access.mark_unchanged();
         let account = Account::current(&access);
         let request = wanted.borrow_and_update().clone();
         if !satisfied.as_ref().is_some_and(|(a, loaded, _, delivered)| {
-            account.as_ref().is_some_and(|b| a.same(b))
+            account.as_ref().is_some_and(|b| a.same_network(b))
                 && loaded.track == request.track
                 && loaded.display_revision == request.display_revision
                 && (loaded.visible || !request.visible)
@@ -443,33 +503,34 @@ async fn run(
         }) {
             satisfied = None;
         }
-        if let Some(account) = account.as_ref().filter(|_| !request.track.is_empty()) {
+        if let Some(account) = account
+            .as_ref()
+            .filter(|a| !request.track.is_empty() && demand_is_bound(&shown, &request, a))
+        {
             let delivery = Delivery {
                 ui: ui.clone(),
                 access: access.clone(),
-                wanted: wanted.clone(),
                 account: account.clone(),
-                request: request.clone(),
                 shown: shown.clone(),
             };
             if account.offline {
-                delivery.media(None, "Offline", None);
+                delivery.media(request, wanted.clone(), None, "Offline", None);
             } else if satisfied.is_none() {
                 // Bias invalidation before work, including an already queued access change.
                 let projected = tokio::select! {
                     biased;
                     change = scope_changed(&mut access, Some(account)) => { if !change { break } continue; }
                     change = wanted.changed() => { if change.is_err() { break } continue; }
-                    data = load(account, &request.track, request.visible, |lyrics| delivery.clone().lyrics(lyrics)) => data,
+                    data = load_media(account, &request.track, request.visible) => data,
                 };
                 let status = projected.status;
                 let delivered = projected.settled.then(|| Arc::new(AtomicBool::new(false)));
                 if let Some(delivered) = &delivered {
                     satisfied = Some((account.clone(), request.clone(), status, delivered.clone()));
                 }
-                delivery.media(Some(projected), status, delivered);
+                delivery.media(request, wanted.clone(), Some(projected), status, delivered);
             } else if let Some((_, _, status, _)) = &satisfied {
-                delivery.media(None, status, None);
+                delivery.media(request, wanted.clone(), None, status, None);
             }
         }
         tokio::select! {
@@ -479,108 +540,109 @@ async fn run(
     }
 }
 
-#[derive(Clone)]
 struct Delivery {
     ui: slint::Weak<AppWindow>,
     access: AccessRx,
-    wanted: watch::Receiver<Demand>,
     account: Account,
-    request: Demand,
     shown: DisplayBinding,
 }
 
 impl Delivery {
-    fn update(self, allow_hidden: bool, apply: impl FnOnce(AppWindow, String) + Send + 'static) {
+    fn update(
+        self,
+        request: Demand,
+        current: impl FnOnce(&AppWindow) -> bool + Send + 'static,
+        apply: impl FnOnce(AppWindow, String) + Send + 'static,
+    ) {
         let Self {
             ui,
             access,
-            wanted,
             account,
-            request,
             shown,
         } = self;
         let _ = ui.upgrade_in_event_loop(move |ui| {
             if !account.matches(&access) {
                 return;
             }
-            // Record a live track change even if it happened between timer
-            // observations, so a coalesced A → B → A can't reuse the receipt.
+            // Record a live track change even if the timer hasn't observed it.
             let live = ui.get_now_track_id();
             let revision = bind_display(&ui, &shown, Some(account), live.as_str());
-            let current_request = if allow_hidden {
-                ui.get_media_track_token() == request.occurrence
-            } else {
-                matches!(wanted.has_changed(), Ok(false))
-                    && (ui.get_page_kind() == "now") == request.visible
-            };
             if live.as_str() == request.track
                 && revision == request.display_revision
-                && current_request
+                && current(&ui)
             {
                 apply(ui, request.track);
             }
         });
     }
 
-    fn lyrics(self, lyrics: LyricProjection) {
-        // Visibility triggers the fetch; it needn't discard same-track text
-        // that arrived just as the reader was closed.
-        self.update(true, move |ui, track| {
-            ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
-            ui.set_lyrics_lines(lyric_model(lyrics.lines));
-            ui.set_lyrics_attribution(lyrics.attribution.into());
-            ui.set_lyrics_status(lyrics.status.into());
-            ui.set_lyrics_settled(lyrics.settled);
-            ui.set_lyrics_track_id(track.into());
-        });
+    fn lyrics(self, request: LyricDemand, lyrics: LyricProjection) {
+        // A result queued just before closing may still publish, but it cannot
+        // cross a repeat, reopen or explicit retry of that reader.
+        self.update(
+            request.view.clone(),
+            move |ui| request.matches(ui),
+            move |ui, track| {
+                let available = lyrics.text.is_some() || !lyrics.lines.is_empty();
+                ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
+                ui.set_lyrics_lines(lyric_model(lyrics.lines));
+                ui.set_lyrics_attribution(lyrics.attribution.into());
+                ui.set_lyrics_status(lyrics.status.into());
+                ui.set_lyrics_available(available);
+                ui.set_lyrics_retryable(!available);
+                ui.set_lyrics_track_id(track.into());
+            },
+        );
     }
 
     fn media(
         self,
+        request: Demand,
+        wanted: watch::Receiver<Demand>,
         projected: Option<Projection>,
         status: &'static str,
         delivered: Option<Arc<AtomicBool>>,
     ) {
-        let request = self.request.clone();
-        self.update(false, move |ui, _| {
-            let mut complete = true;
-            if let Some(data) = projected {
-                if let Some(art) = data.art {
-                    let buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                        &art.rgba, art.width, art.height,
-                    );
-                    ui.set_cover_art(slint::Image::from_rgba8(buffer));
-                }
-                if let Some(envelope) = data.waveform {
-                    let actual = Duration::try_from_secs_f32(ui.get_duration()).ok();
-                    if actual.is_some_and(|duration| envelope.matches_duration(duration)) {
-                        let waveform = envelope
-                            .bins
-                            .into_iter()
-                            .map(|bin| f32::from(bin) / 255.0)
-                            .collect::<Vec<_>>();
-                        ui.set_waveform(ModelRc::new(VecModel::from(waveform)));
-                    } else {
-                        complete = false;
+        let visible = request.visible;
+        self.update(
+            request,
+            move |ui| {
+                matches!(wanted.has_changed(), Ok(false))
+                    && (ui.get_page_kind() == "now") == visible
+            },
+            move |ui, _| {
+                let mut complete = true;
+                if let Some(data) = projected {
+                    if let Some(art) = data.art {
+                        let buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                            &art.rgba, art.width, art.height,
+                        );
+                        ui.set_cover_art(slint::Image::from_rgba8(buffer));
+                    }
+                    if let Some(envelope) = data.waveform {
+                        let actual = Duration::try_from_secs_f32(ui.get_duration()).ok();
+                        if actual.is_some_and(|duration| envelope.matches_duration(duration)) {
+                            let waveform = envelope
+                                .bins
+                                .into_iter()
+                                .map(|bin| f32::from(bin) / 255.0)
+                                .collect::<Vec<_>>();
+                            ui.set_waveform(ModelRc::new(VecModel::from(waveform)));
+                        } else {
+                            complete = false;
+                        }
                     }
                 }
-            }
-            ui.set_media_status(if complete || !status.is_empty() {
-                status.into()
-            } else {
-                "Waveform unavailable for this playback duration.".into()
-            });
-            if let Some(delivered) = delivered {
-                // On repeat, art/waveform may still publish even if the
-                // in-flight lyric receipt belonged to the previous visit.
-                let lyrics_settled =
-                    request.lyrics_settled(&ui.get_lyrics_track_id(), ui.get_lyrics_settled());
-                delivered.store(
-                    complete && (!request.visible || lyrics_settled),
-                    Ordering::Release,
-                );
-            }
-        });
+                ui.set_media_status(if complete || !status.is_empty() {
+                    status.into()
+                } else {
+                    "Waveform unavailable for this playback duration.".into()
+                });
+                if let Some(delivered) = delivered {
+                    delivered.store(complete, Ordering::Release);
+                }
+            },
+        );
     }
 }
 
@@ -603,33 +665,31 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_invalidates_pending_lyrics_without_refetching_accepted_lyrics() {
-        let first = Demand {
-            track: "same-track".into(),
-            occurrence: "online:1:chain:1".into(),
-            visible: true,
-            display_revision: 1,
-        };
-        let repeated = Demand {
-            occurrence: "online:1:chain:2".into(),
-            ..first.clone()
-        };
-        assert!(first.clone().replace(repeated.clone(), false));
-        // Completing art/waveform before the observer notices the repeat
-        // must not cache the load if its lyrics receipt was rejected.
-        assert!(!first.lyrics_settled("", false));
-        assert!(!first.lyrics_settled("same-track", false));
-        assert!(first.lyrics_settled("same-track", true));
-        let mut accepted = first;
-        assert!(!accepted.replace(repeated.clone(), true));
-        assert_eq!(accepted, repeated);
-        assert!(accepted.replace(
-            Demand {
-                display_revision: 2,
-                ..repeated
+    fn lyric_demand_only_revalidates_negatives_on_a_new_request() {
+        let mut negative = LyricDemand {
+            view: Demand {
+                track: "same-track".into(),
+                visible: true,
+                display_revision: 1,
             },
-            true
-        ));
+            occurrence: "online:1:chain:1".into(),
+            generation: 1,
+            available: false,
+        };
+        let (tx, mut rx) = watch::channel(negative.clone());
+        assert!(negative.needs_read());
+        assert!(!update_demand(&tx, negative.clone())); // clock/observer tick
+        negative.generation += 1; // reopen or retry
+        assert!(update_demand(&tx, negative.clone()));
+        assert!(rx.borrow_and_update().needs_read());
+        negative.occurrence = "online:1:chain:2".into();
+        assert!(update_demand(&tx, negative.clone()));
+        assert!(rx.borrow_and_update().needs_read());
+        let mut accepted = negative;
+        accepted.available = true;
+        accepted.occurrence = "online:1:chain:3".into();
+        accepted.generation += 1;
+        assert!(!accepted.needs_read());
     }
 
     #[test]
@@ -646,19 +706,27 @@ mod tests {
             attribution: None,
         };
         use media::LyricsState::*;
-        assert_eq!(project_lyrics(None).status, "Lyrics unavailable.");
+        assert_eq!(project_lyrics(Err(TIMEOUT)).status, "Lyrics unavailable.");
+        assert_eq!(
+            project_lyrics(Err(ApiError {
+                status: 404,
+                ..TIMEOUT
+            }))
+            .status,
+            "No lyrics for this track."
+        );
         for (state, expected) in [
             (Error, "Lyrics unavailable."),
             (Unavailable, "Lyrics unavailable."),
             (Pending, "Lyrics aren’t ready."),
             (NotFound, "No lyrics for this track."),
         ] {
-            let result = project_lyrics(Some(server_lyrics(state)));
+            let result = project_lyrics(Ok(server_lyrics(state)));
             assert!(result.text.is_none());
             assert_eq!(result.status, expected);
-            assert_eq!(result.settled, matches!(state, Unavailable | NotFound));
+            assert!(result.lines.is_empty());
         }
-        let result = project_lyrics(Some(server_lyrics(Instrumental)));
+        let result = project_lyrics(Ok(server_lyrics(Instrumental)));
         assert_eq!(result.text.as_deref(), Some("Instrumental"));
         assert!(result.status.is_empty());
     }
@@ -670,7 +738,7 @@ mod tests {
             recording_version: "v1".into(),
             source_generation: "local-v1".into(),
             state: media::LyricsState::Timed,
-            plain_text: None,
+            plain_text: Some("Alternate transcription".into()),
             lines: ["First", "Second"]
                 .into_iter()
                 .zip([500, 1500])
@@ -687,7 +755,7 @@ mod tests {
                 url: None,
             }),
         };
-        let timed = project_lyrics(Some(lyrics.clone()));
+        let timed = project_lyrics(Ok(lyrics.clone()));
         assert!(timed.text.is_none());
         assert_eq!(timed.attribution, "Lyrics source: Fixture");
         let rows = lyric_model(timed.lines);
@@ -706,7 +774,7 @@ mod tests {
         lyrics.state = media::LyricsState::Plain;
         lyrics.lines.clear();
         lyrics.plain_text = Some("Plain verse".into());
-        let plain = project_lyrics(Some(lyrics));
+        let plain = project_lyrics(Ok(lyrics));
         assert_eq!(
             plain.text.as_deref(),
             Some("Plain verse\n\nLyrics source: Fixture")

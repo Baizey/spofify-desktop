@@ -5,9 +5,8 @@ Build with SLINT_EMIT_DEBUG_INFO=1 cargo build --locked --features slint/mcp.
 Run with Python + Pillow, Cage and wlr-randr; no Go server, live account,
 audio output, ambient profile, or application test backend is used.
 
-This reader highlights the current line without following it: long lyrics still
-scroll manually, so playback does not move the reader or controls. This case
-checks position and identity of visible rows, not manual scrolling.
+Check synchronized line paint during playback, negative recovery and track
+isolation, without following the current line or persisting lyric text.
 """
 import argparse
 from base64 import b64decode, b64encode
@@ -27,8 +26,8 @@ import socket
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
-from time import sleep
+from threading import Event, Lock, Thread
+from time import monotonic, sleep
 
 sys.dont_write_bytecode = True
 from audio_smoke import admission
@@ -41,23 +40,48 @@ from playback import CONNECT, PROTOCOL, SOCKET, WS_GUID
 DURATION = 38
 TIMED = ("synthetic-timed", "Synthetic Timed Recording")
 PLAIN = ("synthetic-plain", "Synthetic Plain Recording")
+STALE = ("synthetic-stale", "Synthetic Delayed Recording")
+RETRY = ("synthetic-retry", "Synthetic Retry Recording")
+TRACKS = (TIMED, PLAIN, STALE, RETRY)
 LINES = ("Quiet morning", "Open water", "Evening light")
 STARTS = (2000, 9000, 18000)
 PLAIN_TEXT = ("Words without a clock", "Only words remain")
 TIMED_SOURCE, PLAIN_SOURCE = "Timed archive", "Plain booklet"
+STALE_TEXT, STALE_SOURCE = "Synthetic late verse must stay hidden", "Delayed lyric credit"
+RETRY_TEXT, RETRY_SOURCE = "Synthetic recovered verse stays in memory", "Recovered lyric credit"
+OLD_TEXT = (*LINES, TIMED_SOURCE, *PLAIN_TEXT, PLAIN_SOURCE, STALE_TEXT, STALE_SOURCE)
+MISSING, UNAVAILABLE = "No lyrics for this track.", "Lyrics unavailable."
 REMOTE = "synthetic-remote-output"
 
 
-def payload(track, source, **fields):
-    return dict(version=1, trackId=track[0], recordingVersion="recording-v1",
-                sourceGeneration="local-v1", offlineTransferAllowed=False,
-                attribution=dict(name=source, ownership="library"), **fields)
+def lyrics_path(track):
+    return f"/api/library/tracks/{track[0]}/lyrics"
+
+
+def payload(track, state, *, source=None, ownership="library", generation="local-v1", lines=(), **fields):
+    result = dict(version=1, trackId=track[0], recordingVersion="recording-v1",
+                  sourceGeneration=generation, offlineTransferAllowed=False,
+                  state=state, lines=list(lines), **fields)
+    if source:
+        result["attribution"] = dict(name=source, ownership=ownership)
+    return result
 
 
 LYRICS = {
-    TIMED[0]: payload(TIMED, TIMED_SOURCE, state="timed", provenance="local_lrc",
-                      lines=[dict(startMs=ms, text=line) for ms, line in zip(STARTS, LINES)]),
-    PLAIN[0]: payload(PLAIN, PLAIN_SOURCE, state="plain", lines=[], plainText="\n".join(PLAIN_TEXT)),
+    lyrics_path(TIMED): [(200, payload(TIMED, "timed", source=TIMED_SOURCE, provenance="local_lrc",
+                                      plainText="\n".join(LINES),
+                                      lines=[dict(startMs=ms, text=line) for ms, line in zip(STARTS, LINES)]))],
+    lyrics_path(PLAIN): [(200, payload(PLAIN, "plain", source=PLAIN_SOURCE, plainText="\n".join(PLAIN_TEXT)))],
+    lyrics_path(STALE): [(200, payload(STALE, "plain", source=STALE_SOURCE, plainText=STALE_TEXT))],
+    lyrics_path(RETRY): [
+        (404, None),
+        (200, payload(RETRY, "unavailable", reason="source_failed")),
+        (200, payload(RETRY, "not_found", reason="no_match")),
+        (None, None),  # Close without sending HTTP headers to exercise a transport error.
+        # Older Go responses could carry the cache's source generation instead of local-v1.
+        (200, payload(RETRY, "plain", source=RETRY_SOURCE, ownership="provider",
+                      provenance="provider", generation="lrclib-signature-v2", plainText=RETRY_TEXT)),
+    ],
 }
 
 
@@ -69,7 +93,7 @@ class RemotePeer(Peer):
     def open_remote(self):
         self.owner = REMOTE  # Never grant the desktop execution authority.
         self.player["queue"] = [dict(id=id_, name=name, duration=DURATION, key=i, order=i, intent="low")
-                                for i, (id_, name) in enumerate((TIMED, PLAIN), 1)]
+                                for i, (id_, name) in enumerate(TRACKS, 1)]
         self.player["cursor"].update(key=1, visit=1, run=1, chain="synthetic-lyrics-chain")
         self.snapshot()
 
@@ -81,15 +105,22 @@ def fixture():
     session = dict(accountId="synthetic-lyrics-account", username=ready["username"], role="user", csrfToken=csrf)
     ticket = Queue(maxsize=1)
     admitted = Queue(maxsize=1)
-    requests, lyrics_reads, audio_reads = deque(maxlen=24), Counter(), set()
+    requests, lyrics_gets, audio_reads = deque(maxlen=24), [], set()
+    lyrics_reads, lyrics_lock = Counter(), Lock()
     connections = set()
-    media_gate, gate_expired = Event(), Event()
+    media_gate, media_expired = Event(), Event()
+    stale_gate, stale_expired, stale_sent = Event(), Event(), Event()
     gated_media = {resource: Event() for resource in ("artwork", "waveform")}
 
     def release_media():
         wait("both timed artwork and waveform in flight", lambda: all(seen.is_set() for seen in gated_media.values()), 2)
-        check(not gate_expired.is_set(), "artwork/waveform gate expired before lyrics rendered")
+        check(not media_expired.is_set(), "artwork/waveform gate expired before lyrics rendered")
         media_gate.set()
+
+    def release_stale():
+        stale_gate.set()
+        wait("delayed old-track response sent", stale_sent.is_set, 2)
+        check(not stale_expired.is_set(), "old-track gate expired before the recording changed")
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
@@ -106,7 +137,7 @@ def fixture():
         def reply(self, result=None, status=200, headers=()):
             data = json.dumps(result).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(data)))
             for name, value in headers:
@@ -151,19 +182,36 @@ def fixture():
                 return self.upgrade()
             if self.path == "/api/auth/session":
                 return self.reply(session)
-            match = re.fullmatch(r"/api/library/tracks/([^/]+)/(lyrics|artwork|waveform|audio)", self.path)
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/api/library/tracks/") and path.endswith("/lyrics"):
+                return self.get_lyrics(path)
+            match = re.fullmatch(r"/api/library/tracks/([^/]+)/(artwork|waveform|audio)", self.path)
             if match:
                 track, resource = match.groups()
                 if resource == "audio":
                     audio_reads.add(track)
-                elif resource == "lyrics" and track in LYRICS:
-                    lyrics_reads[track] += 1
-                    return self.reply(LYRICS[track])
                 elif track == TIMED[0] and resource in gated_media:
                     gated_media[resource].set()
                     if not media_gate.wait(8):
-                        gate_expired.set()
+                        media_expired.set()
             self.reply(status=404)  # No artwork/waveform in this fixture.
+
+        def get_lyrics(self, path):
+            with lyrics_lock:
+                index = lyrics_reads[self.path]
+                lyrics_reads[self.path] += 1
+                replies = LYRICS.get(self.path, ())
+                status, body = replies[index] if index < len(replies) else (500, None)
+                lyrics_gets.append((self.command, path if path == self.path else path + "?<redacted>", status))
+            if status is None:
+                self.close_connection = True
+                return
+            stale = self.path == lyrics_path(STALE) and status == 200
+            if stale and not stale_gate.wait(8):
+                stale_expired.set()
+            self.reply(body, status=status)
+            if stale:
+                stale_sent.set()
 
         def upgrade(self):
             key = self.headers.get("Sec-WebSocket-Key", "")
@@ -208,9 +256,10 @@ def fixture():
         worker = Thread(target=server.serve_forever, name="synthetic-lyrics-server")
         worker.start()
         try:
-            yield ready, admitted, requests, lyrics_reads, release_media
+            yield ready, admitted, requests, lyrics_gets, release_media, release_stale
         finally:
             media_gate.set()
+            stale_gate.set()
             server.shutdown()
             worker.join(timeout=5)
             for conn in tuple(connections):
@@ -223,6 +272,10 @@ def fixture():
 
 def text(win, elements, match):
     return next((e for e in elements if e.get("accessibleRole") == "Text" and win.matches(e, match)), None)
+
+
+def containing(phrases):
+    return r"[\s\S]*(?:" + "|".join(map(re.escape, phrases)) + r")[\s\S]*"
 
 
 def reader(win):
@@ -276,7 +329,7 @@ def paint(image, scale, pane, band, *, multiline=False):
     return stripe, fill
 
 
-def run(win, ready, admitted, requests, lyrics_reads, release_media, image_module, captures):
+def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stale, image_module, captures):
     # Keep the default open queue and still allocate the split Lyrics reader.
     if win.window_properties()["size"]["width"] != DESKTOP[0]:
         win.resize(DESKTOP)
@@ -292,6 +345,28 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
     scale = win.window_properties()["scaleFactor"]
     background = None
     row_boxes = row_handles = initial_pane_top = None
+    expected_gets = []
+
+    def exact_gets():
+        check(lyrics_gets == expected_gets, f"expected exact lyrics GETs {expected_gets}; saw {lyrics_gets}")
+
+    def fetched(track, status):
+        expected_gets.append(("GET", lyrics_path(track), status))
+        wait(f"GET {lyrics_path(track)} ({status})", lambda: len(lyrics_gets) >= len(expected_gets), 6)
+        exact_gets()
+
+    def next_track(track, **cursor):
+        exact_gets()
+        win.click("Next track")
+        peer.command("next")
+        peer.cursor(key=TRACKS.index(track) + 1, **cursor)
+        now_playing_title(track)
+
+    def now_playing_title(track):
+        def title():
+            page = element_type(win.elements(), "NowPlaying")
+            return page and text(win, win.subtree(page), re.escape(track[1]))
+        wait("Now Playing: " + track[1], title)
 
     def save(image, name):
         if captures:
@@ -310,7 +385,10 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
             credit = text(win, elements, "Lyrics source: " + TIMED_SOURCE)
             current = [e.get("accessibleLabel") for e in elements if e.get("accessibleDescription") == "Current line"]
             expected = [] if active is None else [LINES[active]]
-            return (pane, rows, credit) if pane and all(rows) and credit and current == expected else None
+            if pane and all(rows) and credit and current == expected:
+                check(not text(win, elements, re.escape("\n".join(LINES))),
+                      "timed response also rendered its joined plainText fallback")
+                return pane, rows, credit
 
         pane, rows, credit = wait(name + " Lyrics heading, rows, source and current-line state", content, timeout=6)
         image = capture(win, image_module)
@@ -335,6 +413,8 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
         print(f"PASS {name}: expected stripe/tint, stable row positions/handles and source attribution", flush=True)
 
     timed("01-before-first-line", None)
+    fetched(TIMED, 200)
+    win.absent("Retry lyrics", roles=("Button",))
     peer.cursor(elapsed=4.0)
     win.title("Elapsed 0:04")
     timed("02-first-line", 0, clock_only=True)
@@ -344,9 +424,9 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
     win.title("Elapsed 0:00")
     timed("03-repeat-before-first-line", None, clock_only=True)
     sleep(0.2)  # Allow the presentation observer to see the new visit.
-    check(lyrics_reads == {TIMED[0]: 1}, f"same-track repeat refetched accepted lyrics: {lyrics_reads}")
+    exact_gets()
     release_media()
-    print("PASS timed JSON lyric delivery and repeat without refetch while artwork and waveform were held", flush=True)
+    print("PASS timed JSON with plainText fallback, repeat without refetch while artwork and waveform were held", flush=True)
     # Publish just one playing sample. The transition at 9s must come from the
     # desktop's elapsed projection, not a second fixture update or a lyric fetch.
     peer.cursor(elapsed=8.0, desired=True, playing=True, run=3)
@@ -370,12 +450,10 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
     win.find(r"Elapsed 0:2[01]", roles=("Text",))
     timed("06-seek-third-line", 2)
 
-    win.click("Next track")
-    peer.command("next")
     # Start after all old authored starts: a leaked timed model could still be active.
-    peer.cursor(run=6, key=2, visit=3, elapsed=22.0, playing=True, desired=True)
-    win.title(PLAIN[1])
+    next_track(PLAIN, run=6, visit=3, elapsed=22.0, playing=True, desired=True)
     win.find("Pause", roles=("Button",))
+    fetched(PLAIN, 200)
 
     def plain():
         view = reader(win)
@@ -383,23 +461,97 @@ def run(win, ready, admitted, requests, lyrics_reads, release_media, image_modul
             return None
         pane, elements = view
         patterns = (*PLAIN_TEXT, "Lyrics source: " + PLAIN_SOURCE)
-        content = [text(win, elements, r"[\s\S]*" + re.escape(phrase) + r"[\s\S]*") for phrase in patterns]
+        content = [text(win, elements, containing((phrase,))) for phrase in patterns]
         return (pane, elements, content) if pane and all(content) else None
 
     pane, elements, content = wait("plain lyrics and their new attribution", plain)
-    check(not text(win, elements, r"[\s\S]*(" + "|".join((*LINES, TIMED_SOURCE)) + r")[\s\S]*"),
+    check(not text(win, elements, containing((*LINES, TIMED_SOURCE))),
           "old timed lyrics or attribution survived the track transition")
     check(not any(e["handle"] in row_handles or e.get("accessibleDescription") == "Current line" for e in elements),
           "timed row identity or current-line state survived replacement with plain lyrics")
-    check(lyrics_reads == {TIMED[0]: 1, PLAIN[0]: 1}, f"unexpected track-scoped lyric requests: {lyrics_reads}")
+    win.absent("Retry lyrics", roles=("Button",))
     image = capture(win, image_module)
     for i, element in enumerate(content):
         if element not in content[:i]:  # Plain text and its source may be in a single Text element.
             check(paint(image, scale, pane, element, multiline=True) == (False, background),
                   "plain lyrics or attribution gained highlighting")
-    peer.ping("lyrics-check-complete")
     save(image, "07-plain-track")
     print("PASS plain track during playback: no stripe or tint, new attribution, no previous lyrics", flush=True)
+
+    def current_elements():
+        view = reader(win)
+        if not view:
+            return None
+        elements = view[1]
+        check(not text(win, elements, containing(OLD_TEXT)), "previous recording's lyrics or credit appeared")
+        return elements
+
+    def negative(label):
+        elements = current_elements()
+        if elements and text(win, elements, re.escape(label)):
+            return next((e for e in elements if win.matches(e, "Retry lyrics") and
+                         e.get("accessibleRole") == "Button" and e.get("accessibleEnabled", True)), None)
+
+    next_track(STALE, run=7, visit=4, elapsed=0, playing=False, desired=False)
+    fetched(STALE, 200)  # Request has arrived, but no response until after the next switch.
+    check(current_elements(), "missing Lyrics reader during delayed request")
+    win.absent("Retry lyrics", roles=("Button",))
+    next_track(RETRY, run=8, visit=5)
+    fetched(RETRY, 404)
+    wait("404: " + MISSING, lambda: negative(MISSING), 6)
+    release_stale()
+    until = monotonic() + 0.6
+
+    def unchanged_after_stale():
+        check(negative(MISSING), "late old-track response replaced the current negative state")
+        return monotonic() >= until
+
+    wait("current 404 remains after the delayed old-track response", unchanged_after_stale, 2)
+    exact_gets()
+    print("PASS HTTP 404 shows no lyrics; gated previous track never renders", flush=True)
+
+    win.click("Back")
+    wait("Now Playing closed", lambda: not element_type(win.elements(), "NowPlaying"))
+    exact_gets()
+    win.click("Now playing: " + re.escape(RETRY[1]))
+    now_playing_title(RETRY)
+    fetched(RETRY, 200)
+    retry = wait("reopen revalidated to 200 unavailable", lambda: negative(UNAVAILABLE), 6)
+    print("PASS reopening the same track revalidates 404 and projects HTTP 200 unavailable", flush=True)
+
+    for response, status, label in (("200 not_found", 200, MISSING), ("connection drop", None, UNAVAILABLE)):
+        exact_gets()
+        win.click_element(retry)
+        fetched(RETRY, status)
+        retry = wait(response + ": " + label, lambda: negative(label), 6)
+        now_playing_title(RETRY)
+    print("PASS HTTP 200 not_found and transport failure reach distinct negative states via Retry lyrics", flush=True)
+
+    def recovered():
+        elements = current_elements()
+        return (elements and text(win, elements, re.escape(RETRY_TEXT)) and
+                text(win, elements, re.escape("Lyrics source: " + RETRY_SOURCE)))
+
+    exact_gets()
+    win.click_element(retry)
+    fetched(RETRY, 200)
+    wait("same-track Retry lyrics renders alternate generation and attribution", recovered, 6)
+    now_playing_title(RETRY)
+    win.absent("Retry lyrics", roles=("Button",))
+    peer.ping("lyrics-check-complete")
+    exact_gets()
+    if captures:
+        save(capture(win, image_module), "08-recovered-track")
+    print("PASS Retry lyrics succeeds without switching; only exact track lyrics GETs", flush=True)
+
+
+def no_lyrics_on_disk(root):
+    needles = tuple(phrase.encode() for phrase in (*OLD_TEXT, RETRY_TEXT, RETRY_SOURCE))
+    for path in root.rglob("*"):
+        if not path.is_symlink() and path.is_file():
+            data = path.read_bytes()
+            check(not any(needle in data for needle in needles), f"lyric text persisted in {path.relative_to(root)}")
+    print("PASS no synthetic lyric text or attribution in the isolated profile files", flush=True)
 
 
 def main():
@@ -423,6 +575,7 @@ def main():
                        DBUS_SYSTEM_BUS_ADDRESS=f"unix:path={runtime}/no-bus")
             with fixture() as server, desktop(binary, root, env, multisize=True) as win:
                 run(win, *server, Image, args.capture_dir)
+            no_lyrics_on_disk(root)
     except (ImportError, OSError, RuntimeError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"FAIL synced lyrics: {error or type(error).__name__}", file=sys.stderr)
         return 1

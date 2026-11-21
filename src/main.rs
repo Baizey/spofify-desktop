@@ -72,11 +72,7 @@ fn clear(ui: &AppWindow) {
     ui.set_next_title("".into());
     ui.set_next_subtitle("".into());
     ui.set_now_credits(Default::default());
-    ui.set_cover_art(Default::default());
-    ui.set_waveform(Default::default());
-    ui.set_lyrics_track_id(Default::default());
-    ui.set_lyrics_text(Default::default());
-    ui.set_lyrics_status(Default::default());
+    presentation::clear(ui);
     ui.set_now_title("Nothing playing".into());
     ui.set_now_detail("".into());
     ui.set_playing(false);
