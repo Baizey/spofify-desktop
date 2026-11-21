@@ -32,14 +32,15 @@ use crate::{
 };
 
 pub const MAX_TRACK_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_DOWNLOADS: usize = 256;
-/// Aggregate bound across all accounts/origins, including committed headers.
-pub const MAX_STORE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_HEADER: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"SPOFDL01";
 const PREFIX_BYTES: usize = 12;
 const LOCK: &str = ".download-lock";
 const STAGE: &str = ".partial";
+// Earlier development builds also used the v1 directory for their cache metadata.
+// These are not audio records. This app never opens or deletes them.
+const LEGACY_CACHE_INDEX: &str = ".playback-cache-v1";
+const LEGACY_CACHE_STAGE: &str = ".playback-cache-partial";
 const ROOT_DIR: &str = "spofify-downloads-v1";
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 const FILE_FLAGS: OFlags = OFlags::NOFOLLOW
@@ -70,7 +71,7 @@ impl fmt::Display for Error {
             Self::InvalidTrack => "This item cannot be downloaded.",
             Self::NotDownloaded => "This track has not been downloaded.",
             Self::AlreadyDownloaded => "This track is already downloaded.",
-            Self::Full => "The download store is full. Remove a download and try again.",
+            Self::Full => "There is no space for this download. Free disk space and try again.",
             Self::Busy => "The download store is busy. Try again shortly.",
             Self::Storage => "Unable to access private download storage.",
             Self::Damaged => "The downloaded file or store layout is invalid.",
@@ -274,7 +275,7 @@ impl OfflineStore {
         let scope = Scope::new(api, session)?;
         let dir = self.lock_dir(false)?;
         let mut downloads = Vec::new();
-        self.scan(&dir, |name, _| {
+        self.scan(&dir, |name| {
             if scope.contains(name) {
                 api.authenticated_account(session)?;
                 let (_, header) = open_entry(&dir, name, &scope)?;
@@ -378,56 +379,31 @@ impl OfflineStore {
             Ok(()) | Err(Errno::NOENT) => (),
             Err(_) => return Err(Error::Storage),
         }
-        self.check_capacity(&dir, name, (PREFIX_BYTES + 2) as u64)?;
+        reject_existing(&dir, name)?;
         Ok(admission)
     }
 
     fn scan(
         &self,
         dir: &OwnedFd,
-        mut entry: impl FnMut(&str, u64) -> Result<(), Error>,
+        mut entry: impl FnMut(&str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let mut buffer = [MaybeUninit::uninit(); 4096];
         let mut iterator = RawDir::new(dir, &mut buffer);
-        let mut count = 0;
-        let mut total = 0_u64;
         while let Some(next) = iterator.next() {
             let next = storage(next)?;
             let name = next.file_name().to_str().map_err(|_| Error::Damaged)?;
-            if matches!(name, "." | ".." | LOCK | STAGE) {
+            if matches!(
+                name,
+                "." | ".." | LOCK | STAGE | LEGACY_CACHE_INDEX | LEGACY_CACHE_STAGE
+            ) {
                 continue;
             }
-            count += 1;
-            if count > MAX_DOWNLOADS || !valid_key(name) {
+            if !valid_key(name) {
                 return Err(Error::Damaged);
             }
-            let s = storage(fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))?;
-            let len = file_size(&s)?;
-            if !(PREFIX_BYTES as u64 + 2..=max_entry_bytes()).contains(&len) {
-                return Err(Error::Damaged);
-            }
-            total += len;
-            if total > MAX_STORE_BYTES {
-                return Err(Error::Damaged);
-            }
-            entry(name, len)?;
-        }
-        Ok(())
-    }
-
-    fn check_capacity(&self, dir: &OwnedFd, name: &str, bytes: u64) -> Result<(), Error> {
-        let mut count = 0;
-        let mut used = 0;
-        self.scan(dir, |found, len| {
-            if name == found {
-                return Err(Error::AlreadyDownloaded);
-            }
-            count += 1;
-            used += len;
-            Ok(())
-        })?;
-        if count >= MAX_DOWNLOADS || bytes > MAX_STORE_BYTES - used {
-            return Err(Error::Full);
+            validate_entry_stat(&storage(fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))?)?;
+            entry(name)?;
         }
         Ok(())
     }
@@ -456,11 +432,7 @@ impl OfflineStore {
         }
         let dir = self.lock_dir(true)?;
         live()?;
-        self.check_capacity(
-            &dir,
-            &name,
-            (PREFIX_BYTES + json.len() + bytes.len()) as u64,
-        )?;
+        reject_existing(&dir, &name)?;
         let file = storage(fs::openat(
             &dir,
             STAGE,
@@ -478,23 +450,23 @@ impl OfflineStore {
         file.write_all(MAGIC)
             .and_then(|_| file.write_all(&(json.len() as u32).to_le_bytes()))
             .and_then(|_| file.write_all(&json))
-            .map_err(|_| Error::Storage)?;
+            .map_err(write_error)?;
         for chunk in bytes.chunks(64 * 1024) {
             live()?;
-            file.write_all(chunk).map_err(|_| Error::Storage)?;
+            file.write_all(chunk).map_err(write_error)?;
         }
-        file.sync_all().map_err(|_| Error::Storage)?;
+        file.sync_all().map_err(write_error)?;
         live()?;
         // Atomic no-overwrite publication; this is the commit point.
         match fs::renameat_with(&dir, STAGE, &dir, name.as_str(), RenameFlags::NOREPLACE) {
             Ok(()) => stage.published = true,
             Err(Errno::EXIST) => return Err(Error::AlreadyDownloaded),
-            Err(_) => return Err(Error::Storage),
+            Err(err) => return Err(storage_error(err)),
         }
-        if fs::fsync(&dir).is_err() {
+        if let Err(err) = fs::fsync(&dir) {
             let _ = fs::unlinkat(&dir, name.as_str(), AtFlags::empty());
             let _ = fs::fsync(&dir);
-            return Err(Error::Storage);
+            return Err(storage_error(err));
         }
         Ok(header.download())
     }
@@ -752,6 +724,26 @@ fn max_entry_bytes() -> u64 {
     (PREFIX_BYTES + MAX_HEADER + MAX_TRACK_BYTES) as u64
 }
 
+// Admission only needs the candidate key. Real filesystem writes enforce
+// capacity; walking the entire library for each new save would be quadratic.
+fn reject_existing(dir: &OwnedFd, name: &str) -> Result<(), Error> {
+    match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => {
+            validate_entry_stat(&stat)?;
+            Err(Error::AlreadyDownloaded)
+        }
+        Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(storage_error(err)),
+    }
+}
+
+fn validate_entry_stat(s: &Stat) -> Result<(), Error> {
+    if !(PREFIX_BYTES as u64 + 2..=max_entry_bytes()).contains(&file_size(s)?) {
+        return Err(Error::Damaged);
+    }
+    Ok(())
+}
+
 fn file_size(s: &Stat) -> Result<u64, Error> {
     if FileType::from_raw_mode(s.st_mode) != FileType::RegularFile
         || s.st_uid != geteuid().as_raw()
@@ -764,7 +756,18 @@ fn file_size(s: &Stat) -> Result<u64, Error> {
 }
 
 fn storage<T>(result: rustix::io::Result<T>) -> Result<T, Error> {
-    result.map_err(|_| Error::Storage)
+    result.map_err(storage_error)
+}
+fn storage_error(err: Errno) -> Error {
+    match err {
+        Errno::NOSPC | Errno::DQUOT => Error::Full,
+        _ => Error::Storage,
+    }
+}
+fn write_error(err: std::io::Error) -> Error {
+    err.raw_os_error()
+        .map(Errno::from_raw_os_error)
+        .map_or(Error::Storage, storage_error)
 }
 fn lock(fd: &OwnedFd, operation: FlockOperation) -> Result<(), Error> {
     fs::flock(fd, operation).map_err(|err| {
@@ -836,7 +839,7 @@ mod tests {
         env,
         fs::{self as stdfs, DirBuilder, OpenOptions},
         io::{Seek, SeekFrom},
-        os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
         path::PathBuf,
     };
 
@@ -1126,53 +1129,115 @@ mod tests {
         assert!(store.remove(&api, &session, "track").unwrap());
     }
 
+    // Simulate files left by a build without the old release's global quotas.
+    fn write_sparse_entry(root: &std::path::Path, scope: &Scope, id: &str, bytes: u64, hash: &str) {
+        let json = serde_json::to_vec(&Header {
+            scope: scope.0.clone(),
+            track: track(id),
+            bytes,
+            audio_hash: hash.into(),
+        })
+        .unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(scope.name(id).unwrap()))
+            .unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&(json.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&json).unwrap();
+        file.set_len((PREFIX_BYTES + json.len()) as u64 + bytes)
+            .unwrap();
+    }
+
     #[test]
-    fn global_quota_is_bounded_for_all_scopes() {
+    fn large_v1_store_lists_reads_removes_and_admits_new_downloads() {
+        const SAVED_COUNT: usize = 1089;
         let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
         let store = fixture.store();
-        let scope = Scope::from_parts("https://one.invalid", "synthetic");
-        let dir = store.lock_dir(true).unwrap();
-        // Sparse synthetic files exercise quota without allocating the payloads.
-        let track_max = MAX_TRACK_BYTES as u64;
-        for index in 0..31 {
-            let name = scope.name(&format!("track-{index}")).unwrap();
-            let file = fs::openat(
-                &dir,
-                name.as_str(),
-                FILE_FLAGS | OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
-                PRIVATE_FILE,
-            )
-            .unwrap();
-            File::from(file).set_len(track_max).unwrap();
+        let hash = hex(digest(&SHA256, &[0]).as_ref());
+        for index in 0..SAVED_COUNT {
+            write_sparse_entry(&fixture.root(), &scope, &format!("track-{index}"), 1, &hash);
         }
-        drop(dir);
-        let other = Scope::from_parts("https://two.invalid", "synthetic");
-        let dir = store.lock_dir(true).unwrap();
-        let candidate = other.name("new").unwrap();
-        assert!(matches!(
-            store.check_capacity(&dir, &candidate, track_max + 100),
-            Err(Error::Full)
-        ));
-        // Fill the remaining slots without reaching the byte limit.
-        let tiny = (PREFIX_BYTES + 2) as u64;
-        for index in 31..MAX_DOWNLOADS {
-            let name = scope.name(&format!("track-{index}")).unwrap();
-            let file = fs::openat(
-                &dir,
-                name.as_str(),
-                FILE_FLAGS | OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
-                PRIVATE_FILE,
-            )
-            .unwrap();
-            File::from(file).set_len(tiny).unwrap();
+        for name in [LEGACY_CACHE_INDEX, LEGACY_CACHE_STAGE] {
+            stdfs::write(fixture.root().join(name), b"opaque legacy data").unwrap();
         }
-        assert!(31 * track_max + (MAX_DOWNLOADS as u64 - 31) * tiny + tiny < MAX_STORE_BYTES);
-        drop(dir);
-        let dir = store.lock_dir(true).unwrap();
+        // Exceeds the old count bound alone.
+        assert_eq!(store.list(&api, &session).unwrap().len(), SAVED_COUNT);
+        assert_eq!(store.read(&api, &session, "track-1088").unwrap().bytes, [0]);
         assert!(matches!(
-            store.check_capacity(&dir, &candidate, tiny),
-            Err(Error::Full)
+            install(&store, &scope, "track-1088", b"never overwrite"),
+            Err(Error::AlreadyDownloaded)
         ));
+        install(&store, &scope, "new", b"new audio").unwrap();
+        assert!(store.remove(&api, &session, "track-1088").unwrap());
+        assert_eq!(store.list(&api, &session).unwrap().len(), SAVED_COUNT);
+        for name in [LEGACY_CACHE_INDEX, LEGACY_CACHE_STAGE] {
+            assert_eq!(
+                stdfs::read(fixture.root().join(name)).unwrap(),
+                b"opaque legacy data"
+            );
+        }
+
+        // A large store still checks the candidate and validates layout on list.
+        symlink("new", fixture.root().join(scope.name("unsafe").unwrap())).unwrap();
+        assert_eq!(
+            store.admit(&scope.name("unsafe").unwrap()).unwrap_err(),
+            Error::Damaged
+        );
+        assert_eq!(store.list(&api, &session), Err(Error::Damaged));
+    }
+
+    #[test]
+    fn v1_store_over_old_byte_quota_lists_by_header_without_loading_audio() {
+        let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let foreign = Scope::from_parts("https://one.invalid", "other-account");
+        let store = fixture.store();
+        let mut hash = Context::new(&SHA256);
+        for _ in 0..(MAX_TRACK_BYTES / (64 * 1024)) {
+            hash.update(&[0; 64 * 1024]);
+        }
+        let hash = hex(hash.finish().as_ref());
+        // Exceeds the old byte quota alone; the audio payloads are sparse holes.
+        for index in 0..33 {
+            write_sparse_entry(
+                &fixture.root(),
+                if index == 0 { &foreign } else { &scope },
+                &format!("track-{index}"),
+                MAX_TRACK_BYTES as u64,
+                &hash,
+            );
+        }
+        let listed = store.list(&api, &session).unwrap();
+        assert_eq!(listed.len(), 32);
+        assert_eq!(
+            listed.iter().map(|d| d.bytes).sum::<u64>(),
+            1024 * 1024 * 1024
+        );
+        assert!(matches!(
+            store.read(&api, &session, "track-0"),
+            Err(Error::NotDownloaded)
+        ));
+        install(&store, &scope, "new", b"new audio").unwrap();
+    }
+
+    #[test]
+    fn full_is_reported_only_for_filesystem_space_or_quota_errors() {
+        for error in [Errno::NOSPC, Errno::DQUOT] {
+            assert_eq!(storage_error(error), Error::Full);
+            assert_eq!(
+                write_error(std::io::Error::from_raw_os_error(error.raw_os_error())),
+                Error::Full
+            );
+        }
+        assert_eq!(storage_error(Errno::ACCESS), Error::Storage);
     }
 
     #[test]

@@ -349,9 +349,11 @@ impl LocalQueue {
         self.position.and_then(|p| self.entries.get(p))
     }
     pub fn replace(&mut self, tracks: Vec<LocalTrack>, selected: usize, shuffle: bool) -> Change {
-        if tracks.len() > crate::offline::MAX_DOWNLOADS
-            || selected >= tracks.len()
-            || !key(self.next_key + tracks.len() as u64)
+        if selected >= tracks.len()
+            || !self
+                .next_key
+                .checked_add(tracks.len() as u64)
+                .is_some_and(key)
             || !tracks.iter().all(|t| {
                 id(&t.id, 512)
                     && text(&t.title, 1024)
@@ -629,6 +631,18 @@ mod tests {
         q.replace(vec![track("new")], 0, false);
         assert!(q.current().unwrap().key > initial);
         assert_eq!(q.repeat, Repeat::One);
+    }
+    #[test]
+    fn local_queue_accepts_large_saved_collections_with_distinct_occurrences() {
+        let mut q = LocalQueue::default();
+        let mut tracks = vec![track("repeat"); 1161];
+        tracks[1160] = track("last");
+        assert_eq!(q.replace(tracks, 1160, false), Change::Start);
+        assert_eq!(q.entries.len(), 1161);
+        assert_eq!(q.current().unwrap().track.id, "last");
+        assert_eq!(q.advance(true), Change::Start);
+        assert_eq!(q.current().unwrap().track.id, "repeat");
+        assert_ne!(q.entries[1].key, q.entries[2].key);
     }
     #[test]
     fn saved_crossfade_uses_natural_occurrences_but_not_self_repeat() {

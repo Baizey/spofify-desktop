@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Read, Write},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,12 +30,9 @@ use crate::{
     storage as local_storage,
 };
 
-// Bound both the number of requests and the number of playback occurrences,
-// including repeats. Audio bytes have separate limits enforced by OfflineStore.
-const MAX_OCCURRENCES: usize = offline::MAX_DOWNLOADS;
-const MAX_COLLECTIONS: usize = 64;
+// Bound each response, not the total number of membership occurrences. Audio
+// storage and playback limits are independent of collection metadata.
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
 const ROOT: &str = "spofify-collections-v1";
 const INDEX: &str = "index.json";
 const STAGE: &str = ".partial";
@@ -55,12 +52,10 @@ const fn error(message: &'static str) -> ApiError {
 const STORAGE: ApiError = error("Unable to access private collection storage.");
 const DAMAGED: ApiError = error("The saved collection index is invalid.");
 const BUSY: ApiError = error("Another collection operation is in progress. Try again shortly.");
-const FULL: ApiError =
-    error("The saved collection index is full. Remove a collection and try again.");
+const NO_SPACE: ApiError = error("Not enough space on this device to update saved collections.");
+const NOT_DURABLE: ApiError =
+    error("The change was applied, but could not be confirmed on disk. Reopen Saved to check.");
 const INVALID: ApiError = error("The server returned an incompatible collection manifest.");
-const TOO_LARGE: ApiError = error(
-    "This collection exceeds the offline collection song limit. Save individual tracks instead.",
-);
 const UNSUPPORTED: ApiError = error("This page cannot be saved as a collection.");
 const EMPTY: ApiError = error("No tracks in this collection could be saved.");
 const OFFLINE: ApiError = error("Work online to save a collection.");
@@ -211,7 +206,7 @@ pub async fn remove(access: &Access, id: &str) -> Result<(), ApiError> {
         if !removed {
             return Ok(());
         }
-        dir.commit(&index.encode()?, live)
+        dir.commit(&index, live)
     })
     .await
 }
@@ -258,25 +253,24 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
         _ = network.changed() => Err(OFFLINE),
         result = async {
             let (scope, dir, admission, mut index, store) = open.await?;
-            let snapshot = snapshot(access, target).await?;
-            if snapshot.tracks.is_empty() { return Err(EMPTY); }
-            let key = hash_fields(b"spofify-collection-key-v1", &[&scope, target.domain(), target.id()]);
-            index.remove_entry(&scope, &key);
-            index.entries.push(StoredCollection {
-                scope, key, kind: snapshot.kind, title: snapshot.title,
-                tracks: snapshot.tracks.iter().map(|t| t.id.clone()).collect(),
-            });
-            // Preflight the index limits and all manifest pages before audio I/O.
-            let bytes = index.encode()?;
-            let entry = index.entries.pop().ok_or(DAMAGED)?;
-            let mut seen = HashSet::new();
-            for item in &snapshot.tracks {
-                if !item.has_audio || !seen.insert(&item.id) { continue; }
-                check_live(access)?;
-                if let Err(err) = store.download(&access.api, &access.session, item).await {
-                    handle_track_error(err)?;
+            // Validate every manifest page before starting any audio I/O.
+            let Snapshot { kind, title, tracks } = snapshot(access, target).await?;
+            if tracks.is_empty() { return Err(EMPTY); }
+            {
+                let mut seen = HashSet::new();
+                for item in &tracks {
+                    if !item.has_audio || !seen.insert(&item.id) { continue; }
+                    check_live(access)?;
+                    if let Err(err) = store.download(&access.api, &access.session, item).await {
+                        handle_track_error(err)?;
+                    }
                 }
             }
+            let key = hash_fields(b"spofify-collection-key-v1", &[&scope, target.domain(), target.id()]);
+            let entry = StoredCollection {
+                scope, key, kind, title,
+                tracks: tracks.into_iter().map(|t| t.id).collect(),
+            };
             let access = access.clone();
             let changes = access.session.network_changes();
             blocking(move || {
@@ -285,7 +279,8 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
                 // success if the track has already been removed.
                 let summary = entry.summary(&available_tracks(&access, &store)?);
                 if summary.present == 0 { return Err(EMPTY); }
-                dir.commit(&bytes, || {
+                index.replace_entry(entry);
+                dir.commit(&index, || {
                     check_cancelled(&cancelled)?;
                     check_live(&access)?;
                     if *changes.borrow() != generation { return Err(OFFLINE); }
@@ -540,9 +535,6 @@ impl ManifestState {
         {
             return Err(INVALID);
         }
-        if wire.total > MAX_OCCURRENCES as u64 {
-            return Err(TOO_LARGE);
-        }
         if let Some((old, fence, total, recorded, _)) = &self.metadata {
             if *old != header
                 || *fence != wire.fence
@@ -598,7 +590,7 @@ impl ManifestState {
     }
 }
 
-// One small private index; a collection stores only its disjoint account/key
+// The private index stores only each collection's disjoint account/key
 // hashes, display title/kind and ordered opaque track IDs. No session, server
 // paths, cursor/fence or playback capabilities are serializable here.
 #[derive(Clone, Deserialize, Serialize)]
@@ -647,16 +639,19 @@ impl Index {
             .retain(|entry| entry.scope != scope || entry.key != key);
         self.entries.len() != before
     }
+    fn replace_entry(&mut self, entry: StoredCollection) {
+        self.remove_entry(&entry.scope, &entry.key);
+        self.entries.push(entry);
+    }
     fn validate(&self) -> Result<(), ApiError> {
         let mut seen = HashSet::new();
-        if self.entries.len() > MAX_COLLECTIONS
-            || self.version != 1
+        if self.version != 1
             || self.entries.iter().any(|e| {
                 !hex_digest(&e.scope)
                     || !hex_digest(&e.key)
                     || !valid_title(&e.title)
-                    || e.tracks.is_empty()
-                    || e.tracks.len() > MAX_OCCURRENCES
+                    // Older v1 writers could retain snapshot metadata for an empty playlist.
+                    || (e.tracks.is_empty() && !matches!(e.kind, Kind::Manual | Kind::Derived))
                     || e.tracks.iter().any(|id| !valid_id(id))
                     || !seen.insert((&e.scope, &e.key))
             })
@@ -664,17 +659,6 @@ impl Index {
             return Err(DAMAGED);
         }
         Ok(())
-    }
-    fn encode(&self) -> Result<Vec<u8>, ApiError> {
-        if self.entries.len() > MAX_COLLECTIONS {
-            return Err(FULL);
-        }
-        self.validate()?;
-        let json = serde_json::to_vec(self).map_err(|_| STORAGE)?;
-        if json.len() > MAX_INDEX_BYTES {
-            return Err(FULL);
-        }
-        Ok(json)
     }
 }
 
@@ -713,28 +697,25 @@ impl IndexDir {
             Err(_) => return Err(DAMAGED),
         };
         let len = private_len(&storage(fs::fstat(&fd))?)?;
-        if !(1..=MAX_INDEX_BYTES as u64).contains(&len) {
+        // Stream the opened inode without allocating a second copy of the
+        // index or reading beyond its measured length into the parser.
+        let mut file = BufReader::new(File::from(fd));
+        let mut bounded = (&mut file).take(len);
+        let value: Index = serde_json::from_reader(&mut bounded).map_err(|_| DAMAGED)?;
+        if bounded.limit() != 0 || !file.fill_buf().map_err(|_| DAMAGED)?.is_empty() {
             return Err(DAMAGED);
         }
-        let mut json = Vec::with_capacity(len as usize);
-        File::from(fd)
-            .take(len + 1)
-            .read_to_end(&mut json)
-            .map_err(|_| DAMAGED)?;
-        if json.len() as u64 != len {
-            return Err(DAMAGED);
-        }
-        let value: Index = serde_json::from_slice(&json).map_err(|_| DAMAGED)?;
         value.validate()?;
         Ok(value)
     }
     /// Called while holding this directory's exclusive mutation admission.
     fn commit(
         &self,
-        bytes: &[u8],
+        index: &Index,
         live: impl Fn() -> Result<(), ApiError>,
     ) -> Result<(), ApiError> {
         live()?;
+        index.validate()?;
         let fd = storage(fs::openat(
             &self.0,
             STAGE,
@@ -745,9 +726,19 @@ impl IndexDir {
             dir: &self.0,
             published: false,
         };
-        let mut file = File::from(fd);
-        file.write_all(bytes).map_err(|_| STORAGE)?;
-        file.sync_all().map_err(|_| STORAGE)?;
+        // A restrictive umask must not replace a readable index with one the
+        // reader would reject. The stage guard cleans up on this failure too.
+        if private_len(&storage(fs::fstat(&fd))?)? != 0 {
+            return Err(DAMAGED);
+        }
+        let file = File::from(fd);
+        {
+            let mut writer = BufWriter::new(&file);
+            serde_json::to_writer(&mut writer, index)
+                .map_err(|err| err.io_error_kind().map_or(STORAGE, write_error))?;
+            writer.flush().map_err(|err| write_error(err.kind()))?;
+        }
+        file.sync_all().map_err(|err| write_error(err.kind()))?;
         live()?;
         storage(fs::renameat_with(
             &self.0,
@@ -757,7 +748,9 @@ impl IndexDir {
             RenameFlags::empty(),
         ))?;
         stage.published = true;
-        storage(fs::fsync(&self.0))
+        // The new index is already visible. A sync failure here leaves crash
+        // durability uncertain; it does not imply that publication failed.
+        fs::fsync(&self.0).map_err(|_| NOT_DURABLE)
     }
 }
 
@@ -794,7 +787,16 @@ fn lock(fd: &OwnedFd) -> Result<(), ApiError> {
     })
 }
 fn storage<T>(r: rustix::io::Result<T>) -> Result<T, ApiError> {
-    r.map_err(|_| STORAGE)
+    r.map_err(|err| match err {
+        Errno::NOSPC | Errno::DQUOT => NO_SPACE,
+        _ => STORAGE,
+    })
+}
+fn write_error(kind: ErrorKind) -> ApiError {
+    match kind {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => NO_SPACE,
+        _ => STORAGE,
+    }
 }
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
@@ -876,7 +878,7 @@ fn audio_error(e: offline::Error) -> ApiError {
         InvalidTrack => error("This collection contains an invalid track."),
         NotDownloaded => error("A track is not saved on this device."),
         AlreadyDownloaded => error("This track is already saved."),
-        Full => error("The download store is full. Remove a download and try again."),
+        Full => error("There is no space for this download. Free disk space and try again."),
         Busy => error("The download store is busy. Try again shortly."),
         Storage => error("Unable to access private download storage."),
         Damaged => error("The downloaded file or store layout is invalid."),
@@ -895,7 +897,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::{
         fs as stdfs,
-        os::unix::fs::{DirBuilderExt, PermissionsExt},
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         path::PathBuf,
     };
 
@@ -968,13 +970,39 @@ mod tests {
                 id: "fixture",
                 expected: Some((playlist_kind, 7)),
             };
-            let first = wire_page(kind, 21, 0..20, Some("of1_demo.signature"));
-            let last = wire_page(kind, 21, 20..21, None);
+            let page_size = PAGE_SIZE as usize;
+            let total = 2 * page_size + 1;
+            let first = wire_page(kind, total, 0..page_size, Some("of1_first.signature"));
+            let second = wire_page(
+                kind,
+                total,
+                page_size..2 * page_size,
+                Some("of1_second.signature"),
+            );
+            let last = wire_page(kind, total, 2 * page_size..total, None);
             let mut state = ManifestState::default();
-            assert!(append(&mut state, target, first.clone()).unwrap().is_some());
-            let mut stale = last.clone();
+            let mut body = serde_json::to_vec(&first).unwrap();
+            body.resize(MAX_PAGE_BYTES + 1, b' ');
+            assert_eq!(state.append(target, &body), Err(INVALID));
+            body.pop();
+            assert_eq!(
+                state.append(target, &body),
+                Ok(Some("of1_first.signature".into()))
+            );
+
+            let mut stale = second.clone();
             stale["fence"] = json!(format!("f1_{}", "b".repeat(64)));
             assert_eq!(append(&mut state, target, stale), Err(CHANGED));
+            let mut repeated_cursor = second.clone();
+            repeated_cursor["nextCursor"] = first["nextCursor"].clone();
+            assert_eq!(append(&mut state, target, repeated_cursor), Err(INVALID));
+            let mut oversized_page = second.clone();
+            oversized_page["items"].as_array_mut().unwrap().push(json!({
+                "occurrenceId": "extra", "position": 2 * page_size, "track": track("track")
+            }));
+            assert_eq!(append(&mut state, target, oversized_page), Err(INVALID));
+            assert!(append(&mut state, target, second).unwrap().is_some());
+
             let mut duplicate = last.clone();
             duplicate["items"][0]["occurrenceId"] = json!("entry_0");
             assert_eq!(append(&mut state, target, duplicate), Err(INVALID));
@@ -983,16 +1011,49 @@ mod tests {
             assert_eq!(append(&mut state, target, missing_cursor), Err(INVALID));
             assert_eq!(append(&mut state, target, last), Ok(None));
             let snapshot = state.finish().unwrap();
-            assert_eq!(snapshot.tracks.len(), 21);
+            assert_eq!(snapshot.tracks.len(), total);
             assert_eq!(snapshot.tracks[0], snapshot.tracks[20]);
-            assert_eq!(
-                append(
-                    &mut ManifestState::default(),
-                    target,
-                    wire_page(kind, MAX_OCCURRENCES + 1, 0..20, Some("of1_demo.signature"))
-                ),
-                Err(TOO_LARGE)
-            );
+        }
+    }
+
+    #[test]
+    fn large_playlist_manifests_preserve_every_occurrence() {
+        const TOTAL: usize = 1161;
+        for (kind, playlist_kind) in [
+            ("manual", PlaylistKind::Manual),
+            ("derived", PlaylistKind::Derived),
+        ] {
+            let target = Target::Playlist {
+                id: "fixture",
+                expected: Some((playlist_kind, 7)),
+            };
+            let mut state = ManifestState::default();
+            let page_size = PAGE_SIZE as usize;
+            for start in (0..TOTAL).step_by(page_size) {
+                let end = (start + page_size).min(TOTAL);
+                let cursor = format!("of1_page_{end}.signature");
+                let next = (end < TOTAL).then_some(cursor);
+                assert_eq!(
+                    append(
+                        &mut state,
+                        target,
+                        wire_page(kind, TOTAL, start..end, next.as_deref()),
+                    ),
+                    Ok(next)
+                );
+            }
+            let snapshot = state.finish().unwrap();
+            assert_eq!(snapshot.tracks.len(), TOTAL);
+            for (i, item) in snapshot.tracks.iter().enumerate() {
+                assert_eq!(
+                    item.id,
+                    if matches!(i, 0 | 20) {
+                        "repeat"
+                    } else {
+                        "track"
+                    }
+                );
+            }
         }
     }
 
@@ -1074,6 +1135,223 @@ mod tests {
         }
     }
 
+    fn create_v1_fixture(path: &std::path::Path, fixture: &Value) {
+        let file = stdfs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.join(INDEX))
+            .unwrap();
+        serde_json::to_writer(file, fixture).unwrap();
+    }
+
+    #[test]
+    fn legacy_empty_playlists_survive_other_writes_and_removals() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join(ROOT);
+        let disk = IndexDir::open(&path).unwrap();
+        let _admission = disk.admit().unwrap();
+        let scope = "a".repeat(64);
+        let manual = "b".repeat(64);
+        let derived = "c".repeat(64);
+        let added = "d".repeat(64);
+        create_v1_fixture(
+            &path,
+            &json!({"version": 1, "entries": [
+                {"scope": scope, "key": manual, "kind": "manual", "title": "Manual", "tracks": []},
+                {"scope": scope, "key": derived, "kind": "derived", "title": "Derived", "tracks": []},
+            ]}),
+        );
+
+        let mut index = disk.read().unwrap();
+        index.replace_entry(StoredCollection {
+            scope: scope.clone(),
+            key: added.clone(),
+            kind: Kind::Album,
+            title: "New collection".into(),
+            tracks: vec!["track".into()],
+        });
+        disk.commit(&index, || Ok(())).unwrap();
+        let mut index = disk.read().unwrap();
+        assert_eq!(index.entries.len(), 3);
+        assert!(index.remove_entry(&scope, &added));
+        disk.commit(&index, || Ok(())).unwrap();
+
+        let entries: Vec<_> = disk.read().unwrap().in_scope(&scope).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, manual);
+        assert!(matches!(entries[0].kind, Kind::Manual));
+        assert_eq!(entries[1].key, derived);
+        assert!(matches!(entries[1].kind, Kind::Derived));
+        for entry in entries {
+            let page = detail_page(entry, &HashMap::new());
+            assert_eq!(page.total, Some(0));
+            assert!(page.rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn large_v1_membership_reopens_projects_updates_and_removes() {
+        const TOTAL: usize = 1161;
+        let scratch = Scratch::new();
+        let path = scratch.0.join(ROOT);
+        let disk = IndexDir::open(&path).unwrap();
+        let _admission = disk.admit().unwrap();
+        let principal = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        let key = "c".repeat(64);
+        let sibling_key = "d".repeat(64);
+        let ids: Vec<_> = ["saved", "missing", "saved", "another-missing"]
+            .into_iter()
+            .cycle()
+            .take(TOTAL)
+            .collect();
+        // Write the legacy format without using the current serializer.
+        let fixture = json!({"version": 1, "entries": [
+            {"scope": principal, "key": sibling_key, "kind": "album", "title": "Album",
+                "tracks": ["saved", "missing", "saved"]},
+            {"scope": foreign, "key": key, "kind": "derived", "title": "Other account",
+                "tracks": vec!["foreign"; 40]},
+            {"scope": principal, "key": key, "kind": "manual", "title": "Legacy playlist",
+                "tracks": ids},
+        ]});
+        create_v1_fixture(&path, &fixture);
+
+        let entry = disk
+            .read()
+            .unwrap()
+            .in_scope(&principal)
+            .find(|e| e.key == key)
+            .unwrap();
+        let saved = serde_json::from_value::<WireTrack>(track("saved"))
+            .unwrap()
+            .project()
+            .unwrap();
+        let available = HashMap::from([("saved".into(), saved)]);
+        assert_eq!(
+            list_row(entry.clone(), &available).detail,
+            "581 of 1161 songs available"
+        );
+        let page = detail_page(entry, &available);
+        assert_eq!(page.total, Some(TOTAL as u64));
+        assert_eq!(page.status, "580 songs not available on this device.");
+        assert_eq!(page.rows.len(), TOTAL);
+        for (i, (row, id)) in page.rows.iter().zip(ids).enumerate() {
+            assert_eq!(row.position, Some(i as u64));
+            assert_eq!(row.id, id);
+            assert_eq!(row.playable, id == "saved");
+            assert_eq!(row.item.is_some(), row.playable);
+            assert!(row.playback.is_none());
+        }
+
+        let mut index = disk.read().unwrap();
+        index.replace_entry(StoredCollection {
+            scope: principal.clone(),
+            key: key.clone(),
+            kind: Kind::Manual,
+            title: "Updated playlist".into(),
+            tracks: vec!["saved".into(); TOTAL + 1],
+        });
+        disk.commit(&index, || Ok(())).unwrap();
+        let mut index = disk.read().unwrap();
+        assert_eq!(index.entries.len(), 3);
+        let updated = index
+            .entries
+            .iter()
+            .find(|e| e.scope == principal && e.key == key)
+            .unwrap();
+        assert_eq!(updated.title, "Updated playlist");
+        assert_eq!(updated.tracks.len(), TOTAL + 1);
+        assert!(index.remove_entry(&principal, &key));
+        disk.commit(&index, || Ok(())).unwrap();
+
+        let local = disk
+            .read()
+            .unwrap()
+            .in_scope(&principal)
+            .collect::<Vec<_>>();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].key, sibling_key);
+        assert_eq!(local[0].tracks, ["saved", "missing", "saved"]);
+        let other = disk.read().unwrap().in_scope(&foreign).collect::<Vec<_>>();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].key, key);
+        assert_eq!(other[0].tracks, vec!["foreign"; 40]);
+    }
+
+    #[test]
+    fn large_index_remains_readable_after_removal() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join(ROOT);
+        let disk = IndexDir::open(&path).unwrap();
+        let _admission = disk.admit().unwrap();
+        let scope = "a".repeat(64);
+        let mut index = Index::empty();
+        for i in 0..68 {
+            index.entries.push(StoredCollection {
+                scope: scope.clone(),
+                key: format!("{i:064x}"),
+                kind: Kind::Manual,
+                title: format!("Playlist {i}"),
+                tracks: vec!["x".repeat(512); 128],
+            });
+        }
+        disk.commit(&index, || Ok(())).unwrap();
+        let mut index = disk.read().unwrap();
+        assert_eq!(index.entries.len(), 68);
+        let removed_key = index.entries[0].key.clone();
+        assert!(index.remove_entry(&scope, &removed_key));
+        disk.commit(&index, || Ok(())).unwrap();
+        // The remaining index still exceeds both former product quotas.
+        assert!(stdfs::metadata(path.join(INDEX)).unwrap().len() > 4 * 1024 * 1024);
+        assert_eq!(disk.read().unwrap().in_scope(&scope).count(), 67);
+    }
+
+    #[test]
+    fn v1_index_rejects_malformed_data_without_discarding_it() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join(ROOT);
+        let disk = IndexDir::open(&path).unwrap();
+        let _admission = disk.admit().unwrap();
+        let index_path = path.join(INDEX);
+        drop(
+            stdfs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&index_path)
+                .unwrap(),
+        );
+        let record = json!({"scope": "a".repeat(64), "key": "b".repeat(64),
+            "kind": "manual", "title": "Fixture", "tracks": ["same", "same"]});
+        let valid = json!({"version": 1, "entries": [record.clone()]});
+        let mut overlong_id = valid.clone();
+        overlong_id["entries"][0]["tracks"][1] = json!("x".repeat(513));
+        let mut duplicate_key = valid.clone();
+        duplicate_key["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(record);
+        let mut unknown_field = valid.clone();
+        unknown_field["entries"][0]["audioPath"] = json!("/not/allowed");
+        let mut empty_album = valid.clone();
+        empty_album["entries"][0]["kind"] = json!("album");
+        empty_album["entries"][0]["tracks"] = json!([]);
+        let mut trailing_json = serde_json::to_vec(&valid).unwrap();
+        trailing_json.extend_from_slice(b" {}");
+        for invalid in [
+            serde_json::to_vec(&overlong_id).unwrap(),
+            serde_json::to_vec(&duplicate_key).unwrap(),
+            serde_json::to_vec(&unknown_field).unwrap(),
+            serde_json::to_vec(&empty_album).unwrap(),
+            trailing_json,
+        ] {
+            stdfs::write(&index_path, &invalid).unwrap();
+            assert_eq!(disk.read().err(), Some(DAMAGED));
+            assert_eq!(stdfs::read(&index_path).unwrap(), invalid);
+        }
+    }
+
     #[tokio::test]
     async fn private_index_survives_session_replacement_and_offline_mode() {
         let scratch = Scratch::new();
@@ -1092,8 +1370,7 @@ mod tests {
             kind: Kind::Album,
             tracks: vec!["two".into(), "one".into(), "two".into()],
         });
-        let bytes = index.encode().unwrap();
-        disk.commit(&bytes, || check_live(&first)).unwrap();
+        disk.commit(&index, || check_live(&first)).unwrap();
         assert_eq!(
             stdfs::metadata(path.join(INDEX))
                 .unwrap()
@@ -1103,12 +1380,13 @@ mod tests {
             0o600
         );
         assert!(
-            !String::from_utf8(bytes.clone())
+            !stdfs::read_to_string(path.join(INDEX))
                 .unwrap()
                 .contains("synthetic")
         );
+        index.entries[0].tracks.push("unpublished".into());
         assert_eq!(
-            disk.commit(&bytes, || if path.join(STAGE).exists() {
+            disk.commit(&index, || if path.join(STAGE).exists() {
                 Err(CANCELLED)
             } else {
                 Ok(())
@@ -1189,8 +1467,7 @@ mod tests {
         assert_eq!(disk.read().unwrap().in_scope(&foreign_scope).count(), 0);
         assert!(index.remove_entry(&scope(&next).unwrap(), &key));
         let _admission = disk.admit().unwrap();
-        disk.commit(&index.encode().unwrap(), || check_live(&next))
-            .unwrap();
+        disk.commit(&index, || check_live(&next)).unwrap();
         assert_eq!(disk.read().unwrap().in_scope(&principal).count(), 0);
     }
 }

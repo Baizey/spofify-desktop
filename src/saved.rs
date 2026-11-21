@@ -37,7 +37,7 @@ fn error(err: offline::Error) -> ApiError {
             InvalidTrack => "This item cannot be downloaded.",
             NotDownloaded => "This track has not been downloaded.",
             AlreadyDownloaded => "This track is already downloaded.",
-            Full => "The download store is full. Remove a download and try again.",
+            Full => "There is no space for this download. Free disk space and try again.",
             Busy => "The download store is busy. Try again shortly.",
             Storage => STORAGE.message,
             Damaged => "The downloaded file or store layout is invalid.",
@@ -201,13 +201,6 @@ fn queue_selection(
         }) else {
             continue;
         };
-        if queue.len() >= offline::MAX_DOWNLOADS {
-            return Err(ApiError {
-                message: "This saved queue has too many entries.",
-                expired: false,
-                status: 0,
-            });
-        }
         if visible == visible_index {
             selected = Some(queue.len());
         }
@@ -248,6 +241,20 @@ mod tests {
             storage_label(3, 2 * 1024 * 1024),
             "2.0 MiB · 3 downloaded songs"
         );
+    }
+
+    #[test]
+    fn large_saved_view_can_play_an_occurrence_after_the_old_queue_limit() {
+        let mut rows = vec![Row::default()];
+        rows.extend((0..1161).map(|i| row("repeat", i != 1000)));
+        let page = Page {
+            rows,
+            ..Page::default()
+        };
+        let (queue, selected) = queue_selection(&page, 1161).unwrap();
+        assert_eq!(queue.len(), 1160);
+        assert_eq!(selected, 1159);
+        assert_eq!(queue[selected].id, "repeat");
     }
 
     #[test]

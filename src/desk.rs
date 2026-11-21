@@ -1348,6 +1348,8 @@ impl Browser {
                 self.render(false);
             }
             Update::Changed(Err(e)) => {
+                // A removal can be visible even if the final disk sync failed.
+                self.cache.saved_changed();
                 let msg = readable(&e);
                 self.scoped_ui({
                     let m = msg.clone();

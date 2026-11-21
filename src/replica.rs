@@ -36,6 +36,11 @@ impl Replica {
     }
     pub fn put(&mut self, route: Route, page: Arc<Page>) {
         self.0.retain(|e| e.route != route);
+        // A large current Saved view is usable without a retained cache copy.
+        // Don't evict all other views trying to make room for one that can't fit.
+        if page.rows.len() > MAX_ROWS {
+            return;
+        }
         self.0.push_back(Entry {
             route,
             value: page,
@@ -151,6 +156,21 @@ mod tests {
         t.landed(&playlist); // Add succeeds and returns to its destination.
         assert_eq!(t.pop(), Some(Route::Playlists));
         assert!(!t.can_back());
+    }
+    #[test]
+    fn an_uncacheable_saved_view_does_not_evict_other_views() {
+        let mut r = Replica::default();
+        r.put(Route::Offline, Arc::default());
+        r.put(Route::History, Arc::default());
+        r.put(
+            Route::Offline,
+            Arc::new(Page {
+                rows: vec![Default::default(); MAX_ROWS + 1],
+                ..Default::default()
+            }),
+        );
+        assert!(r.get(&Route::Offline).is_none());
+        assert!(r.get(&Route::History).is_some());
     }
     #[test]
     fn cache_evicts_least_recently_used() {
