@@ -891,13 +891,14 @@ export component AppWindow inherits Window {
                 height: work.height - self.y;
                 background: Theme.rail;
                 property <length> inset-left: root.compact ? 12px : 17px;
-                property <length> inset-right: root.compact ? 12px : 16px;
+                // Fluent's overlay scrollbar is 14px wide. Keep its hit area in the margin.
+                property <length> inset-right: root.compact ? 14px : 16px;
                 Divider { x: 0px; y: 0px; width: 1px; height: parent.height; }
                 VerticalLayout {
                     padding-left: queue-pane.inset-left; padding-right: queue-pane.inset-right;
                     padding-top: 10px; padding-bottom: 5px; spacing: 8px;
                     HorizontalLayout {
-                        height: 41px; spacing: 8px;
+                        height: 41px; spacing: 8px; padding-left: 4px;
                         Text { text: "Queue"; color: Theme.text; font-size: 22px * Theme.density; font-weight: 750; vertical-alignment: center; horizontal-stretch: 1; }
                         Action {
                             text: shell.queue-order-edit ? "Done" : "Edit order";
@@ -951,8 +952,8 @@ export component AppWindow inherits Window {
                         max-height: self.visible ? 65535px : 0px;
                         min-width: queue-scroll.min-width;
                         min-height: 0px; vertical-stretch: self.visible ? 1 : 0;
-                        // Use a pane-wide paint clip but keep the stock scroll input and
-                        // scrollbar on their original inset lane, in front of the list.
+                        // Paint row focus to the pane edges without putting row controls
+                        // under the overlay scrollbar in the right margin.
                         Rectangle {
                             x: -queue-pane.inset-left; y: 0px;
                             width: parent.width + queue-pane.inset-left + queue-pane.inset-right;
@@ -960,7 +961,7 @@ export component AppWindow inherits Window {
                             clip: true;
                             queue-list := VerticalLayout {
                                 x: queue-pane.inset-left; y: queue-scroll.content-y;
-                                width: queue-scroll.visible-width; height: self.preferred-height;
+                                width: queue-lane.width; height: self.preferred-height;
                                 spacing: 3px; alignment: start; padding-bottom: 8px;
                                 if root.queue-rows.length > 0 && root.queue-status != "": Notice { text: root.queue-status; }
                                 if root.queue-rows.length == 0: Caption {
@@ -973,9 +974,12 @@ export component AppWindow inherits Window {
                                         property <bool> member: phase == "current" ? row.current : phase == "upcoming" ? row.upcoming && !row.current : !row.current && !row.upcoming;
                                         property <bool> first-upcoming: i == 0 || !root.queue-rows[i - 1].upcoming;
                                         property <bool> first-played: i == 0 || root.queue-rows[i - 1].current || root.queue-rows[i - 1].upcoming;
-                                        if self.member && (row.current || (row.upcoming ? self.first-upcoming : self.first-played)): Eyebrow {
-                                            text: phase == "current" ? "NOW PLAYING" : phase == "upcoming" ? "UP NEXT" : "PLAYED";
-                                            height: 27px; color: phase == "current" ? Theme.primary : Theme.muted;
+                                        if self.member && (row.current || (row.upcoming ? self.first-upcoming : self.first-played)): HorizontalLayout {
+                                            height: 27px; padding-left: 4px;
+                                            Eyebrow {
+                                                text: phase == "current" ? "NOW PLAYING" : phase == "upcoming" ? "UP NEXT" : "PLAYED";
+                                                color: phase == "current" ? Theme.primary : Theme.muted;
+                                            }
                                         }
                                         if self.member: MediaLine {
                                             title: row.title; subtitle: row.subtitle; kind: "track";
@@ -985,9 +989,8 @@ export component AppWindow inherits Window {
                                             playing-track: self.current-track && root.playing;
                                             credits: row.credits; metadata-enabled: !root.local-mode && !root.editor-open;
                                             album-id: row.album-id; album-name: row.album-name;
-                                            artwork: row.current ? root.cover-art : root.no-artwork;
-                                            can-open: false; compact: !row.current;
-                                            queue-columns: true;
+                                            artwork: self.current-track ? root.cover-art : root.no-artwork;
+                                            can-open: false; compact: true; queue-row: true;
                                             paint-left: queue-pane.inset-left; paint-right: queue-pane.inset-right;
                                             paint-surface: Theme.rail;
                                             playable: row.upcoming && root.queue-controls && !root.editor-open;
@@ -1003,7 +1006,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         queue-scroll := ScrollView {
-                            x: 0px; y: 0px; width: parent.width; height: parent.height;
+                            x: 0px; y: 0px; width: parent.width + queue-pane.inset-right; height: parent.height;
                             content-height: queue-list.height;
                             horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
                             function reveal(y: length, h: length) {
