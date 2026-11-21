@@ -124,7 +124,26 @@ export component AppWindow inherits Window {
     in property <string> page-status;
     in property <bool> page-busy;
     in property <bool> page-error;
-    in property <bool> has-more;
+    in property <string> catalog-request-key;
+    in property <string> catalog-continuation-status;
+    in property <bool> catalog-loading;
+    in property <string> catalog-return-key;
+    in property <float> catalog-return-y;
+    in property <int> catalog-return-anchor: -1;
+    in property <float> catalog-return-offset;
+    in property <int> catalog-return-row: -1;
+    in property <string> catalog-return-part;
+    in property <string> catalog-return-credit;
+    in property <int> catalog-return-serial;
+    in-out property <float> catalog-scroll-y;
+    in-out property <int> catalog-anchor-row: -1;
+    in-out property <float> catalog-anchor-y;
+    in-out property <int> catalog-focused-row: -1;
+    in-out property <string> catalog-focused-part;
+    in-out property <string> catalog-focused-credit;
+    // True only during a synchronous row-originated navigation callback.
+    in-out property <bool> catalog-row-navigation;
+    callback catalog-demand(string);
     in property <bool> can-back;
     in property <[string]> page-actions;
     in property <PlaylistActions> playlist-actions;
@@ -368,6 +387,10 @@ export component AppWindow inherits Window {
             root.search-edited();
         }
         function apply-return-scroll() {
+            if catalog-scroll.restore-catalog {
+                self.restoring-key = "";
+                return;
+            }
             if self.restoring-key == "" || self.restoring-key != catalog-scroll.scroll-key { return; }
             if root.playlist-detail && root.page-busy && root.browse-rows.length == 0 { return; }
             catalog-scroll.set-scroll(self.restoring-y);
@@ -630,7 +653,49 @@ export component AppWindow inherits Window {
                         horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
                         property <string> scroll-key: root.is-search ? "search|" + root.query
                             : root.page-key != "" ? root.page-key : root.page-kind + "|" + root.catalog-title;
-                        changed scroll-key => { shell.destination-scrolled(); }
+                        property <bool> catalog-results-route: root.is-search || root.page-kind == "album" || root.page-kind == "artist";
+                        property <length> scroll-position: self.content-y;
+                        changed scroll-position => { root.catalog-scroll-y = self.content-y / 1px; }
+                        changed scroll-key => {
+                            root.catalog-focused-row = -1;
+                            root.catalog-anchor-row = -1;
+                            shell.destination-scrolled();
+                        }
+                        property <int> return-serial: root.catalog-return-serial;
+                        property <int> restored-serial;
+                        property <bool> restore-catalog: self.return-serial != self.restored-serial
+                            && root.page-key == root.catalog-return-key && self.catalog-results-route;
+                        changed return-serial => { self.restore-step = 0; }
+                        Timer {
+                            interval: 1ms;
+                            running: catalog-scroll.restore-catalog && catalog-results.height > 0px
+                                && catalog-scroll.visible-width > 0px && catalog-scroll.visible-height > 0px;
+                            triggered => {
+                                if catalog-scroll.restore-step == 0 {
+                                    catalog-scroll.set-scroll(root.catalog-return-y * 1px);
+                                    catalog-scroll.return-anchor-serial += 1;
+                                } else if catalog-scroll.restore-step == 1 {
+                                    catalog-scroll.return-focus-serial += 1;
+                                } else { catalog-scroll.restored-serial = catalog-scroll.return-serial; }
+                                catalog-scroll.restore-step += 1;
+                            }
+                        }
+                        property <int> restore-step;
+                        property <int> return-anchor-serial;
+                        property <int> return-focus-serial;
+                        property <string> issued-request;
+                        Timer {
+                            interval: 16ms;
+                            running: catalog-scroll.visible && catalog-scroll.catalog-results-route
+                                && !root.editor-open && !root.compact-queue-open && !catalog-scroll.restore-catalog
+                                && root.catalog-request-key != "" && root.catalog-request-key != catalog-scroll.issued-request
+                                && catalog.y + catalog-results.y + catalog-results.height + catalog-scroll.content-y
+                                    <= catalog-scroll.visible-height + min(280px, catalog-scroll.visible-height / 2);
+                            triggered => {
+                                catalog-scroll.issued-request = root.catalog-request-key;
+                                root.catalog-demand(catalog-scroll.issued-request);
+                            }
+                        }
                         changed content-height => {
                             if root.playlist-detail { self.set-scroll(self.content-y); }
                             shell.apply-return-scroll();
@@ -800,6 +865,7 @@ export component AppWindow inherits Window {
                                     : root.saved-view ? "DOWNLOADED MUSIC" : "";
                             }
                             catalog-list := FocusScope {
+                                visible: !catalog-scroll.catalog-results-route;
                                 min-height: root.playlist-detail ? root.browse-rows.length * self.pitch : other-rows.preferred-height;
                                 focus-on-click: false;
                                 focus-on-tab-navigation: root.playlist-detail && root.browse-rows.length > 0;
@@ -902,7 +968,7 @@ export component AppWindow inherits Window {
                                 }
                                 other-rows := VerticalLayout {
                                     x: 0px; y: 0px; width: parent.width; height: self.preferred-height; spacing: 2px;
-                                    for i in root.playlist-detail ? 0 : root.browse-rows.length: shelf-row := VerticalLayout {
+                                    for i in (root.playlist-detail || catalog-scroll.catalog-results-route) ? 0 : root.browse-rows.length: shelf-row := VerticalLayout {
                                         property <BrowseRow> entry: root.browse-rows[i];
                                         spacing: 4px;
                                         if shelf-row.entry.section != "": Eyebrow { text: shelf-row.entry.section; height: 27px; }
@@ -927,9 +993,97 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.has-more && !root.playlist-detail: HorizontalLayout {
-                                Action { text: "Load more"; enabled: !root.page-busy; clicked => { root.page-action("more", ""); } }
-                                Rectangle { horizontal-stretch: 1; }
+                            catalog-results := VerticalLayout {
+                                visible: catalog-scroll.catalog-results-route && root.browse-rows.length > 0;
+                                spacing: 2px;
+                                // Layout slots give the one scroll surface exact geometry. Only
+                                // mount rich row controls around the viewport and keyboard focus.
+                                for entry[index] in (catalog-scroll.catalog-results-route ? root.browse-rows : []): slot := Rectangle {
+                                    property <string> album: root.page-kind == "album" || entry.kind != "track" ? "" : entry.album-name;
+                                    property <bool> show-type: root.is-search && (entry.kind == "track" || entry.kind == "artist" || entry.kind == "album");
+                                    height: Copy.result-height(self.show-type, entry.credits.length > 0 || entry.subtitle != "", self.album != "");
+                                    property <length> row-y: catalog.y + catalog-results.y + self.y;
+                                    property <length> visible-y: self.row-y + catalog-scroll.content-y;
+                                    property <bool> near-viewport: self.visible-y + self.height >= -catalog-scroll.visible-height
+                                        && self.visible-y <= 2 * catalog-scroll.visible-height;
+                                    property <bool> near-focus: root.catalog-focused-row >= 0 && abs(index - root.catalog-focused-row) <= 2;
+                                    property <bool> restoring: catalog-scroll.restore-catalog && index == root.catalog-return-row;
+                                    property <bool> is-anchor: self.visible-y <= 0px && self.visible-y + self.height + catalog-results.spacing > 0px;
+                                    function publish-anchor() {
+                                        if self.is-anchor {
+                                            root.catalog-anchor-row = index;
+                                            root.catalog-anchor-y = self.row-y / 1px;
+                                        }
+                                    }
+                                    changed is-anchor => { self.publish-anchor(); }
+                                    changed row-y => { self.publish-anchor(); }
+                                    property <int> restore-anchor: catalog-scroll.return-anchor-serial;
+                                    changed restore-anchor => {
+                                        if index == root.catalog-return-anchor {
+                                            catalog-scroll.set-scroll(clamp(root.catalog-return-offset * 1px, -self.height, 0px) - self.row-y);
+                                        }
+                                    }
+                                    if slot.near-viewport || slot.near-focus || slot.restoring: MediaLine {
+                                        width: parent.width; height: parent.height;
+                                        title: entry.title; subtitle: entry.subtitle; detail: entry.detail; kind: entry.kind;
+                                        search-result: root.is-search;
+                                        align-credit-fallback: true;
+                                        paint-left: main.inset; paint-right: main.inset;
+                                        sequence: root.page-kind == "album" ? index + 1 : 0;
+                                        artwork: index < root.browse-artwork.length ? root.browse-artwork[index] : root.no-artwork;
+                                        credits: entry.credits; metadata-enabled: !root.local-mode;
+                                        album-id: entry.album-id; album-name: slot.album;
+                                        playable: entry.playable && (!root.local-mode || root.can-play-local);
+                                        can-open: entry.can-open && (!root.local-mode || entry.kind == "saved-collection");
+                                        selectable: entry.kind == "track";
+                                        current-track: entry.track-id != "" && entry.track-id == root.now-track-id;
+                                        playing-track: self.current-track && root.playing;
+                                        compact: main.width < 435px;
+                                        window-height: root.height;
+                                        menu-key: root.page-key + "|" + root.browse-model-key + "|" + index;
+                                        actions: !root.local-mode ? entry.actions : [];
+                                        property <int> return-focus: catalog-scroll.return-focus-serial;
+                                        changed return-focus => {
+                                            if slot.restoring && slot.visible-y + slot.height > 0px && slot.visible-y < catalog-scroll.visible-height {
+                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-part = root.catalog-return-part;
+                                                root.catalog-focused-credit = root.catalog-return-credit;
+                                                self.restore-focus(root.catalog-return-part, root.catalog-return-credit);
+                                            }
+                                        }
+                                        focused => {
+                                            if !catalog-scroll.restore-catalog {
+                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-part = "";
+                                                root.catalog-focused-credit = "";
+                                                catalog-scroll.reveal(slot.row-y, slot.height);
+                                            }
+                                        }
+                                        action(op) => {
+                                            if op == "open" || op == "add" {
+                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-part = op == "add" ? "menu" : "";
+                                                root.catalog-focused-credit = "";
+                                                root.catalog-row-navigation = true;
+                                            }
+                                            shell.browse(op, index);
+                                            root.catalog-row-navigation = false;
+                                        }
+                                        page-action(op, id) => {
+                                            root.catalog-focused-row = index;
+                                            root.catalog-focused-part = op;
+                                            root.catalog-focused-credit = id;
+                                            root.catalog-row-navigation = true;
+                                            shell.entity(op, id, index);
+                                            root.catalog-row-navigation = false;
+                                        }
+                                    }
+                                }
+                            }
+                            if root.catalog-loading: Caption { text: "Loading…"; }
+                            if root.catalog-continuation-status != "": Notice {
+                                text: root.catalog-continuation-status;
+                                error: true;
                             }
                         }
                     }

@@ -7,6 +7,7 @@ component CreditName inherits Rectangle {
     in property <bool> interactive;
     in property <bool> restore-focus;
     in property <length> font-size;
+    in property <int> focus-serial;
     out property <length> text-width: label.preferred-width;
     callback activated(string);
     callback focused();
@@ -34,6 +35,8 @@ component CreditName inherits Rectangle {
             init => { if self.restoring { self.focus(); } }
             changed restoring => { if self.restoring { self.focus(); } }
             focus-on-click: false;
+            property <int> resume: root.focus-serial;
+            changed resume => { if self.resume != 0 { self.focus(); } }
             focus-gained(_) => { root.focused(); }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == Key.Space {
@@ -67,6 +70,8 @@ export component CreditLine inherits Rectangle {
     in property <bool> interactive: true;
     in property <string> restore-control;
     in property <length> font-size: 13px * Theme.density;
+    in property <string> focus-credit;
+    in property <int> focus-serial;
     in property <bool> background-clickable;
     in property <string> background-click-scope;
     in property <MouseCursor> background-cursor: MouseCursor.pointer;
@@ -136,6 +141,7 @@ export component CreditLine inherits Rectangle {
                     x: slot.inset; width: max(0px, slot.width - self.x); height: slot.height;
                     credit: credit; interactive: root.interactive; font-size: root.font-size;
                     restore-focus: root.restore-control == "artist:" + credit.id;
+                    focus-serial: root.focus-credit != "" && root.focus-credit == credit.id ? root.focus-serial : 0;
                     activated(id) => { root.activated(id); }
                     focused => {
                         let start = strip.x + slot.x;
