@@ -58,15 +58,24 @@ export component OutputPicker inherits Action {
             width: 100%; height: 100%;
             background: Theme.panel;
             border-color: Theme.line; border-width: 1px; border-radius: Theme.container-radius;
+            // Panel-local guides. Keep the check in its own gutter, whether or
+            // not there is a selected output, and align the two icon actions.
+            property <length> text-guide: 32px;
+            property <length> check-inset: 12px;
+            property <length> action-inset: 8px;
+            property <length> action-size: 36px;
+            property <length> row-height: 42px;
             header := Rectangle {
-                x: 1px; y: 1px; width: parent.width - 2px; height: 42px;
+                x: 1px; y: 1px; width: parent.width - 2px; height: panel.row-height;
                 Text {
-                    x: 11px; width: parent.width - 54px; height: parent.height;
+                    x: panel.text-guide - header.x; width: close-button.x - self.x - 8px; height: parent.height;
                     text: "Playback devices"; color: Theme.text;
                     font-size: 14px * Theme.density; font-weight: 700; vertical-alignment: center;
                 }
                 close-button := Action {
-                    x: parent.width - 39px; y: 3px; width: 36px; height: 36px;
+                    x: panel.width - header.x - panel.action-inset - self.width;
+                    y: (parent.height - self.height) / 2;
+                    width: panel.action-size; height: self.width;
                     icon: "×"; quiet: true; pointer-focus-visible: false;
                     accessible-label: "Close playback devices";
                     clicked => { picker.close(); }
@@ -85,11 +94,15 @@ export component OutputPicker inherits Action {
                     }
                 }
                 rows := VerticalLayout {
+                    property <length> label-inset: panel.text-guide - scroll.x - self.padding-left;
                     width: scroll.visible-width; padding-left: 5px; padding-right: 15px;
                     padding-bottom: root.message != "" || choices.preferred-height > 0px ? 7px : 0px;
-                    if root.message != "": Caption {
-                        text: root.message; wrap: word-wrap; min-width: 0px;
-                        height: self.preferred-height + 12px;
+                    if root.message != "": Rectangle {
+                        height: status-text.preferred-height + 12px;
+                        status-text := Caption {
+                            x: rows.label-inset; width: parent.width - self.x; height: parent.height;
+                            text: root.message; wrap: word-wrap; min-width: 0px;
+                        }
                     }
                     choices := VerticalLayout {
                         for eligible in [true, false]: VerticalLayout {
@@ -99,7 +112,7 @@ export component OutputPicker inherits Action {
                                         : !device.can-play ? "Cannot play audio" : "";
                                     Action {
                                         height: 34px; min-width: 0px;
-                                        text: device.name; leading: true; quiet: true;
+                                        text: device.name; leading: true; leading-inset: rows.label-inset; quiet: true;
                                         enabled: eligible;
                                         accessible-label: "Select output: " + device.name;
                                         accessible-description: choice.reason;
@@ -113,7 +126,7 @@ export component OutputPicker inherits Action {
                                         }
                                     }
                                     if choice.reason != "": Caption {
-                                        x: 10px; width: parent.width - 20px;
+                                        x: rows.label-inset; width: parent.width - self.x;
                                         text: choice.reason; height: self.preferred-height + 3px;
                                         accessible-role: none;
                                     }
@@ -130,7 +143,8 @@ export component OutputPicker inherits Action {
                 height: self.preferred-height;
                 for device in root.devices: VerticalLayout {
                     if device.selected: row := FocusScope {
-                        height: 42px + (self.reason != "" && !self.editing ? 17px : 0px);
+                        height: panel.row-height + (self.editing && self.stack-editor ? panel.action-size + 4px
+                            : self.reason != "" && !self.editing ? reason-text.height : 0px);
                         focus-on-click: false; focus-on-tab-navigation: false;
                         property <bool> current: device.available && !root.offline;
                         property <string> reason: root.offline ? "" : !device.available ? "Not available"
@@ -138,6 +152,8 @@ export component OutputPicker inherits Action {
                         property <string> device-id: device.id;
                         property <string> editing-id;
                         property <bool> editing: self.current && self.editing-id == self.device-id;
+                        // Larger text needs the whole line to show an ordinary name.
+                        property <bool> stack-editor: Theme.density >= 1.1;
                         property <string> draft;
                         changed device-id => { self.editing-id = ""; }
                         changed current => {
@@ -159,49 +175,69 @@ export component OutputPicker inherits Action {
                             }
                             return reject;
                         }
-                        HorizontalLayout {
-                            height: 42px;
-                            padding-left: 11px; padding-right: 4px; spacing: 3px;
-                            Text {
-                                visible: !row.editing;
-                                min-width: 0px; horizontal-stretch: 1;
-                                max-width: self.visible ? 65535px : 0px;
-                                text: (row.current ? "✓ " : "") + device.name;
-                                color: row.current ? Theme.primary : Theme.muted;
-                                font-size: 14px * Theme.density; font-weight: 600;
-                                vertical-alignment: center; overflow: elide;
-                                accessible-label: device.name;
-                                accessible-item-selectable: row.current;
-                                accessible-item-selected: row.current;
-                                accessible-description: !row.current ? row.reason
-                                    : row.reason == "" ? "Selected output" : "Selected output · " + row.reason;
-                            }
-                            pencil := Action {
-                                visible: row.current && !row.editing; enabled: self.visible;
-                                width: self.visible ? 34px : 0px;
-                                height: 34px; icon: "rename"; quiet: true;
-                                accessible-label: "Rename device: " + device.name;
-                                click-scope: device.id;
-                                clicked => { row.draft = device.name; row.editing-id = device.id; }
-                            }
-                            if row.editing: Field {
-                                height: 36px; text <=> row.draft; field-label: "Device name";
+                        if row.current && !row.editing: checkmark := Text {
+                            x: panel.check-inset - selected-row.x; y: 0px;
+                            width: panel.text-guide - panel.check-inset - 4px; height: panel.row-height;
+                            text: "✓"; color: Theme.primary;
+                            font-size: 14px * Theme.density; font-weight: 600;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            accessible-role: none;
+                        }
+                        selected-name := Text {
+                            visible: !row.editing;
+                            x: panel.text-guide - selected-row.x; y: 0px; height: panel.row-height;
+                            width: max(0px, pencil.x - 8px - self.x);
+                            text: device.name; color: row.current ? Theme.primary : Theme.muted;
+                            font-size: 14px * Theme.density; font-weight: 600;
+                            vertical-alignment: center; overflow: elide;
+                            accessible-label: device.name;
+                            accessible-item-selectable: row.current;
+                            accessible-item-selected: row.current;
+                            accessible-description: !row.current ? row.reason
+                                : row.reason == "" ? "Selected output" : "Selected output · " + row.reason;
+                        }
+                        pencil := Action {
+                            x: panel.width - selected-row.x - panel.action-inset - panel.action-size;
+                            y: (panel.row-height - self.height) / 2;
+                            visible: row.current && !row.editing; enabled: self.visible;
+                            width: panel.action-size; height: self.width; icon: "rename"; quiet: true;
+                            accessible-label: "Rename device: " + device.name;
+                            click-scope: device.id;
+                            clicked => { row.draft = device.name; row.editing-id = device.id; }
+                        }
+                        if row.editing: editor := Rectangle {
+                            // Align the typed text (not the field border) to the names.
+                            x: panel.text-guide - selected-row.x - name-field.text-inset;
+                            y: (panel.row-height - panel.action-size) / 2;
+                            width: panel.width - selected-row.x - self.x - panel.action-inset;
+                            height: cancel-button.y + panel.action-size;
+                            name-field := Field {
+                                x: 0px; y: 0px; height: panel.action-size;
+                                width: row.stack-editor ? parent.width : max(0px, save-button.x - 4px);
+                                text <=> row.draft; field-label: "Device name";
                                 init => { self.take-focus(); }
                                 accepted => { row.finish(true); }
                             }
-                            if row.editing: Action {
-                                text: "Save"; height: 34px; primary: true; enabled: row.draft != "";
+                            save-button := Action {
+                                x: cancel-button.x - self.width - 4px; y: cancel-button.y;
+                                width: self.min-width; height: panel.action-size;
+                                text: "Save"; primary: true; enabled: row.draft != "";
                                 accessible-label: "Save device name";
                                 clicked => { row.finish(true); }
                             }
-                            if row.editing: Action {
-                                text: "Cancel"; height: 34px; quiet: true;
+                            cancel-button := Action {
+                                x: parent.width - self.width;
+                                y: row.stack-editor ? panel.action-size + 4px : 0px;
+                                width: self.min-width; height: panel.action-size;
+                                text: "Cancel"; quiet: true;
                                 accessible-label: "Cancel device rename";
                                 clicked => { row.finish(false); }
                             }
                         }
-                        if row.reason != "" && !row.editing: Caption {
-                            x: 11px; y: 39px; height: 17px;
+                        reason-text := Caption {
+                            visible: row.reason != "" && !row.editing;
+                            x: selected-name.x; y: panel.row-height - 3px;
+                            width: parent.width - self.x - panel.action-inset; height: self.preferred-height + 3px;
                             text: row.reason; accessible-role: none;
                         }
                     }

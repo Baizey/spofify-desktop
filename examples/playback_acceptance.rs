@@ -88,6 +88,20 @@ fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
             "one" => load_roster(&ui, &rows[..1]),
             "mixed" => load_roster(&ui, &rows[..4]),
             "long" => load_roster(&ui, &rows),
+            "long-names" => {
+                let mut roster = rows[..4].to_vec();
+                for device in &mut roster[..2] {
+                    device.name =
+                        format!("{} — {}", device.name, "extended label ".repeat(12)).into();
+                }
+                load_roster(&ui, &roster);
+            }
+            "selected-unavailable" => {
+                let mut roster = rows[..4].to_vec();
+                roster[0].available = false;
+                load_roster(&ui, &roster);
+            }
+            "density-max" => ui.set_density_scale(1.25),
             "offline" => ui.set_manual_offline(true),
             "reconnect" => ui.set_reconnecting(true),
             "online" => {
