@@ -172,7 +172,7 @@ fn retry_lyrics_read(error: ApiError) -> bool {
     // Don't guess at a server's rate-limit cooldown (429).
     error == TIMEOUT
         || error.is_retryable_lyric_transport_failure()
-        || matches!(error.status, 408 | 500 | 502..=504)
+        || crate::api_transport::is_transient_status(error.status)
 }
 
 pub(crate) struct Presentation {
