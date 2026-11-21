@@ -2,7 +2,7 @@
 """Check Play/Pause ink relative to its round fill in native fixture PNGs (requires Pillow).
 
 Usage: python3 scripts/acceptance/icon_alignment.py CAPTURE_DIR
-Run the native acceptance suite with its default fixture palette first.
+Run the native acceptance suite first.
 """
 from pathlib import Path
 import argparse
@@ -25,10 +25,12 @@ def check_frame(path, playing, dock):
             for p in ((x+1,y), (x-1,y), (x,y+1), (x,y-1)):
                 if p in points:
                     points.remove(p); group.append(p)
-        if len(group) < 950:
+        # A focused control reserves up to 4px inside each edge for the
+        # gold ring and dark separation. Locate the mint fill in either state.
+        if len(group) < 730:
             continue
         xs, ys = zip(*group); x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        if 37 <= x1-x0+1 <= 42 and 37 <= y1-y0+1 <= 42:
+        if 33 <= x1-x0+1 <= 42 and 33 <= y1-y0+1 <= 42:
             controls.append(((x0+x1)/2, (y0+y1)/2))
     if len(controls) != 1:
         raise ValueError(f'{path.name}: expected one fully visible transport circle; got {controls}')

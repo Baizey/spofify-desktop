@@ -118,6 +118,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     ui.set_busy(true);
     ui.set_restoring_login(true);
+    preferences::install_density(&ui);
     let (master_gain, _volume_writer) = preferences::install_local_volume(&ui);
     let output = engine::OutputPreferences {
         crossfade_enabled: preferences::install_playback(&ui),
@@ -137,7 +138,6 @@ fn main() -> Result<(), slint::PlatformError> {
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx.clone(), art);
     desk.bind(&ui, mode, access.clone());
     let _media = presentation::install(&ui, access.clone());
-    let _prefs = preferences::install(&ui, access.clone());
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     update::start(&ui, access);
     bind_auth(&ui, &auth_tx, &epoch);

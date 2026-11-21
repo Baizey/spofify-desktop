@@ -1,6 +1,3 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
-  <!-- Faithful adaptation of spofify-mobile app/src/main/res/drawable/ic_spofify.xml.
-       Source/provenance: docs/specs/FEAT-021-mobile-logo-branding.md. -->
-  <path fill="#101412" d="M0,0h108v108h-108z"/>
-  <path fill="#78E0AC" d="M28,38h8v32h-8zM43,25h8v58h-8zM58,34h8v40h-8zM73,43h8v22h-8z"/>
+  <path fill="#66e3b4" d="M28,38h8v32h-8zM43,25h8v58h-8zM58,34h8v40h-8zM73,43h8v22h-8z"/>
 </svg>

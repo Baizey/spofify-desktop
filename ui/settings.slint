@@ -1,7 +1,5 @@
 import { Action, Caption, Divider, Theme } from "theme.slint";
 
-export struct PaletteRow { id: string, title: string, primary: color, on-primary: color, secondary: color, tertiary: color }
-
 export component SettingCard inherits Rectangle {
     in property <string> title;
     in property <string> detail;
@@ -57,7 +55,7 @@ component SettingsChoice inherits SettingsAction {
     if root.selected: Rectangle {
         x: (parent.width - self.width) / 2; y: parent.height - 6px;
         width: 14px; height: 2px; border-radius: 1px;
-        background: Theme.accent; accessible-role: none;
+        background: Theme.primary; accessible-role: none;
     }
 }
 
@@ -135,52 +133,20 @@ component SettingsRow inherits Rectangle {
     }
 }
 
-component SettingsOptions inherits VerticalLayout {
-    in property <string> title;
-    spacing: 5px;
-    SettingsLabel { text: root.title; }
-    FlexboxLayout {
-        flex-wrap: wrap;
-        alignment: stretch;
-        spacing: 5px;
-        @children
-    }
-}
-
 component SettingsNotice inherits Rectangle {
     in property <string> text;
     in property <bool> error;
     border-radius: 8px;
     border-width: 1px;
-    border-color: root.error ? Theme.red.with-alpha(0.40) : Theme.line;
-    background: root.error ? Theme.red.with-alpha(0.09) : Theme.rail;
+    border-color: root.error ? Theme.error.with-alpha(0.40) : Theme.line;
+    background: root.error ? Theme.error.with-alpha(0.09) : Theme.rail;
     min-height: message.preferred-height + 16px;
     vertical-stretch: 0;
     message := SettingsValue {
         x: 10px; y: 8px; width: parent.width - 20px;
         text: root.text;
-        color: root.error ? Theme.red : Theme.muted;
+        color: root.error ? Theme.error : Theme.muted;
         accessible-live-region: polite;
-    }
-}
-
-component PaletteChoice inherits SettingsChoice {
-    in property <PaletteRow> palette;
-    text: palette.title;
-    leading: true;
-    accessible-label: palette.title + (self.selected ? ", selected palette" : ", choose palette");
-    HorizontalLayout {
-        x: parent.width - self.width - 12px;
-        y: (parent.height - self.height) / 2;
-        width: self.preferred-width; height: self.preferred-height;
-        spacing: 1px;
-        for swatch in [root.palette.primary, root.palette.secondary, root.palette.tertiary]: Rectangle {
-            width: 15px; height: 15px;
-            border-radius: self.width / 2;
-            background: swatch;
-            border-width: 1px; border-color: Theme.line;
-            accessible-role: none;
-        }
     }
 }
 
@@ -191,19 +157,12 @@ export component Settings inherits Rectangle {
     in property <string> music-storage;
     in property <bool> crossfade-enabled;
     in property <string> crossfade-status;
-    in property <int> mode;
     in property <float> scale;
-    in property <[PaletteRow]> palettes;
-    in property <string> palette-id;
-    in property <string> palette-status;
-    in property <bool> palette-enabled;
     callback sign-out();
     callback toggle-offline();
     callback crossfade-changed(bool);
     callback open-downloads();
-    callback appearance(int, float);
-    callback select-palette(string);
-    callback reset();
+    callback density-changed(float);
     callback focused(length, length);
     min-height: content.preferred-height;
     vertical-stretch: 0;
@@ -220,9 +179,9 @@ export component Settings inherits Rectangle {
 
         Rectangle {
             // A single instance and reading order at every width keeps focus
-            // and palette selection intact while the page reflows.
-            min-height: root.split ? max(listening.min-height, appearance-panel.min-height)
-                : listening.min-height + root.gap + appearance-panel.min-height;
+            // and density selection intact while the page reflows.
+            min-height: root.split ? max(listening.min-height, density-panel.min-height)
+                : listening.min-height + root.gap + density-panel.min-height;
             vertical-stretch: 0;
             listening := SettingsPanel {
                 x: 0px; y: 0px; width: root.panel-width;
@@ -232,7 +191,7 @@ export component Settings inherits Rectangle {
                 SettingsRow {
                     title: "Connection";
                     status: root.reconnecting ? "Reconnecting…" : root.offline ? "Offline" : "Online";
-                    status-color: root.reconnecting ? Theme.amber : root.offline ? Theme.subtle : Theme.accent;
+                    status-color: root.reconnecting ? Theme.tertiary : root.offline ? Theme.subtle : Theme.primary;
                     detail: root.offline ? "Downloaded music only" : "";
                     SettingsAction {
                         text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline";
@@ -244,7 +203,6 @@ export component Settings inherits Rectangle {
                 Divider { }
                 SettingsRow {
                     title: "Crossfade";
-                    detail: "Up to 5 seconds · This device";
                     SettingsChoice {
                         text: root.crossfade-enabled ? "On" : "Off";
                         min-width: 58px;
@@ -266,40 +224,22 @@ export component Settings inherits Rectangle {
                     }
                 }
             }
-            appearance-panel := SettingsPanel {
+            density-panel := SettingsPanel {
                 x: root.split ? listening.width + root.gap : 0px;
                 y: root.split ? 0px : listening.height + root.gap;
                 width: root.panel-width;
                 height: root.split ? parent.height : self.min-height;
                 inset: root.inset;
-                title: "Appearance on this device";
-                SettingsOptions {
-                    title: "Theme";
-                    for choice in [{ name: "Dark", mode: 0 }, { name: "Light", mode: 1 }]: SettingsChoice {
-                        text: choice.name;
-                        horizontal-stretch: 1;
-                        selected: root.mode == choice.mode;
-                        focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
-                        clicked => { root.appearance(choice.mode, root.scale); }
-                    }
-                }
-                SettingsOptions {
-                    title: "Density";
+                title: "Density";
+                FlexboxLayout {
+                    flex-wrap: wrap; alignment: stretch; spacing: 5px;
                     for choice in [{ name: "Compact", scale: 0.85 }, { name: "Standard", scale: 1.0 }, { name: "Large", scale: 1.2 }]: SettingsChoice {
                         text: choice.name;
                         horizontal-stretch: 1;
                         selected: choice.scale == 0.85 ? root.scale < 0.95
                             : choice.scale == 1.0 ? root.scale >= 0.95 && root.scale < 1.10 : root.scale >= 1.10;
                         focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
-                        clicked => { root.appearance(root.mode, choice.scale); }
-                    }
-                }
-                HorizontalLayout {
-                    alignment: end;
-                    SettingsAction {
-                        text: "Reset display defaults"; quiet: true;
-                        focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
-                        clicked => { root.reset(); }
+                        clicked => { root.density-changed(choice.scale); }
                     }
                 }
             }
@@ -307,39 +247,10 @@ export component Settings inherits Rectangle {
         SettingsPanel {
             inset: root.inset;
             title: "Account";
-            SettingsLabel { text: "Account colors"; }
-            if root.offline: SettingsValue {
-                text: root.reconnecting ? "Available after reconnecting" : "Go online to change colors";
-                accessible-live-region: polite;
-            }
-            if !root.offline && root.palette-status != "": SettingsNotice { text: root.palette-status; }
-            if root.palettes.length > 0: palette-grid := Rectangle {
-                property <length> gap: 8px;
-                property <length> item-height: max(46px, 46px * Theme.density);
-                // One column at compact widths rather than an orphaned third tile.
-                property <int> columns: min(root.palettes.length,
-                    root.width - 2 * root.inset >= 450px * Theme.density + 2 * self.gap ? 3 : 1);
-                property <int> rows: ceil(root.palettes.length / max(1, self.columns));
-                property <length> item-width: (self.width + self.gap) / max(1, self.columns) - self.gap;
-                min-height: self.rows * (self.item-height + self.gap) - self.gap;
-                vertical-stretch: 0;
-                for option[index] in root.palettes: PaletteChoice {
-                    palette: option;
-                    x: mod(index, palette-grid.columns) * (palette-grid.item-width + palette-grid.gap);
-                    y: floor(index / palette-grid.columns) * (palette-grid.item-height + palette-grid.gap);
-                    width: palette-grid.item-width; height: palette-grid.item-height;
-                    selected: self.palette.id == root.palette-id;
-                    enabled: root.palette-enabled && !root.offline;
-                    focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
-                    clicked => { root.select-palette(self.palette.id); }
-                }
-            }
-            if !root.offline && root.palette-status == "" && root.palettes.length == 0: SettingsValue { text: "No colors available"; }
-            Divider { }
             SettingsRow {
                 detail: root.account;
                 SettingsAction {
-                    text: "Sign out"; danger: true;
+                    text: "Sign out";
                     focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
                     clicked => { root.sign-out(); }
                 }

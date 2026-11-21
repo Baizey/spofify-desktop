@@ -123,13 +123,13 @@ export component WorkspaceRail inherits Rectangle {
         }
         Rectangle { vertical-stretch: 1; }
         if root.offline || root.reconnecting: Caption {
-            text: root.reconnecting ? "Reconnecting…" : "Offline mode"; color: Theme.amber; height: 20px;
+            text: root.reconnecting ? "Reconnecting…" : "Offline mode"; color: Theme.tertiary; height: 20px;
         }
         if root.account != "": Caption { text: root.account; height: 22px; }
         settings := Action {
             text: "Settings"; icon: "⚙"; leading: true; quiet: true; min-width: 0px;
             selected: root.kind == "settings" || root.kind == "appearance" || root.kind == "account";
-            accessible-description: self.selected ? "Current section" : "Connection, appearance and account";
+            accessible-description: self.selected ? "Current section" : "Connection, density and account";
             enabled: !root.locked; clicked => { root.navigate("settings"); }
         }
     }

@@ -2,6 +2,7 @@
 from base64 import b64decode
 from contextlib import contextmanager
 import hashlib
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 import os
 from pathlib import Path
@@ -447,12 +448,28 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                                   playlists_root, queue_state, root_navigation, rules_editor, track_face,
                                   track_play_and_highlight, typed_catalog, wide_queue_toggle)
 
+    synthetic = ready is not None and api is None
+    if synthetic:
+        density_file = Path(env["XDG_CONFIG_HOME"]) / "spofify-desktop" / "appearance.json"
+        density_file.parent.mkdir()
+        legacy = '{"version":1,"theme":"light","scale_percent":115}'
+        density_file.write_text(legacy)
+
     failures = []
     with desktop(binary, root, env, pixels, multisize=ready is not None) as window:
         if ready is not None:
             window.resize(DESKTOP)
         window.find("Sign in")
-        login_options(window)
+        def enabled_remember_login():
+            option = login_options(window, required=True)
+            return option if option.get("accessibleEnabled") else None
+
+        option = wait("enabled remember login checkbox", enabled_remember_login)
+        check(not option.get("accessibleChecked"), "remember login should be unchecked at startup")
+        window.click_element(option)
+        check(login_options(window).get("accessibleChecked"), "click did not select remember login")
+        window.key(" ")
+        check(not login_options(window).get("accessibleChecked"), "Space did not clear remember login")
         window.pixels("01-login-empty")
         if ready is None:
             print("NOT RUN native sign-in/browsing/player (window-only run)", flush=True)
@@ -466,7 +483,20 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         pane_layout(window, wide=True)
         window.pixels("02-signed-in", DESKTOP[0])
 
-        if api is None:
+        if synthetic:
+            window.click("Settings")
+            window.find("Density", roles=("Groupbox",))
+            check(window.find("Large", roles=("Button",)).get("accessibleChecked"),
+                  "legacy appearance scale was not preserved")
+            check(density_file.read_text() == legacy, "loading density rewrote the legacy file")
+            window.absent(r"Appearance on this device|Account colors|Theme|Dark|Light|Jade|Ember|Violet")
+            window.click("Standard")
+            check(window.find("Standard", roles=("Button",)).get("accessibleChecked"),
+                  "updated density was not selected")
+            check(json.loads(density_file.read_text()) == {"version": 1, "scale_percent": 100},
+                  "changing density did not write density-only settings")
+            window.click("History")
+            print("PASS preserved legacy density and removed theme choices", flush=True)
             root_navigation(window, wide=True)
             playlist_back(window, wide=True)
             playlist_hit_checks(window)
@@ -488,7 +518,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             typed_catalog(window, COMPACT[0], capture=True, check_compact_targets=True)
             window.click("Settings")
             window.find("Work offline", roles=("Button",))
-            window.find("Reset display defaults", roles=("Button",))
+            window.find("Standard", roles=("Button",))
             window.pixels("06-settings-compact", COMPACT[0])
             track_play_and_highlight(window, ready["play_requests"])
             print("PASS workspace interaction against Go-shaped wire data (no playback execution)", flush=True)

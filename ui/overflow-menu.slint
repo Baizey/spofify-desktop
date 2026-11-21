@@ -86,11 +86,11 @@ export component OverflowMenu inherits Rectangle {
                 for op[i] in root.actions: Action {
                     height: root.item-height; min-width: 0px;
                     text: ActionCopy.label(op); icon: ActionCopy.mark(op);
-                    leading: true; quiet: true; danger: op == "delete" || op == "remove";
+                    leading: true; quiet: true;
                     keyboard-focusable: false;
                     selected: menu.highlighted == i;
                     border-width: self.selected && keys.has-focus ? 2px : 0px;
-                    border-color: Theme.blue;
+                    border-color: Theme.tertiary;
                     accessible-label: self.text + (root.item-context == "" ? "" : " · " + root.item-context);
                     changed has-hover => { if self.has-hover { menu.highlighted = i; } }
                     clicked => { menu.choose(op); }

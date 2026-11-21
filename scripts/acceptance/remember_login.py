@@ -120,7 +120,7 @@ def sign_out(window):
             if 0 <= top < bottom <= window.dimensions()[1] - 100:
                 return item
         # Settings shares the catalog's scroll viewport. The Account card
-        # can start below the fold, especially once palettes have arrived.
+        # can start below the fold.
         window.scroll_catalog(-360)
         return None
 

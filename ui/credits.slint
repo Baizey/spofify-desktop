@@ -20,7 +20,7 @@ component CreditName inherits Rectangle {
         accessible-action-default => { if root.linked { root.activated(root.credit.id); } }
         forward-focus: key;
         border-width: key.has-focus ? 1px : 0px;
-        border-color: Theme.blue;
+        border-color: Theme.tertiary;
         border-radius: 4px;
         background: pointer.has-hover ? Theme.raised : transparent;
 
@@ -45,7 +45,7 @@ component CreditName inherits Rectangle {
         x: 2px; width: max(0px, parent.width - 4px); height: parent.height;
         text: root.credit.name == "" ? "Unknown artist" : root.credit.name;
         font-size: root.font-size;
-        color: root.linked ? Theme.blue : Theme.muted;
+        color: root.linked ? Theme.primary : Theme.muted;
         accessible-role: none;
     }
     if !root.linked: Rectangle {
@@ -155,7 +155,7 @@ component DetailCredit inherits Text {
 
     property <bool> linked: root.interactive && root.credit.id != "";
     text: root.credit.name == "" ? "Unknown artist" : root.credit.name;
-    color: root.linked ? Theme.blue : Theme.muted;
+    color: root.linked ? Theme.primary : Theme.muted;
     wrap: char-wrap;
     overflow: clip;
     vertical-alignment: center;
@@ -169,7 +169,7 @@ component DetailCredit inherits Text {
         forward-focus: key;
         border-radius: 4px;
         border-width: key.has-focus ? 2px : pointer.has-hover ? 1px : 0px;
-        border-color: Theme.blue;
+        border-color: key.has-focus ? Theme.tertiary : Theme.line;
         pointer := TouchArea {
             mouse-cursor: MouseCursor.pointer;
             clicked => { key.focus(); root.activated(root.credit.id); }

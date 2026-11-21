@@ -58,17 +58,6 @@ PROTOCOL = "spofify.account-state.v1"
 SOCKET_PATH = "/api/me/player/socket"
 TICKET_PATH = "/api/me/player/connect"
 PLAYLIST_TOKEN = "wire-rows-v1"
-PALETTE_PATH = "/api/me/palette"
-PALETTE_PRESETS = [
-    {"id": name.lower(), "name": name,
-     "dark": dict(zip(("primary", "onPrimary", "secondary", "tertiary"), dark.split())),
-     "light": dict(zip(("primary", "onPrimary", "secondary", "tertiary"), light.split()))}
-    for name, dark, light in (
-        ("Jade", "#66e3b4 #08271d #91bfff #dfbd78", "#08704e #ffffff #2759a4 #77551b"),
-        ("Ember", "#ffad89 #31170d #c4b0ff #a4d7bd", "#aa431b #ffffff #654199 #23644a"),
-        ("Violet", "#c8b5ff #22183c #6de2d5 #e8b4c5", "#6442a5 #ffffff #0c6d67 #8b465e"),
-    )
-]
 
 
 def diagnostic_path(path):
@@ -213,9 +202,6 @@ def wire_fixture():
     ready["play_requests"] = play_requests
     tickets = {}
     ticket_lock = Lock()
-    palette_lock = Lock()
-    palette = dict(accountId=ready["userId"], paletteId="jade", revision=0, catalogVersion=1,
-                   defaultPaletteId="jade", presets=PALETTE_PRESETS)
 
     def consume_ticket(ticket):
         with ticket_lock:
@@ -343,35 +329,7 @@ def wire_fixture():
             if self.trusted() and self.owned():
                 self.reject_mutation()
 
-        do_DELETE = do_PATCH
-
-        def do_PUT(self):
-            if not self.trusted() or not self.owned():
-                return
-            if self.path != PALETTE_PATH:
-                return self.reject_mutation()
-            if self.headers.get("Origin") != ready["origin"] or self.headers.get("X-CSRF-Token") != csrf:
-                return self.error(403)
-            try:
-                size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 1024:
-                    raise ValueError
-                request = json.loads(self.rfile.read(size))
-                if (not isinstance(request, dict) or set(request) != {"paletteId", "catalogVersion", "expectedRevision"}
-                        or request["paletteId"] not in [p["id"] for p in PALETTE_PRESETS]
-                        or type(request["expectedRevision"]) is not int or request["expectedRevision"] < 0
-                        or type(request["catalogVersion"]) is not int):
-                    raise ValueError
-            except (ValueError, OSError):
-                return self.error(400)
-            with palette_lock:
-                if request["catalogVersion"] != 1:
-                    return self.reply({"code": "PALETTE_CATALOG_CONFLICT"}, 409)
-                if request["expectedRevision"] != palette["revision"]:
-                    return self.reply({"code": "PALETTE_REVISION_CONFLICT"}, 409)
-                palette.update(paletteId=request["paletteId"], revision=palette["revision"] + 1)
-                response = palette.copy()
-            self.reply(response)
+        do_DELETE = do_PUT = do_PATCH
 
         def do_GET(self):
             if not self.trusted() or not self.owned():
@@ -395,10 +353,6 @@ def wire_fixture():
                 self.reply(session)
             elif self.path == SOCKET_PATH:
                 self.account_socket()
-            elif self.path == PALETTE_PATH:
-                with palette_lock:
-                    response = palette.copy()
-                self.reply(response)
             elif route.path.startswith("/api/me/"):
                 violations.append(f"unexpected GET {diagnostic_path(route.path)}")
                 self.error(404)

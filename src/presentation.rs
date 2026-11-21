@@ -56,10 +56,6 @@ impl Account {
         self.epoch == other.epoch && Arc::ptr_eq(&self.api, &other.api) && self.id == other.id
     }
 
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
     fn same_network(&self, other: &Self) -> bool {
         self.same(other) && self.offline == other.offline && self.network == other.network
     }

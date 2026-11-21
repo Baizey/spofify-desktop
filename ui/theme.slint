@@ -1,25 +1,22 @@
 import { Glyph } from "icon.slint";
 export global Theme {
-    in-out property <bool> light;
     in-out property <float> density: 1.0;
-    out property <color> bg: light ? #fafbf9 : #131617;
-    out property <color> rail: light ? #f1f3ef : #191d1e;
-    out property <color> panel: light ? #ffffff : #1e2324;
-    out property <color> raised: light ? #e2e8e4 : #293032;
-    out property <color> line: light ? #cdd3d5 : #303638;
-    out property <color> muted: light ? #41516a : #b4bdcb;
-    out property <color> subtle: light ? #53657b : #9ca9ba;
-    out property <color> text: light ? #142034 : #f4f6fa;
-    in-out property <color> primary: #66e3b4;
-    in-out property <color> on-accent: #08271d;
-    in-out property <color> secondary: #91bfff;
-    in-out property <color> tertiary: #dfbd78;
-    out property <color> accent: light && primary == #66e3b4 ? #14614b : primary;
-    out property <color> button-fill: light && primary == #66e3b4 ? #147357 : primary;
-    out property <color> button-ink: light && primary == #66e3b4 ? #ffffff : on-accent;
-    out property <color> blue: light && secondary == #91bfff ? #275da5 : secondary;
-    out property <color> amber: light && tertiary == #dfbd78 ? #875611 : tertiary;
-    out property <color> red: light ? #a12546 : #ffa2ac;
+    out property <color> bg: #131617;
+    out property <color> rail: #191d1e;
+    out property <color> panel: #1e2324;
+    out property <color> raised: #293032;
+    out property <color> line: #303638;
+    out property <color> text: #f4f6fa;
+    out property <color> muted: #b4bdcb;
+    out property <color> subtle: #9ca9ba;
+    out property <color> primary: #66e3b4;
+    out property <color> on-primary: #08271d;
+    out property <color> tertiary: #dfbd78;
+    out property <color> error: #ffa2ac;
+
+    public pure function field-border(focused: bool) -> color {
+        return focused ? self.tertiary : self.subtle.with-alpha(0.65);
+    }
 }
 
 export component Caption inherits Text {
@@ -30,7 +27,7 @@ export component Caption inherits Text {
 }
 
 export component Eyebrow inherits Caption {
-    color: Theme.accent;
+    color: Theme.subtle;
     font-size: 11px * Theme.density;
     font-weight: 700;
     letter-spacing: 1.2px;
@@ -49,7 +46,6 @@ export component Action inherits Rectangle {
     in property <bool> primary;
     in property <bool> quiet;
     in property <bool> selected;
-    in property <bool> danger;
     in property <bool> leading;
     in property <bool> round;
     // An action whose target can change while the pointer is down can supply an identity.
@@ -75,12 +71,18 @@ export component Action inherits Rectangle {
     vertical-stretch: 0;
     border-radius: round ? self.height / 2 : 8px;
     border-width: key.has-focus && enabled ? 2px : (quiet ? 0px : 1px);
-    border-color: key.has-focus && enabled ? Theme.blue : primary ? Theme.accent : selected ? Theme.accent.with-alpha(0.48) : Theme.line;
+    border-color: key.has-focus && enabled ? Theme.tertiary : primary ? Theme.primary : selected ? Theme.primary.with-alpha(0.48) : Theme.line;
     background: !enabled ? (quiet ? transparent : Theme.panel)
-        : primary ? (pointer.pressed ? Theme.button-fill.darker(0.18) : pointer.has-hover ? Theme.button-fill.brighter(0.14) : Theme.button-fill)
-        : pointer.pressed ? Theme.line : selected ? Theme.accent.with-alpha(0.15) : pointer.has-hover || key.has-focus ? Theme.raised : quiet ? transparent : Theme.panel;
+        : primary ? (pointer.pressed ? Theme.primary.darker(0.18) : pointer.has-hover ? Theme.primary.brighter(0.14) : Theme.primary)
+        : pointer.pressed ? Theme.raised : selected ? Theme.primary.with-alpha(0.15) : pointer.has-hover || key.has-focus ? Theme.raised : quiet ? transparent : Theme.panel;
     opacity: enabled ? 1 : 0.48;
-    property <color> ink: primary && enabled ? Theme.button-ink : danger ? Theme.red : selected ? Theme.accent : Theme.text;
+    // Keep gold focus distinct from the similarly bright mint fill.
+    if root.primary && root.has-focus && root.enabled: Rectangle {
+        x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px;
+        border-width: 2px; border-color: Theme.bg; border-radius: max(0px, parent.border-radius - 2px);
+        accessible-role: none;
+    }
+    property <color> ink: primary && enabled ? Theme.on-primary : selected ? Theme.primary : Theme.text;
     property <length> glyph-size: root.icon == "" ? 0px : 18px;
     property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
     // An empty Text still has a preferred width. An icon-only button has no label to reserve room for.
@@ -140,13 +142,64 @@ export component Action inherits Rectangle {
     }
 }
 
+export component CheckChoice inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    height: max(24px, label.preferred-height + 6px);
+    border-radius: 4px;
+    border-width: key.has-focus && enabled ? 2px : 0px;
+    border-color: Theme.tertiary;
+    opacity: enabled ? 1 : 0.55;
+    forward-focus: key;
+    accessible-role: checkbox;
+    accessible-label: text;
+    accessible-enabled: enabled;
+    accessible-checkable: true;
+    accessible-checked: checked;
+    accessible-action-default => { if root.enabled { root.toggle(); } }
+
+    function toggle() { root.checked = !root.checked; }
+    Rectangle {
+        x: 4px; y: (parent.height - self.height) / 2; width: 18px; height: self.width;
+        border-radius: 3px; border-width: 1px;
+        border-color: root.checked ? Theme.primary : Theme.subtle;
+        background: root.checked ? (pointer.pressed ? Theme.primary.darker(0.18) : Theme.primary)
+            : pointer.has-hover ? Theme.raised : Theme.bg;
+        if root.checked: Path {
+            x: 3px; y: 3px; width: 12px; height: 12px; viewbox-width: 12; viewbox-height: 12;
+            commands: "M1,6 L4.5,9.5 L11,3"; stroke: Theme.on-primary; stroke-width: 2px;
+            accessible-role: none;
+        }
+    }
+    label := Text {
+        x: 32px; width: parent.width - self.x - 4px; height: parent.height; text: root.text;
+        color: Theme.text; vertical-alignment: center; accessible-role: none;
+    }
+    pointer := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { key.focus(); root.toggle(); }
+    }
+    key := FocusScope {
+        enabled: root.enabled; focus-on-click: false;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if !event.repeat { root.toggle(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
 // A text-sized target with its own hit area, separate from the containing row.
 // Slint 1.18 has no accessible link role; navigation is exposed as a named button.
 export component TextTarget inherits Rectangle {
     in property <string> text;
     in property <string> label: text;
     in property <bool> interactive: true;
-    in property <bool> accent;
+    in property <bool> link;
     in property <bool> fit-link;
     in property <color> ink: Theme.text;
     in property <length> font-size: 15px * Theme.density;
@@ -167,11 +220,11 @@ export component TextTarget inherits Rectangle {
         accessible-action-default => { key.focus(); root.activated(); }
         border-radius: 5px;
         border-width: key.has-focus ? 2px : 0px;
-        border-color: Theme.blue;
+        border-color: Theme.tertiary;
         background: pointer.has-hover || key.has-focus ? Theme.raised : transparent;
         words := Text {
             x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-            text: root.text; color: root.accent ? Theme.blue : root.ink;
+            text: root.text; color: root.link ? Theme.primary : root.ink;
             font-size: root.font-size; font-weight: root.font-weight;
             vertical-alignment: center; overflow: elide; accessible-role: none;
         }
@@ -205,7 +258,7 @@ export component AlbumLine inherits TextTarget {
     in property <bool> links-enabled: true;
     label: "Open album: " + self.text;
     interactive: links-enabled && album-id != "" && self.text != "";
-    accent: true;
+    link: true;
     ink: Theme.muted;
     font-size: 12px * Theme.density;
     font-weight: 500;
@@ -234,7 +287,7 @@ export component Field inherits Rectangle {
     border-radius: pill ? 23px : 8px;
     property <bool> show-focus: root.enabled && input.has-focus;
     border-width: show-focus ? 2px : 1px;
-    border-color: show-focus ? Theme.blue : Theme.line;
+    border-color: Theme.field-border(show-focus);
     opacity: enabled ? 1 : 0.55;
     clip: true;
     if root.prefix != "": Glyph { x: 13px; y: (parent.height - self.height)/2; width: 16px; height: 16px; name: root.prefix; ink: Theme.muted; }
@@ -256,7 +309,7 @@ export component Field inherits Rectangle {
         font-size: 14px * Theme.density;
         wrap: root.multiline ? word-wrap : no-wrap;
         vertical-alignment: root.multiline ? top : center;
-        selection-background-color: Theme.accent.with-alpha(0.3);
+        selection-background-color: Theme.primary.with-alpha(0.3);
         selection-foreground-color: Theme.text;
         accessible-label: root.field-label;
         edited => { root.edited(); }
@@ -268,15 +321,14 @@ export component Field inherits Rectangle {
 export component Cover inherits Rectangle {
     in property <image> artwork;
     in property <string> mark: "♫";
-    in property <color> tint: Theme.accent;
     in property <bool> circular;
     border-radius: circular && artwork.width == 0 ? self.height / 2 : min(12px, self.height / 5);
     background: Theme.raised;
     border-width: 1px;
-    border-color: #ffffff22;
+    border-color: Theme.line;
     clip: true;
     accessible-role: none;
-    if root.artwork.width == 0: Glyph { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: parent.height * 0.47; height: self.width; name: root.mark; ink: root.tint; }
+    if root.artwork.width == 0: Glyph { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: parent.height * 0.47; height: self.width; name: root.mark; ink: Theme.subtle; }
     Image {
         x: 0; y: 0; width: parent.width; height: parent.height;
         source: root.artwork; visible: root.artwork.width > 0; image-fit: cover; accessible-role: none;
@@ -291,11 +343,11 @@ export component Notice inherits Rectangle {
     vertical-stretch: 0;
     border-radius: 10px;
     border-width: 1px;
-    border-color: error ? Theme.red.with-alpha(0.40) : Theme.line;
-    background: error ? Theme.red.with-alpha(0.09) : Theme.panel;
+    border-color: error ? Theme.error.with-alpha(0.40) : Theme.line;
+    background: error ? Theme.error.with-alpha(0.09) : Theme.panel;
     message := Text {
         x: 12px; y: 9px; width: parent.width - 24px;
-        text: root.text; color: root.error ? Theme.red : Theme.muted;
+        text: root.text; color: root.error ? Theme.error : Theme.muted;
         font-size: 12px; wrap: word-wrap; vertical-alignment: center;
     }
 }

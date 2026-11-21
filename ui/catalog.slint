@@ -21,10 +21,6 @@ export global Copy {
             : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" || kind == "queue" ? "≡"
             : kind == "devices" ? "◫" : kind == "saved-collection" ? "↓" : "♫";
     }
-    public pure function tint(kind: string) -> color {
-        return kind == "history" || kind == "recent" || kind == "album" || kind == "albums" ? Theme.blue
-            : kind == "artist" || kind == "artists" ? Theme.amber : Theme.accent;
-    }
     public pure function action-label(action: string) -> string {
         return ActionCopy.label(action);
     }
@@ -39,7 +35,6 @@ export component Hero inherits Rectangle {
     in property <string> section;
     in property <string> glyph;
     in property <image> artwork;
-    in property <color> tint: Theme.accent;
     in property <bool> compact;
     in property <bool> show-art: true;
     in property <bool> large;
@@ -58,7 +53,7 @@ export component Hero inherits Rectangle {
             Cover {
                 y: (parent.height - self.height) / 2;
                 width: parent.width; height: self.width;
-                artwork: root.artwork; mark: root.glyph; tint: root.tint;
+                artwork: root.artwork; mark: root.glyph;
             }
         }
         copy := VerticalLayout {
@@ -66,7 +61,7 @@ export component Hero inherits Rectangle {
             horizontal-stretch: 1;
             alignment: center;
             spacing: 4px;
-            if root.section != "": Eyebrow { text: root.section; color: root.tint; }
+            if root.section != "": Eyebrow { text: root.section; }
             Text {
                 text: root.title; color: Theme.text; font-size: (root.compact ? 28px : 37px) * Theme.density;
                 font-weight: 700; letter-spacing: -1px; overflow: elide; wrap: word-wrap; max-height: root.compact ? 61px : 86px;
@@ -102,11 +97,11 @@ component TrackState inherits Rectangle {
     in property <bool> playing;
     width: 16px; height: self.width;
     Glyph {
-        visible: root.playing; name: "playing"; ink: Theme.accent;
+        visible: root.playing; name: "playing"; ink: Theme.primary;
         width: parent.width; height: parent.height;
     }
     Rectangle {
-        visible: !root.playing; background: Theme.accent;
+        visible: !root.playing; background: Theme.primary;
         width: 6px; height: self.width; border-radius: self.width / 2;
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
     }
@@ -167,7 +162,7 @@ export component MediaLine inherits Rectangle {
         width: parent.width; height: parent.height;
         border-radius: root.border-radius;
         border-width: row-keys.has-focus ? 2px : 0px;
-        border-color: Theme.blue;
+        border-color: Theme.tertiary;
         background: !root.body-focusable ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
             : row-face.has-hover || row-keys.has-focus ? Theme.raised.with-alpha(0.55) : transparent;
 
@@ -226,7 +221,7 @@ export component MediaLine inherits Rectangle {
             if root.sequence == 0 && !root.compact: Rectangle {
                 width: 39px;
                 Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
-                    artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist";
+                    artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
                     Rectangle {
                         visible: root.current-track;
                         x: parent.width - self.width; y: parent.height - self.height;
@@ -246,7 +241,7 @@ export component MediaLine inherits Rectangle {
                     height: max(20px, font-size + 7px);
                     Text {
                         x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-                        text: root.title; color: root.current-track || root.selected ? Theme.accent : Theme.text;
+                        text: root.title; color: root.current-track || root.selected ? Theme.primary : Theme.text;
                         font-size: parent.font-size; font-weight: 600;
                         vertical-alignment: center; overflow: elide;
                         accessible-role: none;

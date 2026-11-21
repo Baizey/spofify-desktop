@@ -6,10 +6,10 @@ import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
 import { PlayerBar } from "playback.slint";
 import { NowPlaying } from "now-playing.slint";
-import { PaletteRow, Settings, SettingCard } from "settings.slint";
+import { Settings, SettingCard } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { ArtistCredit, PaletteRow }
+export { ArtistCredit }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
@@ -23,6 +23,7 @@ export struct DeviceRow { id: string, name: string, selected: bool, available: b
 
 export component AppWindow inherits Window {
     title: "Spofify Desktop";
+    icon: @image-url("../assets/spofify-logo.svg");
     in property <length> inspection-width: 0px;
     in property <length> inspection-height: 0px;
     preferred-width: 1280px;
@@ -125,16 +126,8 @@ export component AppWindow inherits Window {
     in property <bool> crossfade-enabled;
     in property <string> crossfade-status;
     callback crossfade-changed(bool);
-    in property <int> appearance-mode;
-    in property <float> appearance-scale: 1.0;
-    in property <int> appearance-accent;
-    in property <[PaletteRow]> palettes;
-    in property <string> palette-id;
-    in property <string> palette-status;
-    in property <bool> palette-enabled;
-    callback palette-selected(string);
-    callback appearance-changed(int, float, int);
-    callback reset-appearance();
+    in property <float> density-scale: 1.0;
+    callback density-changed(float);
 
     in property <string> room-token;
     in property <string> media-track-token;
@@ -153,33 +146,8 @@ export component AppWindow inherits Window {
 
     default-font-size: 13px * Theme.density;
     background: Theme.bg;
-    changed appearance-mode => { Theme.light = root.appearance-mode == 1; }
-    changed appearance-scale => { Theme.density = clamp(root.appearance-scale, 0.85, 1.25); }
+    changed density-scale => { Theme.density = clamp(root.density-scale, 0.85, 1.25); }
     property <image> no-artwork;
-    changed palette-id => {
-        if root.palette-id == "" {
-            Theme.primary = Theme.light ? #147357 : #66e3b4;
-            Theme.on-accent = Theme.light ? #ffffff : #08271d;
-            Theme.secondary = Theme.light ? #275da5 : #91bfff;
-            Theme.tertiary = Theme.light ? #875611 : #dfbd78;
-        }
-    }
-    for preset in root.palettes: Rectangle {
-        visible: false;
-        property <bool> current: preset.id == root.palette-id;
-        function apply() {
-            if self.current {
-                Theme.primary = preset.primary;
-                Theme.on-accent = preset.on-primary;
-                Theme.secondary = preset.secondary;
-                Theme.tertiary = preset.tertiary;
-            }
-        }
-        init => { self.apply(); }
-        changed current => { self.apply(); }
-        property <color> active-primary: preset.primary;
-        changed active-primary => { self.apply(); }
-    }
 
     property <bool> compact: self.width < 820px;
     property <bool> wide: self.width >= 1136px;
@@ -518,9 +486,8 @@ export component AppWindow inherits Window {
                             spacing: 8px; alignment: start;
                             detail-hero := Rectangle {
                                 property <bool> with-art: root.is-playlist || root.page-kind == "album" || root.page-kind == "artist";
-                                property <color> tint: Copy.tint(root.page-kind);
                                 border-radius: 12px;
-                                background: self.with-art ? @linear-gradient(120deg, self.tint.with-alpha(0.16) 0%, Theme.panel 85%) : transparent;
+                                background: self.with-art ? Theme.panel : transparent;
                                 min-height: hero-layout.preferred-height; vertical-stretch: 0;
                                 hero-layout := VerticalLayout {
                                     padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;
@@ -528,7 +495,7 @@ export component AppWindow inherits Window {
                                         title: root.is-settings ? "Settings" : root.catalog-title;
                                         subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
                                         section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : root.is-playlist ? "PLAYLIST" : "";
-                                        glyph: Copy.mark(root.page-kind); tint: detail-hero.tint;
+                                        glyph: Copy.mark(root.page-kind);
                                         artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
                                         credits: root.page-credits; metadata-enabled: !root.local-mode;
                                         focused(y, h) => { catalog-scroll.reveal(catalog.y + detail-hero.y + self.y + y, h); }
@@ -570,11 +537,9 @@ export component AppWindow inherits Window {
                                 music-storage: root.music-storage;
                                 open-downloads => { shell.route("offline"); }
                                 crossfade-changed(enabled) => { root.crossfade-changed(enabled); }
-                                mode: root.appearance-mode; scale: root.appearance-scale;
-                                palettes: root.palettes; palette-id: root.palette-id; palette-status: root.palette-status; palette-enabled: root.palette-enabled;
+                                scale: root.density-scale;
                                 sign-out => { root.sign-out(); } toggle-offline => { root.flip-offline(); }
-                                appearance(mode, scale) => { root.appearance-changed(mode, scale, root.appearance-accent); }
-                                select-palette(id) => { root.palette-selected(id); } reset => { root.reset-appearance(); }
+                                density-changed(scale) => { root.density-changed(scale); }
                                 focused(y, h) => { catalog-scroll.reveal(catalog.y + self.y + y, h); }
                             }
                             if root.page-kind == "devices" && root.device-rows.length > 0 && root.device-status != "": Notice { text: root.device-status; }
@@ -733,7 +698,7 @@ export component AppWindow inherits Window {
                                     property <bool> first-played: i == 0 || root.queue-rows[i - 1].current || root.queue-rows[i - 1].upcoming;
                                     if self.member && (row.current || (row.upcoming ? self.first-upcoming : self.first-played)): Eyebrow {
                                         text: phase == "current" ? "NOW PLAYING" : phase == "upcoming" ? "UP NEXT" : "PLAYED";
-                                        height: 27px; color: phase == "current" ? Theme.accent : Theme.muted;
+                                        height: 27px; color: phase == "current" ? Theme.primary : Theme.muted;
                                     }
                                     if self.member: MediaLine {
                                         title: row.title; subtitle: row.subtitle; kind: "track";

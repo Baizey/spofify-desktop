@@ -21,10 +21,15 @@ from native import RETURN, bounds, desktop, element_id, element_type, verify, wa
 
 
 TYPICAL, WIDE, MINIMUM = (1280, 800), (1740, 920), (480, 440)
-PANELS = ("Listening", "Appearance on this device", "Account")
-PALETTES = tuple(f"{name}, (?:choose|selected) palette" for name in ("Jade", "Ember", "Violet"))
-DISPLAY = ("Dark", "Light", "Compact", "Standard", "Large", "Reset display defaults")
-ACTIONS = ("Work offline", "Crossfade", "Manage downloads", *DISPLAY, *PALETTES, "Sign out")
+PANELS = ("Listening", "Density", "Account")
+LISTENING = ("Work offline", "Crossfade", "Manage downloads")
+DENSITIES = ("Compact", "Standard", "Large")
+ACTIONS = (*LISTENING, *DENSITIES, "Sign out")
+RETIRED_COPY = (r"Appearance on this device|Theme|Dark|Light|Reset display defaults|"
+                r".*\b(?:palette|colors)\b.*|Up to 5 seconds · This device")
+FOCUS_GOLD = bytes.fromhex("dfbd78")
+PRIMARY_MINT = bytes.fromhex("66e3b4")
+CROSSFADE_ERROR = r"Couldn’t save Crossfade on this desktop\. The setting hasn’t changed\."
 
 
 def resize(window, size):
@@ -99,11 +104,12 @@ class View:
                 return match
         raise Failure(f"missing Settings {role}: {name} (page y during scroll: {offsets})")
 
-    def visible(self, name):
-        def revealed():
-            match = self.find(name)
-            return match if match and contained(self.viewport(), bounds(match)) else None
-        return wait(f"fully revealed Settings action: {name}", revealed, timeout=2)
+    def fully_visible(self, name, role="Button"):
+        match = self.find(name, role)
+        return match if match and contained(self.viewport(), bounds(match)) else None
+
+    def visible(self, name, role="Button"):
+        return wait(f"fully revealed Settings {role}: {name}", lambda: self.fully_visible(name, role), timeout=2)
 
     def reveal(self, name, role="Button"):
         _, y, _, b = bounds(self.locate(name, role))
@@ -117,29 +123,38 @@ class View:
         check(element.get("accessibleEnabled"), f"Settings control disabled: {name}")
         self.window.click_element(element)
 
-    def state(self, name, *, enabled=True, checked=False):
+    def state(self, name, *, checked=False):
         element = self.locate(name)
         actual = tuple(bool(element.get(key)) for key in ("accessibleEnabled", "accessibleCheckable", "accessibleChecked"))
-        check(actual == (enabled, True, checked), f"wrong enabled/checkable/checked state for {name}: {actual}")
+        check(actual == (True, True, checked), f"wrong enabled/checkable/checked state for {name}: {actual}")
 
     def geometry(self, *, compact):
         roles = {name: "Groupbox" for name in PANELS} | {name: "Button" for name in ACTIONS}
-        boxes = {}
+        boxes, unexpected = {}, set()
         for elements, page_y in self.scan():
+            unexpected.update(e.get("accessibleLabel") or "<unnamed>" for e in elements
+                              if self.window.matches(e, RETIRED_COPY) or
+                              (e.get("accessibleRole") == "Button" and
+                               not any(self.window.matches(e, name) for name in ACTIONS)))
             for name, role in roles.items():
                 match = self.find(name, role, elements)
                 if match:
                     x, y, r, b = bounds(match)
                     boxes[name] = x, y - page_y, r, b - page_y
         self.scroll(1600)
+        check(not unexpected, f"unexpected Settings controls or copy: {sorted(unexpected)}")
         check(len(boxes) == len(roles), f"missing Settings groups or controls: {sorted(roles.keys() - boxes.keys())}")
-        listening, appearance, account = (boxes[name] for name in PANELS)
+        listening, density, account = (boxes[name] for name in PANELS)
         if compact:
-            check(abs(listening[0] - appearance[0]) <= 1 and listening[3] <= appearance[1], "panels did not stack")
+            check(abs(listening[0] - density[0]) <= 1 and abs(listening[2] - density[2]) <= 1 and
+                  listening[3] <= density[1], "panels did not stack")
         else:
-            check(listening[2] <= appearance[0] and abs(listening[1] - appearance[1]) <= 1, "panels did not sit side by side")
-        check(abs(listening[0] - account[0]) <= 1 and abs(appearance[2] - account[2]) <= 1 and
-              account[1] >= max(listening[3], appearance[3]), "Account must span both panels and follow them")
+            check(listening[2] <= density[0] and abs(listening[1] - density[1]) <= 1, "panels did not sit side by side")
+        check(abs(listening[0] - account[0]) <= 1 and abs(density[2] - account[2]) <= 1 and
+              account[1] >= max(listening[3], density[3]), "Account must span both panels and follow them")
+        for panel, names in zip(PANELS, (LISTENING, DENSITIES, ("Sign out",))):
+            for name in names:
+                check(contained(boxes[panel], boxes[name]), f"{name} is outside the {panel} panel")
         left, _, right, _ = self.viewport()
         previous = []
         for name in ACTIONS:
@@ -148,30 +163,37 @@ class View:
             for other, (a, c, d, e) in previous:
                 check(r <= a + 1 or d <= x + 1 or b <= c + 1 or e <= y + 1, f"controls overlap: {other} and {name}")
             previous.append((name, boxes[name]))
-        rows = {round(boxes[name][1]) for name in PALETTES}
-        check((len(rows) > 1) == compact, "palette grid did not adapt to width")
-        check(boxes["Sign out"][1] >= max(boxes[name][3] for name in PALETTES), "Sign out should follow palette grid")
-        return appearance[0] - listening[0]
+        return density[0] - listening[0]
 
-    def focused(self, name, color=b"\x91\xbf\xff"):
-        # Slint MCP does not expose the focused item. Read the actual visible
-        # outline: two matching straight edges, excluding corners.
-        match = self.find(name)
-        if not match or not contained(self.viewport(), bounds(match)):
-            return False
-        x, y, r, b = map(round, bounds(match))
-        left, width = x + (r - x) // 4, (r - x) // 2
+    def crop_rgb(self, x, y, width, height):
         parts = self.window.mcp.call("take_screenshot", {"windowHandle": self.window.handle})["content"]
         png = b64decode(next(p["data"] for p in parts if p["type"] == "image"), validate=True)
-        rgb = subprocess.run([self.magick, "png:-", "-crop", f"{width}x{b-y}+{left}+{y}",
+        rgb = subprocess.run([self.magick, "png:-", "-crop", f"{width}x{height}+{x}+{y}",
                              "+repage", "-alpha", "off", "-depth", "8", "rgb:-"], input=png,
                              capture_output=True, check=True, timeout=5).stdout
+        check(len(rgb) == width * height * 3, "screenshot crop differs from requested bounds")
+        return rgb
+
+    def focused(self, name):
+        # Slint MCP does not expose the focused item. Read the gold outline:
+        # two matching straight edges, excluding corners.
+        match = self.fully_visible(name)
+        if not match:
+            return False
+        x, y, r, b = map(round, bounds(match))
+        width, height = (r - x) // 2, b - y
+        rgb = self.crop_rgb(x + (r - x) // 4, y, width, height)
         stride = width * 3
-        check(len(rgb) == stride * (b - y), "focus crop differs from action bounds")
         def edge(row):
             start = row * stride
-            return sum(rgb[i:i + 3] == color for i in range(start, start + stride, 3)) >= width * .8
-        return any(edge(row) for row in (0, 1)) and any(edge(row) for row in (b - y - 1, b - y - 2))
+            return sum(rgb[i:i + 3] == FOCUS_GOLD for i in range(start, start + stride, 3)) >= width * .8
+        return any(edge(row) for row in (0, 1)) and any(edge(row) for row in (height - 1, height - 2))
+
+    def selected_mint(self, name):
+        x, y, r, b = map(round, bounds(self.visible(name)))
+        rgb = self.crop_rgb(x + 2, y + 2, r - x - 4, b - y - 4)
+        check(sum(rgb[i:i + 3] == PRIMARY_MINT for i in range(0, len(rgb), 3)) >= 8,
+              f"selected {name} lacks a visible mint accent")
 
     def tab(self, name, *, backwards=False):
         if backwards:
@@ -186,9 +208,8 @@ def layouts(view):
     resize(view.window, TYPICAL)
     view.locate(r"12 downloads · 164\.7 MB on this device", "Text")
     view.locate("SyntheticSettingsUserWithLongUnbrokenName", "Text")
-    for name in ("Dark", "Standard", "Jade, selected palette"):
-        view.state(name, checked=True)
-    for name in ("Light", "Large", "Compact", "Crossfade", "Ember, choose palette", "Violet, choose palette"):
+    view.state("Standard", checked=True)
+    for name in ("Large", "Compact", "Crossfade"):
         view.state(name)
     gap = None
     for name, size in (("01-typical", TYPICAL), ("02-wide", WIDE), ("03-minimum", MINIMUM)):
@@ -196,7 +217,7 @@ def layouts(view):
         view.scroll(1600)
         view.window.pixels(name, size[0])
         if size == MINIMUM:
-            check(not view.find("Sign out"), "expected Sign out below the fold")
+            check(not view.fully_visible("Sign out"), "expected Sign out below the fold")
         measured = view.geometry(compact=size == MINIMUM)
         if size == TYPICAL:
             gap = measured
@@ -220,16 +241,19 @@ def keyboard(view):
     view.state("Crossfade", checked=True)
     window.key(" ")
     view.state("Crossfade")
-    for name in ("Manage downloads", *DISPLAY[:-1]):
+    for name in ("Manage downloads", *DENSITIES):
         view.tab(name)
     window.key(RETURN)
     view.state("Large", checked=True)
     check(view.focused("Large"), "density reflow lost visible keyboard focus")
+    view.selected_mint("Large")
     window.pixels("04-minimum-large-focus", MINIMUM[0])
-    for name in (DISPLAY[-1], *PALETTES, "Sign out"):
-        view.tab(name)
+    before = bounds(view.root())[1]
+    check(not view.fully_visible("Sign out"), "expected Sign out below the fold before Tab")
+    view.tab("Sign out")
+    check(bounds(view.root())[1] < before, "Tab to Sign out did not scroll Settings")
     window.pixels("05-minimum-sign-out-focus", MINIMUM[0])
-    view.tab(PALETTES[-1], backwards=True)
+    view.tab("Large", backwards=True)
     # Inspect every control at Large only after keyboard evidence: wheel
     # scanning before the next Tab could scroll focus completely out of view.
     view.geometry(compact=True)
@@ -237,21 +261,21 @@ def keyboard(view):
 
 
 def wheel(view):
-    # A focused control must not keep pulling itself into view as the user
-    # wheels away. Reproduce the large one-event jump before any other input.
-    view.click("Crossfade")
-    view.click("Ember, choose palette")
-    check(view.focused("Ember, selected palette", color=bytes.fromhex("c4b0ff")),
-          "expected visible Ember focus before wheel input")
+    # Geometry scanning returned to the top and clipped Large. Slint can
+    # clear clipped focus before dispatching a key, so re-establish it by
+    # clicking the already-selected density before tabbing to Sign out.
+    top = bounds(view.root())[1]
+    view.click("Large")
+    check(view.focused("Large"), "could not establish visible Large focus before wheel test")
+    view.tab("Sign out")
     before = bounds(view.root())[1]
     view.scroll(1600)
     after = bounds(view.root())[1]
-    check(before < 0 < after and view.find("Work offline") and not view.find("Ember, selected palette"),
-          f"large wheel did not reach Listening from focused Ember (Settings y: {before:g} → {after:g})")
+    check(before < after and abs(after - top) <= 1 and view.fully_visible("Work offline") and
+          not view.fully_visible("Sign out"),
+          f"large wheel did not reach Listening from focused Sign out (Settings y: {before:g} → {after:g})")
     view.window.pixels("06-minimum-wheel-top", MINIMUM[0])
-    print(f"PASS compact Large wheel +1600 from focused Ember (Settings y: {before:g} → {after:g})", flush=True)
-    view.click("Jade, choose palette")
-    view.click("Crossfade")
+    print(f"PASS compact Large wheel +1600 from focused Sign out (Settings y: {before:g} → {after:g})", flush=True)
 
 
 def controls(view):
@@ -262,17 +286,12 @@ def controls(view):
     view.scroll(1600)
     view.click("Crossfade")
     view.state("Crossfade", checked=True)
-    view.click("Ember, choose palette")
-    view.state("Ember, selected palette", checked=True)
-    view.state("Jade, choose palette")
-    view.click("Light")
-    view.state("Light", checked=True)
     view.click("Compact")
     view.state("Compact", checked=True)
-    view.click("Reset display defaults")
-    view.state("Dark", checked=True)
+    view.state("Large")
+    view.click("Standard")
     view.state("Standard", checked=True)
-    view.state("Ember, selected palette", checked=True)
+    view.state("Compact")
     view.state("Crossfade", checked=True)
     view.click("Manage downloads")
     window.section("Saved offline")
@@ -282,31 +301,26 @@ def controls(view):
     view.locate("Offline", "Text")
     view.scroll(1600)
     window.pixels("07-typical-offline", TYPICAL[0])
-    view.locate("Go online to change colors", "Text")
-    for name in PALETTES:
-        view.state(name, enabled=False, checked=name == PALETTES[1])
     view.click("Go online")
     view.locate("Online", "Text")
-    view.state("Ember, selected palette", checked=True)
+    view.state("Standard", checked=True)
+    view.state("Crossfade", checked=True)
     view.click("Sign out")
     window.find("Sign in", roles=("Button",))
     check(not view.root(), "Settings remained after sign-out")
-    print("PASS synthetic Settings callbacks for display, Crossfade, palette, downloads, offline and sign-out", flush=True)
+    print("PASS synthetic Settings callbacks for density, Crossfade, downloads, offline and sign-out", flush=True)
 
 
 def errors(view):
     resize(view.window, MINIMUM)
-    view.reveal(r"Couldn’t save Crossfade on this desktop\. The setting hasn’t changed\.", "Text")
+    view.state("Large", checked=True)
+    view.state("Crossfade")
+    view.click("Crossfade")
+    view.reveal(CROSSFADE_ERROR, "Text")
+    view.visible(CROSSFADE_ERROR, "Text")
     view.state("Crossfade")
     view.window.pixels("08-minimum-error-crossfade", MINIMUM[0])
-    view.state("Light", checked=True)
-    view.state("Large", checked=True)
-    view.reveal(r"Account palettes are unavailable right now\.", "Text")
-    for name in PALETTES:
-        view.state(name, enabled=False, checked=name == PALETTES[0])
-    view.reveal(r"Account palettes are unavailable right now\.", "Text")
-    view.window.pixels("09-minimum-error-palette", MINIMUM[0])
-    print("PASS light/Large error states and disabled palette", flush=True)
+    print("PASS Crossfade save error is visible at minimum size and leaves the switch unchanged", flush=True)
 
 
 def main():

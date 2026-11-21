@@ -7,6 +7,7 @@ export component SeekBar inherits Rectangle {
     in property <float> duration;
     in property <bool> enabled;
     in property <[float]> waveform;
+    in property <color> track-background: Theme.bg;
     callback seek(float);
     height: 24px;
     min-width: 0px;
@@ -38,22 +39,22 @@ export component SeekBar inherits Rectangle {
         released(value) => { root.commit(value); }
     }
     Rectangle {
-        background: Theme.panel;
+        background: root.track-background;
         accessible-role: none;
         border-radius: 4px;
         border-width: control.has-focus ? 2px : 0px;
-        border-color: Theme.blue;
+        border-color: Theme.tertiary;
         Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: parent.width - 16px; height: 3px; background: Theme.line; border-radius: 2px; }
-        if root.waveform.length == 0: Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: (parent.width - 16px) * root.ratio; height: 3px; background: Theme.accent; border-radius: 2px; }
+        if root.waveform.length == 0: Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: (parent.width - 16px) * root.ratio; height: 3px; background: Theme.primary; border-radius: 2px; }
         for sample[i] in root.waveform: Rectangle {
             x: 8px + (parent.width - 16px) * i / max(1, root.waveform.length);
             width: max(1px, (parent.width - 16px) / max(1, root.waveform.length) - 1px);
             height: 2px + clamp(sample, 0, 1) * (parent.height - 8px);
             y: (parent.height - self.height) / 2;
             border-radius: 1px;
-            background: i < root.ratio * root.waveform.length ? Theme.accent : Theme.line;
+            background: i < root.ratio * root.waveform.length ? Theme.primary : Theme.line;
         }
-        Rectangle { x: 3px + (parent.width - 16px) * root.ratio; y: (parent.height - 11px) / 2; width: 11px; height: 11px; border-radius: 6px; background: root.enabled ? Theme.accent : Theme.muted; }
+        Rectangle { x: 3px + (parent.width - 16px) * root.ratio; y: (parent.height - 11px) / 2; width: 11px; height: 11px; border-radius: 6px; background: root.enabled ? Theme.primary : Theme.muted; }
     }
 }
 
@@ -137,14 +138,14 @@ component VolumeSlider inherits Rectangle {
     }
     Rectangle {
         y: slider.y; height: slider.height;
-        background: Theme.panel;
+        background: Theme.rail;
         border-radius: 5px;
         border-width: slider.has-focus ? 2px : 0px;
-        border-color: Theme.blue;
+        border-color: Theme.tertiary;
         accessible-role: none;
         Rectangle { x: 6px; y: (parent.height - 3px) / 2; width: parent.width - 12px; height: 3px; border-radius: 2px; background: Theme.line; }
-        Rectangle { x: 6px; y: (parent.height - 3px) / 2; width: (parent.width - 12px) * slider.value / 100; height: 3px; border-radius: 2px; background: root.muted ? Theme.muted : Theme.accent; }
-        Rectangle { x: 2px + (parent.width - 12px) * slider.value / 100; y: (parent.height - 9px) / 2; width: 9px; height: 9px; border-radius: 5px; background: root.muted ? Theme.muted : Theme.accent; }
+        Rectangle { x: 6px; y: (parent.height - 3px) / 2; width: (parent.width - 12px) * slider.value / 100; height: 3px; border-radius: 2px; background: root.muted ? Theme.muted : Theme.primary; }
+        Rectangle { x: 2px + (parent.width - 12px) * slider.value / 100; y: (parent.height - 9px) / 2; width: 9px; height: 9px; border-radius: 5px; background: root.muted ? Theme.muted : Theme.primary; }
     }
     Caption {
         y: 26px; height: 12px;
@@ -194,7 +195,7 @@ export component PlayerBar inherits Rectangle {
     property <length> top-height: root.layered ? (root.status == "" ? 58px : 72px) : root.height;
     property <bool> title-repaint-phase;
     changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
-    vertical-stretch: 0; background: Theme.panel;
+    vertical-stretch: 0; background: Theme.rail;
     Divider { y: 0px; }
     track-info := Rectangle {
         x: root.pad; y: 0px;
@@ -228,7 +229,7 @@ export component PlayerBar inherits Rectangle {
                 text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
                 activated => { root.page-action("album", root.album-id); }
             }
-            if root.status != "": Caption { text: root.status; color: Theme.amber; }
+            if root.status != "": Caption { text: root.status; color: Theme.tertiary; }
         }
     }
     Rectangle {
@@ -244,7 +245,7 @@ export component PlayerBar inherits Rectangle {
         }
         if root.duration > 0: HorizontalLayout { y: root.layered ? 44px : 52px; height: 22px; spacing: 4px;
             Clock { seconds: root.elapsed; }
-            SeekBar { elapsed: root.elapsed; duration: root.duration; enabled: root.can-seek; horizontal-stretch: 1; seek(v) => { root.seek(v); } }
+            SeekBar { elapsed: root.elapsed; duration: root.duration; track-background: Theme.rail; enabled: root.can-seek; horizontal-stretch: 1; seek(v) => { root.seek(v); } }
             Clock { seconds: root.duration; }
         }
     }

@@ -1,5 +1,5 @@
-import { CheckBox, ScrollView, TextEdit } from "std-widgets.slint";
-import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Action, Caption, CheckChoice, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 
 export component SignInView inherits Rectangle {
     in-out property <string> origin;
@@ -45,7 +45,7 @@ export component SignInView inherits Rectangle {
                     Field { text <=> root.username; field-label: "Username"; enabled: !root.busy; edited => { root.username-edited(); } }
                     HorizontalLayout { height: 28px; Caption { text: "Password"; color: Theme.text; } Rectangle { horizontal-stretch: 1; } Action { text: root.reveal-password ? "Hide" : "Show"; accessible-label: root.reveal-password ? "Hide password" : "Show password"; quiet: true; height: 28px; enabled: !root.busy; clicked => { root.reveal-password = !root.reveal-password; } } }
                     Field { text <=> root.password; field-label: "Password"; input-type: root.reveal-password ? InputType.text : InputType.password; enabled: !root.busy; accepted => { if root.ready { root.reveal-password = false; root.sign-in(); } } }
-                    CheckBox { text: "Keep me signed in"; checked <=> root.keep-signed-in; enabled: !root.busy; }
+                    CheckChoice { text: "Keep me signed in"; checked <=> root.keep-signed-in; enabled: !root.busy; }
                     HorizontalLayout {
                         spacing: 8px;
                         Action { text: root.restoring ? "Restoring session…" : root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: root.ready; clicked => { root.reveal-password = false; root.sign-in(); } }
@@ -54,6 +54,54 @@ export component SignInView inherits Rectangle {
                     if root.status != "": Notice { text: root.status; error: root.error; }
                     if root.auth-notice != "": Notice { text: root.auth-notice; }
                     if root.can-retry-session && !root.busy: Action { text: "Retry saved session"; quiet: true; clicked => { root.retry-session(); } }
+                }
+            }
+        }
+    }
+}
+
+component RulesField inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    public function take-focus() { input.focus(); }
+    forward-focus: input;
+    height: 178px;
+    background: Theme.bg;
+    border-radius: 8px;
+    border-width: input.has-focus ? 2px : 1px;
+    border-color: Theme.field-border(input.has-focus);
+    opacity: enabled ? 1 : 0.55;
+
+    ContextMenuArea {
+        enabled: root.enabled;
+        Menu {
+            MenuItem { title: @tr("Cut"); enabled: input.text != ""; activated => { input.cut(); } }
+            MenuItem { title: @tr("Copy"); enabled: input.text != ""; activated => { input.copy(); } }
+            MenuItem { title: @tr("Paste"); activated => { input.paste(); } }
+            MenuItem { title: @tr("Select All"); enabled: input.text != ""; activated => { input.select-all(); } }
+        }
+        scroll := ScrollView {
+            x: 12px; y: 12px; width: parent.width - 24px; height: parent.height - 24px;
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, input.preferred-height);
+            input := TextInput {
+                width: scroll.visible-width; height: scroll.content-height;
+                enabled: root.enabled;
+                single-line: false; wrap: word-wrap;
+                page-height: scroll.visible-height;
+                font-family: "JetBrains Mono"; font-size: 13px * Theme.density;
+                color: Theme.text;
+                selection-background-color: Theme.primary.with-alpha(0.3);
+                selection-foreground-color: Theme.text;
+                accessible-label: "Playlist rules definition";
+                cursor-position-changed(position) => {
+                    let cursor-y = position.y + scroll.content-y;
+                    let line-height = self.font-size * 1.55;
+                    if cursor-y < 0px {
+                        scroll.content-y = clamp(-position.y, scroll.visible-height - self.height, 0px);
+                    } else if cursor-y + line-height > scroll.visible-height {
+                        scroll.content-y = clamp(scroll.visible-height - position.y - line-height, scroll.visible-height - self.height, 0px);
+                    }
                 }
             }
         }
@@ -115,11 +163,9 @@ export component Editor inherits Rectangle {
                         if root.editing-description: Field { text <=> root.description; field-label: "Playlist description"; enabled: !root.busy; }
                         if root.editing-rules: Caption { text: "Rules"; color: Theme.text; }
                         if root.editing-rules: Caption { text: root.help == "" ? "Write one directive per line. Use two spaces to indent conditions." : root.help; wrap: word-wrap; }
-                        if root.editing-rules: TextEdit {
-                            text <=> root.definition; accessible-label: "Playlist rules definition";
-                            font-family: "JetBrains Mono"; font-size: 13px * Theme.density;
-                            height: 178px; enabled: !root.busy; wrap: word-wrap;
-                            init => { if !root.editing-name { self.focus(); } }
+                        if root.editing-rules: RulesField {
+                            text <=> root.definition; enabled: !root.busy;
+                            init => { if !root.editing-name { self.take-focus(); } }
                         }
                         if root.error != "": Notice { text: root.error; error: true; }
                         Divider { }
@@ -134,7 +180,7 @@ export component Editor inherits Rectangle {
                             Rectangle { horizontal-stretch: 1; }
                             Action {
                                 text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove from Saved" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
-                                enabled: root.ready; primary: !root.deleting; danger: root.deleting;
+                                enabled: root.ready; primary: !root.deleting;
                                 clicked => { root.save(); }
                             }
                         }
