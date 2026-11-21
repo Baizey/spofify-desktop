@@ -102,7 +102,6 @@ pub(crate) async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> 
             Err(e) if e.status == 404 => Page {
                 title: target.title.clone(),
                 kind: "saved-collection".into(),
-                status: "Pending".into(),
                 ..Page::default()
             },
             other => other?,

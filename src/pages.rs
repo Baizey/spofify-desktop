@@ -203,6 +203,7 @@ pub struct Page {
     pub playback: Option<PlaybackSelection>,
     /// Local status for unavailable evaluation or incomplete views.
     pub status: String,
+    pub(crate) playlist_evaluation_failed: bool,
     pub total: Option<u64>,
     pub music: MusicMetadata,
     pub picker_track_id: Option<String>,
@@ -789,6 +790,7 @@ pub fn personal_playlist(
         })
         .collect();
     if !ready {
+        page.playlist_evaluation_failed = summary.evaluation_state == Some(EvaluationState::Error);
         page.status = match summary.evaluation_state {
             Some(EvaluationState::Error) => "Songs aren't available for this playlist right now.",
             _ => "This playlist is still updating.",
@@ -1001,6 +1003,42 @@ fn playlist_metadata(summary: &PlaylistSummary) -> PlaylistMetadata {
         available_count: summary.available_count,
         capabilities: summary.capabilities.clone(),
     }
+}
+
+/// Detail has its own compact copy; keep the Playlists row subtitles unchanged.
+pub(crate) fn playlist_detail_copy(page: &Page) -> (String, String) {
+    if page.kind == "saved-collection" {
+        let metadata = if page.subtitle.is_empty() {
+            page.saved_pin
+                .as_ref()
+                .map_or_else(String::new, |target| match target.kind {
+                    PlaylistKind::Manual => String::new(),
+                    PlaylistKind::Derived => "Rule playlist".into(),
+                })
+        } else {
+            page.subtitle.clone()
+        };
+        return (metadata, String::new());
+    }
+    let kind = if page.kind == "playlist-rules" {
+        "Rule playlist"
+    } else {
+        ""
+    };
+    let count = page
+        .playlist
+        .as_ref()
+        .and_then(|m| m.track_count)
+        .map(|n| count_label(n, "song", "songs"));
+    let metadata = join_labels(kind, count.as_deref().unwrap_or(""));
+    let description = ui_text(
+        &page
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    (metadata, description)
 }
 
 fn playlist_subtitle(summary: &PlaylistSummary) -> String {

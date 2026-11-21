@@ -1,7 +1,7 @@
 //! Desktop browsing controller. A single owner accepts navigation and writes;
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
-    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, ReorderRow, actions,
+    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, PlaylistOfflineState, ReorderRow, actions,
     api::{Api, ApiError, Session},
     engine::Command,
     pages::{self, Page, Route, RowKey},
@@ -603,8 +603,35 @@ fn pin_subtitle(row: &pages::Row, status: Option<&playlist_pins::Status>) -> sli
     }
 }
 
-// Only the playlist list and Saved rows need the keyed pin state. Playlist
-// detail uses its own status line so the track model stays stable as it saves.
+fn playlist_detail_offline(
+    route: &Route,
+    page: &Page,
+    pin: Option<&playlist_pins::Status>,
+) -> PlaylistOfflineState {
+    // The committed pin or a loaded Saved snapshot represents usable local
+    // membership, not merely the intent to save. Keep removal authority separate.
+    let saved_snapshot = matches!(route, Route::SavedCollection(_))
+        && page.kind == "saved-collection"
+        && page.total.is_some();
+    PlaylistOfflineState {
+        saved: saved_snapshot || pin.is_some_and(|status| status.has_committed),
+        feedback: pin.map_or_else(
+            || {
+                if matches!(route, Route::SavedCollection(_))
+                    && page.saved_pin.is_some()
+                    && !saved_snapshot
+                {
+                    "Waiting to download".into()
+                } else {
+                    Default::default()
+                }
+            },
+            |status| status.detail_feedback().into(),
+        ),
+    }
+}
+
+// Detail pin state is published independently of the track model and notices.
 struct PinDisplay<'a> {
     view: Option<&'a playlist_pins::View>,
     sources: HashMap<&'a str, &'a playlist_pins::Status>,
@@ -832,20 +859,21 @@ impl Browser {
         } else {
             p.title.clone()
         };
-        let message = if !self.message.is_empty() {
-            self.message.clone()
-        } else if let Some(status) = pin.page(&route) {
-            if p.status.is_empty() || p.status == "Pending" {
-                status.label()
-            } else {
-                format!("{} · {}", status.label(), p.status)
-            }
-        } else {
+        let message = if self.message.is_empty() {
             p.status.clone()
+        } else {
+            self.message.clone()
         };
+        let playlist_offline_state = playlist_detail_offline(&route, &p, pin.page(&route));
+        let (playlist_metadata, playlist_description) =
+            if matches!(route, Route::Playlist(_) | Route::SavedCollection(_)) {
+                pages::playlist_detail_copy(&p)
+            } else {
+                Default::default()
+            };
         let (busy, error, back) = (
             self.busy && !self.silent_read,
-            self.error,
+            self.error || (self.message.is_empty() && p.playlist_evaluation_failed),
             self.trail.can_back(),
         );
         let (account, offline) = self
@@ -886,6 +914,9 @@ impl Browser {
             ui.set_page_key(key.into());
             ui.set_page_title(title.into());
             ui.set_page_subtitle(p.subtitle.clone().into());
+            ui.set_playlist_metadata(playlist_metadata.into());
+            ui.set_playlist_description(playlist_description.into());
+            ui.set_playlist_offline_state(playlist_offline_state);
             ui.set_page_status(message.into());
             ui.set_page_busy(busy);
             ui.set_page_error(error);
@@ -1096,7 +1127,11 @@ impl Browser {
                 }
             });
         }
-        if old.map(|r| r.label()) != new.map(|r| r.label()) {
+        let detail_state = |status: Option<&playlist_pins::Status>| {
+            let state = playlist_detail_offline(&self.route, &self.page, status);
+            (state.saved, state.feedback)
+        };
+        if detail_state(old) != detail_state(new) {
             self.render(false);
         }
     }
@@ -2851,6 +2886,71 @@ mod tests {
                 .remove_action
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn detail_copy_preserves_rules_counts_and_validated_editor_values() {
+        use crate::api::library::{EvaluationState, PlaylistKind};
+
+        let mut summary = editable_playlist();
+        summary.name = "Late rotation".into();
+        summary.description = "One\nline\tthen another".into();
+        assert_eq!(
+            pages::playlist_detail_copy(&pages::personal_playlist(&summary, None, &[])),
+            (
+                "Rule playlist · 3 songs".into(),
+                "One line then another".into()
+            )
+        );
+        summary.track_count = None;
+        summary.evaluation_state = Some(EvaluationState::Error);
+        let detail = pages::personal_playlist(&summary, None, &[]);
+        assert_eq!(pages::playlist_detail_copy(&detail).0, "Rule playlist");
+        assert_eq!(detail.description, summary.description);
+        assert!(detail.status.contains("aren't available"));
+        assert!(detail.playlist_evaluation_failed);
+        summary.kind = PlaylistKind::Manual;
+        summary.track_count = Some(1);
+        let detail = pages::personal_playlist(&summary, None, &[]);
+        assert_eq!(pages::playlist_detail_copy(&detail).0, "1 song");
+        assert_eq!(detail.subtitle, "Playlist · 1 song");
+    }
+
+    #[test]
+    fn saved_detail_projects_pending_intent_separately_from_local_snapshot() {
+        let route = Route::SavedCollection("fixture".into());
+        let mut page = Page {
+            kind: "saved-collection".into(),
+            saved_pin: Some(crate::playlist_pin_store::Target {
+                id: "mix".into(),
+                title: "Mix".into(),
+                kind: crate::api::library::PlaylistKind::Derived,
+            }),
+            ..Default::default()
+        };
+        let pending = playlist_detail_offline(&route, &page, None);
+        assert!(!pending.saved);
+        assert_eq!(pending.feedback, "Waiting to download");
+        assert_eq!(pages::playlist_detail_copy(&page).0, "Rule playlist");
+        page.total = Some(3);
+        page.subtitle = "Rule playlist · 2 of 3 songs".into();
+        page.status = "1 song not available on this device.".into();
+        let saved = playlist_detail_offline(&route, &page, None);
+        assert!(saved.saved);
+        assert_eq!(saved.feedback, "");
+        assert_eq!(pages::playlist_detail_copy(&page).0, page.subtitle);
+        assert_eq!(page.status, "1 song not available on this device.");
+        assert_eq!(
+            playlist_detail_actions(&route, &page, false, false).remove_action,
+            "unpin-playlist"
+        );
+        page.saved_pin = None;
+        assert!(playlist_detail_offline(&route, &page, None).saved);
+        assert_eq!(
+            playlist_detail_actions(&route, &page, false, false).remove_action,
+            "remove"
+        );
+        assert!(!playlist_detail_offline(&Route::Playlist("mix".into()), &page, None).saved);
     }
 
     #[test]
