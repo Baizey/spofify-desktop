@@ -529,8 +529,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     def recovered():
         elements = current_elements()
-        return (elements and text(win, elements, re.escape(RETRY_TEXT)) and
-                text(win, elements, re.escape("Lyrics source: " + RETRY_SOURCE)))
+        return elements and text(win, elements, re.escape(RETRY_TEXT + "\n\nLyrics source: " + RETRY_SOURCE))
 
     exact_gets()
     win.click_element(retry)
