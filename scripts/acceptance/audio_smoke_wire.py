@@ -250,18 +250,21 @@ class Peer:
 
 
 @contextmanager
-def audio_fixture():
+def audio_fixture(*, wav=None, peer_class=Peer, port=0, accepted_connections=None):
     ready = {"username": "synthetic-audio", "password": token_hex(16)}
     token, csrf = token_hex(32), token_hex(32)
     cookie = "spofify_session=" + token
     session = dict(accountId="synthetic-audio-account", username=ready["username"], role="user", csrfToken=csrf)
-    wav = tone()
+    if wav is None:
+        wav = tone()
     tickets, sockets = set(), set()
     lock = Lock()
     admitted, media, requests = Queue(maxsize=8), [], deque(maxlen=24)
 
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
+            if accepted_connections is not None:
+                accepted_connections.append(None)  # no peer addresses or request data
             super().setup()
             self.connection.settimeout(4)
 
@@ -321,7 +324,7 @@ def audio_fixture():
                                 ("Sec-WebSocket-Protocol", PROTOCOL), ("Sec-WebSocket-Accept", accept)):
                 self.send_header(name, value)
             self.end_headers()
-            peer = Peer(self)
+            peer = peer_class(self)
             with lock:
                 sockets.add(self.connection)
             try:
@@ -373,7 +376,7 @@ def audio_fixture():
     class Server(ThreadingHTTPServer):
         daemon_threads = False
 
-    with Server(("127.0.0.1", 0), Handler) as server:
+    with Server(("127.0.0.1", port), Handler) as server:
         ready["origin"] = f"http://127.0.0.1:{server.server_port}"
         worker = Thread(target=server.serve_forever)
         worker.start()

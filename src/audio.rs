@@ -60,6 +60,8 @@ pub struct Facts {
 
 pub struct Audio {
     stream: Option<OutputStream>,
+    #[cfg(test)]
+    test_mixer: Option<Mixer>,
     primary: Option<Run>,
     crossfade: Option<Crossfade>,
     master_gain: MasterGain,
@@ -129,6 +131,8 @@ impl Audio {
         });
         Self {
             stream: None,
+            #[cfg(test)]
+            test_mixer: None,
             primary: None,
             crossfade: None,
             master_gain,
@@ -141,6 +145,11 @@ impl Audio {
             elapsed: 0.0,
             duration: 0.0,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn use_test_output(&mut self, mixer: Mixer, id: String, bytes: Arc<[u8]>) {
+        self.test_mixer = Some(mixer);
+        self.cached = Some((id, bytes));
     }
     pub fn cached(&self, id: &str) -> Option<Arc<[u8]>> {
         self.cached
@@ -159,6 +168,14 @@ impl Audio {
             self.stream = Some(stream);
         }
         Ok(())
+    }
+    fn playback_mixer(&mut self) -> Result<&Mixer, Status> {
+        #[cfg(test)]
+        if self.test_mixer.is_some() {
+            return Ok(self.test_mixer.as_ref().unwrap());
+        }
+        self.output()?;
+        Ok(self.stream.as_ref().expect("output initialized").mixer())
     }
     pub fn play(
         &mut self,
@@ -182,14 +199,14 @@ impl Audio {
             self.elapsed = self.elapsed.min(self.duration);
         }
         self.cached = Some((id, bytes));
-        if let Err(e) = self.output() {
-            return e;
-        }
+        let mixer = match self.playback_mixer() {
+            Ok(mixer) => mixer.clone(),
+            Err(e) => return e,
+        };
         if !self.current() || !authority.may_start() {
             return Status::Rejected;
         }
-        let mixer = self.stream.as_ref().expect("output initialized").mixer();
-        let run = self.attach(mixer, source, authority, UNITY);
+        let run = self.attach(&mixer, source, authority, UNITY);
         if self.current() && run.authority.is_valid() {
             run.sink.play();
             self.primary = Some(run);

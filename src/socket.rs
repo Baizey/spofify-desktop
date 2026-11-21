@@ -87,11 +87,39 @@ pub(crate) struct OutputAuthority {
     pub(crate) generation: Generation,
     pub(crate) deadline: Instant,
     pub(crate) attached: bool,
+    // A grant answers a presence sent after these local Resume writes. Go
+    // handles them synchronously in wire order; this is not a Play receipt.
+    pub(crate) resume_through: u64,
 }
 
 impl OutputAuthority {
     pub(crate) fn permits(self, now: Instant) -> bool {
         now < self.deadline
+    }
+}
+
+/// Immediate sample-side fence for direct starts, before the engine drains
+/// the corresponding projection. A fresh visible selection may not have a
+/// grant yet; a known expired grant is not that case.
+#[derive(Default)]
+pub(crate) struct DirectStartFence(AtomicU64);
+impl DirectStartFence {
+    // The low bit says a known lease expired. Keep it in the same atomic so
+    // native PCM cannot miss the generation change across a renewal.
+    pub(crate) fn stamp(&self) -> Option<u64> {
+        let state = self.0.load(Ordering::Acquire);
+        (state & 1 == 0).then_some(state)
+    }
+    fn invalidate(&self) {
+        self.0.fetch_add(2, Ordering::AcqRel);
+    }
+    fn set_expired(&self, expired: bool) {
+        if expired {
+            self.0.fetch_or(1, Ordering::AcqRel);
+            self.invalidate();
+        } else {
+            self.0.fetch_and(!1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -123,8 +151,10 @@ pub(crate) enum SocketError {
 pub(crate) struct Socket {
     pub(crate) link: watch::Receiver<Link>,
     pub(crate) authority: watch::Receiver<Option<OutputAuthority>>,
+    pub(crate) direct_start: Arc<DirectStartFence>,
     pub(crate) events: mpsc::Receiver<Event>,
     outbound: mpsc::Sender<WriteFrame>,
+    resume_sequence: AtomicU64,
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
@@ -143,9 +173,11 @@ pub(crate) fn spawn(
     let (link_out, link) = watch::channel(Link::Connecting);
     let (authority_out, authority) = watch::channel(None);
     let (actual, _) = watch::channel(None);
+    let direct_start: Arc<DirectStartFence> = Arc::default();
     let signals = Signals {
         link: link_out,
         authority: authority_out,
+        direct_start: direct_start.clone(),
         events: event_out,
     };
     let task = tokio::spawn(run(
@@ -159,8 +191,10 @@ pub(crate) fn spawn(
     Ok(Socket {
         link,
         authority,
+        direct_start,
         events,
         outbound,
+        resume_sequence: AtomicU64::new(0),
         actual,
         session,
         task,
@@ -173,7 +207,7 @@ impl Socket {
         &self,
         generation: Generation,
         command: Command,
-    ) -> Result<(), SocketError> {
+    ) -> Result<Option<u64>, SocketError> {
         if !command.valid() {
             return Err(SocketError::Invalid);
         }
@@ -182,7 +216,10 @@ impl Socket {
         } else {
             Class::Choice
         };
-        self.submit(generation, class, &command)
+        let resume = matches!(command, Command::Resume)
+            .then(|| self.resume_sequence.fetch_add(1, Ordering::Relaxed) + 1);
+        self.submit(generation, class, &command, resume)?;
+        Ok(resume)
     }
 
     pub(crate) fn fact(&self, generation: Generation, fact: Fact) -> Result<(), SocketError> {
@@ -200,6 +237,7 @@ impl Socket {
             generation,
             Class::Fact,
             &Outgoing::<()>::Fact { fact: &fact },
+            None,
         )
     }
 
@@ -210,13 +248,18 @@ impl Socket {
         generation: Generation,
         command: &(impl Serialize + ?Sized),
     ) -> Result<(), SocketError> {
-        self.submit(generation, Class::Choice, &Outgoing::Personal { command })
+        self.submit(
+            generation,
+            Class::Choice,
+            &Outgoing::Personal { command },
+            None,
+        )
     }
 
     /// The server responds with a fresh player snapshot and personal initial
     /// projection. Scoped playlist repairs are personal `syncPlaylist` writes.
     pub(crate) fn sync(&self, generation: Generation) -> Result<(), SocketError> {
-        self.submit(generation, Class::Choice, &Outgoing::<()>::Sync)
+        self.submit(generation, Class::Choice, &Outgoing::<()>::Sync, None)
     }
 
     /// Replaces a local sample, never queues a fact. `None` from an unexportable
@@ -243,6 +286,7 @@ impl Socket {
         generation: Generation,
         class: Class,
         frame: &(impl Serialize + ?Sized),
+        resume: Option<u64>,
     ) -> Result<(), SocketError> {
         let raw = encode(frame)?;
         // Admission holds the watch read lock. Once the actor publishes loss,
@@ -261,10 +305,58 @@ impl Socket {
         slot.send(WriteFrame {
             generation,
             class,
+            resume,
             at: Instant::now(),
             raw,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestPeer {
+    pub(crate) events: mpsc::Sender<Event>,
+    pub(crate) authority: watch::Sender<Option<OutputAuthority>>,
+    _link: watch::Sender<Link>,
+    outbound: mpsc::Receiver<WriteFrame>,
+}
+#[cfg(test)]
+impl TestPeer {
+    pub(crate) fn read(&mut self) -> Option<Value> {
+        self.outbound
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame.raw).unwrap())
+    }
+}
+#[cfg(test)]
+impl Socket {
+    pub(crate) fn test_peer(session: Session, generation: Generation) -> (Self, TestPeer) {
+        let (_link, link) = watch::channel(Link::Connected(generation));
+        let (authority, grant) = watch::channel(None);
+        let (event_out, events) = mpsc::channel(EVENT_CAPACITY);
+        let (outbound, input) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (actual, _) = watch::channel(None);
+        let socket = Self {
+            link,
+            authority: grant,
+            direct_start: Arc::default(),
+            events,
+            outbound,
+            resume_sequence: AtomicU64::new(0),
+            actual,
+            session,
+            task: tokio::spawn(pending()),
+        };
+        (
+            socket,
+            TestPeer {
+                _link,
+                authority,
+                events: event_out,
+                outbound: input,
+            },
+        )
     }
 }
 
@@ -284,6 +376,7 @@ enum Class {
 struct WriteFrame {
     generation: Generation,
     class: Class,
+    resume: Option<u64>,
     at: Instant,
     raw: String,
 }
@@ -323,6 +416,7 @@ enum End {
 struct Signals {
     link: watch::Sender<Link>,
     authority: watch::Sender<Option<OutputAuthority>>,
+    direct_start: Arc<DirectStartFence>,
     events: mpsc::Sender<Event>,
 }
 
@@ -382,6 +476,7 @@ impl OutputState {
             .as_ref()
             .is_some_and(|l| Instant::now() >= l.deadline)
         {
+            signals.direct_start.set_expired(true);
             self.clear(signals);
         }
     }
@@ -398,6 +493,7 @@ impl OutputState {
                 generation,
                 deadline: lease.deadline,
                 attached: false,
+                resume_through: 0,
             }));
         }
     }
@@ -447,7 +543,9 @@ impl OutputState {
 struct Pulses {
     sequence: u64,
     last_granted: u64,
-    outstanding: VecDeque<(u64, Instant)>,
+    written_resume: u64,
+    seen_resume: u64,
+    outstanding: VecDeque<(u64, Instant, u64)>,
 }
 
 impl Pulses {
@@ -460,12 +558,13 @@ impl Pulses {
         while self
             .outstanding
             .front()
-            .is_some_and(|(_, sent)| now.duration_since(*sent) >= MAX_LEASE)
+            .is_some_and(|(_, sent, _)| now.duration_since(*sent) >= MAX_LEASE)
             || self.outstanding.len() >= 8
         {
             self.outstanding.pop_front();
         }
-        self.outstanding.push_back((self.sequence, now));
+        self.outstanding
+            .push_back((self.sequence, now, self.written_resume));
         Ok(self.sequence)
     }
 
@@ -476,13 +575,14 @@ impl Pulses {
         {
             return None;
         }
-        let i = self.outstanding.iter().position(|(n, _)| *n == basis)?;
-        let (_, sent) = self.outstanding.remove(i)?;
+        let i = self.outstanding.iter().position(|(n, _, _)| *n == basis)?;
+        let (_, sent, resume) = self.outstanding.remove(i)?;
         let deadline = sent.checked_add(Duration::from_millis(ms))?;
         if deadline <= now {
             return None;
         }
         self.last_granted = basis;
+        self.seen_resume = resume;
         Some(deadline)
     }
 }
@@ -608,6 +708,8 @@ impl Connection {
             releasing: false,
         };
         output.owner_changed(&result.owner, &result.id, signals);
+        signals.direct_start.invalidate();
+        signals.direct_start.set_expired(false);
         signals.event(
             generation,
             EventKind::Snapshot {
@@ -637,6 +739,7 @@ impl Connection {
                     return Err(End::Protocol);
                 }
                 self.canonical = player.cursor.clone();
+                signals.direct_start.invalidate();
                 pulse_now = self.outputs(&outputs, output, signals);
                 EventKind::Snapshot {
                     connection_id,
@@ -665,10 +768,12 @@ impl Connection {
                             handle,
                             detached: None,
                         });
+                        signals.direct_start.set_expired(false);
                         signals.authority.send_replace(Some(OutputAuthority {
                             generation: self.generation,
                             deadline,
                             attached: true,
+                            resume_through: self.pulses.seen_resume,
                         }));
                     }
                 }
@@ -682,6 +787,18 @@ impl Connection {
 
     fn outputs(&mut self, outputs: &Outputs, output: &mut OutputState, signals: &Signals) -> bool {
         let gained = self.owner != self.id && outputs.owner == self.id;
+        if (self.owner != outputs.owner && !(self.owner.is_empty() && gained))
+            || (outputs.owner.is_empty()
+                && outputs
+                    .devices
+                    .iter()
+                    .any(|d| d.can_play && d.id != self.id))
+        {
+            signals.direct_start.invalidate();
+        }
+        if self.owner != outputs.owner {
+            signals.direct_start.set_expired(false);
+        }
         // For a plain owner change, outstanding bases issued for a prior
         // ownership epoch cannot mint authority. Keep the current attach
         // pulse when this follows a successful server-side reattach.
@@ -763,6 +880,9 @@ impl Connection {
                         if now.duration_since(frame.at) > MAX_QUEUE_AGE { return Err(End::Backpressure); }
                         if frame.class == Class::Release { self.release(output, signals); }
                         send(ws, frame.raw).await?;
+                        if let Some(resume) = frame.resume {
+                            self.pulses.written_resume = resume;
+                        }
                     }
                     Drive::Write(None) => return Err(End::Closed),
                     Drive::Read(message) => {

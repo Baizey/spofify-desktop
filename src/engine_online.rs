@@ -1,6 +1,11 @@
 //! Online actor. Socket admission is not a server acknowledgement. Player state
 //! comes from Go; only a native EOF can advance the shared cursor. A local
 //! crossfade can overlap its known successor under the attached output grant.
+#[path = "engine_local_start.rs"]
+mod local_start;
+#[cfg(test)]
+#[path = "engine_online_pcm_tests.rs"]
+mod pcm_tests;
 use super::{
     CreditView, Engine, LOAD_BUDGET, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply,
     artist_subtitle, context_kind, credit_views, crossfade, metadata_id, output,
@@ -95,6 +100,11 @@ pub(super) struct Online {
     pub execution: Option<Execution>,
     connection: String,
     outputs: Outputs,
+    local_start: Option<local_start::Start>,
+    receipts: local_start::Receipts,
+    // We saw this very socket retire and queued Release after stopping it.
+    // An opening/unknown empty owner never establishes vacancy.
+    released_here: bool,
     generation: Option<Generation>,
     personal_generation: Option<Generation>,
     repair: Option<Generation>,
@@ -125,6 +135,26 @@ impl Online {
     }
     fn is_owner(&self) -> bool {
         !self.connection.is_empty() && self.outputs.owner == self.connection
+    }
+    pub fn starting_locally(&self) -> bool {
+        self.local_start.is_some()
+    }
+    pub fn clear_local_start(&mut self) {
+        self.local_start = None;
+    }
+    fn locally_vacant(&self) -> bool {
+        self.released_here
+            && self.outputs.owner.is_empty()
+            && self
+                .outputs
+                .devices
+                .iter()
+                .all(|d| !d.can_play || d.id == self.connection)
+            && self
+                .outputs
+                .devices
+                .iter()
+                .any(|d| d.can_play && d.id == self.connection)
     }
     fn stop_for(&self, cursor: &Cursor) -> bool {
         self.stopped
@@ -223,6 +253,9 @@ impl Engine {
     }
     fn accept_outputs(&mut self, generation: Generation, outputs: Outputs) {
         let retiring = self.online.is_owner() && outputs.owner.is_empty();
+        if !outputs.owner.is_empty() {
+            self.online.released_here = false;
+        }
         self.online.outputs = outputs;
         if retiring {
             if self.local_store.is_none() {
@@ -230,9 +263,17 @@ impl Engine {
                 self.stop();
             }
             self.online.advance = None;
-            if let Some(socket) = &self.socket {
-                let _ = socket.command(generation, socket::Command::Release);
+            self.online.released_here = self
+                .socket
+                .as_ref()
+                .is_some_and(|socket| socket.command(generation, socket::Command::Release).is_ok());
+        }
+        if self.online.is_owner() || self.online.locally_vacant() {
+            if let Some(start) = &mut self.online.local_start {
+                start.output_confirmed();
             }
+        } else {
+            self.cancel_local_start();
         }
     }
     fn handle_event(&mut self, event: Event) {
@@ -240,14 +281,26 @@ impl Engine {
         if self.link() != Link::Connected(generation) {
             return;
         }
+        if self
+            .online
+            .local_start
+            .as_ref()
+            .is_some_and(|s| s.output_pulse.is_some())
+            && !matches!(&event.kind, EventKind::Outputs(_))
+        {
+            self.cancel_local_start();
+        }
         match event.kind {
             EventKind::Snapshot {
                 connection_id,
                 player,
                 outputs,
             } => {
+                self.cancel_local_start();
+                self.online.released_here = false;
                 let fresh = self.online.generation != Some(generation);
                 if fresh {
+                    self.online.receipts = local_start::Receipts::default();
                     self.disconnect_personal();
                     self.online.generation = Some(generation);
                     self.online.connection = connection_id;
@@ -294,12 +347,21 @@ impl Engine {
                 if changed {
                     self.online.revision = self.online.revision.wrapping_add(1);
                 }
-                if delta.source.as_deref() == Some(self.online.connection.as_str()) {
+                let own = delta.source.as_deref() == Some(self.online.connection.as_str());
+                if own {
+                    self.online.receipts.received(&delta, state);
                     self.action_status = if delta.queue.is_none() {
                         "That selection is unavailable."
                     } else {
                         ""
                     };
+                }
+                let vacant = self.online.locally_vacant();
+                if let (Some(start), Some(state)) =
+                    (&mut self.online.local_start, &self.online.state)
+                    && !start.observe(&delta, state, own, vacant)
+                {
+                    self.cancel_local_start();
                 }
                 if let Some(cursor) = &delta.cursor {
                     self.online.adopt_cursor(cursor, delta.observed);
@@ -422,9 +484,24 @@ impl Engine {
         // A later queue edit can itself drain the opening snapshot. Send any
         // deferred Play first so it cannot erase that edit by arriving later.
         self.finish_initial_play();
-        self.send_online_command(command);
+        self.send_online_command(command, true);
     }
-    fn send_online_command(&mut self, command: socket::Command) {
+    fn send_online_command(&mut self, command: socket::Command, explicit: bool) {
+        let replaced_start = self.online.starting_locally();
+        if matches!(
+            command,
+            socket::Command::Play { .. }
+                | socket::Command::Resume
+                | socket::Command::Pause
+                | socket::Command::Close
+                | socket::Command::Seek { .. }
+                | socket::Command::Next
+                | socket::Command::Previous
+                | socket::Command::Jump { .. }
+                | socket::Command::Select { .. }
+        ) {
+            self.cancel_local_start();
+        }
         if matches!(command, socket::Command::Pause | socket::Command::Close)
             && (self.online.is_owner()
                 || self.online.execution.is_some()
@@ -453,11 +530,51 @@ impl Engine {
                 | socket::Command::Jump { .. }
                 | socket::Command::Select { .. }
         );
-        self.action_status = if self
-            .socket
-            .as_ref()
-            .is_some_and(|s| s.command(generation, command).is_ok())
+        let socket = self.socket.as_ref().expect("live generation has a socket");
+        let start = if explicit
+            && !replaced_start
+            && socket.events.is_empty()
+            && self.audio.is_some()
+            && self.local_store.is_none()
+            && self.online.execution.is_none()
+            && self.online.work.is_none()
+            && self
+                .grant()
+                .is_none_or(|g| g.attached && g.generation == generation)
+            && (self.online.is_owner() || self.online.locally_vacant())
         {
+            self.online.state.as_ref().and_then(|state| {
+                let resume_through = self.attached().map_or(0, |g| g.resume_through);
+                if !self.online.receipts.may_start(&command, resume_through) {
+                    return None;
+                }
+                local_start::Start::new(
+                    &command,
+                    state,
+                    generation,
+                    socket.link.clone(),
+                    socket.authority.clone(),
+                    socket.direct_start.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        self.action_status = if let Ok(resume) = socket.command(generation, command.clone()) {
+            self.online.receipts.sent(&command, resume);
+            if let Some(mut start) = start {
+                // This cache contains only the current account's previously
+                // authenticated media. Downloaded files always re-verify.
+                if let Some(bytes) = self.audio.as_ref().and_then(|a| a.cached(&start.id)) {
+                    start.ready = Some(OnlineMedia {
+                        bytes,
+                        downloaded: false,
+                    });
+                } else {
+                    self.load_online_media(start.id.clone());
+                }
+                self.online.local_start = Some(start);
+            }
             if changes_run && self.crossfade_enabled.load(Ordering::Acquire) {
                 // Don't (re)start an overlap of the run a manual navigation
                 // is about to replace. A rejected choice can simply use EOF.
@@ -480,10 +597,13 @@ impl Engine {
             self.action_status = "The playback action was not sent.";
         } else if self.online_generation().is_some() {
             let (_, command) = self.pending_initial_play.take().unwrap();
-            self.send_online_command(command);
+            self.send_online_command(command, false);
         }
     }
     fn reconcile_online(&mut self) {
+        if self.reconcile_local_start() {
+            return;
+        }
         let grant = self.grant();
         if grant.is_none() && self.online.advance.take().is_some() {
             self.online.revision = self.online.revision.wrapping_add(1);
@@ -569,15 +689,17 @@ impl Engine {
             duration: track.duration,
         };
         self.cancel_work();
+        self.load_online_media(work.id.clone());
         self.online.work = Some(work);
-        let work = self.online.work.as_ref().expect("just installed");
+    }
+    fn load_online_media(&mut self, id: String) {
         if let Some(account) = &self.account {
             let (api, session, slot, replies, id) = (
                 account.api.clone(),
                 account.session.clone(),
                 self.local_read_slot.clone(),
                 self.results.clone(),
-                work.id.clone(),
+                id,
             );
             let cached = self.audio.as_ref().and_then(|audio| audio.cached(&id));
             let (epoch, operation) = (self.epoch, self.operation);
@@ -602,15 +724,130 @@ impl Engine {
             }));
         }
     }
-    pub(super) fn complete_online(&mut self, result: Result<OnlineMedia, ApiError>) {
+    pub(super) fn complete_online(
+        &mut self,
+        operation: u64,
+        result: Result<OnlineMedia, ApiError>,
+    ) {
         self.drain_online_events(None);
-        if let Some(work) = self.online.work.take() {
-            if result.as_ref().is_err_and(|e| e.expired) {
+        if !self.network_allowed() {
+            if result.as_ref().is_err_and(|e| e.expired)
+                && self.current()
+                && !self.explicit_offline()
+            {
                 self.expire();
-                return;
             }
+            return;
+        }
+        if self.operation != operation {
+            return;
+        }
+        if result.as_ref().is_err_and(|e| e.expired) {
+            self.expire();
+            return;
+        }
+        if let Some(start) = &mut self.online.local_start {
+            match result {
+                Ok(media) => start.ready = Some(media),
+                Err(_) => self.cancel_local_start(),
+            }
+            self.reconcile_online();
+        } else if let Some(work) = self.online.work.take() {
             self.start_online(work, result.map_err(|_| Status::Media));
         }
+    }
+    fn cancel_local_start(&mut self) {
+        if self.online.starting_locally() {
+            self.cancel_work();
+            self.stop();
+        }
+    }
+    /// Return true only while the separate local start owns native audio/load.
+    /// Promotion never stops/re-appends the sink or creates a new decoder.
+    fn reconcile_local_start(&mut self) -> bool {
+        let Some(start) = self.online.local_start.as_ref() else {
+            return false;
+        };
+        if self.online_generation() != Some(start.generation)
+            || !start.permit.live()
+            || !(self.online.is_owner() || self.online.locally_vacant())
+            || start.started
+                && self
+                    .audio
+                    .as_ref()
+                    .is_none_or(|a| a.was_fenced() || a.facts().ended)
+        {
+            self.cancel_local_start();
+            return false;
+        }
+        let Some(socket) = &self.socket else {
+            return false;
+        };
+        if !socket.events.is_empty() || start.output_pulse.is_some() {
+            return true;
+        }
+        let grant = self.attached();
+        let start = self.online.local_start.as_mut().expect("checked above");
+        if let (Some(grant), Some(cursor)) = (grant, start.canonical.as_ref()) {
+            if start.started {
+                let permit = output::RunPermit::new(socket.authority.clone(), grant);
+                if start
+                    .permit
+                    .commit(permit.source(socket.link.clone(), grant.generation))
+                {
+                    self.online.execution = Some(Execution {
+                        cursor: cursor.clone(),
+                        permit,
+                        pending_crossfade: None,
+                        status: Status::Ok,
+                        last_fact: None,
+                    });
+                    self.online.clear_local_start();
+                    return false;
+                }
+                self.cancel_local_start();
+                return false;
+            }
+            // Go won the race with media loading. Reuse the same fetch as
+            // canonical work instead of starting it or opening audio twice.
+            let mut start = self.online.local_start.take().unwrap();
+            let work = Work {
+                generation: grant.generation,
+                cursor: start.canonical.take().unwrap(),
+                id: start.id,
+                duration: self
+                    .online
+                    .state
+                    .as_ref()
+                    .and_then(State::current)
+                    .map_or(start.duration, |t| t.duration),
+            };
+            if let Some(media) = start.ready {
+                self.start_online(work, Ok(media));
+            } else {
+                self.online.work = Some(work);
+            }
+            return false;
+        }
+        if let Some(OnlineMedia { bytes, downloaded }) = start.ready.take() {
+            let audio = self.audio.as_mut().expect("local start has audio");
+            let status = audio.play(
+                start.id.clone(),
+                bytes,
+                start.elapsed,
+                start.duration,
+                start.permit.source(),
+            );
+            if downloaded {
+                audio.discard_cache();
+            }
+            if status != Status::Ok {
+                self.cancel_local_start();
+                return false;
+            }
+            start.started = true;
+        }
+        true
     }
     fn start_online(&mut self, work: Work, media: Result<OnlineMedia, Status>) {
         let Some(grant) = self.attached().filter(|g| g.generation == work.generation) else {
@@ -1004,8 +1241,12 @@ impl Engine {
                 }
             })
             .collect();
-        if p.status.is_empty() && self.online.work.is_some() {
-            p.status = "Loading audio…";
+        if p.status.is_empty() {
+            if self.online.starting_locally() {
+                p.status = "Starting playback…";
+            } else if self.online.work.is_some() {
+                p.status = "Loading audio…";
+            }
         }
     }
 }
@@ -1023,6 +1264,42 @@ mod tests {
             desired: true,
             ..Cursor::default()
         }
+    }
+
+    #[test]
+    fn empty_owner_only_allows_a_locally_witnessed_release_with_no_competitor() {
+        let mut online = Online {
+            connection: "local".into(),
+            ..Online::default()
+        };
+        let outputs = |owner, other| {
+            let mut devices = vec![serde_json::json!({
+                "id": "local", "deviceId": "desktop", "name": "Desktop", "canPlay": true
+            })];
+            if other {
+                devices.push(serde_json::json!({
+                    "id": "remote", "deviceId": "phone", "name": "Phone", "canPlay": true
+                }));
+            }
+            serde_json::from_value(serde_json::json!({"owner":owner,"devices":devices})).unwrap()
+        };
+        online.outputs = outputs("", false);
+        assert!(
+            !online.locally_vacant(),
+            "opening empty may be startup drain or an unseen handoff"
+        );
+        online.released_here = true;
+        assert!(online.locally_vacant());
+        online.outputs = outputs("", true);
+        assert!(
+            !online.locally_vacant(),
+            "a handoff may still elect another eligible output"
+        );
+        online.outputs = outputs("detached-remote", false);
+        assert!(
+            !online.locally_vacant(),
+            "missing roster row does not imply a detached owner is gone"
+        );
     }
 
     #[test]
@@ -1060,6 +1337,7 @@ mod tests {
             generation: 8,
             deadline: Instant::now() + std::time::Duration::from_secs(5),
             attached: false,
+            resume_through: 0,
         };
         let (authority, receiver) = tokio::sync::watch::channel(Some(grant));
         let execution = Execution {

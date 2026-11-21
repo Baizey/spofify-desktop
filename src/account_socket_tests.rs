@@ -35,6 +35,7 @@ fn signals() -> (
         Signals {
             link: link_tx,
             authority: authority_tx,
+            direct_start: Arc::default(),
             events: event_tx,
         },
         link,
@@ -238,7 +239,9 @@ fn grant_must_match_a_sent_basis_and_cannot_remake_or_extend_it() {
     let time = Instant::now();
     let mut pulses = Pulses::default();
     let older = pulses.next(time).unwrap();
+    pulses.written_resume = 3;
     let newer = pulses.next(time + Duration::from_secs(1)).unwrap();
+    pulses.written_resume = 7; // written after this presence; not covered by its grant
     assert_eq!(pulses.accept(92, 8000, "handle", time), None);
     assert_eq!(pulses.accept(newer, 15_001, "handle", time), None);
     assert_eq!(pulses.accept(newer, 8000, "", time), None);
@@ -246,6 +249,7 @@ fn grant_must_match_a_sent_basis_and_cannot_remake_or_extend_it() {
         pulses.accept(newer, 15_000, "handle", time + Duration::from_secs(3)),
         Some(time + Duration::from_secs(16))
     );
+    assert_eq!(pulses.seen_resume, 3);
     assert_eq!(pulses.accept(older, 8000, "handle", time), None);
     assert_eq!(pulses.accept(newer, 8000, "handle", time), None);
     let fresh = pulses.next(time + Duration::from_secs(2)).unwrap();
@@ -408,6 +412,7 @@ async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices()
         .try_send(WriteFrame {
             generation: gen1,
             class: Class::Choice,
+            resume: None,
             at: Instant::now(),
             raw: encode(&Command::Next).unwrap(),
         })
@@ -455,6 +460,7 @@ async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices()
             .try_send(WriteFrame {
                 generation: gen2,
                 class: Class::Choice,
+                resume: None,
                 at: Instant::now(),
                 raw: encode(&Command::Pause).unwrap(),
             })
@@ -495,6 +501,53 @@ async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices()
     };
     assert_eq!(next.receive(msg, &mut output, &signals), Ok(false));
     assert!(authority.borrow().is_none());
+}
+
+#[test]
+fn a_wire_output_correction_fences_direct_pcm_before_the_actor_consumes_it() {
+    let (signals, _, _, mut events) = signals();
+    let (_, mut output) = output_state();
+    let mut conn = begin(NEW, "", &mut output, &signals);
+    let _ = events.try_recv().unwrap();
+    let direct = signals.direct_start.stamp().unwrap();
+    let outputs = |owner: &str, competitor: bool| {
+        let mut devices = vec![json!({"id":NEW,"deviceId":DEVICE,"name":"Desk","canPlay":true})];
+        if competitor {
+            devices.push(json!({"id":"phone","deviceId":"phone","name":"Phone","canPlay":true}));
+        }
+        decode(
+            &json!({"type":"outputs","owner":owner,"devices":devices}).to_string(),
+            DEVICE,
+        )
+        .unwrap()
+    };
+    conn.receive(outputs(NEW, false), &mut output, &signals)
+        .ok()
+        .unwrap();
+    assert_eq!(
+        signals.direct_start.stamp(),
+        Some(direct),
+        "vacancy election preserves the sink"
+    );
+    let _ = events.try_recv().unwrap();
+    conn.receive(outputs("", true), &mut output, &signals)
+        .ok()
+        .unwrap();
+    assert_ne!(signals.direct_start.stamp(), Some(direct));
+    assert_eq!(
+        events.len(),
+        1,
+        "native fence did not depend on actor consuming Outputs"
+    );
+    let recent = signals.direct_start.stamp().unwrap();
+    signals.direct_start.set_expired(true);
+    assert_eq!(signals.direct_start.stamp(), None);
+    signals.direct_start.set_expired(false);
+    assert_ne!(
+        signals.direct_start.stamp(),
+        Some(recent),
+        "a renewal does not resurrect stopped speculative PCM"
+    );
 }
 
 #[test]
