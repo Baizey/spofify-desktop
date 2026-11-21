@@ -8,14 +8,17 @@
 use std::{
     fmt,
     fs::File,
+    future::{Future, pending},
     io::{Read, Write},
     mem::MaybeUninit,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
+use futures_util::{Stream, StreamExt, stream};
 use ring::digest::{Context, SHA256, digest};
 use rustix::{
     fd::OwnedFd,
@@ -24,14 +27,20 @@ use rustix::{
     process::geteuid,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     api::{Api, ApiError, Item, Session},
+    audio_input::AudioInput,
     storage::{self as local_storage, DIR_FLAGS},
 };
 
-pub const MAX_TRACK_BYTES: usize = 32 * 1024 * 1024;
+const IO_CHUNK: usize = 64 * 1024;
+const DOWNLOAD_DISK_STALL: Duration = Duration::from_secs(10);
+// The default download store is shared by all callers in this process. Even
+// an admission worker stuck before it acquires the file lock keeps this slot.
+static DOWNLOAD_SLOT: Semaphore = Semaphore::const_new(1);
+static DOWNLOAD_OPEN_SLOTS: Semaphore = Semaphore::const_new(2);
 const MAX_HEADER: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"SPOFDL01";
 const PREFIX_BYTES: usize = 12;
@@ -59,7 +68,6 @@ pub enum Error {
     Damaged,
     UnsupportedAudio,
     InvalidMedia,
-    TrackTooLarge,
     Offline,
     Cancelled,
 }
@@ -77,7 +85,6 @@ impl fmt::Display for Error {
             Self::Damaged => "The downloaded file or store layout is invalid.",
             Self::UnsupportedAudio => "This audio cannot be played on this device.",
             Self::InvalidMedia => "Unable to verify this track’s download.",
-            Self::TrackTooLarge => "This track exceeds the 32 MiB download limit.",
             Self::Offline => "Downloads are unavailable while offline.",
             Self::Cancelled => "The download was cancelled.",
         })
@@ -96,18 +103,16 @@ pub struct Download {
     pub bytes: u64,
 }
 
-/// Same bounded original-format bytes as `Api::media`, for use by the existing
-/// audio endpoint. The caller must still fence late results and playback on
-/// session/occurrence changes, and use the appropriate player admission path.
+/// A verified, original-format payload from the same descriptor that was hashed.
+/// The caller must still fence late results and playback on session/occurrence
+/// changes, and use the appropriate player admission path.
 pub struct PlaybackInput {
     pub item: Item,
-    pub bytes: Vec<u8>,
+    pub source: AudioInput,
 }
 
 pub(crate) struct OnlineMedia {
-    pub bytes: Arc<[u8]>,
-    /// Do not add a second, RAM-backed copy to the online stream cache.
-    pub downloaded: bool,
+    pub source: AudioInput,
 }
 
 /// Choose authenticated account media; this does not interpret queue, output,
@@ -118,7 +123,7 @@ pub(crate) async fn online_media(
     session: &Session,
     slot: Arc<Semaphore>,
     id: &str,
-    cached: Option<Arc<[u8]>>,
+    cached: Option<AudioInput>,
 ) -> Result<OnlineMedia, ApiError> {
     online_media_with_store(api, session, slot, id, cached, OfflineStore::open_existing).await
 }
@@ -128,45 +133,77 @@ async fn online_media_with_store(
     session: &Session,
     slot: Arc<Semaphore>,
     id: &str,
-    cached: Option<Arc<[u8]>>,
+    cached: Option<AudioInput>,
     open: impl FnOnce() -> Result<Option<OfflineStore>, Error> + Send + 'static,
 ) -> Result<OnlineMedia, ApiError> {
-    let network = session.network_changes();
-    let stamp = *network.borrow();
     api.with_authenticated_network(session, async {
-        let permit = slot.acquire_owned().await.ok();
-        if let Some(permit) = permit {
-            let (api, session, id) = (api.clone(), session.clone(), id.to_owned());
-            let local = tokio::task::spawn_blocking(move || {
-                // Hold the same worker slot as Saved playback, even if the
-                // awaiting online task is dropped or the occurrence changes.
-                let _permit = permit;
-                if *network.borrow() != stamp || stamp & 1 != 0 || session.is_expired() {
-                    return None;
-                }
-                let input = open().ok()??.read(&api, &session, &id).ok()?;
-                Some(Arc::from(input.bytes))
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(bytes) = local {
-                return Ok(OnlineMedia {
-                    bytes,
-                    downloaded: true,
-                });
-            }
-        }
-        let bytes = match cached {
-            Some(bytes) => bytes,
-            None => api.media(session, id).await?.into(),
+        let input = read_verified(
+            api.clone(),
+            session.clone(),
+            slot,
+            id.to_owned(),
+            move || open()?.ok_or(Error::NotDownloaded),
+        )
+        .await;
+        let source = match (input, cached) {
+            (Ok((_, input)), _) => input.source,
+            (_, Some(source)) if source.reusable_online() => source,
+            _ => AudioInput::online(api.media(session, id).await?).await?,
         };
-        Ok(OnlineMedia {
-            bytes,
-            downloaded: false,
-        })
+        Ok(OnlineMedia { source })
     })
     .await
+}
+
+/// Incremental verification renews a disk stall timer, not a track deadline.
+/// A retired kernel read still owns its slot until it actually returns.
+pub(crate) async fn read_verified(
+    api: Arc<Api>,
+    session: Session,
+    slot: Arc<Semaphore>,
+    id: String,
+    open: impl FnOnce() -> Result<OfflineStore, Error> + Send + 'static,
+) -> Result<(OfflineStore, PlaybackInput), Error> {
+    use std::time::Duration;
+    use tokio::{sync::watch, time::timeout};
+    const STALL: Duration = Duration::from_secs(10);
+    let mut mode = session.network_changes();
+    let stamp = *mode.borrow_and_update();
+    let permit = tokio::select! {
+        biased;
+        _ = mode.changed() => return Err(Error::Cancelled),
+        permit = timeout(STALL, slot.acquire_owned()) => permit.map_err(|_| Error::Busy)?.map_err(|_| Error::Cancelled)?,
+    };
+    let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let cancelled = cancellation.0.clone();
+    let (progress, mut advances) = watch::channel(());
+    let worker_mode = mode.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let live = || {
+            if cancelled.load(Ordering::Acquire) || *worker_mode.borrow() != stamp {
+                return Err(Error::Cancelled);
+            }
+            let _ = progress.send(());
+            Ok(())
+        };
+        live()?;
+        let store = open()?;
+        let input = store.read_live(&api, &session, &id, live)?;
+        Ok((store, input))
+    });
+    loop {
+        tokio::select! {
+            biased;
+            _ = mode.changed() => return Err(Error::Cancelled),
+            result = &mut worker => return result.map_err(|_| Error::Storage)?,
+            progress = timeout(STALL, advances.changed()) => match progress {
+                Err(_) => return Err(Error::Storage),
+                Ok(Err(_)) => return worker.await.map_err(|_| Error::Storage)?,
+                Ok(Ok(())) => (),
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -181,6 +218,23 @@ impl OfflineStore {
         Ok(Self {
             root: Arc::new(storage(local_storage::open_default(ROOT_DIR))?),
         })
+    }
+
+    /// Bound even the initial path walk for download and pin operations.
+    pub(crate) async fn open_for_download(
+        open: impl FnOnce() -> Result<Self, Error> + Send + 'static,
+    ) -> Result<Self, Error> {
+        let slot = DOWNLOAD_OPEN_SLOTS.try_acquire().map_err(|_| Error::Busy)?;
+        tokio::time::timeout(
+            DOWNLOAD_DISK_STALL,
+            tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                open()
+            }),
+        )
+        .await
+        .map_err(|_| Error::Storage)?
+        .map_err(|_| Error::Storage)?
     }
 
     pub(crate) fn open_existing() -> Result<Option<Self>, Error> {
@@ -218,17 +272,15 @@ impl OfflineStore {
         Track::validate_item(item)?;
         let track = Track::from(item);
         let name = scope.name(&track.id)?;
-        let store = self.clone();
-        let admission = tokio::task::spawn_blocking(move || store.admit(&name))
-            .await
-            .map_err(|_| Error::Storage)??;
-        api.authenticated_account(session)?;
-        let prepare = async {
+        let live = download_liveness(session.clone(), network.clone(), generation);
+        in_download_mode(&mut network, async {
+            let admission = self
+                .admit_download(name, live.clone(), DOWNLOAD_DISK_STALL)
+                .await?;
+            api.authenticated_account(session)?;
             let body = api.offline_manifest(session, &track.id).await?;
             let manifest = Manifest::parse(&body, &track.id)?;
-            if *session.network_changes().borrow() != generation {
-                return Err(Error::Offline);
-            }
+            live()?;
             let audio = api
                 .offline_audio(
                     session,
@@ -238,36 +290,131 @@ impl OfflineStore {
                     manifest.byte_length,
                 )
                 .await?;
-            Ok::<_, Error>((manifest, audio))
-        };
-        let (manifest, audio) = tokio::select! {
-            biased;
-            _ = network.changed() => return Err(Error::Offline),
-            result = prepare => result?,
-        };
-        api.authenticated_account(session)?;
-        let store = self.clone();
-        let session = session.clone();
-        let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-        let cancelled = cancellation.0.clone();
-        tokio::task::spawn_blocking(move || {
-            let _admission = admission;
-            let live = || {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(Error::Cancelled);
-                }
-                if *network.borrow() != generation {
-                    return Err(Error::Offline);
-                }
-                check_online_liveness(&session)
-            };
             live()?;
-            manifest.verify(&audio)?;
-            let audio = probe_audio(audio)?;
-            store.commit(&scope, track, audio.as_ref(), live)
+            let header = Header {
+                scope: scope.0,
+                track,
+                bytes: manifest.byte_length,
+                audio_hash: manifest.sha256,
+            };
+            self.transfer(
+                admission,
+                header,
+                stream::try_unfold(audio, |mut audio| async {
+                    Ok(audio.chunk().await?.map(|bytes| (bytes, audio)))
+                }),
+                live,
+                DOWNLOAD_DISK_STALL,
+            )
+            .await
         })
         .await
-        .map_err(|_| Error::Storage)?
+    }
+
+    async fn admit_download(
+        &self,
+        name: String,
+        live: impl Fn() -> Result<(), Error> + Send + 'static,
+        stall: Duration,
+    ) -> Result<DownloadAdmission, Error> {
+        let slot = DOWNLOAD_SLOT.try_acquire().map_err(|_| Error::Busy)?;
+        let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let cancelled = cancellation.0.clone();
+        let (progress, mut advances) = watch::channel(());
+        let store = self.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let fd =
+                store.admit_live(&name, || download_checkpoint(&cancelled, &progress, &live))?;
+            Ok(DownloadAdmission {
+                _fd: fd,
+                _slot: slot,
+            })
+        });
+        await_download_disk(&mut advances, stall, worker)
+            .await?
+            .map_err(|_| Error::Storage)?
+    }
+
+    async fn transfer<B: AsRef<[u8]> + Send + 'static>(
+        &self,
+        admission: impl Send + 'static,
+        header: Header,
+        chunks: impl Stream<Item = Result<B, Error>>,
+        live: impl Fn() -> Result<(), Error> + Send + Sync + 'static,
+        stall: Duration,
+    ) -> Result<Download, Error> {
+        // Acknowledge staging and each chunk before polling the network again.
+        // This bounds the handoff to one chunk and lets the disk watchdog run
+        // only when waiting for disk, not when the worker is waiting for HTTP.
+        let (send, mut receive) = mpsc::channel::<Packet<B>>(1);
+        let (ready, staged) = oneshot::channel();
+        let (progress, mut advances) = watch::channel(());
+        let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let cancelled = cancellation.0.clone();
+        let store = self.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            let live = Arc::new(live);
+            let publish_progress = progress.clone();
+            let live = move || download_checkpoint(&cancelled, &progress, &*live);
+            live()?;
+            let mut stage = store.stage_live(header, &live)?;
+            if ready.send(()).is_err() {
+                return Err(Error::Cancelled);
+            }
+            while let Some(packet) = receive.blocking_recv() {
+                live()?;
+                match packet {
+                    Packet::Chunk(chunk, written) => {
+                        stage.write(chunk.as_ref(), &live)?;
+                        if written.send(()).is_err() {
+                            return Err(Error::Cancelled);
+                        }
+                    }
+                    Packet::Complete => {
+                        let (partial, header) = stage.verify_and_sync(live.clone())?;
+                        return store.publish(partial, header, live, || {
+                            let _ = publish_progress.send(());
+                        });
+                    }
+                }
+            }
+            Err(Error::Cancelled)
+        });
+        let transfer = async {
+            if await_download_disk(&mut advances, stall, staged)
+                .await?
+                .is_err()
+            {
+                return Ok(()); // The worker has the actual storage error.
+            }
+            tokio::pin!(chunks);
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk?;
+                let (written, ack) = oneshot::channel();
+                let received = await_download_disk(&mut advances, stall, async {
+                    send.send(Packet::Chunk(chunk, written)).await.is_ok() && ack.await.is_ok()
+                })
+                .await?;
+                if !received {
+                    return Ok(());
+                }
+            }
+            // A closed channel alone is never permission to publish.
+            let _ = await_download_disk(&mut advances, stall, send.send(Packet::Complete)).await?;
+            Ok::<_, Error>(())
+        };
+        tokio::select! {
+            biased;
+            result = &mut worker => return result.map_err(|_| Error::Storage)?,
+            result = transfer => result?,
+        }
+        // On a transfer/network error or mode change the future drops its
+        // guard and channel immediately. The worker retires with its lease.
+        drop(send);
+        await_download_disk(&mut advances, stall, worker)
+            .await?
+            .map_err(|_| Error::Storage)?
     }
 
     /// Disk I/O only; use a blocking worker when calling from an async/UI actor.
@@ -278,7 +425,7 @@ impl OfflineStore {
         self.scan(&dir, |name| {
             if scope.contains(name) {
                 api.authenticated_account(session)?;
-                let (_, header) = open_entry(&dir, name, &scope)?;
+                let (_, header, _) = open_entry(&dir, name, &scope)?;
                 downloads.push(header.download());
             }
             Ok(())
@@ -293,34 +440,60 @@ impl OfflineStore {
         Ok(downloads)
     }
 
-    /// Read and verify one track. Does not fall back to a network request.
+    /// Read and verify one test record without a caller-owned cancellation fence.
+    #[cfg(test)]
     pub fn read(
         &self,
         api: &Api,
         session: &Session,
         track_id: &str,
     ) -> Result<PlaybackInput, Error> {
+        self.read_live(api, session, track_id, || Ok(()))
+    }
+
+    /// As in `read`, with an additional caller-owned cancellation or mode fence
+    /// checked between bounded disk reads, including before returning the source.
+    pub fn read_live(
+        &self,
+        api: &Api,
+        session: &Session,
+        track_id: &str,
+        live: impl Fn() -> Result<(), Error>,
+    ) -> Result<PlaybackInput, Error> {
+        let check = || {
+            live()?;
+            api.authenticated_account(session)?;
+            Ok::<_, Error>(())
+        };
+        check()?;
         let scope = Scope::new(api, session)?;
-        let dir = self.lock_dir(false)?;
-        let (mut file, header) = open_entry(&dir, &scope.name(track_id)?, &scope)?;
+        let (mut file, header, offset) = {
+            let dir = self.lock_dir(false)?;
+            open_entry(&dir, &scope.name(track_id)?, &scope)?
+        }; // Only pin the name during open; the descriptor survives unlink.
         if header.track.id != track_id {
             return Err(Error::Damaged);
         }
-        let mut bytes = vec![0; header.bytes as usize];
-        for chunk in bytes.chunks_mut(64 * 1024) {
-            api.authenticated_account(session)?;
+        let mut hash = Context::new(&SHA256);
+        let mut remaining = header.bytes;
+        let mut buffer = [0; IO_CHUNK];
+        while remaining != 0 {
+            check()?;
+            let chunk = &mut buffer[..remaining.min(IO_CHUNK as u64) as usize];
             file.read_exact(chunk).map_err(|_| Error::Damaged)?;
+            hash.update(chunk);
+            remaining -= chunk.len() as u64;
         }
-        let mut end = [0];
-        if file.read(&mut end).map_err(|_| Error::Damaged)? != 0
-            || header.audio_hash != hex(digest(&SHA256, &bytes).as_ref())
+        check()?;
+        if file.read(&mut [0]).map_err(|_| Error::Damaged)? != 0
+            || header.audio_hash != hex(hash.finish().as_ref())
         {
             return Err(Error::Damaged);
         }
-        api.authenticated_account(session)?;
+        check()?;
         Ok(PlaybackInput {
             item: header.track.item(),
-            bytes,
+            source: AudioInput::file(file, offset, header.bytes),
         })
     }
 
@@ -384,24 +557,39 @@ impl OfflineStore {
         Ok(dir)
     }
 
+    #[cfg(test)]
     fn admit(&self, name: &str) -> Result<OwnedFd, Error> {
+        self.admit_live(name, || Ok(()))
+    }
+
+    fn admit_live(
+        &self,
+        name: &str,
+        live: impl Fn() -> Result<(), Error>,
+    ) -> Result<OwnedFd, Error> {
+        live()?;
         let dir = self.lock_dir(true)?;
+        live()?;
         let admission = storage(fs::openat(
             &dir,
             LOCK,
             FILE_FLAGS | OFlags::RDWR | OFlags::CREATE,
             PRIVATE_FILE,
         ))?;
+        live()?;
         if file_size(&storage(fs::fstat(&admission))?)? != 0 {
             return Err(Error::Damaged);
         }
         lock(&admission, FlockOperation::NonBlockingLockExclusive)?;
+        live()?;
         // Recover an abandoned private staging file after a process crash.
         match fs::unlinkat(&dir, STAGE, AtFlags::empty()) {
             Ok(()) | Err(Errno::NOENT) => (),
             Err(_) => return Err(Error::Storage),
         }
+        live()?;
         reject_existing(&dir, name)?;
+        live()?;
         Ok(admission)
     }
 
@@ -430,63 +618,81 @@ impl OfflineStore {
         Ok(())
     }
 
-    /// Must hold download admission. The staging file is not part of any listing.
-    fn commit(
+    #[cfg(test)]
+    fn stage(&self, header: Header) -> Result<StagedDownload<'_>, Error> {
+        self.stage_live(header, || Ok(()))
+    }
+
+    /// Must hold download admission, but not the directory publication lock.
+    fn stage_live(
         &self,
-        scope: &Scope,
-        track: Track,
-        bytes: &[u8],
+        header: Header,
         live: impl Fn() -> Result<(), Error>,
-    ) -> Result<Download, Error> {
-        if bytes.is_empty() || bytes.len() > MAX_TRACK_BYTES {
-            return Err(Error::UnsupportedAudio);
-        }
-        let header = Header {
-            scope: scope.0.clone(),
-            track,
-            bytes: bytes.len() as u64,
-            audio_hash: hex(digest(&SHA256, bytes).as_ref()),
-        };
-        let name = scope.name(&header.track.id)?;
+    ) -> Result<StagedDownload<'_>, Error> {
         let json = serde_json::to_vec(&header).map_err(|_| Error::Storage)?;
         if json.is_empty() || json.len() > MAX_HEADER {
             return Err(Error::InvalidTrack);
         }
-        let dir = self.lock_dir(true)?;
+        let offset = (PREFIX_BYTES + json.len()) as u64;
+        if header.bytes == 0 || header.bytes > i64::MAX as u64 - offset {
+            return Err(Error::InvalidMedia);
+        }
         live()?;
-        reject_existing(&dir, &name)?;
-        let file = storage(fs::openat(
-            &dir,
+        let fd = storage(fs::openat(
+            self.root.as_ref(),
             STAGE,
-            FILE_FLAGS | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            FILE_FLAGS | OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
             PRIVATE_FILE,
         ))?;
-        let mut stage = Stage {
-            dir: &dir,
+        let partial = Stage {
+            dir: self.root.as_ref(),
             published: false,
         };
-        if file_size(&storage(fs::fstat(&file))?)? != 0 {
+        live()?;
+        if file_size(&storage(fs::fstat(&fd))?)? != 0 {
             return Err(Error::Damaged);
         }
-        let mut file = File::from(file);
+        live()?;
+        let mut file = File::from(fd);
         file.write_all(MAGIC)
             .and_then(|_| file.write_all(&(json.len() as u32).to_le_bytes()))
             .and_then(|_| file.write_all(&json))
             .map_err(write_error)?;
-        for chunk in bytes.chunks(64 * 1024) {
-            live()?;
-            file.write_all(chunk).map_err(write_error)?;
-        }
-        file.sync_all().map_err(write_error)?;
+        Ok(StagedDownload {
+            file,
+            partial,
+            offset,
+            remaining: header.bytes,
+            header,
+            hash: Context::new(&SHA256),
+        })
+    }
+
+    fn publish(
+        &self,
+        mut partial: Stage<'_>,
+        header: Header,
+        live: impl Fn() -> Result<(), Error>,
+        progress: impl Fn(),
+    ) -> Result<Download, Error> {
+        let name = Scope(header.scope.clone()).name(&header.track.id)?;
         live()?;
-        // Atomic no-overwrite publication; this is the commit point.
+        let dir = self.lock_dir(true)?;
+        live()?;
+        reject_existing(&dir, &name)?;
+        // As in v1, check just before entering the commit syscall. Never make
+        // mode changes wait for rename (or directory fsync) to return.
+        live()?;
         match fs::renameat_with(&dir, STAGE, &dir, name.as_str(), RenameFlags::NOREPLACE) {
-            Ok(()) => stage.published = true,
+            Ok(()) => partial.published = true,
             Err(Errno::EXIST) => return Err(Error::AlreadyDownloaded),
             Err(err) => return Err(storage_error(err)),
         }
+        progress();
         if let Err(err) = fs::fsync(&dir) {
+            progress();
             let _ = fs::unlinkat(&dir, name.as_str(), AtFlags::empty());
+            progress();
             let _ = fs::fsync(&dir);
             return Err(storage_error(err));
         }
@@ -494,23 +700,138 @@ impl OfflineStore {
     }
 }
 
-/// Give Rodio an owned, `'static` reader without cloning the audio allocation.
-#[derive(Clone)]
-struct ProbeBuffer(Arc<Vec<u8>>);
+struct DownloadAdmission {
+    _fd: OwnedFd,
+    _slot: tokio::sync::SemaphorePermit<'static>,
+}
 
-impl AsRef<[u8]> for ProbeBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
+async fn in_download_mode<T>(
+    mode: &mut watch::Receiver<u64>,
+    operation: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    tokio::select! {
+        biased;
+        _ = mode.changed() => Err(Error::Offline),
+        result = operation => result,
     }
 }
 
-fn probe_audio(bytes: Vec<u8>) -> Result<ProbeBuffer, Error> {
-    let bytes = ProbeBuffer(Arc::new(bytes));
+fn download_liveness(
+    session: Session,
+    mode: watch::Receiver<u64>,
+    generation: u64,
+) -> impl Fn() -> Result<(), Error> + Clone + use<> {
+    move || {
+        check_online_liveness(&session)?;
+        if *mode.borrow() != generation {
+            return Err(Error::Offline);
+        }
+        Ok(())
+    }
+}
+
+fn download_checkpoint(
+    cancelled: &AtomicBool,
+    progress: &watch::Sender<()>,
+    live: impl Fn() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Error::Cancelled);
+    }
+    live()?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Error::Cancelled);
+    }
+    let _ = progress.send(());
+    Ok(())
+}
+
+async fn await_download_disk<T>(
+    advances: &mut watch::Receiver<()>,
+    stall: Duration,
+    work: impl Future<Output = T>,
+) -> Result<T, Error> {
+    advances.borrow_and_update(); // Ignore progress from the previous phase.
+    tokio::pin!(work);
+    loop {
+        let progress = async {
+            // A closed sender does not prove that the worker has joined;
+            // it may still be dropping disk resources after an error.
+            if advances.changed().await.is_err() {
+                pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = &mut work => return Ok(result),
+            progress = tokio::time::timeout(stall, progress) => {
+                progress.map_err(|_| Error::Storage)?;
+            }
+        }
+    }
+}
+
+enum Packet<B> {
+    Chunk(B, oneshot::Sender<()>),
+    Complete,
+}
+
+struct StagedDownload<'a> {
+    file: File,
+    partial: Stage<'a>,
+    offset: u64,
+    remaining: u64,
+    header: Header,
+    hash: Context,
+}
+
+impl<'a> StagedDownload<'a> {
+    fn write(&mut self, bytes: &[u8], live: impl Fn() -> Result<(), Error>) -> Result<(), Error> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(Error::InvalidMedia);
+        }
+        for chunk in bytes.chunks(IO_CHUNK) {
+            live()?;
+            self.file.write_all(chunk).map_err(write_error)?;
+            self.hash.update(chunk);
+            self.remaining -= chunk.len() as u64;
+        }
+        Ok(())
+    }
+
+    fn verify_and_sync(
+        self,
+        live: impl Fn() -> Result<(), Error> + Send + Sync + Clone + 'static,
+    ) -> Result<(Stage<'a>, Header), Error> {
+        if self.remaining != 0 || hex(self.hash.finish().as_ref()) != self.header.audio_hash {
+            return Err(Error::InvalidMedia);
+        }
+        live()?;
+        let source = AudioInput::file(
+            self.file.try_clone().map_err(write_error)?,
+            self.offset,
+            self.header.bytes,
+        );
+        probe_audio(&source, live)?;
+        self.file.sync_all().map_err(write_error)?;
+        Ok((self.partial, self.header))
+    }
+}
+
+fn probe_audio(
+    source: &AudioInput,
+    live: impl Fn() -> Result<(), Error> + Send + Sync + Clone + 'static,
+) -> Result<(), Error> {
     // Admission check only; one decoded sample does not validate every frame.
-    let mut decoder = rodio::Decoder::try_from(std::io::Cursor::new(bytes.clone()))
-        .map_err(|_| Error::UnsupportedAudio)?;
-    decoder.next().ok_or(Error::UnsupportedAudio)?;
-    Ok(bytes)
+    let probe_live = live.clone();
+    let supported = rodio::Decoder::builder()
+        .with_data(source.reader_with_cancel(move || probe_live().is_ok()))
+        .with_byte_len(source.len())
+        .with_seekable(true)
+        .build()
+        .is_ok_and(|mut decoder| decoder.next().is_some());
+    live()?;
+    supported.then_some(()).ok_or(Error::UnsupportedAudio)
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -575,7 +896,7 @@ struct Manifest {
     track_id: String,
     media_version: String,
     sha256: String,
-    byte_length: usize,
+    byte_length: u64,
     format: String,
     content_type: String,
 }
@@ -605,17 +926,7 @@ impl Manifest {
         {
             return Err(Error::InvalidMedia);
         }
-        if value.byte_length > MAX_TRACK_BYTES {
-            return Err(Error::TrackTooLarge);
-        }
         Ok(value)
-    }
-
-    fn verify(&self, bytes: &[u8]) -> Result<(), Error> {
-        if self.byte_length != bytes.len() || self.sha256 != hex(digest(&SHA256, bytes).as_ref()) {
-            return Err(Error::InvalidMedia);
-        }
-        Ok(())
     }
 }
 
@@ -707,7 +1018,7 @@ impl Track {
     }
 }
 
-fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header), Error> {
+fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header, u64), Error> {
     let fd = fs::openat(dir, name, FILE_FLAGS | OFlags::RDONLY, Mode::empty()).map_err(|e| {
         if e == Errno::NOENT {
             Error::NotDownloaded
@@ -720,11 +1031,8 @@ fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header)
     let mut prefix = [0; PREFIX_BYTES];
     file.read_exact(&mut prefix).map_err(|_| Error::Damaged)?;
     let len = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
-    if &prefix[..8] != MAGIC
-        || !(1..=MAX_HEADER).contains(&len)
-        || actual > max_entry_bytes()
-        || actual <= (PREFIX_BYTES + len) as u64
-    {
+    let offset = PREFIX_BYTES as u64 + len as u64;
+    if &prefix[..8] != MAGIC || !(1..=MAX_HEADER).contains(&len) || actual <= offset {
         return Err(Error::Damaged);
     }
     let mut json = vec![0; len];
@@ -733,17 +1041,12 @@ fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header)
     if header.scope != scope.0
         || !header.track.valid()
         || !hex_digest(&header.audio_hash)
-        || !(1..=MAX_TRACK_BYTES as u64).contains(&header.bytes)
-        || actual != (PREFIX_BYTES + len) as u64 + header.bytes
+        || actual.checked_sub(offset) != Some(header.bytes)
         || scope.name(&header.track.id).map_err(|_| Error::Damaged)? != name
     {
         return Err(Error::Damaged);
     }
-    Ok((file, header))
-}
-
-fn max_entry_bytes() -> u64 {
-    (PREFIX_BYTES + MAX_HEADER + MAX_TRACK_BYTES) as u64
+    Ok((file, header, offset))
 }
 
 // Admission only needs the candidate key. Real filesystem writes enforce
@@ -760,7 +1063,7 @@ fn reject_existing(dir: &OwnedFd, name: &str) -> Result<(), Error> {
 }
 
 fn validate_entry_stat(s: &Stat) -> Result<(), Error> {
-    if !(PREFIX_BYTES as u64 + 2..=max_entry_bytes()).contains(&file_size(s)?) {
+    if file_size(s)? < PREFIX_BYTES as u64 + 2 {
         return Err(Error::Damaged);
     }
     Ok(())
@@ -909,7 +1212,26 @@ mod tests {
         data: &[u8],
     ) -> Result<Download, Error> {
         let _guard = store.admit(&scope.name(id)?)?;
-        store.commit(scope, track(id), data, || Ok(()))
+        // Some legacy fixtures deliberately contain non-audio payloads.
+        let mut stage = store.stage(fixture_header(scope, id, data))?;
+        stage.write(data, || Ok(()))?;
+        stage.file.sync_all().map_err(write_error)?;
+        store.publish(stage.partial, stage.header, || Ok(()), || ())
+    }
+
+    fn fixture_header(scope: &Scope, id: &str, data: &[u8]) -> Header {
+        Header {
+            scope: scope.0.clone(),
+            track: track(id),
+            bytes: data.len() as u64,
+            audio_hash: hex(digest(&SHA256, data).as_ref()),
+        }
+    }
+
+    fn fixture_payload(input: PlaybackInput) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        input.source.reader().read_to_end(&mut bytes).unwrap();
+        bytes
     }
 
     #[tokio::test]
@@ -929,17 +1251,21 @@ mod tests {
                 &session,
                 Arc::new(Semaphore::new(1)),
                 id,
-                Some(Arc::from(&b"reusable stream"[..])),
+                Some(AudioInput::from(Arc::from(&b"reusable stream"[..]))),
                 move || Ok(Some(store)),
             )
         };
         let chosen = read("saved").await.unwrap();
-        assert!(chosen.downloaded);
-        assert_eq!(&*chosen.bytes, b"verified local bytes");
+        assert!(!chosen.source.reusable_online());
+        let mut actual = Vec::new();
+        chosen.source.reader().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, b"verified local bytes");
         for id in ["foreign", "missing"] {
             let chosen = read(id).await.unwrap();
-            assert!(!chosen.downloaded);
-            assert_eq!(&*chosen.bytes, b"reusable stream");
+            assert!(chosen.source.reusable_online());
+            actual.clear();
+            chosen.source.reader().read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, b"reusable stream");
         }
         session.set_offline(true);
         assert!(read("saved").await.is_err());
@@ -966,13 +1292,13 @@ mod tests {
         new_session.set_offline(true);
         assert_eq!(reopened.list(&same, &new_session).unwrap().len(), 1);
         assert_eq!(
-            reopened.read(&same, &new_session, "track-1").unwrap().bytes,
+            fixture_payload(reopened.read(&same, &new_session, "track-1").unwrap()),
             b"fixture bytes"
         );
         let mut altered = new_session.clone();
         altered.account_id = "other-account".into();
         assert_eq!(
-            reopened.read(&same, &altered, "track-1").unwrap().bytes,
+            fixture_payload(reopened.read(&same, &altered, "track-1").unwrap()),
             b"fixture bytes"
         );
         let foreign = api("https://two.invalid");
@@ -1032,7 +1358,7 @@ mod tests {
         assert!(expired.is_expired()); // The network cookie is still expired.
         assert_eq!(store.list(&api, &expired).unwrap().len(), 2);
         assert_eq!(
-            store.read(&api, &expired, "keep").unwrap().bytes,
+            fixture_payload(store.read(&api, &expired, "keep").unwrap()),
             b"verified fixture"
         );
         assert!(store.remove(&api, &expired, "remove").unwrap());
@@ -1121,16 +1447,15 @@ mod tests {
         let permit = store.admit(&key).unwrap();
         assert!(!stale.exists());
         assert!(matches!(fixture.store().admit(&key), Err(Error::Busy)));
-        let calls = std::cell::Cell::new(0);
-        let result = store.commit(&scope, track("track"), b"temporary", || {
-            calls.set(calls.get() + 1);
-            if calls.get() == 3 {
-                Err(Error::Cancelled)
-            } else {
-                Ok(())
-            }
-        });
-        assert!(matches!(result, Err(Error::Cancelled)));
+        let mut stage = store
+            .stage(fixture_header(&scope, "track", b"temporary"))
+            .unwrap();
+        assert!(stale.exists());
+        assert_eq!(
+            stage.write(b"temporary", || Err(Error::Cancelled)),
+            Err(Error::Cancelled)
+        );
+        drop(stage);
         assert!(!stale.exists());
         assert!(!fixture.root().join(&key).exists());
         drop(permit);
@@ -1190,7 +1515,10 @@ mod tests {
         }
         // Exceeds the old count bound alone.
         assert_eq!(store.list(&api, &session).unwrap().len(), SAVED_COUNT);
-        assert_eq!(store.read(&api, &session, "track-1088").unwrap().bytes, [0]);
+        assert_eq!(
+            fixture_payload(store.read(&api, &session, "track-1088").unwrap()),
+            [0]
+        );
         assert!(matches!(
             install(&store, &scope, "track-1088", b"never overwrite"),
             Err(Error::AlreadyDownloaded)
@@ -1222,9 +1550,10 @@ mod tests {
         let scope = Scope::new(&api, &session).unwrap();
         let foreign = Scope::from_parts("https://one.invalid", "other-account");
         let store = fixture.store();
+        const OLD_TRACK_CAP: usize = 32 * 1024 * 1024;
         let mut hash = Context::new(&SHA256);
-        for _ in 0..(MAX_TRACK_BYTES / (64 * 1024)) {
-            hash.update(&[0; 64 * 1024]);
+        for _ in 0..(OLD_TRACK_CAP / IO_CHUNK) {
+            hash.update(&[0; IO_CHUNK]);
         }
         let hash = hex(hash.finish().as_ref());
         // Exceeds the old byte quota alone; the audio payloads are sparse holes.
@@ -1233,7 +1562,7 @@ mod tests {
                 &fixture.root(),
                 if index == 0 { &foreign } else { &scope },
                 &format!("track-{index}"),
-                MAX_TRACK_BYTES as u64,
+                OLD_TRACK_CAP as u64,
                 &hash,
             );
         }
@@ -1263,18 +1592,437 @@ mod tests {
     }
 
     #[test]
-    fn probes_real_wav_without_copying_or_changing_the_bytes() {
-        // Mono 16-bit PCM at 8 kHz, two samples.
-        let wav = b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data\x04\0\0\0\x01\0\xff\xff";
-        let owned = wav.to_vec();
-        let ptr = owned.as_ptr();
-        let probed = probe_audio(owned).unwrap();
-        assert_eq!(probed.as_ref(), wav);
-        assert_eq!(probed.as_ref().as_ptr(), ptr);
+    fn kernel_enospc_cleans_stage_and_releases_admission() {
+        let full = match fs::open("/dev/full", FILE_FLAGS | OFlags::WRONLY, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
+                eprintln!("Skipping kernel ENOSPC fixture: /dev/full is unavailable");
+                return;
+            }
+            Err(err) => panic!("open Linux ENOSPC fixture: {err}"),
+        };
+        let stat = fs::fstat(&full).unwrap();
+        assert_eq!(
+            FileType::from_raw_mode(stat.st_mode),
+            FileType::CharacterDevice
+        );
+        assert_eq!(stat.st_rdev, fs::makedev(1, 7));
+
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let scope = Scope::from_parts("https://one.invalid", "fixture");
+        let key = scope.name("track").unwrap();
+        let partial = fixture.root().join(STAGE);
+        let data = b"nonempty body";
+        let result = (|| {
+            let _admission = store.admit(&key)?;
+            let mut stage = store.stage(fixture_header(&scope, "track", data))?;
+            assert!(partial.exists());
+            // Inject only the write sink; the real private stage still needs cleanup.
+            stage.file = File::from(full);
+            stage.write(data, || Ok(()))
+        })();
+        assert_eq!(result, Err(Error::Full));
+        assert!(!partial.exists());
+        assert!(!fixture.root().join(&key).exists());
+        let _next = store.admit(&key).expect("admission released after ENOSPC");
+    }
+
+    // Mono 16-bit PCM at 8 kHz. Generate only the header; transfer samples in chunks.
+    fn wav_header(data_len: u32) -> [u8; 44] {
+        let mut bytes = *b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data\0\0\0\0";
+        bytes[4..8].copy_from_slice(&(36 + data_len).to_le_bytes());
+        bytes[40..44].copy_from_slice(&data_len.to_le_bytes());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn streams_large_v1_wav_and_reads_same_descriptor_after_unlink() {
+        const CHUNKS: usize = 33 * 1024 * 1024 / IO_CHUNK;
+        let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+        let key = scope.name("large").unwrap();
+        let path = fixture.root().join(&key);
+        let wav = wav_header((CHUNKS * IO_CHUNK) as u32);
+        let len = (wav.len() + CHUNKS * IO_CHUNK) as u64;
+        let sample = [0x34, 0x12];
+        let mut samples = [0; IO_CHUNK];
+        samples[..sample.len()].copy_from_slice(&sample);
+        samples[IO_CHUNK - sample.len()..].copy_from_slice(&sample);
+        let mut hash = Context::new(&SHA256);
+        hash.update(&wav);
+        for _ in 0..CHUNKS {
+            hash.update(&samples);
+        }
+        let digest = hex(hash.finish().as_ref());
+        let parts = std::iter::once(wav.to_vec()).chain((0..CHUNKS).map(|_| samples.to_vec()));
+        let saved = store
+            .transfer(
+                store.admit(&key).unwrap(),
+                Header {
+                    scope: scope.0.clone(),
+                    track: track("large"),
+                    bytes: len,
+                    audio_hash: digest.clone(),
+                },
+                stream::iter(parts.map(Ok)),
+                || Ok(()),
+                DOWNLOAD_DISK_STALL,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.bytes, len);
+        assert_eq!(store.list(&api, &session).unwrap(), [saved]);
+        assert!(!fixture.root().join(STAGE).exists());
+
+        // Match the original v1 keys, order, and prefix exactly, not just a new round trip.
+        let expected = format!(
+            concat!(
+                "{{\"scope\":\"{}\",\"track\":{{\"id\":\"large\",\"name\":\"Fixture track\",",
+                "\"artists\":\"Fixture artist\",\"album_name\":\"\",\"duration_ms\":10,",
+                "\"track_number\":1,\"disc_number\":1}},\"bytes\":{},\"audio_hash\":\"{}\"}}"
+            ),
+            scope.0, len, digest
+        );
+        let mut persisted = File::open(&path).unwrap();
+        let mut prefix = [0; PREFIX_BYTES];
+        persisted.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix[..8], b"SPOFDL01");
+        assert_eq!(&prefix[8..], &(expected.len() as u32).to_le_bytes());
+        let mut json = vec![0; expected.len()];
+        persisted.read_exact(&mut json).unwrap();
+        assert_eq!(json, expected.as_bytes());
+        drop(persisted);
+
+        let pinned = store
+            .lock_members(&api, &session, &["large".into()])
+            .unwrap();
+        assert_eq!(store.remove(&api, &session, "large"), Err(Error::Busy));
+        drop(pinned);
+
+        let checks = std::cell::Cell::new(0);
+        let bump = || {
+            checks.set(checks.get() + 1);
+            checks.get()
+        };
         assert!(matches!(
-            probe_audio(b"not audio".to_vec()),
-            Err(Error::UnsupportedAudio)
+            store.read_live(&api, &session, "large", || {
+                if bump() == 3 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
         ));
+        checks.set(0);
+        let input = store
+            .read_live(&api, &session, "large", || {
+                if bump() == 3 {
+                    // During the hash pass, replace the pathname with a different file.
+                    assert!(store.remove(&api, &session, "large").unwrap());
+                    install(&store, &scope, "large", b"different recording").unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(input.source.len(), len);
+        let mut reader = input.source.reader();
+        assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), len - 2);
+        let mut last = [0; 2];
+        reader.read_exact(&mut last).unwrap();
+        assert_eq!(last, sample);
+        assert_eq!(reader.read(&mut last).unwrap(), 0);
+        let mut decoder = rodio::Decoder::builder()
+            .with_data(input.source.reader())
+            .with_byte_len(len)
+            .build()
+            .unwrap();
+        assert!(
+            (decoder.next().unwrap() - (i16::from_le_bytes(sample) as f32 / 32768.0)).abs() < 0.001
+        );
+        assert_eq!(
+            fixture_payload(store.read(&api, &session, "large").unwrap()),
+            b"different recording"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_long_corrupt_and_unsupported_transfers_do_not_publish() {
+        let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+        let key = scope.name("track").unwrap();
+        let wav = wav_header(2);
+        let mut audio = wav.to_vec();
+        audio.extend_from_slice(&[1, 0]);
+        let mut altered = audio.clone();
+        *altered.last_mut().unwrap() ^= 0xff;
+        for (body, actual, error) in [
+            (&audio[..], &audio[..45], Error::InvalidMedia),
+            (&audio[..45], &audio[..], Error::InvalidMedia),
+            (&audio[..], &altered[..], Error::InvalidMedia),
+            (
+                &b"not audio"[..],
+                &b"not audio"[..],
+                Error::UnsupportedAudio,
+            ),
+        ] {
+            assert_eq!(
+                store
+                    .transfer(
+                        store.admit(&key).unwrap(),
+                        fixture_header(&scope, "track", body),
+                        stream::iter([Ok(actual.to_vec())]),
+                        || Ok(()),
+                        DOWNLOAD_DISK_STALL,
+                    )
+                    .await,
+                Err(error)
+            );
+            assert!(!fixture.root().join(STAGE).exists());
+            assert!(!fixture.root().join(&key).exists());
+        }
+        store
+            .transfer(
+                store.admit(&key).unwrap(),
+                fixture_header(&scope, "track", &audio),
+                stream::iter([Ok(audio)]),
+                || Ok(()),
+                DOWNLOAD_DISK_STALL,
+            )
+            .await
+            .unwrap();
+        assert!(fixture.root().join(key).exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_transfer_times_out_or_cancels_without_losing_its_stage_lease() {
+        for stop in [Some(Error::Storage), Some(Error::Offline), None] {
+            exercise_stalled_transfer(stop).await;
+        }
+    }
+
+    async fn exercise_stalled_transfer(stop: Option<Error>) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::{sync::Notify, time::timeout};
+
+        const WAIT: Duration = Duration::from_secs(10);
+        let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+        let key = scope.name("track").unwrap();
+        let admission = store.admit(&key).unwrap();
+        let header = fixture_header(&scope, "track", b"partial body");
+        let writing = Arc::new(Notify::new());
+        let worker_writing = writing.clone();
+        let produced = Arc::new(AtomicUsize::new(0));
+        let producer_count = produced.clone();
+        let worker_count = produced.clone();
+        let (resume, wait) = std::sync::mpsc::sync_channel(1);
+        let wait = std::sync::Mutex::new(wait);
+        let blocked = AtomicBool::new(false);
+        let mut mode = session.network_changes();
+        let generation = *mode.borrow_and_update();
+        let live = download_liveness(session.clone(), mode.clone(), generation);
+        let mut task = tokio::spawn({
+            let store = store.clone();
+            async move {
+                in_download_mode(
+                    &mut mode,
+                    store.transfer(
+                        admission,
+                        header,
+                        stream::repeat_with(move || {
+                            producer_count.fetch_add(1, Ordering::Relaxed);
+                            Ok(&b"partial"[..])
+                        }),
+                        move || {
+                            // Stall on the first packet after staging, not while awaiting HTTP.
+                            if worker_count.load(Ordering::Relaxed) != 0
+                                && !blocked.swap(true, Ordering::Relaxed)
+                            {
+                                worker_writing.notify_one();
+                                let _ = wait.lock().unwrap().recv_timeout(WAIT);
+                            }
+                            live()
+                        },
+                        if stop == Some(Error::Storage) {
+                            Duration::from_millis(250)
+                        } else {
+                            WAIT
+                        },
+                    ),
+                )
+                .await
+            }
+        });
+        timeout(WAIT, writing.notified()).await.unwrap();
+        assert_eq!(produced.load(Ordering::Relaxed), 1);
+        let stage = fixture.root().join(STAGE);
+        assert!(stage.exists());
+        assert!(store.list(&api, &session).unwrap().is_empty());
+        assert!(matches!(store.admit(&key), Err(Error::Busy)));
+        match stop {
+            Some(err) => {
+                if err == Error::Offline {
+                    session.set_offline(true);
+                }
+                assert_eq!(
+                    timeout(Duration::from_secs(2), &mut task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Err(err)
+                );
+            }
+            None => {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+        }
+        // Returning from the async operation must not release a retired disk worker's lease.
+        assert!(stage.exists());
+        assert!(matches!(store.admit(&key), Err(Error::Busy)));
+        assert!(!fixture.root().join(&key).exists());
+        resume.send(()).unwrap();
+        timeout(WAIT, async {
+            while stage.exists() {
+                tokio::task::yield_now().await;
+            }
+            loop {
+                match store.admit(&key) {
+                    Ok(_) => break,
+                    Err(Error::Busy) => tokio::task::yield_now().await,
+                    other => panic!("unexpected admission result: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!fixture.root().join(key).exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_admission_keeps_worker_slot_until_it_physically_returns() {
+        use tokio::{sync::Notify, time::timeout};
+
+        const WAIT: Duration = Duration::from_secs(10);
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let key = Scope::from_parts("https://one.invalid", "fixture")
+            .name("track")
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let blocked = started.clone();
+        let (resume, wait) = std::sync::mpsc::sync_channel(1);
+        let task = tokio::spawn({
+            let (store, key) = (store.clone(), key.clone());
+            async move {
+                store
+                    .admit_download(
+                        key,
+                        move || {
+                            blocked.notify_one();
+                            let _ = wait.recv_timeout(WAIT);
+                            Ok(())
+                        },
+                        Duration::from_millis(250),
+                    )
+                    .await
+            }
+        });
+        timeout(WAIT, started.notified()).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Error::Storage)
+        ));
+        assert!(matches!(
+            store.admit_download(key.clone(), || Ok(()), WAIT).await,
+            Err(Error::Busy)
+        ));
+        resume.send(()).unwrap();
+        timeout(WAIT, async {
+            loop {
+                match store.admit_download(key.clone(), || Ok(()), WAIT).await {
+                    Ok(_) => break,
+                    Err(Error::Busy) => tokio::task::yield_now().await,
+                    Err(err) => panic!("unexpected admission result: {err}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_publication_does_not_block_network_mode_changes() {
+        use tokio::{sync::Notify, time::timeout};
+
+        const WAIT: Duration = Duration::from_secs(10);
+        let fixture = Fixture::new();
+        let api = api("https://one.invalid");
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let mut mode = session.network_changes();
+        let generation = *mode.borrow_and_update();
+        let live = download_liveness(session.clone(), mode, generation);
+        let store = fixture.store();
+        let key = scope.name("track").unwrap();
+        let at_rename = Arc::new(Notify::new());
+        let blocked = at_rename.clone();
+        let (resume, wait) = std::sync::mpsc::sync_channel(1);
+        let worker = tokio::task::spawn_blocking({
+            let (store, key) = (store.clone(), key.clone());
+            move || {
+                let _admission = store.admit(&key)?;
+                let data = b"fixture payload";
+                let mut stage = store.stage(fixture_header(&scope, "track", data))?;
+                stage.write(data, || Ok(()))?;
+                let checks = std::cell::Cell::new(0);
+                store.publish(
+                    stage.partial,
+                    stage.header,
+                    || {
+                        let check = checks.get();
+                        checks.set(check + 1);
+                        if check == 2 {
+                            // At the final check with the directory locked, before rename.
+                            blocked.notify_one();
+                            let _ = wait.recv_timeout(WAIT);
+                        }
+                        live()
+                    },
+                    || (),
+                )
+            }
+        });
+        timeout(WAIT, at_rename.notified()).await.unwrap();
+        timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || session.set_offline(true)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(fixture.root().join(STAGE).exists());
+        resume.send(()).unwrap();
+        assert_eq!(
+            timeout(WAIT, worker).await.unwrap().unwrap(),
+            Err(Error::Offline)
+        );
+        assert!(!fixture.root().join(STAGE).exists());
+        assert!(!fixture.root().join(key).exists());
     }
 
     #[test]
@@ -1285,23 +2033,19 @@ mod tests {
             "sha256":hash, "format":"wav", "byteLength":audio.len(), "contentType":"audio/wav", "downloadUrl":"https://ignored.invalid/"});
         let parse =
             |body: &serde_json::Value| Manifest::parse(&serde_json::to_vec(body).unwrap(), "track");
-        let manifest = parse(&body).unwrap();
-        assert!(manifest.verify(audio).is_ok());
-        assert_eq!(
-            manifest.verify(&audio[..audio.len() - 1]),
-            Err(Error::InvalidMedia)
-        );
-        assert_eq!(
-            manifest.verify(b"modified payload!"),
-            Err(Error::InvalidMedia)
-        );
+        assert_eq!(parse(&body).unwrap().byte_length, audio.len() as u64);
+        body["mediaVersion"] = format!("sha256:{}", "0".repeat(64)).into();
+        assert!(matches!(parse(&body), Err(Error::InvalidMedia)));
+        body["mediaVersion"] = format!("sha256:{hash}").into();
         body["trackId"] = "another".into();
         assert!(matches!(parse(&body), Err(Error::InvalidMedia)));
         body["trackId"] = "track".into();
         body["contentType"] = "image/png".into();
         assert!(matches!(parse(&body), Err(Error::InvalidMedia)));
         body["contentType"] = "audio/wav".into();
-        body["byteLength"] = (MAX_TRACK_BYTES + 1).into();
-        assert!(matches!(parse(&body), Err(Error::TrackTooLarge)));
+        body["byteLength"] = 0.into();
+        assert!(matches!(parse(&body), Err(Error::InvalidMedia)));
+        body["byteLength"] = (u32::MAX as u64 + 1).into();
+        assert_eq!(parse(&body).unwrap().byte_length, 1 << 32);
     }
 }

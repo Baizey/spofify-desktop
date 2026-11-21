@@ -102,7 +102,7 @@ fn play(engine: &mut Engine, peer: &mut TestPeer) {
     );
     assert!(
         engine.media.is_none(),
-        "use verified same-account RAM media"
+        "use the verified same-account media fixture"
     );
 }
 fn update(peer: &TestPeer, kind: EventKind) {
@@ -251,8 +251,7 @@ async fn canonical_fallback_plays_after_startup_drain_or_preview_deadline() {
         e.complete_online(
             e.operation,
             Ok(OnlineMedia {
-                bytes: media(),
-                downloaded: false,
+                source: media().into(),
             }),
         );
         e.tick_online(None);
@@ -299,8 +298,7 @@ async fn uncached_media_load_and_resume_need_no_new_response_to_start() {
     e.complete_online(
         e.operation,
         Ok(OnlineMedia {
-            bytes: media(),
-            downloaded: false,
+            source: media().into(),
         }),
     );
     assert_eq!(
@@ -329,6 +327,109 @@ async fn uncached_media_load_and_resume_need_no_new_response_to_start() {
     assert_eq!(fact["chain"], "paused");
     assert_eq!(fact["run"], 3);
     assert_eq!(pcm.next().map(f32::abs), Some(0.5));
+}
+
+fn admit_canonical(e: &mut Engine, peer: &TestPeer) -> Cursor {
+    let state: State = serde_json::from_value(json!({
+        "cursor":{"key":1,"chain":"confirmed","visit":0,"run":0,"elapsed":0.0,"desired":true,"playing":false},
+        "queue":[{"id":"tone","key":1,"order":1,"duration":2.0,"intent":"low"},
+                 {"id":"next","key":2,"order":2,"duration":2.0,"intent":"low"}],
+        "shuffle":false,"repeat":"off"
+    })).unwrap();
+    let cursor = state.cursor.clone();
+    e.online.state = Some(state);
+    peer.authority.send_replace(Some(OutputAuthority {
+        generation: GEN,
+        deadline: Instant::now() + Duration::from_secs(2),
+        attached: true,
+        resume_through: 0,
+    }));
+    e.start_online(
+        Work {
+            generation: GEN,
+            cursor: cursor.clone(),
+            id: "tone".into(),
+            duration: 2.0,
+        },
+        Ok(OnlineMedia {
+            source: media().into(),
+        }),
+    );
+    cursor
+}
+
+#[tokio::test]
+async fn canonical_seek_keeps_the_source_until_event_backlog_drains() {
+    let (mut e, peer, mut pcm) = fixture("desktop");
+    let mut cursor = admit_canonical(&mut e, &peer);
+    assert_eq!(first_pcm(&mut pcm), Some(0.25));
+    cursor.run += 1;
+    cursor.elapsed = 0.5;
+    e.online.state.as_mut().unwrap().cursor = cursor.clone();
+    update(&peer, EventKind::Outputs(outputs("desktop")));
+    e.reconcile_online();
+    assert!(e.online.execution.is_none() && e.media.is_none());
+    assert!(
+        e.online
+            .handoff
+            .as_ref()
+            .is_some_and(|h| h.key.to.same_run(&cursor))
+    );
+    e.tick_online(None);
+    assert!(e.online.handoff.is_none() && e.media.is_none());
+    assert!(
+        e.online
+            .execution
+            .as_ref()
+            .is_some_and(|run| run.cursor.same_run(&cursor))
+    );
+    assert_eq!(first_pcm(&mut pcm), Some(0.5));
+}
+
+#[tokio::test]
+async fn busy_eof_keeps_the_preview_load_but_never_admits_forecast_pcm() {
+    let (mut e, mut peer, mut pcm) = fixture("desktop");
+    let from = admit_canonical(&mut e, &peer);
+    let to = output::successor(e.online.state.as_ref().unwrap(), &from).unwrap();
+    e.crossfade_enabled.store(true, Ordering::Release);
+    e.online.lookahead = Some(crossfade::Lookahead::new(
+        PreviewKey {
+            generation: GEN,
+            from,
+            to: to.clone(),
+            id: "next".into(),
+        },
+        std::future::pending(),
+    ));
+    for _ in 0..(RATE * 3) {
+        let _ = pcm.next();
+    }
+    assert!(e.audio.as_ref().unwrap().facts().ended);
+    let sock = e.socket.as_ref().unwrap();
+    let mut full = false;
+    for _ in 0..64 {
+        if sock.command(GEN, socket::Command::Pause).is_err() {
+            full = true;
+            break;
+        }
+    }
+    assert!(full);
+    assert!(!e.sample_online(true, false));
+    assert!(e.online.lookahead.is_some() && e.online.advance.is_none());
+    while peer.read().is_some() {}
+    assert!(e.sample_online(true, false));
+    assert_eq!(peer.read().unwrap()["ended"], true);
+    assert!(matches!(
+        e.online.handoff.as_ref().map(|h| &h.media),
+        Some(HandoffMedia::Loading(_))
+    ));
+    e.reconcile_online();
+    assert!(e.online.work.is_none() && e.online.execution.is_none() && e.media.is_none());
+    e.online.state.as_mut().unwrap().cursor = to.clone();
+    e.online.adopt_cursor(&to, false);
+    e.reconcile_online();
+    assert!(e.online.handoff.is_none() && e.media.is_some());
+    e.cancel_work();
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ mod api;
 mod api_transport;
 mod artwork;
 mod audio;
+mod audio_input;
 mod auth;
 mod collections;
 mod desk;

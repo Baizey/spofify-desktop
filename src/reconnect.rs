@@ -179,7 +179,7 @@ mod tests {
 
     async fn assert_media_fenced(api: &Api, session: &Session, expected: ApiError) {
         assert!(session.is_offline());
-        assert_eq!(api.media(session, "track").await, Err(expected));
+        assert_eq!(api.media(session, "track").await.err(), Some(expected));
         assert_eq!(
             api.track_resource(session, "track", TrackResource::Artwork)
                 .await,

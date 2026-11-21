@@ -8,7 +8,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -296,8 +296,7 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
             let dir = IndexDir::open_default()?;
             let admission = dir.admit()?;
             let index = dir.read()?;
-            let store = OfflineStore::open_default().map_err(audio_error)?;
-            Ok((scope, dir, admission, index, store))
+            Ok((scope, dir, admission, index))
         })
     };
     let cancel = Cancellation::new();
@@ -306,10 +305,11 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
         biased;
         _ = network.changed() => Err(OFFLINE),
         result = async {
-            let (scope, dir, admission, mut index, store) = open.await?;
+            let (scope, dir, admission, mut index) = open.await?;
             // Validate every manifest page before starting any audio I/O.
             let Snapshot { kind, title, tracks } = snapshot(access, target).await?;
             if tracks.is_empty() { return Err(EMPTY); }
+            let store = OfflineStore::open_for_download(OfflineStore::open_default).await.map_err(audio_error)?;
             {
                 let mut seen = HashSet::new();
                 for item in &tracks {
@@ -425,18 +425,27 @@ async fn verify_track(
     access: &Access,
     id: &str,
 ) -> Result<(), offline::Error> {
-    let (store, access, id) = (store.clone(), access.clone(), id.to_owned());
-    tokio::task::spawn_blocking(move || store.read(&access.api, &access.session, &id).map(|_| ()))
-        .await
-        .map_err(|_| offline::Error::Storage)?
+    static PIN_VERIFY_SLOT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let slot = PIN_VERIFY_SLOT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone();
+    let store = store.clone();
+    offline::read_verified(
+        access.api.clone(),
+        access.session.clone(),
+        slot,
+        id.to_owned(),
+        move || Ok(store),
+    )
+    .await
+    .map(|_| ())
 }
 
 fn handle_track_error(err: offline::Error) -> Result<(), ApiError> {
     match err {
         offline::Error::AlreadyDownloaded
         | offline::Error::NotDownloaded
-        | offline::Error::UnsupportedAudio
-        | offline::Error::TrackTooLarge => Ok(()),
+        | offline::Error::UnsupportedAudio => Ok(()),
         // Skip only item-level absence or unsupported representations, not
         // authentication, transport, integrity, quota or consistency failures.
         offline::Error::Api(e) if !e.expired && matches!(e.status, 404 | 410 | 413 | 415) => Ok(()),
@@ -827,7 +836,9 @@ impl ManifestState<PlaylistTracks> {
             return Err(UNRECORDED);
         }
         if total != 0 {
-            let store = blocking(move || open().map_err(audio_error)).await?;
+            let store = OfflineStore::open_for_download(open)
+                .await
+                .map_err(audio_error)?;
             let mut verified = 0;
             for (item, count) in &unique {
                 live()?;
@@ -1168,7 +1179,6 @@ fn audio_error(e: offline::Error) -> ApiError {
         Damaged => error("The downloaded file or store layout is invalid."),
         UnsupportedAudio => error("This audio cannot be played on this device."),
         InvalidMedia => error("Unable to verify a track’s download."),
-        TrackTooLarge => error("A track exceeds the 32 MiB download limit."),
         Offline => OFFLINE,
         Cancelled => CANCELLED,
     }
@@ -1379,12 +1389,7 @@ mod tests {
                 Ok(())
             );
         }
-        for err in [
-            offline::Error::UnsupportedAudio,
-            offline::Error::TrackTooLarge,
-        ] {
-            assert_eq!(handle_track_error(err), Ok(()));
-        }
+        assert_eq!(handle_track_error(offline::Error::UnsupportedAudio), Ok(()));
         for err in [
             offline::Error::Api(CHANGED),
             offline::Error::InvalidMedia,

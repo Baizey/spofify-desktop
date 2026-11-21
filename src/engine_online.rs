@@ -7,13 +7,14 @@ mod local_start;
 #[path = "engine_online_pcm_tests.rs"]
 mod pcm_tests;
 use super::{
-    CreditView, Engine, LOAD_BUDGET, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply,
-    artist_subtitle, context_kind, credit_views, crossfade, metadata_id, output,
+    CreditView, Engine, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply, artist_subtitle,
+    context_kind, credit_views, crossfade, metadata_id, output,
 };
 use crate::{
     DeviceRow,
     api::ApiError,
     audio::CROSSFADE_SECONDS,
+    audio_input::AudioInput,
     offline::{self, OnlineMedia},
     personal::{Command as PersonalCommand, Update as PersonalUpdate},
     player::{Action, Status},
@@ -44,6 +45,7 @@ pub(super) struct Execution {
     pending_crossfade: Option<CrossfadeConfirmation>,
     status: Status,
     last_fact: Option<Instant>,
+    stop_fact_pending: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -55,7 +57,10 @@ impl Execution {
         room: u64,
         revision: u64,
     ) -> Option<String> {
-        (output::same_execution(&self.cursor, displayed) && self.permit.granted()).then(|| {
+        (self.status == Status::Ok
+            && output::same_execution(&self.cursor, displayed)
+            && self.permit.granted())
+        .then(|| {
             let cursor = &self.cursor;
             format!(
                 "detached:{room}:{revision}:{}:{}:{}:{}",
@@ -65,6 +70,7 @@ impl Execution {
     }
 }
 
+#[derive(Clone)]
 struct PreviewKey {
     generation: Generation,
     from: Cursor,
@@ -81,6 +87,16 @@ impl PreviewKey {
 struct PreviewPlayback {
     permit: output::RunPermit,
     confirmation: CrossfadeConfirmation,
+    source: AudioInput,
+    admitted: bool,
+}
+struct Handoff {
+    key: PreviewKey,
+    media: HandoffMedia,
+}
+enum HandoffMedia {
+    Ready(AudioInput),
+    Loading(crossfade::Load),
 }
 struct CrossfadeConfirmation {
     generation: Generation,
@@ -153,6 +169,7 @@ pub(super) struct Online {
     advance: Option<Advance>,
     stopped: Option<Cursor>,
     lookahead: Option<crossfade::Lookahead<PreviewKey, PreviewPlayback>>,
+    handoff: Option<Handoff>,
     suppress_crossfade: Option<Cursor>,
 }
 
@@ -197,6 +214,9 @@ impl Online {
     }
     pub fn clear_local_start(&mut self) {
         self.local_start = None;
+    }
+    pub(super) fn clear_handoff(&mut self) {
+        self.handoff = None;
     }
     fn locally_vacant(&self) -> bool {
         self.released_here
@@ -739,13 +759,15 @@ impl Engine {
             if let Some(mut start) = start {
                 // This cache contains only the current account's previously
                 // authenticated media. Downloaded files always re-verify.
-                if let Some(bytes) = self.audio.as_ref().and_then(|a| a.cached(&start.id)) {
-                    start.ready = Some(OnlineMedia {
-                        bytes,
-                        downloaded: false,
-                    });
+                if let Some(source) = self
+                    .audio
+                    .as_ref()
+                    .and_then(|a| a.cached(&start.id))
+                    .filter(crate::audio_input::AudioInput::reusable_online)
+                {
+                    start.ready = Some(Ok(OnlineMedia { source }));
                 } else {
-                    self.load_online_media(start.id.clone());
+                    self.load_online_media(start.id.clone(), None);
                 }
                 self.online.local_start = Some(start);
             }
@@ -814,6 +836,12 @@ impl Engine {
                     .as_ref()
                     .is_some_and(|s| s.queue.iter().any(|t| t.key == cursor.key))
         });
+        if self.online.handoff.as_ref().is_some_and(|handoff| {
+            attached.is_none_or(|g| g.generation != handoff.key.generation)
+                || current.is_none_or(|c| !output::same_execution(c, &handoff.key.to))
+        }) {
+            self.online.handoff = None;
+        }
         if let Some(work) = &self.online.work
             && (attached.is_none_or(|g| g.generation != work.generation)
                 || current.is_none_or(|c| !output::same_execution(c, &work.cursor)))
@@ -829,11 +857,44 @@ impl Engine {
                 && if let Some(grant) = attached {
                     execution.permit.adopt(grant)
                 } else {
-                    // A not-yet-audible source or failed start isn't grace.
-                    self.audio.as_ref().is_some_and(|audio| audio.has_started())
+                    // A terminal run has no output, but may owe Go a stop
+                    // after an exact same-run reattach. It must not refetch.
+                    matches!(execution.status, Status::Load | Status::Media)
+                        || self.audio.as_ref().is_some_and(|audio| audio.has_started())
                 };
             if !keep {
+                // A canonical seek creates a new run and PCM buffer, but it
+                // can read the same authenticated GET for the same visit.
+                let seek = if let Some(grant) = attached
+                    && execution.permit.granted()
+                    && execution.pending_crossfade.is_none()
+                    && execution.status == Status::Ok
+                    && let Some(cursor) = current
+                    && cursor.key == execution.cursor.key
+                    && cursor.chain == execution.cursor.chain
+                    && cursor.visit == execution.cursor.visit
+                    && cursor.run != execution.cursor.run
+                    && let Some(track) = self.online.state.as_ref().and_then(State::current)
+                {
+                    self.audio
+                        .as_ref()
+                        .and_then(|a| a.cached(&track.id))
+                        .filter(AudioInput::reusable_online)
+                        .map(|source| Handoff {
+                            key: PreviewKey {
+                                generation: grant.generation,
+                                from: execution.cursor.clone(),
+                                to: cursor.clone(),
+                                id: track.id.clone(),
+                            },
+                            media: HandoffMedia::Ready(source),
+                        })
+                } else {
+                    None
+                };
                 self.stop();
+                // Keep ownership while reconciliation waits for queued events.
+                self.online.handoff = seek;
             }
         }
         let (Some(grant), Some(cursor)) = (attached, current) else {
@@ -841,6 +902,9 @@ impl Engine {
         };
         if self.online.execution.is_some()
             || self.online.work.is_some()
+            // Never start exportable playback for an EOF forecast. An
+            // admitted crossfade uses its separate confirmation fence.
+            || self.online.advance.is_some()
             || self
                 .socket
                 .as_ref()
@@ -862,11 +926,30 @@ impl Engine {
             id: track.id.clone(),
             duration: track.duration,
         };
+        let fallback = self
+            .online
+            .handoff
+            .take()
+            .and_then(|handoff| (handoff.key.id == work.id).then_some(handoff.media));
         self.cancel_work();
-        self.load_online_media(work.id.clone());
-        self.online.work = Some(work);
+        match fallback {
+            Some(HandoffMedia::Ready(source)) if source.reusable_online() => {
+                self.start_online(work, Ok(OnlineMedia { source }));
+            }
+            Some(HandoffMedia::Ready(source)) if source.is_failed() => {
+                self.start_online(work, Err(Status::Load));
+            }
+            pending => {
+                let load = match pending {
+                    Some(HandoffMedia::Loading(load)) => Some(load),
+                    _ => None,
+                };
+                self.load_online_media(work.id.clone(), load);
+                self.online.work = Some(work);
+            }
+        }
     }
-    fn load_online_media(&mut self, id: String) {
+    fn load_online_media(&mut self, id: String, pending: Option<crossfade::Load>) {
         if let Some(account) = &self.account {
             let (api, session, slot, replies, id) = (
                 account.api.clone(),
@@ -878,16 +961,25 @@ impl Engine {
             let cached = self.audio.as_ref().and_then(|audio| audio.cached(&id));
             let (epoch, operation) = (self.epoch, self.operation);
             self.media = Some(tokio::spawn(async move {
-                let result = tokio::time::timeout(
-                    LOAD_BUDGET,
-                    offline::online_media(&api, &session, slot, &id, cached),
-                )
-                .await
-                .unwrap_or(Err(ApiError {
-                    message: "Media could not be loaded in time.",
-                    expired: false,
-                    status: 0,
-                }));
+                let result = async {
+                    if let Some(load) = pending {
+                        match load.ready().await {
+                            Some(source) if source.reusable_online() => {
+                                return Ok(OnlineMedia { source });
+                            }
+                            Some(source) if !source.is_failed() => (), // Saved source: verify again.
+                            _ => {
+                                return Err(ApiError {
+                                    message: "Audio could not be loaded.",
+                                    expired: session.is_expired(),
+                                    status: 0,
+                                });
+                            }
+                        }
+                    }
+                    offline::online_media(&api, &session, slot, &id, cached).await
+                }
+                .await;
                 let _ = replies
                     .send(Reply::Media {
                         epoch,
@@ -920,14 +1012,12 @@ impl Engine {
             self.expire();
             return;
         }
+        let result = result.map_err(|_| Status::Load);
         if let Some(start) = &mut self.online.local_start {
-            match result {
-                Ok(media) => start.ready = Some(media),
-                Err(_) => self.cancel_local_start(),
-            }
+            start.ready = Some(result);
             self.reconcile_online();
         } else if let Some(work) = self.online.work.take() {
-            self.start_online(work, result.map_err(|_| Status::Media));
+            self.start_online(work, result);
         }
     }
     fn cancel_local_start(&mut self) {
@@ -939,6 +1029,17 @@ impl Engine {
     /// Return true only while the separate local start owns native audio/load.
     /// Promotion never stops/re-appends the sink or creates a new decoder.
     fn reconcile_local_start(&mut self) -> bool {
+        if let (Some(start), Some(audio)) = (&mut self.online.local_start, &mut self.audio)
+            && start.started
+            && let Some(status) = audio.failure()
+        {
+            // Do not promote or export an already failed preview. Keep the
+            // failure tied to this request until its exact canonical echo.
+            audio.stop();
+            audio.discard_cache();
+            start.started = false;
+            start.ready = Some(Err(status));
+        }
         let Some(start) = self.online.local_start.as_ref() else {
             return false;
         };
@@ -975,6 +1076,7 @@ impl Engine {
                         pending_crossfade: None,
                         status: Status::Ok,
                         last_fact: None,
+                        stop_fact_pending: false,
                     });
                     self.online.clear_local_start();
                     return false;
@@ -997,29 +1099,29 @@ impl Engine {
                     .map_or(start.duration, |t| t.duration),
             };
             if let Some(media) = start.ready {
-                self.start_online(work, Ok(media));
+                self.start_online(work, media);
             } else {
                 self.online.work = Some(work);
             }
             return false;
         }
-        if let Some(OnlineMedia { bytes, downloaded }) = start.ready.take() {
+        if start.ready.as_ref().is_some_and(Result::is_ok) {
+            let Some(Ok(OnlineMedia { source })) = start.ready.take() else {
+                unreachable!()
+            };
             let audio = self.audio.as_mut().expect("local start has audio");
             let status = audio.play(
                 start.id.clone(),
-                bytes,
+                source,
                 start.elapsed,
                 start.duration,
                 start.permit.source(),
             );
-            if downloaded {
-                audio.discard_cache();
-            }
             if status != Status::Ok {
-                self.cancel_local_start();
-                return false;
+                start.ready = Some(Err(status));
+            } else {
+                start.started = true;
             }
-            start.started = true;
         }
         true
     }
@@ -1041,20 +1143,13 @@ impl Engine {
         let permit = output::RunPermit::new(socket.authority.clone(), grant);
         audio.anchor(work.cursor.elapsed, work.duration);
         let status = match media {
-            Ok(OnlineMedia { bytes, downloaded }) => {
-                let status = audio.play(
-                    work.id,
-                    bytes,
-                    work.cursor.elapsed,
-                    work.duration,
-                    permit.source(socket.link.clone(), grant.generation),
-                );
-                if downloaded {
-                    // A later admission must re-verify the file in case it was removed.
-                    audio.discard_cache();
-                }
-                status
-            }
+            Ok(OnlineMedia { source }) => audio.play(
+                work.id,
+                source,
+                work.cursor.elapsed,
+                work.duration,
+                permit.source(socket.link.clone(), grant.generation),
+            ),
             Err(status) => status,
         };
         if status != Status::Rejected {
@@ -1064,6 +1159,7 @@ impl Engine {
                 pending_crossfade: None,
                 status,
                 last_fact: None,
+                stop_fact_pending: false,
             });
         }
     }
@@ -1139,19 +1235,15 @@ impl Engine {
                 id: id.clone(),
             };
             self.online.lookahead = Some(crossfade::Lookahead::new(key, async move {
-                let media = tokio::time::timeout(
-                    LOAD_BUDGET,
-                    offline::online_media(&api, &session, slot, &media_id, cached),
-                )
-                .await
-                .ok()?
-                .ok()?;
-                Some(media.bytes)
+                let media = offline::online_media(&api, &session, slot, &media_id, cached)
+                    .await
+                    .ok()?;
+                Some(media.source)
             }));
         }
         if remaining <= CROSSFADE_SECONDS
             && let Some(look) = &mut self.online.lookahead
-            && let Some(bytes) = look.take_bytes()
+            && let Some(source) = look.take_source()
         {
             let permit = output::RunPermit::new(socket.authority.clone(), grant);
             let confirmation = CrossfadeConfirmation {
@@ -1163,12 +1255,13 @@ impl Engine {
                 grant.generation,
                 Arc::clone(&confirmation.confirmed),
             );
-            if audio.start_crossfade(look.key.id.clone(), bytes, authority) {
-                look.started(PreviewPlayback {
-                    permit,
-                    confirmation,
-                });
-            }
+            let admitted = audio.start_crossfade(look.key.id.clone(), source.clone(), authority);
+            look.started(PreviewPlayback {
+                permit,
+                confirmation,
+                source,
+                admitted,
+            });
         }
     }
     fn keep_online_crossfade(
@@ -1176,47 +1269,66 @@ impl Engine {
         generation: Generation,
         from: &Cursor,
         to: &Cursor,
-    ) -> bool {
+    ) -> (bool, Option<Handoff>) {
         let Some(look) = self.online.lookahead.take() else {
-            return false;
+            return (false, None);
         };
         if self.attached().is_none_or(|g| g.generation != generation)
             || !self.crossfade_enabled.load(Ordering::Acquire)
             || !look.key.matches_landing(generation, from, to)
         {
-            return false;
+            return (false, None);
         }
-        let Some(playing) = look.into_playing() else {
-            return false;
+        let key = look.key.clone();
+        use crossfade::Landing;
+        let media = match look.landing() {
+            Landing::Playing(playing)
+                if playing.admitted
+                    && self.audio.as_mut().is_some_and(|a| a.promote_crossfade()) =>
+            {
+                self.online.execution = Some(Execution {
+                    cursor: to.clone(),
+                    permit: playing.permit,
+                    pending_crossfade: Some(playing.confirmation),
+                    status: Status::Ok,
+                    last_fact: None,
+                    stop_fact_pending: false,
+                });
+                return (true, None);
+            }
+            Landing::Ready(source) | Landing::Playing(PreviewPlayback { source, .. }) => {
+                HandoffMedia::Ready(source)
+            }
+            Landing::Loading(load) => HandoffMedia::Loading(load),
+            Landing::Unavailable => return (false, None),
         };
-        let Some(audio) = &mut self.audio else {
-            return false;
-        };
-        if !audio.promote_crossfade() {
-            return false;
-        }
-        // A preview can be disk-backed; revalidate on the next admission.
-        audio.discard_cache();
-        self.online.execution = Some(Execution {
-            cursor: to.clone(),
-            permit: playing.permit,
-            pending_crossfade: Some(playing.confirmation),
-            status: Status::Ok,
-            last_fact: None,
-        });
-        true
+        (false, Some(Handoff { key, media }))
     }
     /// Publish actual native position to the transport even within transient
     /// grace. Facts are admitted only by the current attached generation.
     fn sample_online(&mut self, allow_end: bool, force: bool) -> bool {
+        if let (Some(audio), Some(execution)) = (&mut self.audio, &mut self.online.execution)
+            && execution.status == Status::Ok
+            && let Some(status) = audio.failure()
+        {
+            // Retain the failed execution so reconciliation doesn't issue a
+            // second transfer. Report the stop only if real PCM had started.
+            execution.stop_fact_pending =
+                execution.pending_crossfade.is_none() && audio.has_started();
+            execution.status = status;
+            audio.stop();
+            audio.discard_cache();
+            self.cancel_online_crossfade();
+        }
         let grant = self.grant();
         let (Some(grant), Some(socket), Some(audio), Some(execution)) =
             (grant, &self.socket, &self.audio, &self.online.execution)
         else {
             return false;
         };
+        let report_failure = execution.stop_fact_pending;
         if !execution.permit.granted()
-            || execution.status == Status::Media
+            || (!report_failure && matches!(execution.status, Status::Media | Status::Load))
             || !self.network_allowed()
         {
             return false;
@@ -1228,7 +1340,7 @@ impl Engine {
             playing: facts.playing,
             ..execution.cursor.clone()
         };
-        if execution.pending_crossfade.is_none() {
+        if execution.pending_crossfade.is_none() && self.online.advance.is_none() {
             let _ = socket.observe_local(grant.generation, actual);
         }
         let generation = grant.generation;
@@ -1266,6 +1378,7 @@ impl Engine {
             None
         };
         if !force
+            && !report_failure
             && next.is_none()
             && execution.last_fact.is_some_and(|at| {
                 execution.status == Status::Blocked || now.duration_since(at) < REPORT_INTERVAL
@@ -1286,16 +1399,23 @@ impl Engine {
             (execution.status == Status::Blocked).then_some(FactError::Blocked),
         );
         if socket.fact(generation, report).is_err() {
-            if next.is_some() {
-                self.cancel_online_crossfade();
+            if next.is_some()
+                && let Some(audio) = &mut self.audio
+            {
+                // Outbound pressure may clear on the next tick. Silence the
+                // preview, but keep its pinned GET under the existing key.
+                audio.cancel_crossfade();
             }
             return false;
         }
         execution.last_fact = Some(now);
+        execution.stop_fact_pending = false;
         if let Some(to) = next {
             let from = execution.cursor.clone();
-            if !self.keep_online_crossfade(generation, &from, &to) {
+            let (promoted, fallback) = self.keep_online_crossfade(generation, &from, &to);
+            if !promoted {
                 self.stop();
+                self.online.handoff = fallback;
             }
             self.online.advance = Some(Advance { from, to });
             self.online.revision = self.online.revision.wrapping_add(1);
@@ -1365,7 +1485,8 @@ impl Engine {
             if p.status.is_empty() {
                 p.status = match execution.status {
                     Status::Blocked => "Audio output is unavailable on this desktop.",
-                    Status::Media => "This desktop could not play the audio.",
+                    Status::Load => "Audio could not be loaded from the server or local storage.",
+                    Status::Media => "This desktop could not decode or seek this audio.",
                     _ => "",
                 };
             }
@@ -1520,6 +1641,7 @@ mod tests {
             pending_crossfade: None,
             status: Status::Ok,
             last_fact: None,
+            stop_fact_pending: false,
         };
         assert!(execution.media_pause_token(&old, 5, 3).is_some());
         assert!(execution.media_pause_token(&next, 5, 3).is_none());
