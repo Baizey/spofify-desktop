@@ -64,6 +64,8 @@ pub enum Command {
         command: PersonalCommand,
     },
     Guarded(String, Action),
+    #[cfg(target_os = "linux")]
+    GuardedToggle(String),
     #[cfg(test)]
     Offline(bool),
     PlaySaved {
@@ -157,6 +159,7 @@ struct Engine {
     operation: u64,
     room_incarnation: u64,
     local_revision: u64,
+    local_queue_instance: u64,
     action_status: &'static str,
 }
 impl Engine {
@@ -623,28 +626,28 @@ impl Engine {
                     self.cancel_work();
                     self.stop();
                     self.local_store = Some(store);
+                    self.local_queue_instance = self.local_queue_instance.wrapping_add(1);
                     self.local_revision = self.local_revision.wrapping_add(1);
                     self.start_saved(Some(input));
                 }
             }
             Command::Guarded(token, action) => {
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
-                    self.action(action);
+                    match action {
+                        Action::Pause if !self.wants_pause() => (),
+                        Action::Resume if self.wants_pause() => (),
+                        _ => self.action(action),
+                    }
                 }
             }
             Command::Playback(action) if !action.depends_on_visible_queue() => self.action(action),
-            Command::Toggle => {
-                let desired = if self.offline || self.local_store.is_some() {
-                    self.local.desired
-                } else {
-                    self.online.wants_pause()
-                };
-                self.action(if desired {
-                    Action::Pause
-                } else {
-                    Action::Resume
-                });
+            #[cfg(target_os = "linux")]
+            Command::GuardedToggle(token)
+                if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) =>
+            {
+                self.toggle();
             }
+            Command::Toggle => self.toggle(),
             Command::Transport("next") => self.action(Action::Next),
             Command::Transport("previous") => self.action(Action::Previous),
             Command::Transport("pause") => self.action(Action::Pause),
@@ -652,6 +655,20 @@ impl Engine {
             Command::Transport("close") => self.action(Action::Close),
             _ => {}
         }
+    }
+    fn wants_pause(&self) -> bool {
+        if self.offline || self.local_store.is_some() {
+            self.local.desired
+        } else {
+            self.online.wants_pause()
+        }
+    }
+    fn toggle(&mut self) {
+        self.action(if self.wants_pause() {
+            Action::Pause
+        } else {
+            Action::Resume
+        });
     }
     fn action(&mut self, action: Action) {
         if !self.offline {
@@ -1091,8 +1108,13 @@ impl Engine {
         };
         if !self.offline {
             self.project_online(&mut p);
+            if let Some(cursor) = self.online.cursor().filter(|_| !p.track.is_empty()) {
+                p.media_track_token =
+                    format!("online:{}:{}:{}", cursor.key, cursor.chain, cursor.visit);
+            }
         }
         if p.local_playback {
+            p.media_track_token.clear();
             p.output = if self.offline {
                 "This desktop · Offline"
             } else {
@@ -1108,6 +1130,10 @@ impl Engine {
             p.repeat = self.local.repeat.wire();
             p.elapsed = self.local.elapsed;
             if let Some(entry) = self.local.current() {
+                p.media_track_token = format!(
+                    "local:{}:{}:{}",
+                    self.room_incarnation, self.local_queue_instance, entry.key
+                );
                 p.title = entry.track.title.clone();
                 p.detail = entry.track.subtitle.clone();
                 p.track = entry.track.id.clone();
@@ -1232,6 +1258,7 @@ struct PlayerView {
     repeat: &'static str,
     status: &'static str,
     room_token: String,
+    media_track_token: String,
     playing: bool,
     control: bool,
     transport: bool,
@@ -1262,6 +1289,7 @@ impl PlayerView {
             ui.set_local_playback(self.local_playback);
             ui.set_reconnecting(self.reconnecting);
             ui.set_room_token(self.room_token.into());
+            ui.set_media_track_token(self.media_track_token.into());
             ui.set_shuffle(self.shuffle);
             ui.set_repeat_mode(
                 if self.repeat.is_empty() {
@@ -1544,6 +1572,7 @@ pub fn start(
                 operation: 0,
                 room_incarnation: 0,
                 local_revision: 0,
+                local_queue_instance: 0,
                 action_status: "",
             };
             e.start_restore(None);
@@ -1676,6 +1705,7 @@ mod tests {
             operation: 0,
             room_incarnation: 0,
             local_revision: 0,
+            local_queue_instance: 0,
             action_status: "",
         }
     }
@@ -1691,6 +1721,47 @@ mod tests {
         e.shared_epoch.store(8, Ordering::SeqCst);
         e.command(Command::Offline(false).scoped(7));
         assert!(e.offline);
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn guarded_media_cannot_retarget_a_new_run_mode_or_account() {
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        e.account = Some(Account {
+            session: api.test_session(),
+            api,
+        });
+        e.command(Command::Offline(true).scoped(7));
+        assert!(e.offline);
+        let track = LocalTrack {
+            id: "same-song".into(),
+            title: "Fixture".into(),
+            subtitle: String::new(),
+            album_name: String::new(),
+            duration: 25.0,
+        };
+        assert_eq!(
+            e.local.replace(vec![track.clone(), track], 0, false),
+            Change::Start
+        );
+        let first_run = e.room_token().unwrap();
+        e.command(Command::Guarded(first_run.clone(), Action::Seek(4.0)).scoped(7));
+        assert_eq!(e.local.elapsed, 4.0);
+        let sought_run = e.room_token().unwrap();
+        e.command(Command::Guarded(sought_run.clone(), Action::Next).scoped(7));
+        assert_eq!(e.local.position, Some(1));
+        e.command(Command::Guarded(sought_run, Action::Seek(12.0)).scoped(7));
+        assert_eq!(e.local.elapsed, 0.0);
+
+        let current = e.room_token().unwrap();
+        e.command(Command::Guarded("retired-online:3".into(), Action::Seek(12.0)).scoped(7));
+        assert_eq!(e.local.elapsed, 0.0);
+        let intended = e.local.desired;
+        e.command(Command::GuardedToggle(first_run).scoped(7));
+        assert_eq!(e.local.desired, intended);
+        e.shared_epoch.store(8, Ordering::SeqCst);
+        e.command(Command::Guarded(current, Action::Seek(12.0)).scoped(7));
+        assert_eq!(e.local.elapsed, 0.0);
     }
     #[tokio::test]
     async fn saved_queue_is_admitted_online_only_for_the_current_mode_generation() {

@@ -62,6 +62,8 @@ fn clear(ui: &AppWindow) {
     ui.set_form_value("".into());
     ui.set_form_description("".into());
     ui.set_now_track_id("".into());
+    ui.set_room_token("".into());
+    ui.set_media_track_token("".into());
     ui.set_now_album_id("".into());
     ui.set_now_album_name("".into());
     ui.set_next_title("".into());
@@ -248,7 +250,9 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     #[cfg(target_os = "linux")]
-    let _media_keys = mpris::attach(&ui, epoch.clone());
+    let _media_keys = mpris::attach(&ui, epoch.clone(), move |ui, command| {
+        send(&tx, command, ui);
+    });
     let result = ui.run();
     let _ = auth_tx.send(AuthCommand::Shutdown);
     if worker.join().is_err() {
