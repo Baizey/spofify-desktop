@@ -21,6 +21,15 @@ export global Copy {
             : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" ? "playlists"
             : kind == "queue" ? "≡" : kind == "saved-collection" ? "↓" : "♫";
     }
+    // Catalog sizing corresponds to MediaLine's title, optional type, credits,
+    // album link, and 6px padding on both sides. It remains available without
+    // mounting any of those controls for an offscreen row.
+    public pure function result-height(typed: bool, credits: bool, album: bool) -> length {
+        return max(max(48px, 56px * Theme.density), 12px + max(20px, 15px * Theme.density + 7px)
+            + (typed ? max(18px, 16px * Theme.density) : 0px)
+            + (credits ? max(20px, 13px * Theme.density + 6px) : 0px)
+            + (album ? max(20px, 12px * Theme.density + 7px) : 0px));
+    }
     public pure function action-label(action: string) -> string {
         return ActionCopy.label(action);
     }
@@ -177,6 +186,7 @@ export component MediaLine inherits Rectangle {
     in property <bool> compact;
     in property <bool> queue-columns;
     in property <bool> search-result;
+    in property <bool> align-credit-fallback;
     in property <bool> selected;
     in property <length> paint-left;
     in property <length> paint-right;
@@ -206,6 +216,20 @@ export component MediaLine inherits Rectangle {
     property <string> track-state-label: !root.current-track ? root.occurrence-description
         : (root.occurrence-description == "" ? "" : root.occurrence-description + ", ")
             + (root.playing-track ? "Playing" : "Current track");
+    property <string> resume-part;
+    property <string> resume-credit;
+    property <int> resume-serial;
+    public function restore-focus(part: string, credit: string) {
+        if ((part == "artist" || part == "album") && !root.metadata-enabled)
+            || (part == "album" && (root.album-id == "" || root.album-name == ""))
+            || (part == "menu" && root.actions.length == 0) {
+            if root.body-focusable { row-keys.focus(); }
+        } else if part == "artist" || part == "album" || part == "menu" {
+            root.resume-credit = credit;
+            root.resume-part = part;
+            root.resume-serial += 1;
+        } else if root.body-focusable { row-keys.focus(); }
+    }
     function activate-row() {
         if root.can-open { root.action("open"); }
         else if root.play-on-activate { root.action("play"); }
@@ -337,9 +361,11 @@ export component MediaLine inherits Rectangle {
                     height: artist-line.preferred-height;
                     artist-line := CreditLine {
                         // Credit names already have a 2px text inset; the fallback has none.
-                        x: !root.queue-columns ? 0px : root.credits.length > 0 ? 2px : 4px;
+                        x: root.queue-columns || root.align-credit-fallback ? (root.credits.length > 0 ? 2px : 4px) : 0px;
                         width: max(0px, parent.width - 2 * self.x); height: parent.height;
                         credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                        focus-credit: root.resume-part == "artist" ? root.resume-credit : "";
+                        focus-serial: root.resume-serial;
                         background-clickable: root.body-focusable;
                         background-click-scope: root.menu-key;
                         background-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
@@ -352,6 +378,7 @@ export component MediaLine inherits Rectangle {
                 if root.album-name != "": AlbumLine {
                     text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
                     fit-link: true;
+                    focus-serial: root.resume-part == "album" ? root.resume-serial : 0;
                     activated => { root.page-action("album", root.album-id); }
                     focused => { root.focused(); }
                 }
@@ -377,6 +404,8 @@ export component MediaLine inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
                     item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+                    property <int> resume: root.resume-part == "menu" ? root.resume-serial : 0;
+                    changed resume => { if self.resume != 0 { self.take-focus(); } }
                     action(op) => { root.action(op); }
                     focused => { root.focused(); }
                 }

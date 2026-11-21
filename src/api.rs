@@ -1677,17 +1677,17 @@ mod tests {
                 personal: Default::default(),
             };
             let history = Route::History;
-            let history_page = Arc::new(pages::load(&access, &history, None).await.unwrap());
+            let history_page = Arc::new(pages::load(&access, &history).await.unwrap());
             assert!(history_page.rows.is_empty());
             assert!(!history_page.status.is_empty());
             let query = Route::Search("Björk".into());
-            let search = Arc::new(pages::load(&access, &query, None).await.unwrap());
+            let search = Arc::new(pages::load(&access, &query).await.unwrap());
             let hit = &search.rows[0];
             assert!(hit.music.credits.is_empty());
             assert_eq!(hit.title, "Björk");
             let target = hit.route.clone().unwrap();
             assert_eq!(target, Route::Artist("root".into()));
-            let page = pages::load(&access, &target, None).await.unwrap();
+            let page = pages::load(&access, &target).await.unwrap();
             assert_eq!(page.title, "Björk");
             assert_eq!(page.subtitle, "1 available song");
             assert_eq!(page.rows.len(), 1);
@@ -1699,7 +1699,7 @@ mod tests {
             );
             let release = page.rows[0].route.clone().unwrap();
             assert_eq!(release, Route::Album("album".into()));
-            let album = pages::load(&access, &release, None).await.unwrap();
+            let album = pages::load(&access, &release).await.unwrap();
             assert_eq!(album.title, "Vespertine");
             assert_eq!(album.music.credits[0].target, Some(target.clone()));
             assert!(

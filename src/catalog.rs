@@ -312,8 +312,7 @@ impl WireSearchPage {
         cursor: Option<&str>,
     ) -> Result<SearchPage, ApiError> {
         let count = self.items.len() as u32;
-        if self.result_count > 300
-            || count > 100
+        if count > 100
             || count > self.result_count
             || !safe_timestamp(&self.expires_at)
             || self.next_cursor.as_deref().is_some_and(|next| {

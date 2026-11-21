@@ -27,8 +27,6 @@ use crate::{
     personal, player,
 };
 
-pub const MAX_ROWS: usize = 500;
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
     History,
@@ -46,6 +44,10 @@ pub enum Route {
 }
 
 impl Route {
+    pub const fn catalog_continuity(&self) -> bool {
+        matches!(self, Self::Search(_) | Self::Album(_) | Self::Artist(_))
+    }
+
     pub const fn personal(&self) -> bool {
         matches!(
             self,
@@ -336,6 +338,7 @@ pub struct PageState {
     next: Option<Next>,
     snapshot: Option<Snapshot>,
     used_cursors: HashSet<String>,
+    keys: HashSet<RowKey>,
 }
 
 impl fmt::Debug for PageState {
@@ -371,16 +374,9 @@ const OFFLINE: ApiError = ApiError {
     status: 0,
 };
 
-/// A continuation lost its snapshot. The actor may retain the old projection
-/// while scheduling a fresh first page instead of retrying the same cursor.
-pub fn continuation_changed(error: &ApiError) -> bool {
-    !error.expired && matches!(error.status, 409 | 410 | 412)
-}
-
-/// Fetch one bounded segment. The actor owns the retained account replica, decides
-/// when to call this, and must discard results for superseded navigation/access.
-/// An append failure returns no replacement, so the accepted page can stay visible.
-pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<Page, ApiError> {
+/// Fetch the initial projection. Catalog continuation fetches a separate bounded
+/// delta; only the browsing actor can commit it to an accepted page.
+pub async fn load(access: &Access, route: &Route) -> Result<Page, ApiError> {
     let (api, session) = (&access.api, &access.session);
     if session.is_expired() {
         return Err(EXPIRED);
@@ -411,41 +407,15 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
     {
         return Err(OFFLINE);
     }
-    let mut page = match old {
-        Some(old) => {
-            if old.state.route.as_ref() != Some(route)
-                || old.state.epoch != access.epoch
-                || old.state.account_id != session.account_id
-            {
-                return Err(CHANGED);
-            }
-            if !old.more || old.rows.len() >= MAX_ROWS || old.state.next.is_none() {
-                return Ok(old.clone());
-            }
-            old.clone()
-        }
-        None => Page {
-            kind: route.kind().into(),
-            state: PageState {
-                route: Some(route.clone()),
-                epoch: access.epoch,
-                account_id: session.account_id.clone(),
-                ..PageState::default()
-            },
-            ..Page::default()
+    let mut page = Page {
+        kind: route.kind().into(),
+        state: PageState {
+            route: Some(route.clone()),
+            epoch: access.epoch,
+            account_id: session.account_id.clone(),
+            ..PageState::default()
         },
-    };
-    let limit = PAGE_SIZE.min((MAX_ROWS - page.rows.len()) as u32);
-    let request = PageRequest {
-        offset: match page.state.next {
-            Some(Next::Offset(n)) => n,
-            _ => 0,
-        },
-        limit,
-    };
-    let cursor = match &page.state.next {
-        Some(Next::Cursor(value)) => Some(value.clone()),
-        _ => None,
+        ..Page::default()
     };
 
     match route {
@@ -455,30 +425,9 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
                 page.subtitle = "Find tracks, albums, and artists".into();
                 return Ok(page);
             }
-            let result = if let Some(cursor) = &cursor {
-                api.unified_search_next(session, cursor).await?
-            } else {
-                api.unified_search(session, query, None, request.limit)
-                    .await?
-            };
-            let total = u64::from(result.result_count);
-            let end = (page.rows.len() + result.items.len()) as u64;
-            if end > total || result.next_cursor.is_some() != (end < total) {
-                return Err(CHANGED);
-            }
-            let rows = result
-                .items
-                .into_iter()
-                .map(|item| catalog_row(item, None))
-                .collect();
-            page.append(
-                rows,
-                total,
-                result.next_cursor.map(Next::Cursor),
-                None,
-                cursor,
-            )?;
-            page.subtitle = count_label(total, "result", "results");
+            let batch = fetch_catalog(access, route, None, 0, &page.title).await?;
+            page.subtitle = count_label(batch.total, "result", "results");
+            batch.commit(&mut page)?;
         }
         Route::Album(id) | Route::Artist(id) => {
             let album = matches!(route, Route::Album(_));
@@ -487,32 +436,21 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             } else {
                 CatalogKind::Artist
             };
-            if old.is_none() {
-                let detail = api.catalog_detail(session, kind, id).await?;
-                let row = catalog_row(detail.item, None);
-                page.title = row.title;
-                page.subtitle = if album {
-                    row.detail
-                } else {
-                    join_labels(&row.subtitle, &row.detail)
-                };
-                page.music = row.music;
-                page.playback = row.playback;
-                // These are two separate Go transactions. Only the child
-                // listing's revision fences its subsequent offsets.
-            }
-            let result = if album {
-                api.album_tracks(session, id, request).await?
+            let detail = api.catalog_detail(session, kind, id).await?;
+            let row = catalog_row(detail.item, None);
+            page.title = row.title;
+            page.subtitle = if album {
+                row.detail
             } else {
-                api.artist_albums(session, id, request).await?
+                join_labels(&row.subtitle, &row.detail)
             };
-            // Artist album cards play their own albums, never the entire artist.
-            let context = if album {
-                Some(context_for(ContextKind::Album, id, &page.title))
-            } else {
-                None
-            };
-            project_catalog(&mut page, request, result, context)?;
+            page.music = row.music;
+            page.playback = row.playback;
+            // Detail and listing are separate transactions. Only the child
+            // listing's revision fences subsequent offsets.
+            fetch_catalog(access, route, None, 0, &page.title)
+                .await?
+                .commit(&mut page)?;
         }
         Route::History | Route::Playlists | Route::Playlist(_) | Route::Picker(_) => {
             // Only the account socket can supply these projections.
@@ -529,6 +467,138 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
         return Err(EXPIRED);
     }
     Ok(page)
+}
+
+pub struct CatalogBatch {
+    rows: Vec<Row>,
+    total: u64,
+    expected: Option<Next>,
+    next: Option<Next>,
+    snapshot: Option<Snapshot>,
+}
+
+impl CatalogBatch {
+    pub fn commit(self, page: &mut Page) -> Result<(), ApiError> {
+        if page.state.next != self.expected || (self.expected.is_some() && self.rows.is_empty()) {
+            return Err(CHANGED);
+        }
+        let cursor = match self.expected {
+            Some(Next::Cursor(cursor)) => Some(cursor),
+            _ => None,
+        };
+        page.append(self.rows, self.total, self.next, self.snapshot, cursor)
+    }
+}
+
+pub async fn load_next(
+    access: &Access,
+    route: &Route,
+    page: &Page,
+) -> Result<CatalogBatch, ApiError> {
+    if access.session.is_expired() {
+        return Err(EXPIRED);
+    }
+    if access.offline || access.session.is_offline() {
+        return Err(OFFLINE);
+    }
+    if page.state.route.as_ref() != Some(route)
+        || page.state.epoch != access.epoch
+        || page.state.account_id != access.session.account_id
+        || page.state.next.is_none()
+    {
+        return Err(CHANGED);
+    }
+    fetch_catalog(
+        access,
+        route,
+        page.state.next.as_ref(),
+        page.rows.len(),
+        &page.title,
+    )
+    .await
+}
+
+async fn fetch_catalog(
+    access: &Access,
+    route: &Route,
+    expected: Option<&Next>,
+    before: usize,
+    title: &str,
+) -> Result<CatalogBatch, ApiError> {
+    let (api, session) = (&access.api, &access.session);
+    let request = PageRequest {
+        offset: match expected {
+            Some(Next::Offset(n)) => *n,
+            _ => 0,
+        },
+        limit: PAGE_SIZE,
+    };
+    let (items, total, next, snapshot, context) = match route {
+        Route::Search(query) => {
+            let result = match expected {
+                Some(Next::Cursor(cursor)) => api.unified_search_next(session, cursor).await?,
+                None => {
+                    api.unified_search(session, query, None, request.limit)
+                        .await?
+                }
+                _ => return Err(CHANGED),
+            };
+            let total = u64::from(result.result_count);
+            let count = result.items.len();
+            let end = before as u64 + count as u64;
+            if count > request.limit as usize
+                || end > total
+                || result.next_cursor.is_some() != (end < total)
+            {
+                return Err(CHANGED);
+            }
+            (
+                result.items,
+                total,
+                result.next_cursor.map(Next::Cursor),
+                None,
+                None,
+            )
+        }
+        Route::Album(id) | Route::Artist(id) => {
+            let album = matches!(route, Route::Album(_));
+            let result = if album {
+                api.album_tracks(session, id, request).await?
+            } else {
+                api.artist_albums(session, id, request).await?
+            };
+            let next = offset_next(
+                request,
+                result.offset,
+                result.limit,
+                result.items.len(),
+                result.total,
+            )?;
+            // Artist album cards play their own albums, not the entire artist.
+            let context = album.then(|| context_for(ContextKind::Album, id, title));
+            (
+                result.items,
+                result.total,
+                next,
+                Some(Snapshot::Catalog(result.revision)),
+                context,
+            )
+        }
+        _ => return Err(CHANGED),
+    };
+    if session.is_expired() {
+        return Err(EXPIRED);
+    }
+    Ok(CatalogBatch {
+        rows: items
+            .into_iter()
+            .map(|item| catalog_row(item, context.as_ref()))
+            .collect(),
+        total,
+        expected: expected.cloned(),
+        next,
+        snapshot,
+    })
 }
 
 /// Search the current account’s Downloads projection, not the online query cache.
@@ -588,26 +658,21 @@ impl Page {
                 return Err(CHANGED);
             }
         }
-        let mut seen: HashSet<&RowKey> = self.rows.iter().map(|row| &row.key).collect();
-        if rows
-            .iter()
-            .any(|row| row.key == RowKey::None || !seen.insert(&row.key))
-        {
+        let mut seen = HashSet::with_capacity(rows.len());
+        if rows.iter().any(|row| {
+            row.key == RowKey::None || self.state.keys.contains(&row.key) || !seen.insert(&row.key)
+        }) {
             return Err(CHANGED);
         }
-        let remaining = MAX_ROWS.saturating_sub(self.rows.len());
-        let capped = rows.len() > remaining || (rows.len() == remaining && next.is_some());
-        self.rows.extend(rows.into_iter().take(remaining));
+        self.state.keys.extend(seen.into_iter().cloned());
+        self.rows.extend(rows);
         if let Some(cursor) = cursor {
             self.state.used_cursors.insert(cursor);
         }
         self.total = Some(total);
         self.state.snapshot = snapshot;
-        self.state.next = if capped { None } else { next };
+        self.state.next = next;
         self.more = self.state.next.is_some();
-        if capped {
-            self.status = "Showing the first 500 items.".into();
-        }
         Ok(())
     }
 }
@@ -630,33 +695,6 @@ fn offset_next(
         return Err(CHANGED);
     }
     Ok(Some(Next::Offset(u32::try_from(end).map_err(|_| CHANGED)?)))
-}
-
-fn project_catalog(
-    page: &mut Page,
-    request: PageRequest,
-    result: catalog::CatalogPage,
-    context: Option<Arc<PlaybackContext>>,
-) -> Result<(), ApiError> {
-    let next = offset_next(
-        request,
-        result.offset,
-        result.limit,
-        result.items.len(),
-        result.total,
-    )?;
-    let rows = result
-        .items
-        .into_iter()
-        .map(|item| catalog_row(item, context.as_ref()))
-        .collect();
-    page.append(
-        rows,
-        result.total,
-        next,
-        Some(Snapshot::Catalog(result.revision)),
-        None,
-    )
 }
 
 pub fn personal_projection(route: &Route, replica: &personal::Replica) -> Option<Page> {
@@ -707,7 +745,6 @@ pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
     page.rows = summaries
         .iter()
         .filter(|p| !picker || (p.kind == PlaylistKind::Manual && p.capabilities.add_tracks))
-        .take(MAX_ROWS)
         .cloned()
         .map(|summary| {
             let mut row = playlist_row(summary);
@@ -1576,9 +1613,50 @@ mod tests {
     }
 
     #[test]
+    fn catalog_commit_is_transactional_and_requires_the_accepted_boundary() {
+        let mut page = Page::default();
+        let batch =
+            |expected: Option<u32>, next: Option<u32>, revision, keys: &[&str]| CatalogBatch {
+                rows: keys
+                    .iter()
+                    .map(|key| Row {
+                        key: RowKey::Track((*key).into()),
+                        ..Row::default()
+                    })
+                    .collect(),
+                total: 3,
+                expected: expected.map(Next::Offset),
+                next: next.map(Next::Offset),
+                snapshot: Some(Snapshot::Catalog(revision)),
+            };
+        batch(None, Some(1), 8, &["a"]).commit(&mut page).unwrap();
+        let accepted = page.clone();
+        for invalid in [
+            batch(None, None, 8, &["b", "c"]),
+            batch(Some(1), None, 9, &["b", "c"]),
+            batch(Some(1), None, 8, &[]),
+            batch(Some(1), None, 8, &["a", "c"]),
+            batch(Some(1), None, 8, &["b", "b"]),
+        ] {
+            assert_eq!(invalid.commit(&mut page), Err(CHANGED));
+            assert_eq!(page, accepted);
+        }
+        batch(Some(1), None, 8, &["b", "c"])
+            .commit(&mut page)
+            .unwrap();
+        assert!(!page.more);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"].map(|key| RowKey::Track(key.into()))
+        );
+    }
+
+    #[test]
     fn offset_progress_and_append_are_bounded_and_reject_overlap_or_cursor_cycles() {
         assert_eq!(CHANGED.status, 409);
-        assert!(continuation_changed(&CHANGED));
         let request = PageRequest {
             offset: 20,
             limit: 20,
@@ -1624,16 +1702,24 @@ mod tests {
             ),
             Err(CHANGED)
         );
-        page.append(
-            (2..510).map(row).collect(),
-            999,
-            Some(Next::Cursor("c".into())),
-            None,
-            Some("b".into()),
-        )
-        .unwrap();
-        assert_eq!(page.rows.len(), MAX_ROWS);
-        assert!(!page.more);
+        for start in (2..999).step_by(PAGE_SIZE as usize) {
+            let end = (start + PAGE_SIZE as usize).min(999);
+            let before = if start == 2 {
+                "b".into()
+            } else {
+                start.to_string()
+            };
+            page.append(
+                (start..end).map(row).collect(),
+                999,
+                (end < 999).then(|| Next::Cursor(end.to_string())),
+                None,
+                Some(before),
+            )
+            .unwrap();
+            assert_eq!(page.rows.len(), end);
+            assert_eq!(page.more, end < 999);
+        }
         assert!(page.state.next.is_none());
     }
 }

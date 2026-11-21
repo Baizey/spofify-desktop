@@ -54,7 +54,38 @@ struct Input {
     epoch: u64,
     generation: u64,
     intent: Intent,
+    catalog_position: Option<CatalogPosition>,
 }
+
+struct CatalogPosition {
+    y: f32,
+    anchor: i32,
+    anchor_offset: f32,
+    row: i32,
+    part: String,
+    credit: String,
+}
+
+#[derive(Default)]
+struct CatalogContinuation {
+    loading: bool,
+    stopped: bool,
+    status: String,
+}
+
+struct CatalogVisit {
+    page: Arc<Page>,
+    position: CatalogPosition,
+    continuation: CatalogContinuation,
+}
+
+#[derive(Clone)]
+struct CatalogDemand {
+    epoch: u64,
+    generation: u64,
+    key: String,
+}
+
 struct Stamp {
     epoch: Arc<AtomicU64>,
     shown: Arc<AtomicU64>,
@@ -62,15 +93,38 @@ struct Stamp {
 #[derive(Clone)]
 pub struct Desk {
     tx: mpsc::Sender<Input>,
+    catalog_demand: watch::Sender<Option<CatalogDemand>>,
     stamp: Arc<Stamp>,
 }
 impl Desk {
     fn submit(&self, ui: &AppWindow, intent: Intent) {
+        let position =
+            matches!(ui.get_page_kind().as_str(), "search" | "album" | "artist").then(|| {
+                let y = ui.get_catalog_scroll_y();
+                let anchor_offset = ui.get_catalog_anchor_y() + y;
+                let row = ui
+                    .get_catalog_row_navigation()
+                    .then(|| ui.get_catalog_focused_row());
+                CatalogPosition {
+                    y,
+                    anchor: if anchor_offset <= 0.0 {
+                        ui.get_catalog_anchor_row()
+                    } else {
+                        -1
+                    },
+                    anchor_offset,
+                    row: row.unwrap_or(-1),
+                    part: row.map_or_else(String::new, |_| ui.get_catalog_focused_part().into()),
+                    credit: row
+                        .map_or_else(String::new, |_| ui.get_catalog_focused_credit().into()),
+                }
+            });
         if self
             .tx
             .try_send(Input {
                 epoch: self.stamp.epoch.load(Ordering::SeqCst),
                 generation: self.stamp.shown.load(Ordering::SeqCst),
+                catalog_position: position,
                 intent,
             })
             .is_err()
@@ -104,6 +158,14 @@ impl Desk {
                 d.submit(&ui, Intent::Row(op.into(), i as usize));
             }
         });
+        let d = self.clone();
+        ui.on_catalog_demand(move |key| {
+            d.catalog_demand.send_replace(Some(CatalogDemand {
+                epoch: d.stamp.epoch.load(Ordering::SeqCst),
+                generation: d.stamp.shown.load(Ordering::SeqCst),
+                key: key.into(),
+            }));
+        });
         let (d, w) = (self.clone(), ui.as_weak());
         ui.on_playlist_order_drop(move |scope, grabbed, after| {
             if let Some(ui) = w.upgrade() {
@@ -135,6 +197,7 @@ impl Desk {
 enum Update {
     Read(Result<Page, ApiError>, bool), // true when the task will retry
     ReadGap,
+    CatalogAppend(u64, Option<Result<pages::CatalogBatch, ApiError>>),
     SearchDownloads(Result<Page, ApiError>),
     Storage(Result<String, ApiError>),
     Changed(Result<Option<Route>, ApiError>),
@@ -212,6 +275,10 @@ struct Browser {
     trail: Trail,
     cache: Replica,
     page: Arc<Page>,
+    catalog_visits: HashMap<u64, CatalogVisit>,
+    catalog_position: Option<CatalogPosition>,
+    catalog_restore: Option<CatalogPosition>,
+    continuation: CatalogContinuation,
     generation: u64,
     serial: u64,
     busy: bool,
@@ -594,6 +661,13 @@ fn readable(e: &ApiError) -> String {
         _ => e.message.into(),
     }
 }
+const READ_RETRIES: u32 = 4;
+fn read_retry<T>(attempt: u32, result: &Result<T, ApiError>) -> bool {
+    attempt < READ_RETRIES && result.as_ref().err().is_some_and(recoverable)
+}
+fn read_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1 << attempt)
+}
 fn recoverable(e: &ApiError) -> bool {
     !e.expired
         && (matches!(e.status, 408 | 429 | 500..=599)
@@ -610,6 +684,9 @@ impl Browser {
         self.serial += 1;
         self.busy = false;
         self.silent_read = false;
+        // Same-view cancellation (for example, a save starting) must not
+        // re-arm observer demand for the same in-flight boundary.
+        self.continuation.stopped |= std::mem::take(&mut self.continuation.loading);
         self.writing = false;
         self.unpinning = false;
     }
@@ -708,10 +785,35 @@ impl Browser {
     }
 
     fn render(&mut self, models: bool) {
+        self.render_rows(models, None);
+    }
+
+    fn catalog_request_key(&self) -> String {
+        if self.route.catalog_continuity()
+            && self.page.more
+            && !self.continuation.stopped
+            && !self.busy
+            && self.task.is_none()
+            && self
+                .access
+                .as_ref()
+                .is_some_and(|a| !a.offline && !a.session.is_offline())
+        {
+            format!("{}:{}", self.generation, self.serial)
+        } else {
+            String::new()
+        }
+    }
+
+    fn render_rows(&mut self, models: bool, append_from: Option<usize>) {
         if models {
             self.generation += 1;
         }
         let order = self.refresh_playlist_order();
+        let catalog_request_key = self.catalog_request_key();
+        let catalog_status = self.continuation.status.clone();
+        let catalog_loading = self.continuation.loading;
+        let catalog_restore = self.catalog_restore.take();
         let token = self.generation;
         let shown = self.shown.clone();
         let p = self.page.clone();
@@ -788,53 +890,68 @@ impl Browser {
             ui.set_page_busy(busy);
             ui.set_page_error(error);
             ui.set_can_back(back);
-            ui.set_has_more(p.more && !offline);
+            ui.set_catalog_request_key(catalog_request_key.into());
+            ui.set_catalog_continuation_status(catalog_status.into());
+            ui.set_catalog_loading(catalog_loading);
             ui.set_form_busy(write);
-            if models {
-                ui.set_browse_model_key(token.to_string().into());
-                let pin = PinDisplay::new(&pin_view, access.as_ref());
-                ui.set_page_credits(artist_credits(&p.music, offline));
-                ui.set_browse_rows(ModelRc::new(VecModel::from(
-                    p.rows
-                        .iter()
-                        .map(|r| {
-                            let (album_id, album_name) =
-                                projected_music(r.music.album.as_ref(), offline, false);
-                            let status = if matches!(kind.as_str(), "playlists" | "offline") {
-                                pin.row(r)
+            let pin = PinDisplay::new(&pin_view, access.as_ref());
+            if models || append_from.is_some() {
+                let rows = p
+                    .rows
+                    .iter()
+                    .skip(append_from.unwrap_or(0))
+                    .map(|r| {
+                        let (album_id, album_name) =
+                            projected_music(r.music.album.as_ref(), offline, false);
+                        let status = if matches!(kind.as_str(), "playlists" | "offline") {
+                            pin.row(r)
+                        } else {
+                            None
+                        };
+                        BrowseRow {
+                            section: Default::default(),
+                            actions: strings(row_actions(
+                                &p,
+                                r,
+                                offline,
+                                personal_actions,
+                                status.is_some(),
+                            )),
+                            kind: r.kind.as_str().into(),
+                            track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
+                            title: r.title.as_str().into(),
+                            subtitle: pin_subtitle(r, status),
+                            playlist_pinned: status.is_some(),
+                            detail: r.detail.as_str().into(),
+                            can_open: if matches!(route, Route::Picker(_)) {
+                                !offline && personal_actions
                             } else {
-                                None
-                            };
-                            BrowseRow {
-                                section: Default::default(),
-                                actions: strings(row_actions(
-                                    &p,
-                                    r,
-                                    offline,
-                                    personal_actions,
-                                    status.is_some(),
-                                )),
-                                kind: r.kind.as_str().into(),
-                                track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
-                                title: r.title.as_str().into(),
-                                subtitle: pin_subtitle(r, status),
-                                playlist_pinned: status.is_some(),
-                                detail: r.detail.as_str().into(),
-                                can_open: if matches!(route, Route::Picker(_)) {
-                                    !offline && personal_actions
-                                } else {
-                                    row_open_target(&route, r, offline).is_some()
-                                },
-                                playable: r.playable
-                                    && personal_actions
-                                    && (!offline || local_playback),
-                                credits: artist_credits(&r.music, offline),
-                                album_id: album_id.into(),
-                                album_name: album_name.into(),
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                )));
+                                row_open_target(&route, r, offline).is_some()
+                            },
+                            playable: r.playable
+                                && personal_actions
+                                && (!offline || local_playback),
+                            credits: artist_credits(&r.music, offline),
+                            album_id: album_id.into(),
+                            album_name: album_name.into(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(start) = append_from {
+                    let displayed = ui.get_browse_rows();
+                    if let Some(model) = displayed.as_any().downcast_ref::<VecModel<BrowseRow>>()
+                        && model.row_count() == start
+                        && shown.load(Ordering::SeqCst) == token
+                    {
+                        model.extend(rows);
+                    }
+                } else {
+                    ui.set_browse_model_key(token.to_string().into());
+                    ui.set_page_credits(artist_credits(&p.music, offline));
+                    ui.set_browse_rows(ModelRc::new(VecModel::from(rows)));
+                }
+            }
+            if models {
                 let pinned = pin.page(&route).is_some();
                 let mut actions = Vec::new();
                 if kind == "offline" && p.rows.iter().any(|r| r.playable) {
@@ -877,6 +994,16 @@ impl Browser {
             // Keep the preview until the confirmed rows and scope are published,
             // not until a separate form-completion callback clears form-busy.
             ui.set_playlist_order_pending(order_pending);
+            if let Some(position) = catalog_restore {
+                ui.set_catalog_return_key(ui.get_page_key());
+                ui.set_catalog_return_y(position.y);
+                ui.set_catalog_return_anchor(position.anchor);
+                ui.set_catalog_return_offset(position.anchor_offset);
+                ui.set_catalog_return_row(position.row);
+                ui.set_catalog_return_part(position.part.into());
+                ui.set_catalog_return_credit(position.credit.into());
+                ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
+            }
         });
     }
     fn pins_changed(&mut self, view: playlist_pins::View) {
@@ -891,7 +1018,7 @@ impl Browser {
                 if self.writing {
                     self.saved_reload_due = true;
                 } else {
-                    self.visit(Navigation::Untracked(self.route.clone()), false);
+                    self.visit(Navigation::Untracked(self.route.clone()));
                 }
                 return;
             }
@@ -974,6 +1101,8 @@ impl Browser {
         self.edit_basis = None;
         self.row_editor = None;
         self.cache = Replica::default();
+        self.catalog_visits.clear();
+        self.continuation = CatalogContinuation::default();
         self.trail = Trail::default();
         self.page_keys = RandomState::new();
         self.route = INITIAL_ROUTE;
@@ -986,7 +1115,7 @@ impl Browser {
             clear_form(&ui);
         });
         if self.access.is_some() {
-            self.visit(Navigation::Untracked(INITIAL_ROUTE), false);
+            self.visit(Navigation::Untracked(INITIAL_ROUTE));
         } else {
             self.render(true);
         }
@@ -1005,6 +1134,7 @@ impl Browser {
         let a = self.access.as_ref().unwrap();
         let offline = a.offline;
         if old.offline != offline {
+            self.catalog_visits.clear();
             if self.unpinning {
                 // Durable unpin needs the same local account grant, not the
                 // previous online connection. Finish before refreshing Saved.
@@ -1024,14 +1154,11 @@ impl Browser {
             // a downloaded collection or a query that can continue locally.
             let jump_to_downloads =
                 offline && !saved_route(&self.route) && !matches!(self.route, Route::Search(_));
-            self.visit(
-                if jump_to_downloads {
-                    Navigation::Follow(Route::Offline)
-                } else {
-                    Navigation::Untracked(self.route.clone())
-                },
-                false,
-            );
+            self.visit(if jump_to_downloads {
+                Navigation::Follow(Route::Offline)
+            } else {
+                Navigation::Untracked(self.route.clone())
+            });
             if let Some(pending) = interrupted {
                 self.message = if matches!(pending.effect, Effect::Move { .. }) {
                     "You went offline before the playlist order change was confirmed."
@@ -1233,7 +1360,7 @@ impl Browser {
                 self.scoped_ui(clear_form_owned);
                 if let Some(next) = observed {
                     self.trail.landed(&next);
-                    self.visit(Navigation::Untracked(next), false);
+                    self.visit(Navigation::Untracked(next));
                 }
                 self.error = false;
                 self.message.clear();
@@ -1369,11 +1496,65 @@ impl Browser {
         }
     }
 
-    fn visit(&mut self, navigation: Navigation, more: bool) {
+    fn demand_catalog(&mut self, demand: CatalogDemand) {
+        if demand.generation == self.generation
+            && !demand.key.is_empty()
+            && demand.key == self.catalog_request_key()
+            && !self.writing
+            && let Some(access) = self
+                .access
+                .clone()
+                .filter(|a| a.epoch == demand.epoch && a.usable())
+        {
+            self.continue_catalog(access);
+        }
+    }
+
+    fn continue_catalog(&mut self, access: Access) {
+        self.serial += 1;
+        let serial = self.serial;
+        let route = self.route.clone();
+        let prior = self.page.clone();
+        let tx = self.results.clone();
+        self.busy = true;
+        self.silent_read = true;
+        self.continuation.loading = true;
+        let network = access.session.network_changes();
+        let mode = *network.borrow();
+        self.task = Some(tokio::spawn(async move {
+            let mut result = None;
+            for attempt in 0..=READ_RETRIES {
+                if mode & 1 != 0 || *network.borrow() != mode || !access.usable() {
+                    break;
+                }
+                let reply = pages::load_next(&access, &route, &prior).await;
+                if *network.borrow() != mode {
+                    break;
+                }
+                if !read_retry(attempt, &reply) {
+                    result = Some(reply);
+                    break;
+                }
+                tokio::time::sleep(read_backoff(attempt)).await;
+            }
+            drop(prior);
+            let _ = tx
+                .send(Delivery {
+                    serial,
+                    result: Update::CatalogAppend(mode, result),
+                })
+                .await;
+        }));
+        self.render(false);
+    }
+
+    fn visit(&mut self, navigation: Navigation) {
         if self.writing {
             return;
         }
         let back = matches!(navigation, Navigation::Back);
+        let follow = matches!(navigation, Navigation::Follow(_));
+        let previous_top = self.trail.top_id();
         let Some(next) = navigation.resolve(
             &self.route,
             &mut self.trail,
@@ -1384,6 +1565,37 @@ impl Browser {
         };
         self.row_editor = None;
         let changed = next != self.route;
+        self.continuation.loading = false;
+        if let Some(entry) = self
+            .trail
+            .top_id()
+            .filter(|id| previous_top.is_none_or(|previous| *id > previous))
+            && self.route.catalog_continuity()
+            && !self.page.rows.is_empty()
+            && let Some(position) = self.catalog_position.take()
+            && self
+                .access
+                .as_ref()
+                .is_some_and(|a| !a.offline && !a.session.is_offline())
+        {
+            self.catalog_visits.insert(
+                entry,
+                CatalogVisit {
+                    page: self.page.clone(),
+                    position,
+                    continuation: std::mem::take(&mut self.continuation),
+                },
+            );
+        }
+        let returned =
+            if back || (follow && previous_top.is_some_and(|id| !self.trail.contains_id(id))) {
+                previous_top.and_then(|id| self.catalog_visits.remove(&id))
+            } else {
+                None
+            };
+        self.catalog_visits
+            .retain(|id, _| self.trail.contains_id(*id));
+        self.continuation = CatalogContinuation::default();
         let retry_personal = !changed && self.error && matches!(next, Route::Playlist(_));
         if back && let Route::Search(q) = &next {
             let q = q.clone();
@@ -1438,6 +1650,19 @@ impl Browser {
         }
         let offline_search =
             self.access.as_ref().is_some_and(|a| a.offline) && matches!(next, Route::Search(_));
+        if let Some(visit) = returned
+            && self
+                .access
+                .as_ref()
+                .is_some_and(|a| !a.offline && !a.session.is_offline())
+        {
+            self.route = next;
+            self.page = visit.page;
+            self.continuation = visit.continuation;
+            self.catalog_restore = Some(visit.position);
+            self.render(true);
+            return;
+        }
         let cached = if offline_search {
             None
         } else {
@@ -1499,42 +1724,29 @@ impl Browser {
             self.render(true);
             return;
         }
-        if fresh && !more {
+        if fresh {
             self.render(true);
             return;
         }
-        let prior = if more { Some(self.page.clone()) } else { None };
-        let depth = prior.as_ref().map_or(0, |page| {
-            (page.rows.len() + crate::api::PAGE_SIZE as usize).min(pages::MAX_ROWS)
-        });
         let tx = self.results.clone();
         let serial = self.serial;
         self.busy = true;
-        self.silent_read = have && !more;
+        self.silent_read = have;
         self.render(changed || !have || !Arc::ptr_eq(&prior_page, &self.page));
         self.task = Some(tokio::spawn(async move {
-            if matches!(next, Route::Search(_)) && !more {
+            if matches!(next, Route::Search(_)) {
                 tokio::time::sleep(SEARCH_DELAY).await;
             }
-            let mut rebuilding = false;
-            for attempt in 0..=4 {
+            for attempt in 0..=READ_RETRIES {
                 if !a.usable() {
                     return;
                 }
-                let mut result = match &next {
+                let result = match &next {
                     Route::Offline => downloads_page(&a).await,
                     Route::SavedCollection(id) => playlist_browser::detail(&a, id).await,
-                    _ if rebuilding => rebuild_for(&a, &next, depth).await,
-                    _ => pages::load(&a, &next, prior.as_deref()).await,
+                    _ => pages::load(&a, &next).await,
                 };
-                if !rebuilding
-                    && prior.is_some()
-                    && result.as_ref().is_err_and(pages::continuation_changed)
-                {
-                    rebuilding = true;
-                    result = rebuild_for(&a, &next, depth).await;
-                }
-                let retry = attempt < 4 && result.as_ref().err().is_some_and(recoverable);
+                let retry = read_retry(attempt, &result);
                 if retry {
                     let result = match result {
                         Ok(p) => Update::Read(Ok(p), true),
@@ -1543,7 +1755,7 @@ impl Browser {
                     if tx.send(Delivery { serial, result }).await.is_err() {
                         return;
                     }
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    tokio::time::sleep(read_backoff(attempt)).await;
                 } else {
                     let _ = tx
                         .send(Delivery {
@@ -1623,7 +1835,17 @@ impl Browser {
             self.render(false);
         }
     }
-    fn input(&mut self, i: Input) {
+    fn input(&mut self, mut i: Input) {
+        self.catalog_position = if i.generation == self.generation {
+            i.catalog_position.take()
+        } else {
+            None
+        };
+        self.handle_input(i);
+        self.catalog_position = None;
+    }
+
+    fn handle_input(&mut self, i: Input) {
         let Some(a) = self
             .access
             .clone()
@@ -1637,13 +1859,13 @@ impl Browser {
         let (op, idx, val) = match i.intent {
             Intent::Navigate(s) => {
                 if let Some(navigation) = Navigation::named(&s) {
-                    self.visit(navigation, false);
+                    self.visit(navigation);
                 }
                 return;
             }
             Intent::Search(q) => {
                 if q.len() <= 1000 {
-                    self.visit(Navigation::Follow(Route::Search(q.trim().into())), false);
+                    self.visit(Navigation::Follow(Route::Search(q.trim().into())));
                 }
                 return;
             }
@@ -1674,10 +1896,7 @@ impl Browser {
                 match (&route, row.as_ref()) {
                     (Route::Playlists, Some(row)) => {
                         if let Some(editor) = RowEditor::select(row, mode) {
-                            self.visit(
-                                Navigation::Follow(Route::Playlist(editor.id.clone())),
-                                false,
-                            );
+                            self.visit(Navigation::Follow(Route::Playlist(editor.id.clone())));
                             if self.personal_ready || self.personal_due.is_some() {
                                 self.row_editor = Some(editor);
                                 self.finish_row_editor();
@@ -1687,12 +1906,6 @@ impl Browser {
                     (Route::Playlist(_), None) => self.open_playlist_editor(mode),
                     _ => {}
                 }
-            }
-            return;
-        }
-        if op == "more" {
-            if page.more && self.task.is_none() && !a.offline {
-                self.visit(Navigation::Untracked(route), true);
             }
             return;
         }
@@ -1766,7 +1979,7 @@ impl Browser {
         }
         if let Some(kind) = op.strip_prefix("context-") {
             if !offline && let Some(target) = context_route(kind, &val) {
-                self.visit(Navigation::Follow(target), false);
+                self.visit(Navigation::Follow(target));
             }
             return;
         }
@@ -1774,7 +1987,7 @@ impl Browser {
             if let Some(target) =
                 metadata_route(&op, &val, offline).filter(|target| *target != route)
             {
-                self.visit(Navigation::Follow(target), false);
+                self.visit(Navigation::Follow(target));
             }
             return;
         }
@@ -1785,7 +1998,7 @@ impl Browser {
                 .as_ref()
                 .and_then(|r| row_open_target(&route, r, offline))
             {
-                self.visit(Navigation::Follow(target.clone()), false);
+                self.visit(Navigation::Follow(target.clone()));
             }
             return;
         }
@@ -1793,7 +2006,7 @@ impl Browser {
             if let Some(r) = row
                 && !offline
             {
-                self.visit(Navigation::Follow(Route::Picker(r.id)), false);
+                self.visit(Navigation::Follow(Route::Picker(r.id)));
             }
             return;
         }
@@ -1944,6 +2157,33 @@ impl Browser {
         {
             return;
         }
+        if let Update::CatalogAppend(mode, result) = d.result {
+            self.task = None;
+            self.busy = false;
+            self.continuation.loading = false;
+            let online = self.access.as_ref().is_some_and(|a| {
+                !a.offline
+                    && !a.session.is_expired()
+                    && *a.session.network_changes().borrow() == mode
+            });
+            let start = self.page.rows.len();
+            let failure = online && result.is_some();
+            if online
+                && let Some(Ok(batch)) = result
+                && batch.commit(Arc::make_mut(&mut self.page)).is_ok()
+            {
+                self.render_rows(false, Some(start));
+            } else {
+                // Never rebuild or reenter the observer on a failed or cancelled
+                // continuation. The accepted snapshot and its controls survive.
+                self.continuation.stopped = true;
+                if failure {
+                    self.continuation.status = "More results couldn’t be loaded.".into();
+                }
+                self.render(false);
+            }
+            return;
+        }
         if !matches!(&d.result, Update::Read(_, true) | Update::ReadGap) {
             self.task = None;
         }
@@ -1953,6 +2193,7 @@ impl Browser {
         self.error = false;
         self.message.clear();
         match d.result {
+            Update::CatalogAppend(..) => unreachable!("handled above"),
             Update::Read(Ok(page), _) => {
                 let changed = *self.page != page;
                 self.page = Arc::new(page);
@@ -1987,6 +2228,7 @@ impl Browser {
                 self.render(false);
             }
             Update::Read(Err(e), _) => {
+                self.continuation.stopped = true;
                 self.error = true;
                 self.message = readable(&e);
                 self.render(false);
@@ -2004,10 +2246,9 @@ impl Browser {
                 if let Some(next) = &route {
                     self.trail.landed(next);
                 }
-                self.visit(
-                    Navigation::Untracked(route.unwrap_or_else(|| self.route.clone())),
-                    false,
-                );
+                self.visit(Navigation::Untracked(
+                    route.unwrap_or_else(|| self.route.clone()),
+                ));
             }
             Update::CollectionSaved(result) => {
                 self.cache.saved_changed();
@@ -2051,7 +2292,7 @@ impl Browser {
                     if matches!(self.route, Route::SavedCollection(_)) {
                         self.trail.landed(&Route::Offline);
                     }
-                    self.visit(Navigation::Untracked(Route::Offline), false);
+                    self.visit(Navigation::Untracked(Route::Offline));
                     // The original popup trigger may no longer exist.
                     self.scoped_ui(|ui| {
                         ui.set_saved_pin_focus_serial(
@@ -2068,7 +2309,7 @@ impl Browser {
                     });
                 }
                 if unpinning && landed_offline && !saved_route(&self.route) {
-                    self.visit(Navigation::Follow(Route::Offline), false);
+                    self.visit(Navigation::Follow(Route::Offline));
                 }
                 if let Err(e) = result {
                     self.message = readable(&e);
@@ -2091,7 +2332,7 @@ impl Browser {
             Update::Local(Ok(command)) => {
                 self.playback(command);
                 if std::mem::take(&mut self.saved_reload_due) && saved_route(&self.route) {
-                    self.visit(Navigation::Untracked(self.route.clone()), false);
+                    self.visit(Navigation::Untracked(self.route.clone()));
                 } else {
                     self.render(false);
                 }
@@ -2118,33 +2359,6 @@ async fn downloads_page(access: &Access) -> Result<Page, ApiError> {
     Ok(page)
 }
 
-/// A continuation is scoped to a point-in-time result set. If it expires, start
-/// at the first page and follow only its new cursors until the requested depth.
-async fn rebuild_for(a: &Access, r: &Route, depth: usize) -> Result<Page, ApiError> {
-    rebuild(depth, |old: Option<Page>| async move {
-        pages::load(a, r, old.as_ref()).await
-    })
-    .await
-}
-async fn rebuild<F, Fut>(depth: usize, mut fetch: F) -> Result<Page, ApiError>
-where
-    F: FnMut(Option<Page>) -> Fut,
-    Fut: Future<Output = Result<Page, ApiError>>,
-{
-    let mut page = fetch(None).await?;
-    for _ in 0..pages::MAX_ROWS {
-        if !page.more || page.rows.len() >= depth {
-            break;
-        }
-        let count = page.rows.len();
-        let next = fetch(Some(page)).await?;
-        if next.rows.len() <= count {
-            return Err(unavailable("The library could not load the next items."));
-        }
-        page = next;
-    }
-    Ok(page)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2234,35 +2448,22 @@ mod tests {
         assert!(!access.read(|status, _| fence.blocks(status, 10)));
     }
 
-    #[tokio::test]
-    async fn expired_continuation_rebuilds_previous_depth_plus_one_new_page() {
-        let mut offsets = Vec::new();
-        let p = rebuild(60, |old: Option<Page>| {
-            let mut p = old.unwrap_or_default();
-            let n = p.rows.len();
-            offsets.push(n);
-            p.rows.resize_with(n + 20, Default::default);
-            p.more = true;
-            std::future::ready(Ok(p))
-        })
-        .await
-        .unwrap();
-        assert_eq!(offsets, [0, 20, 40]);
-        assert_eq!(p.rows.len(), 60);
-    }
-    #[tokio::test]
-    async fn rebuild_stops_at_actual_end_and_rejects_stuck_page() {
-        let p = rebuild(60, |_| std::future::ready(Ok(Page::default())))
-            .await
-            .unwrap();
-        assert!(p.rows.is_empty());
-        assert!(
-            rebuild(60, |_| std::future::ready(Ok(Page {
-                more: true,
-                ..Default::default()
-            })))
-            .await
-            .is_err()
+    #[test]
+    fn catalog_retry_is_bounded_and_only_for_transient_errors() {
+        for status in [400, 401, 404, 409, 410, 412, 408, 429, 503] {
+            let reply: Result<(), _> = Err(ApiError {
+                message: "",
+                status,
+                expired: status == 401,
+            });
+            assert_eq!(read_retry(0, &reply), matches!(status, 408 | 429 | 503));
+            assert!(!read_retry(READ_RETRIES, &reply));
+        }
+        assert_eq!(
+            (0..READ_RETRIES)
+                .map(|i| read_backoff(i).as_secs())
+                .sum::<u64>(),
+            15
         );
     }
     #[test]
@@ -2688,10 +2889,12 @@ pub fn start(
     art: watch::Sender<Option<crate::artwork::Request>>,
 ) -> (Desk, thread::JoinHandle<()>) {
     let (tx, mut inputs) = mpsc::channel(48);
+    let (catalog_demand, mut demands) = watch::channel(None);
     let (results, mut updates) = mpsc::channel(8);
     let shown = Arc::new(AtomicU64::new(0));
     let desk = Desk {
         tx,
+        catalog_demand,
         stamp: Arc::new(Stamp {
             epoch: epoch.clone(),
             shown: shown.clone(),
@@ -2705,7 +2908,7 @@ pub fn start(
             .expect("browser runtime");
         runtime.block_on(async move {
             let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),catalog_visits:HashMap::new(),catalog_position:None,catalog_restore:None,continuation:CatalogContinuation::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);
@@ -2725,6 +2928,10 @@ pub fn start(
                     Ok(())=pin_updates.changed()=>b.pins_changed(pin_updates.borrow_and_update().clone()),
                     Some(u)=updates.recv()=>b.result(u),
                     input=inputs.recv()=>{let Some(i)=input else{break;};b.input(i);},
+                    Ok(())=demands.changed()=>{
+                        let demand = demands.borrow_and_update().clone();
+                        if let Some(demand) = demand { b.demand_catalog(demand); }
+                    },
                 }
             }
             b.cancel();

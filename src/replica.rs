@@ -62,7 +62,7 @@ impl Replica {
     }
 }
 #[derive(Default)]
-pub struct Trail(VecDeque<Route>);
+pub struct Trail(VecDeque<(u64, Route)>, u64);
 impl Trail {
     pub fn clear(&mut self) {
         self.0.clear();
@@ -74,26 +74,36 @@ impl Trail {
         if old == new || matches!((old, new), (Route::Search(_), Route::Search(_))) {
             return;
         }
-        if self.0.back() == Some(new) {
+        if self.top_route() == Some(new) {
             self.0.pop_back(); // Directly returning to the previous screen.
         } else if !matches!(old, Route::Picker(_))
             && !matches!(old, Route::Search(q) if q.is_empty())
-            && self.0.back() != Some(old)
+            && self.top_route() != Some(old)
         {
             if self.0.len() >= MAX_HISTORY {
                 self.0.pop_front();
             }
-            self.0.push_back(old.clone());
+            self.1 = self.1.wrapping_add(1);
+            self.0.push_back((self.1, old.clone()));
         }
     }
     /// When a mutation lands on the previous screen, don't leave it as Back.
     pub fn landed(&mut self, route: &Route) {
-        if self.0.back() == Some(route) {
+        if self.top_route() == Some(route) {
             self.0.pop_back();
         }
     }
     pub fn pop(&mut self) -> Option<Route> {
-        self.0.pop_back()
+        self.0.pop_back().map(|(_, route)| route)
+    }
+    fn top_route(&self) -> Option<&Route> {
+        self.0.back().map(|(_, route)| route)
+    }
+    pub fn top_id(&self) -> Option<u64> {
+        self.0.back().map(|(id, _)| *id)
+    }
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.0.iter().any(|(entry, _)| *entry == id)
     }
     pub fn can_back(&self) -> bool {
         !self.0.is_empty()

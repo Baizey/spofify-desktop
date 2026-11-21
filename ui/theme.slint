@@ -216,6 +216,7 @@ export component TextTarget inherits Rectangle {
     in property <color> ink: Theme.text;
     in property <length> font-size: 15px * Theme.density;
     in property <int> font-weight: 600;
+    in property <int> focus-serial;
     callback activated();
     callback focused();
     min-width: 0px;
@@ -246,6 +247,8 @@ export component TextTarget inherits Rectangle {
         }
         key := FocusScope {
             focus-on-click: false;
+            property <int> resume: root.focus-serial;
+            changed resume => { if self.resume != 0 { self.focus(); } }
             focus-gained(_) => { root.focused(); }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == Key.Space {
