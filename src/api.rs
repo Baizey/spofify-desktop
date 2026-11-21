@@ -1647,7 +1647,7 @@ mod tests {
                 "album has no redundant self link"
             );
             let recording = &album.rows[0];
-            assert_eq!(recording.route, Some(Route::Track("one".into())));
+            assert!(recording.route.is_none());
             assert_eq!(
                 recording.music.album.as_ref().unwrap().target,
                 Some(release.clone())

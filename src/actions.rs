@@ -1320,9 +1320,18 @@ mod tests {
             )
             .is_err()
         );
-        let route = Route::Track("track".into());
+        let catalog = Page {
+            rows: vec![Row {
+                key: RowKey::Track("track".into()),
+                kind: "track".into(),
+                id: "track".into(),
+                ..Row::default()
+            }],
+            ..Page::default()
+        };
+        let route = Route::Album("album".into());
         for operation in ["like", "unlike"] {
-            let error = mutation(&route, &page, operation, Some(0), "")
+            let error = mutation(&route, &catalog, operation, Some(0), "")
                 .err()
                 .unwrap();
             assert_eq!(error.message, "That library action is not available here.");

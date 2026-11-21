@@ -166,12 +166,18 @@ class Peer:
 
         msg = self.expect(kind + " account choice", choice)
         check(msg["type"] == kind, f"expected {kind} but received {msg['type']}")
-        fields = {"type"} | ({"value"} if kind == "seek" else set())
+        fields = {"type"} | {"seek": {"value"}, "repeat": {"repeat"}, "shuffle": {"shuffle"}}.get(kind, set())
         if kind == "play":
             fields.add("selection")
             fields.update(k for k in ("shuffle", "seed") if k in msg)
         check(set(msg) == fields, f"unexpected fields in account {kind} choice")
         return msg
+
+    def mode(self, kind, value, cursor):
+        command = self.command(kind, before=lambda msg: self.observe(cursor, msg))
+        check(command[kind] == value, f"expected {kind} {value}, got {command[kind]}")
+        self.player[kind] = value
+        self.send("player", player={kind: value})
 
     def play(self, command):
         check(command["selection"] == {"kind": "track", "track": {"id": TRACK_ID}} and
@@ -348,10 +354,16 @@ def audio_fixture():
                 return self.upgrade()
             if path.path == "/api/auth/session":
                 return self.reply(session)
-            if path.path == "/api/library/tracks/" + TRACK_ID + "/audio":
+            track = "/api/library/tracks/" + TRACK_ID
+            if path.path == track + "/audio":
                 self.reply(wav)
                 media.append(len(wav))
                 return
+            if path.path == track + "/lyrics":
+                return self.reply(dict(version=1, trackId=TRACK_ID, recordingVersion="recording-v1",
+                                       sourceGeneration="local-v1", state="plain", plainText="Fixture verse",
+                                       attribution=dict(name="Fixture lyrics", ownership="library"),
+                                       lines=[], offlineTransferAllowed=False))
             if path.path == "/search":
                 query = parse_qs(path.query).get("query", [""])[0].strip().lower()
                 items = [CATALOG] if query and query in TITLE.lower() else []

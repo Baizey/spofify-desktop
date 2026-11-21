@@ -55,6 +55,9 @@ export component Action inherits Rectangle {
     // An action whose target can change while the pointer is down can supply an identity.
     in property <string> click-scope;
     property <string> pressed-scope;
+    in property <bool> single-pointer-activation;
+    property <int> pending-clicks;
+    property <string> pending-click-scope;
     // Composite controls such as a popup menu can own keyboard focus themselves.
     in property <bool> keyboard-focusable: true;
     out property <bool> has-focus: key.has-focus;
@@ -100,8 +103,28 @@ export component Action inherits Rectangle {
         clicked => {
             if root.pressed-scope == root.click-scope {
                 if root.keyboard-focusable { key.focus(); }
-                root.clicked();
+                if root.single-pointer-activation {
+                    if root.pending-click-scope != root.click-scope { root.pending-clicks = 0; }
+                    root.pending-click-scope = root.click-scope;
+                    root.pending-clicks += 1;
+                } else { root.clicked(); }
             }
+        }
+        double-clicked => {
+            // Slint reports both clicked releases, then double-clicked for
+            // the second. Drop just that release, even if both are pending.
+            if root.single-pointer-activation && root.pressed-scope == root.click-scope {
+                root.pending-clicks = max(0, root.pending-clicks - 1);
+            }
+        }
+    }
+    Timer {
+        interval: 1ms;
+        running: root.pending-clicks > 0;
+        triggered => {
+            let activate = root.pending-clicks > 0 && root.enabled && root.pending-click-scope == root.click-scope;
+            root.pending-clicks = 0;
+            if activate { root.clicked(); }
         }
     }
     key := FocusScope {

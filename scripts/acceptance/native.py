@@ -120,34 +120,37 @@ class Window:
         props = self.window_properties()
         return tuple(props["size"][key] / props["scaleFactor"] for key in ("width", "height"))
 
-    def click_element(self, element):
-        # MCP synthesizes a left press/release at the item's center in this
+    def click_element(self, element, *, double=False):
+        # MCP synthesizes left presses/releases at the item's center in this
         # window, including popup offsets. Never invoke accessible default.
         x, y, x2, y2 = bounds(element)
         check(x2 > x and y2 > y, f"empty pointer target: {element.get('accessibleLabel')}")
-        self.mcp.call("click_element", {"elementHandle": element["handle"]})
+        self.mcp.call("click_element", {"elementHandle": element["handle"],
+                                        "action": "DoubleClick" if double else "SingleClick"})
 
     def click(self, pattern):
         element = self.find(pattern, roles=("Button", "Checkbox"))
         check(element.get("accessibleEnabled", True), f"native control disabled: {pattern}")
         self.click_element(element)
 
-    def pointer_position_for_click(self, label, *, element=None):
+    def pointer_position_for_click(self, label, *, element=None, double=False):
         # Record the actual client-window press, even for popup-local bounds
         # or a non-accessible item such as a playlist icon or subtitle.
         self.mcp.call("start_event_recording", {})
         try:
             if element is None:
+                check(not double, "double-click requires a specific pointer target")
                 self.click(label)
             else:
-                self.click_element(element)
+                self.click_element(element, double=double)
         finally:
             events = self.mcp.value("stop_event_recording", {})
         check(not events.get("droppedCount") and not events.get("unknownEventCount"),
               "incomplete native pointer event recording")
         presses = [item["event"]["pointerPressed"]["position"] for item in events["events"]
                    if "pointerPressed" in item["event"] and item["windowHandle"] == self.handle]
-        check(len(presses) == 1, f"expected one native pointer press for {label}")
+        check(len(presses) == (2 if double else 1) and all(p == presses[0] for p in presses),
+              f"unexpected native pointer presses for {label}: {presses}")
         return presses[0]["x"], presses[0]["y"]
 
     def key(self, text, event="PressAndRelease"):
@@ -233,22 +236,26 @@ def verify(failures, label):
         print(f"FAIL {failures[-1]}", flush=True)
 
 
-def assert_dock_layout(window):
+def assert_dock_layout(window, title=DOCK_TITLE):
     elements = window.elements()
-    def named(pattern):
-        return next((e for e in elements if window.matches(e, pattern) and e.get("accessibleRole") == "Button"), None)
     dock = element_type(elements, "PlayerBar")
     catalog = element_id(elements, "catalog-scroll")
     check(dock and catalog, "missing catalog viewport or dock in the Slint tree")
     left, top, right, bottom = bounds(dock)
     width, height = window.dimensions()
     check(abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
-    check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= 100,
+    max_height = 145 if width < 820 else 100
+    check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= max_height,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
-    transport = element_type(window.subtree(dock), "Transport")
+    dock_controls = window.subtree(dock)
+
+    def named(pattern, role="Button"):
+        return next((e for e in dock_controls if window.matches(e, pattern) and e.get("accessibleRole") == role), None)
+
+    transport = element_type(dock_controls, "Transport")
     check(transport, "missing dock transport")
     transport_controls = window.subtree(transport)
-    for label in ("Previous track", "Play|Pause", "Next track"):
+    for label in ("Shuffle", "Previous track", "Play|Pause", "Next track", "Repeat"):
         check(any(window.matches(e, label) and e.get("accessibleRole") == "Button" for e in transport_controls),
               f"missing dock transport control {label}")
     midpoint = sum(bounds(transport)[::2]) / 2
@@ -258,14 +265,21 @@ def assert_dock_layout(window):
     x, y, x2, y2 = bounds(rail)
     check(left <= x < x2 <= right and bounds(transport)[3] <= y < y2 <= bottom,
           "dock seek rail overlaps transport or leaves the dock")
-    previous_right = left
-    for label, control in ((DOCK_TITLE, named(DOCK_TITLE)), ("Transport", transport),
-                           ("Play queue", named("Play queue")), ("Playback devices", named("Playback devices"))):
+    track_info = element_id(dock_controls, "track-info")
+    check(named(title), f"missing dock control {title}")
+    controls = (("Transport", transport), ("Playback position", rail), ("Track information", track_info),
+                ("Lyrics", named("Lyrics")), ("Play queue", named("Play queue")),
+                ("Playback devices", named("Playback devices")), ("Mute", named("(Unmute|Mute) desktop playback")),
+                ("Desktop volume", named("Desktop volume", "Slider")))
+    for i, (label, control) in enumerate(controls):
         check(control, f"missing dock control {label}")
         x, y, x2, y2 = bounds(control)
-        check(previous_right <= x < x2 <= right and top <= y < y2 <= bottom,
-              f"dock control {label} is clipped or overlaps another group: {bounds(control)}")
-        previous_right = x2
+        check(left <= x < x2 <= right and top <= y < y2 <= bottom,
+              f"dock control {label} is clipped: {bounds(control)}")
+        for other_label, other in controls[:i]:
+            ox, oy, ox2, oy2 = bounds(other)
+            check(x2 <= ox or ox2 <= x or y2 <= oy or oy2 <= y,
+                  f"dock controls {label} and {other_label} overlap")
     print(f"PASS dock geometry: {width:g}×{height:g} logical, height {bottom - top:g}, controls disjoint", flush=True)
 
 
@@ -424,9 +438,9 @@ def native_observer(api):
 def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None):
     from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
                                   compact_queue, empty_devices, keyboard_playlist_menu, manual_options, open_manual,
-                                  pane_layout, playlist_back, playlist_hit_checks, playlist_play, playlist_row_menu,
-                                  playlists_root, queue_state, root_navigation, rules_editor, typed_catalog,
-                                  wide_queue_toggle)
+                                  pane_layout, playlist_back, playlist_hit_checks, playlist_row_menu,
+                                  playlists_root, queue_state, root_navigation, rules_editor, track_face,
+                                  track_play_and_highlight, typed_catalog, wide_queue_toggle)
 
     failures = []
     with desktop(binary, root, env, pixels, multisize=ready is not None) as window:
@@ -471,7 +485,8 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             window.find("Work offline", roles=("Button",))
             window.find("Reset display defaults", roles=("Button",))
             window.pixels("06-settings-compact", COMPACT[0])
-            print("PASS workspace interaction against Go-shaped wire data (no Go playback)", flush=True)
+            track_play_and_highlight(window, ready["play_requests"])
+            print("PASS workspace interaction against Go-shaped wire data (no playback execution)", flush=True)
             return
         # Join only after the desktop: an observer must not become the initial
         # selected logical output or change how the desktop is admitted.
@@ -507,32 +522,37 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             open_manual(window)
             manual_options(window)
             window.pixels("03-manual-playlist", DESKTOP[0])
-            window.click("Back")
-            restore_playlists()
+            manual = next(t for t in ready["targets"] if t["kind"] == "playlist" and t["name"] == PLAYLIST)
+            with Peer(api, name="Acceptance occurrence readback") as reader:
+                duplicates = [r["id"] for r in reader.playlist(manual["id"])["rows"]
+                              if r["track"]["id"] == ready["duplicateTrackId"]]
+            check(len(duplicates) >= 2, "fixture lost the duplicate used for track double-click")
 
             def canonical_track(snapshot):
                 state = snapshot.get("player", {})
                 queue, cursor = state.get("queue", []), state.get("cursor", {})
                 return (len(queue) > 1 and cursor.get("desired") and any(
                     track.get("key") == cursor.get("key") and track.get("id") == ready["duplicateTrackId"]
-                    for track in queue))
+                    and track.get("entryId") == duplicates[1] for track in queue))
 
             if pcm is not None:
                 from audio_smoke import heard_tone
                 baseline = pcm.stat().st_size
-            # The actual Go fixture clips last one second. Start the full
-            # playlist using the row's separate Play target, not its open target.
-            playlist_play(window)
-            observe("playlist row Play to update the canonical online queue", canonical_track, timeout=20)
+            # The fixture clips last one second. A native double-click on the
+            # second duplicate must select that entry, not just the recording.
+            track_face(window, occurrence=1, double=True)
+            observe("double-click to select the exact Go playlist occurrence", canonical_track, timeout=20)
+            window.title(PLAYLIST)
             if pcm is not None:
                 with verify(failures, "real Go online PCM"):
                     wait("220 Hz Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                     print("PASS real Go online track rendered 220 Hz PCM", flush=True)
             window.find(DOCK_TITLE, roles=("Button",))
             window.find("Pause", roles=("Button",))
+            window.click("Back")
             restore_playlists()
             window.absent("Back", roles=("Button",))
-            print("PASS playlist row Play updates the canonical online queue and dock without opening detail", flush=True)
+            print("PASS native track double-click selects the exact canonical Go occurrence without opening detail", flush=True)
             open_manual(window)
             for mode in (DESKTOP, WIDE):
                 if mode != DESKTOP:
@@ -574,7 +594,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         album = next(target["name"] for target in ready["targets"] if target["kind"] == "album")
         window.click(f"Open album: {re.escape(album)}")
         window.title(album)
-        window.find(f"Open {TRACK}", roles=("Button",))
+        window.find(f"Play track: {TRACK}", roles=("Button",))
         window.pixels("09-album-detail", WIDE[0])
         print("PASS native album metadata link opens the real Go catalog detail", flush=True)
 
@@ -590,7 +610,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.click(SAVED)
         window.section(SAVED)
         window.absent("Back", roles=("Button",))
-        window.find(f"Open {TRACK}", roles=("Button",))
+        window.find(f"Play track: {TRACK}", roles=("Button",))
         window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
         window.click("Settings")
         window.title("Settings")
@@ -609,7 +629,8 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.pixels("11-offline-ready")
         if pcm is not None:
             baseline = pcm.stat().st_size
-        window.click("Play Synthetic Tone 001")
+        track_face(window, double=True)
+        window.section(SAVED)
         window.find("Now playing: Synthetic Tone 001")
         window.pixels("12-offline-dock")
         if pcm is not None:

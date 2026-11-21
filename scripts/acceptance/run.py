@@ -31,7 +31,7 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--window-only", action="store_true", help="check empty sign-in, allowing only the Remember Login checkbox, without starting Go")
     mode.add_argument("--synthetic-wire-ui", action="store_true",
-                      help="native typed-search and navigation checks against a Go-shaped Python wire fixture; not Go integration")
+                      help="native browsing and track-intent checks against a Go-shaped Python fixture; no Go or audio execution")
     parser.add_argument("--scratch-dir", type=Path,
                         help="existing base for disposable build/cache/DB/profile state (e.g. worker-private /dev/shm)")
     parser.add_argument("--capture-dir", type=Path,
@@ -64,7 +64,7 @@ def main():
             from native import native_checks
             if args.synthetic_wire_ui:
                 from wire_ui import wire_fixture
-                print("SYNTHETIC WIRE UI ONLY — no Go server, online player or offline media", flush=True)
+                print("SYNTHETIC WIRE UI ONLY — no Go server or audio execution", flush=True)
                 with wire_fixture() as ready:
                     native_checks(desktop, root, env, ready, pixels=captures)
             else:

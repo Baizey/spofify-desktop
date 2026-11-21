@@ -1,8 +1,9 @@
-//! Theme, scale and crossfade are device-local. The palette is account-scoped.
+//! Theme, scale, crossfade and output volume are device-local. The palette is account-scoped.
 
 use super::{ApiError, INVALID_RESPONSE, decode};
 use crate::{
     AppWindow, PaletteRow,
+    audio::MasterGain,
     presentation::{AccessRx, Account, TIMEOUT, Worker, read_with_backoff, scope_changed},
 };
 use reqwest::{Method, header};
@@ -16,10 +17,11 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -206,6 +208,164 @@ pub(crate) fn install_playback(ui: &AppWindow) -> Arc<AtomicBool> {
         }
     });
     live
+}
+
+const VOLUME_SAVE_DELAY: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalVolume {
+    version: u8,
+    level: f32,
+    muted: bool,
+}
+
+impl Default for LocalVolume {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            level: 1.0,
+            muted: false,
+        }
+    }
+}
+
+impl LocalVolume {
+    fn set_level(&mut self, level: f32) {
+        if level.is_finite() {
+            self.level = level.clamp(0.0, 1.0);
+        }
+    }
+
+    fn effective(self) -> f32 {
+        if self.muted { 0.0 } else { self.level }
+    }
+
+    fn apply(self, ui: &AppWindow, gain: &MasterGain) {
+        gain.set(self.effective());
+        ui.set_local_volume(self.level);
+        ui.set_local_muted(self.muted);
+    }
+}
+
+fn parse_volume(bytes: &[u8]) -> Option<LocalVolume> {
+    let volume: LocalVolume = parse_config(bytes)?;
+    (volume.version == VERSION && (0.0..=1.0).contains(&volume.level)).then_some(volume)
+}
+
+struct VolumeState {
+    value: LocalVolume,
+    changed: Option<Instant>,
+    closed: bool,
+}
+
+struct PendingVolume {
+    state: Mutex<VolumeState>,
+    wake: Condvar,
+}
+
+impl PendingVolume {
+    fn update(&self, change: impl FnOnce(&mut LocalVolume)) -> LocalVolume {
+        let mut state = self.state.lock().unwrap();
+        let before = state.value;
+        change(&mut state.value);
+        // A dirty writer already has a wakeup scheduled. Drag samples only
+        // extend its deadline; they do not queue individual disk writes.
+        if before != state.value && state.changed.replace(Instant::now()).is_none() {
+            self.wake.notify_one();
+        }
+        state.value
+    }
+}
+
+pub(crate) struct VolumeWriter {
+    pending: Arc<PendingVolume>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl VolumeWriter {
+    fn start(path: Option<PathBuf>, initial: LocalVolume) -> Self {
+        let pending = Arc::new(PendingVolume {
+            state: Mutex::new(VolumeState {
+                value: initial,
+                changed: None,
+                closed: false,
+            }),
+            wake: Condvar::new(),
+        });
+        let worker = path.and_then(|path| {
+            let pending = pending.clone();
+            thread::Builder::new()
+                .name("desktop-volume-save".into())
+                .spawn(move || write_volume(&pending, &path, initial))
+                .map_err(|_| eprintln!("Could not start the local volume settings writer."))
+                .ok()
+        });
+        Self { pending, worker }
+    }
+}
+
+impl Drop for VolumeWriter {
+    fn drop(&mut self) {
+        self.pending.state.lock().unwrap().closed = true;
+        self.pending.wake.notify_one();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("Local volume settings writer closed unexpectedly.");
+        }
+    }
+}
+
+fn write_volume(pending: &PendingVolume, path: &Path, mut saved: LocalVolume) {
+    let mut state = pending.state.lock().unwrap();
+    loop {
+        let Some(changed) = state.changed else {
+            if state.closed {
+                return;
+            }
+            state = pending.wake.wait(state).unwrap();
+            continue;
+        };
+        let wait = VOLUME_SAVE_DELAY.saturating_sub(changed.elapsed());
+        if !state.closed && !wait.is_zero() {
+            state = pending.wake.wait_timeout(state, wait).unwrap().0;
+            continue;
+        }
+        let next = state.value;
+        state.changed = None;
+        // Neither persistence nor its failures may block live gain updates.
+        drop(state);
+        if next != saved {
+            match save(path, &next) {
+                Ok(()) => saved = next,
+                Err(_) => eprintln!("Could not save local volume settings."),
+            }
+        }
+        state = pending.state.lock().unwrap();
+    }
+}
+
+/// Install the desktop output control independently of login and playback mode.
+pub(crate) fn install_local_volume(ui: &AppWindow) -> (MasterGain, VolumeWriter) {
+    let path = config_path("local-volume.json");
+    let initial = path
+        .as_deref()
+        .and_then(|path| load(path, parse_volume))
+        .unwrap_or_default();
+    let gain = MasterGain::default();
+    initial.apply(ui, &gain);
+    let writer = VolumeWriter::start(path, initial);
+    let (weak, live, pending) = (ui.as_weak(), gain.clone(), writer.pending.clone());
+    let apply = move |change: &dyn Fn(&mut LocalVolume)| {
+        if let Some(ui) = weak.upgrade() {
+            pending.update(change).apply(&ui, &live);
+        }
+    };
+    let set_level = apply.clone();
+    ui.on_local_volume_change(move |level| set_level(&|volume| volume.set_level(level)));
+    ui.on_local_mute_toggle(move || apply(&|volume| volume.muted = !volume.muted));
+    (gain, writer)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -724,6 +884,68 @@ mod tests {
         assert!(live.load(Ordering::Relaxed));
         assert!(playback.is_dir());
         assert_eq!(fs::read_dir(&config.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn local_volume_keeps_a_separate_level_while_muted() {
+        let mut volume = LocalVolume::default();
+        assert_eq!(volume.effective(), 1.0);
+        volume.set_level(0.35);
+        volume.muted = true;
+        assert_eq!(volume.effective(), 0.0);
+        assert_eq!(volume.level, 0.35);
+        volume.set_level(f32::NAN);
+        volume.set_level(f32::INFINITY);
+        volume.muted = false;
+        assert_eq!(volume.effective(), 0.35);
+        volume.set_level(-1.0);
+        assert_eq!(volume.effective(), 0.0);
+        assert!(!volume.muted);
+        volume.set_level(1.1);
+        assert_eq!(volume.effective(), 1.0);
+    }
+
+    #[test]
+    fn local_volume_config_is_bounded_versioned_and_validated() {
+        assert_eq!(
+            parse_volume(br#"{"version":1,"level":0.0,"muted":false}"#)
+                .unwrap()
+                .effective(),
+            0.0
+        );
+        for invalid in [
+            br#"{"version":2,"level":0.5,"muted":true}"#.as_slice(),
+            br#"{"version":1,"level":-0.5,"muted":false}"#,
+            br#"{"version":1,"level":1.5,"muted":false}"#,
+            br#"{"version":1,"level":null,"muted":false}"#,
+            br#"{"version":1,"level":0.5}"#,
+            br#"{"version":1,"level":0.5,"muted":false,"account":"not-local"}"#,
+        ] {
+            assert!(parse_volume(invalid).is_none());
+        }
+        assert!(parse_volume(&[b' '; MAX_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn closing_local_volume_writer_flushes_the_latest_state_without_touching_crossfade() {
+        let config = TestConfig::new();
+        let volume = config.0.join("local-volume.json");
+        let playback = config.0.join("playback.json");
+        let unrelated = br#"{"version":1,"crossfade":true}"#;
+        fs::write(&playback, unrelated).unwrap();
+        let writer = VolumeWriter::start(Some(volume.clone()), LocalVolume::default());
+        writer.pending.update(|v| v.set_level(0.25));
+        writer.pending.update(|v| v.set_level(0.35));
+        writer.pending.update(|v| v.muted = true);
+        drop(writer);
+        let mut saved = load(&volume, parse_volume).unwrap();
+        assert_eq!(saved.level, 0.35);
+        assert!(saved.muted);
+        assert_eq!(saved.effective(), 0.0);
+        saved.muted = false;
+        assert_eq!(saved.effective(), 0.35);
+        assert_eq!(fs::read(&playback).unwrap(), unrelated);
+        assert_eq!(fs::read_dir(&config.0).unwrap().count(), 2);
     }
 
     fn wire(id: Id, revision: u64) -> Wire {

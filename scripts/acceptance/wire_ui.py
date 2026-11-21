@@ -43,11 +43,11 @@ ID_ONLY_RELEASE = catalog_item("album", "wire-album-02", "Uncredited Wire Single
                                albumType="single", releaseDate="2025-02-01")
 TRACK = catalog_item("track", "wire-track-01", TRACK_NAME, durationMs=1000, artists=CREDITS,
                      albumId=ALBUM["id"], albumName=ALBUM_NAME, discNumber=1, trackNumber=1)
-SINGLE_TRACK = catalog_item("track", "wire-track-02", "Uncredited Wire Recording", durationMs=1000,
+SINGLE_TRACK = catalog_item("track", "wire-track-02", "Synthetic Uncredited Wire Recording", durationMs=1000,
                             artists=ID_ONLY_RELEASE["artists"], albumId=ID_ONLY_RELEASE["id"],
                             albumName=ID_ONLY_RELEASE["name"], discNumber=1, trackNumber=1)
 ITEMS = (ARTIST, GUEST, ALBUM, TRACK, ID_ONLY_RELEASE, SINGLE_TRACK)
-DETAILS = {f"/api/library/{item['kind']}s/{item['id']}": item for item in ITEMS}
+DETAILS = {f"/api/library/{item['kind']}s/{item['id']}": item for item in ITEMS if item['kind'] != 'track'}
 SUMMARY = {"id": "wire-playlist-01", "name": PLAYLIST, "description": "Two synthetic occurrences",
            "kind": "manual", "countState": "exact", "trackCount": 2, "availableCount": 2,
            "capabilities": {"editMetadata": True, "editEntries": True, "editDefinition": False,
@@ -81,12 +81,13 @@ def diagnostic_path(path):
 
 
 class AccountWire:
-    """Bounded idle account replica for the native browsing test, not a player."""
+    """Bounded account replica and Play request probe, not an audio executor."""
 
-    def __init__(self, handler, consume_ticket, writes):
+    def __init__(self, handler, consume_ticket, writes, record_play):
         self.handler = handler
         self.consume_ticket = consume_ticket
         self.writes = writes
+        self.record_play = record_play
         self.connection = token_hex(16)
         self.grant = token_hex(16)
         self.snapshot = None
@@ -130,6 +131,23 @@ class AccountWire:
         self.send(self.snapshot)
         self.personal(snapshot=dict(playlists=[SUMMARY], recent=[]))
 
+    def play(self, message):
+        selection = message.get("selection")
+        check(set(message) == {"type", "selection", "shuffle"} and message["shuffle"] is False
+              and isinstance(selection, dict) and selection.get("kind") == "track"
+              and isinstance(selection.get("track"), dict), "unexpected synthetic Play request")
+        track = next((t for t in (TRACK, SINGLE_TRACK) if t["id"] == selection["track"].get("id")), None)
+        check(track, "synthetic Play used an unknown track ID")
+        run = self.record_play(selection)
+        # A paused cursor exercises the app's actual player projection without
+        # starting a download, emitting an audio grant, or mutating a Go account.
+        row = dict(id=track["id"], name=track["name"], artists=track["artists"], albumId=track["albumId"],
+                   albumName=track["albumName"], duration=1, key=run, order=1, intent="low")
+        cursor = dict(key=run, chain="wire-play", visit=run, run=run, elapsed=0, desired=False, playing=False)
+        self.snapshot["player"].update(queue=[row], cursor=cursor)
+        self.send(dict(type="player", player=dict(source=self.connection, cursor=cursor,
+                                                 queue=dict(kind="replace", rows=[row]))))
+
     def serve(self):
         hello = self.message()
         check(isinstance(hello, dict) and hello.get("type") == "hello"
@@ -162,6 +180,8 @@ class AccountWire:
                       "synthetic account asked for an unknown playlist/offset")
                 if command.get("known") != PLAYLIST_TOKEN:
                     self.personal(part=dict(summary=SUMMARY, token=PLAYLIST_TOKEN, offset=0, rows=ENTRIES, more=False))
+            elif kind == "play":
+                self.play(message)
             elif kind == "release":
                 owner = ""
                 self.snapshot["owner"] = ""
@@ -177,6 +197,20 @@ def wire_fixture():
     token, csrf = token_hex(32), token_hex(32)
     session = {"accountId": ready["userId"], "username": ready["username"], "role": "user", "csrfToken": csrf}
     violations = []
+    plays = []
+    play_lock = Lock()
+
+    def record_play(selection):
+        with play_lock:
+            check(len(plays) < 8, "synthetic Play request cap exceeded")
+            plays.append(selection)
+            return len(plays)
+
+    def play_requests():
+        with play_lock:
+            return plays.copy()
+
+    ready["play_requests"] = play_requests
     tickets = {}
     ticket_lock = Lock()
     palette_lock = Lock()
@@ -297,7 +331,7 @@ def wire_fixture():
             self.send_header("Sec-WebSocket-Protocol", PROTOCOL)
             self.end_headers()
             try:
-                AccountWire(self, consume_ticket, violations).serve()
+                AccountWire(self, consume_ticket, violations, record_play).serve()
             except (EOFError, BrokenPipeError, ConnectionResetError):
                 pass  # The owned window exits before the fixture.
             except TimeoutError:
@@ -367,6 +401,9 @@ def wire_fixture():
                 self.reply(response)
             elif route.path.startswith("/api/me/"):
                 violations.append(f"unexpected GET {diagnostic_path(route.path)}")
+                self.error(404)
+            elif re.fullmatch(r"/api/library/tracks/[^/]+", route.path):
+                violations.append("unexpected standalone Track detail request")
                 self.error(404)
             elif route.path in DETAILS and not args:
                 self.reply({"item": DETAILS[route.path], "revision": REVISION})

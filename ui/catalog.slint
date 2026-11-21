@@ -1,6 +1,7 @@
 import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
 import { ArtistCredit, CreditLine, WrappingCredits } from "credits.slint";
 import { ActionCopy, OverflowMenu } from "overflow-menu.slint";
+import { Glyph } from "icon.slint";
 
 export global Copy {
     public pure function title(kind: string) -> string {
@@ -9,7 +10,7 @@ export global Copy {
             : kind == "appearance" || kind == "settings" || kind == "account" ? "Settings"
             : kind == "albums" ? "Albums" : kind == "artists" ? "Artists" : kind == "picker" ? "Add to playlist"
             : kind == "now" ? "Now playing" : kind == "queue" ? "Play queue" : kind == "devices" ? "Playback devices"
-            : kind == "album" ? "Album" : kind == "artist" ? "Artist" : kind == "track" ? "Track"
+            : kind == "album" ? "Album" : kind == "artist" ? "Artist"
             : kind == "saved-collection" ? "Saved collection"
             : kind == "playlist" || kind == "playlist-manual" || kind == "playlist-rules" ? "Playlist" : "Search";
     }
@@ -43,8 +44,6 @@ export component Hero inherits Rectangle {
     in property <bool> show-art: true;
     in property <bool> large;
     in property <[ArtistCredit]> credits;
-    in property <string> album-id;
-    in property <string> album-name;
     in property <bool> metadata-enabled: true;
     callback page-action(string, string);
     callback focused(length, length);
@@ -78,11 +77,6 @@ export component Hero inherits Rectangle {
                 activated(id) => { root.page-action("artist", id); }
                 focused(y, h) => { root.focused(copy.y + hero-credits.y + y, h); }
             }
-            if root.album-name != "": AlbumLine {
-                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
-                activated => { root.page-action("album", root.album-id); }
-                focused => { root.focused(copy.y + self.y, self.height); }
-            }
         }
     }
 }
@@ -104,6 +98,20 @@ export component EmptyState inherits Rectangle {
     }
 }
 
+component TrackState inherits Rectangle {
+    in property <bool> playing;
+    width: 16px; height: self.width;
+    Glyph {
+        visible: root.playing; name: "playing"; ink: Theme.accent;
+        width: parent.width; height: parent.height;
+    }
+    Rectangle {
+        visible: !root.playing; background: Theme.accent;
+        width: 6px; height: self.width; border-radius: self.width / 2;
+        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+    }
+}
+
 export component MediaLine inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
@@ -111,11 +119,15 @@ export component MediaLine inherits Rectangle {
     in property <string> kind;
     in property <image> artwork;
     in property <bool> playable;
-    in property <bool> can-open: true;
+    in property <bool> can-open;
+    in property <bool> selectable;
+    in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
     in property <bool> compact;
     in property <bool> search-result;
     in property <bool> selected;
+    in property <bool> current-track;
+    in property <bool> playing-track;
     in property <[string]> actions;
     in property <[ArtistCredit]> credits;
     in property <string> album-id;
@@ -132,38 +144,50 @@ export component MediaLine inherits Rectangle {
     min-height: max(max(48px, 56px * Theme.density), words.min-height + 12px);
     vertical-stretch: 0;
     border-radius: 10px;
-    background: selected ? Theme.panel : transparent;
-    function open-row() {
-        if root.can-open {
-            open-keys.focus();
-            root.action("open");
-        }
+    background: selected || (selectable && row-keys.has-focus) ? Theme.panel : transparent;
+    property <bool> play-on-activate: root.selectable && root.playable && !root.can-open;
+    property <bool> body-actionable: root.can-open || root.play-on-activate;
+    property <bool> body-focusable: root.can-open || root.selectable;
+    property <string> pressed-row-key;
+    property <string> track-state-label: !root.current-track ? ""
+        : root.playing-track ? "Playing" : "Current track";
+    function activate-row() {
+        if root.can-open { root.action("open"); }
+        else if root.play-on-activate { root.action("play"); }
+    }
+    function click-row() {
+        row-keys.focus();
+        if root.can-open { root.activate-row(); }
+    }
+    function double-click-row() {
+        if root.play-on-activate { root.activate-row(); }
     }
 
-    // One accessible Open button, separate from the other row controls.
     Rectangle {
         width: parent.width; height: parent.height;
         border-radius: root.border-radius;
-        border-width: root.can-open && open-keys.has-focus ? 2px : 0px;
+        border-width: row-keys.has-focus ? 2px : 0px;
         border-color: Theme.blue;
-        background: !root.can-open ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
-            : row-face.has-hover || open-keys.has-focus ? Theme.raised.with-alpha(0.55) : transparent;
+        background: !root.body-focusable ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
+            : row-face.has-hover || row-keys.has-focus ? Theme.raised.with-alpha(0.55) : transparent;
 
-        if root.can-open: Rectangle {
+        if root.body-actionable: Rectangle {
             width: parent.width; height: parent.height;
             accessible-role: button;
-            accessible-label: "Open " + root.title;
-            accessible-action-default => { root.open-row(); }
-            forward-focus: open-keys;
+            accessible-label: root.can-open ? root.open-label : "Play track: " + root.title;
+            accessible-description: root.track-state-label;
+            accessible-action-default => { row-keys.focus(); root.activate-row(); }
+            forward-focus: row-keys;
         }
 
-        open-keys := FocusScope {
-            enabled: root.can-open;
+        row-keys := FocusScope {
+            enabled: root.body-focusable;
             focus-on-click: false;
+            focus-on-tab-navigation: root.body-actionable;
             focus-gained(_) => { root.focused(); }
             key-pressed(event) => {
-                if event.text == Key.Return || event.text == Key.Space {
-                    if !event.repeat { root.open-row(); }
+                if root.body-actionable && (event.text == Key.Return || event.text == Key.Space) {
+                    if !event.repeat { root.activate-row(); }
                     return accept;
                 }
                 return reject;
@@ -172,23 +196,48 @@ export component MediaLine inherits Rectangle {
     }
 
     // Slint offers the press to descendants first, so links and controls
-    // consume their own clicks and the rest of the face opens the row.
+    // consume their own clicks. Only the plain track face starts this gesture.
     row-face := TouchArea {
         width: parent.width; height: parent.height;
-        enabled: root.can-open;
-        mouse-cursor: MouseCursor.pointer;
-        clicked => { root.open-row(); }
+        enabled: root.body-focusable;
+        mouse-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                root.pressed-row-key = root.menu-key;
+            }
+        }
+        clicked => { if root.pressed-row-key == root.menu-key { root.click-row(); } }
+        double-clicked => { if root.pressed-row-key == root.menu-key { root.double-click-row(); } }
 
         HorizontalLayout {
-            padding-top: 6px; padding-bottom: 6px; spacing: 8px;
-            if root.sequence > 0: Caption {
-                width: 33px; text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
+            padding-top: 6px; padding-bottom: 6px;
+            spacing: root.compact && root.kind == "track" ? 6px : 8px;
+            if root.sequence > 0: Rectangle {
+                width: root.compact ? 26px : 33px;
+                Caption {
+                    width: parent.width; height: parent.height; visible: !root.current-track;
+                    text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
+                }
+                TrackState {
+                    visible: root.current-track; playing: root.playing-track;
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                }
             }
             if root.sequence == 0 && !root.compact: Rectangle {
                 width: 39px;
                 Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
                     artwork: root.artwork; mark: Copy.mark(root.kind); tint: Copy.tint(root.kind); circular: root.kind == "artist";
+                    Rectangle {
+                        visible: root.current-track;
+                        x: parent.width - self.width; y: parent.height - self.height;
+                        width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
+                        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
+                    }
                 }
+            }
+            if root.sequence == 0 && root.compact && root.kind == "track": Rectangle {
+                width: 16px;
+                TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
             }
             words := VerticalLayout {
                 min-width: 0px; horizontal-stretch: 1; alignment: center;
@@ -197,15 +246,16 @@ export component MediaLine inherits Rectangle {
                     height: max(20px, font-size + 7px);
                     Text {
                         x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-                        text: root.title; color: root.selected ? Theme.accent : Theme.text;
+                        text: root.title; color: root.current-track || root.selected ? Theme.accent : Theme.text;
                         font-size: parent.font-size; font-weight: 600;
                         vertical-alignment: center; overflow: elide;
                         accessible-role: none;
                     }
-                    if !root.can-open: Rectangle {
+                    if !root.body-actionable: Rectangle {
                         width: parent.width; height: parent.height;
                         accessible-role: text;
                         accessible-label: root.title;
+                        accessible-description: root.track-state-label;
                     }
                 }
                 if root.result-type != "": Rectangle {
@@ -218,8 +268,11 @@ export component MediaLine inherits Rectangle {
                 if root.credits.length > 0 || root.subtitle != "": CreditLine {
                     credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
                     height: max(20px, self.font-size + 6px);
-                    background-clickable: root.can-open;
-                    background-clicked => { root.open-row(); }
+                    background-clickable: root.body-focusable;
+                    background-click-scope: root.menu-key;
+                    background-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
+                    background-clicked => { root.click-row(); }
+                    background-double-clicked => { root.double-click-row(); }
                     activated(id) => { root.page-action("artist", id); }
                     focused => { root.focused(); }
                 }
@@ -231,7 +284,7 @@ export component MediaLine inherits Rectangle {
                 }
             }
             if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
-                width: root.sequence > 0 ? 64px : 126px;
+                width: root.sequence > 0 ? (root.compact ? 42px : 64px) : 126px;
                 text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
             }
             if root.playable: Rectangle {
@@ -239,6 +292,8 @@ export component MediaLine inherits Rectangle {
                 Action {
                     y: (parent.height - self.height) / 2; width: parent.width;
                     icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
+                    accessible-description: root.track-state-label;
+                    single-pointer-activation: true; click-scope: root.menu-key;
                     changed has-focus => { if self.has-focus { root.focused(); } }
                     clicked => { root.action("play"); }
                 }
@@ -255,5 +310,5 @@ export component MediaLine inherits Rectangle {
             }
         }
     }
-    Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: open-keys.has-focus ? 0 : 0.5; }
+    Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: row-keys.has-focus ? 0 : 0.5; }
 }

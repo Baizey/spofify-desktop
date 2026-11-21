@@ -175,18 +175,22 @@ pub(crate) struct Presentation {
 struct Demand {
     track: String,
     visible: bool,
+    display_revision: u64,
 }
 
-fn demand(ui: &AppWindow) -> Demand {
+fn demand(ui: &AppWindow, display_revision: u64) -> Demand {
     Demand {
         track: ui.get_now_track_id().to_string(),
         visible: ui.get_page_kind() == "now",
+        display_revision,
     }
 }
 
 fn clear(ui: &AppWindow) {
     ui.set_cover_art(Default::default());
+    ui.set_lyrics_track_id(Default::default());
     ui.set_lyrics_text(Default::default());
+    ui.set_lyrics_status(Default::default());
     ui.set_waveform(Default::default());
     ui.set_media_status(Default::default());
 }
@@ -196,21 +200,23 @@ fn clear(ui: &AppWindow) {
 /// observation interval can never let data from a different track publish.
 pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     clear(ui);
-    let initial = demand(ui);
+    let initial = demand(ui, 0);
     let (tx, rx) = watch::channel(initial.clone());
     let weak = ui.as_weak();
     let observer = Timer::default();
-    let shown = Arc::new(Mutex::new((
-        Account::current(&access),
-        initial.track.clone(),
-    )));
+    let shown = Arc::new(Mutex::new(DisplayedScope {
+        account: Account::current(&access),
+        track: initial.track.clone(),
+        revision: initial.display_revision,
+    }));
     {
         let (access, shown) = (access.clone(), shown.clone());
         let previous = std::cell::RefCell::new(initial);
         observer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let next = demand(&ui);
-            bind_display(&ui, &shown, Account::current(&access), &next.track);
+            let mut next = demand(&ui, 0);
+            next.display_revision =
+                bind_display(&ui, &shown, Account::current(&access), &next.track);
             let mut previous = previous.borrow_mut();
             if next != *previous {
                 tx.send_replace(next.clone());
@@ -226,31 +232,60 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     }
 }
 
-type DisplayBinding = Arc<Mutex<(Option<Account>, String)>>;
+struct DisplayedScope {
+    account: Option<Account>,
+    track: String,
+    revision: u64,
+}
 
-fn bind_display(ui: &AppWindow, shown: &DisplayBinding, account: Option<Account>, track: &str) {
+type DisplayBinding = Arc<Mutex<DisplayedScope>>;
+
+impl DisplayedScope {
+    fn rebind(&mut self, account: Option<Account>, track: &str) -> bool {
+        let same_account = match (&self.account, &account) {
+            (Some(a), Some(b)) => a.same(b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_account && self.track == track {
+            return false;
+        }
+        self.account = account;
+        self.track = track.to_owned();
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+}
+
+fn bind_display(
+    ui: &AppWindow,
+    shown: &DisplayBinding,
+    account: Option<Account>,
+    track: &str,
+) -> u64 {
     let mut shown = shown.lock().unwrap();
-    let same_account = match (&shown.0, &account) {
-        (Some(a), Some(b)) => a.same(b),
-        (None, None) => true,
-        _ => false,
-    };
-    if !same_account || shown.1 != track {
-        *shown = (account, track.to_owned());
-        drop(shown);
+    let changed = shown.rebind(account, track);
+    let revision = shown.revision;
+    drop(shown);
+    if changed {
         clear(ui);
     }
+    revision
 }
 
 struct Projection {
     art: Option<media::Artwork>,
-    lyrics: Option<String>,
     waveform: Option<media::Envelope>,
     status: &'static str,
     settled: bool,
 }
 
-async fn load(account: &Account, id: &str, expanded: bool) -> Projection {
+async fn load(
+    account: &Account,
+    id: &str,
+    expanded: bool,
+    deliver_lyrics: impl FnOnce(LyricProjection),
+) -> Projection {
     if !expanded {
         let art =
             read_with_backoff(async || media::artwork(&account.api, &account.session, id).await)
@@ -258,23 +293,31 @@ async fn load(account: &Account, id: &str, expanded: bool) -> Projection {
         return Projection {
             settled: art.is_ok(),
             art: art.ok().flatten(),
-            lyrics: None,
             waveform: None,
             status: "",
         };
     }
-    let (art, lyrics, waveform) = tokio::join!(
+    let (art, (lyrics_settled, lyrics_usable), waveform) = tokio::join!(
         read_with_backoff(async || media::artwork(&account.api, &account.session, id).await),
-        read_with_backoff(async || media::lyrics(&account.api, &account.session, id).await),
+        async {
+            let lyrics =
+                read_with_backoff(async || media::lyrics(&account.api, &account.session, id).await)
+                    .await;
+            let settled = lyrics.as_ref().is_ok_and(|v| {
+                !matches!(
+                    v.state,
+                    media::LyricsState::Pending | media::LyricsState::Error
+                )
+            });
+            let projected = project_lyrics(lyrics.ok());
+            let usable = projected.text.is_some();
+            deliver_lyrics(projected);
+            (settled, usable)
+        },
         read_with_backoff(async || media::waveform(&account.api, &account.session, id).await),
     );
     let settled = art.is_ok()
-        && lyrics.as_ref().is_ok_and(|v| {
-            !matches!(
-                v.state,
-                media::LyricsState::Pending | media::LyricsState::Error
-            )
-        })
+        && lyrics_settled
         && waveform.as_ref().is_ok_and(|v| {
             !matches!(
                 v.state,
@@ -287,12 +330,10 @@ async fn load(account: &Account, id: &str, expanded: bool) -> Projection {
             )
         });
     let art = art.ok().flatten();
-    let lyrics = lyrics.ok().and_then(lyric_text);
     let waveform = waveform.ok().and_then(|v| v.envelope);
-    let usable = art.is_some() as usize + lyrics.is_some() as usize + waveform.is_some() as usize;
+    let usable = art.is_some() as usize + lyrics_usable as usize + waveform.is_some() as usize;
     Projection {
         art,
-        lyrics,
         waveform,
         status: match usable {
             3 => "",
@@ -302,6 +343,23 @@ async fn load(account: &Account, id: &str, expanded: bool) -> Projection {
         },
         settled,
     }
+}
+
+struct LyricProjection {
+    text: Option<String>,
+    status: &'static str,
+}
+
+fn project_lyrics(lyrics: Option<media::Lyrics>) -> LyricProjection {
+    use media::LyricsState::*;
+    let status = match lyrics.as_ref().map(|lyrics| lyrics.state) {
+        Some(NotFound) => "No lyrics for this track.",
+        Some(Pending) => "Lyrics aren’t ready.",
+        Some(Plain | Timed | Instrumental) => "",
+        Some(Unavailable | Error) | None => "Lyrics unavailable.",
+    };
+    let text = lyrics.and_then(lyric_text);
+    LyricProjection { text, status }
 }
 
 fn lyric_text(lyrics: media::Lyrics) -> Option<String> {
@@ -331,79 +389,47 @@ async fn run(
 ) {
     // This key keeps the last complete/missing response for this track while
     // the pane is hidden. No catalog-wide or on-disk media cache exists here.
-    let mut satisfied: Option<(Account, String, bool, &'static str, Arc<AtomicBool>)> = None;
+    let mut satisfied: Option<(Account, Demand, &'static str, Arc<AtomicBool>)> = None;
     loop {
         access.mark_unchanged();
         let account = Account::current(&access);
         let request = wanted.borrow_and_update().clone();
-        if !satisfied
-            .as_ref()
-            .is_some_and(|(a, track, full, _, delivered)| {
-                account.as_ref().is_some_and(|b| a.same(b))
-                    && track == &request.track
-                    && (*full || !request.visible)
-                    && delivered.load(Ordering::Acquire)
-            })
-        {
+        if !satisfied.as_ref().is_some_and(|(a, loaded, _, delivered)| {
+            account.as_ref().is_some_and(|b| a.same(b))
+                && loaded.track == request.track
+                && loaded.display_revision == request.display_revision
+                && (loaded.visible || !request.visible)
+                && delivered.load(Ordering::Acquire)
+        }) {
             satisfied = None;
         }
         if let Some(account) = account.as_ref().filter(|_| !request.track.is_empty()) {
-            let a_fence = access.clone();
-            let r_fence = wanted.clone();
+            let delivery = Delivery {
+                ui: ui.clone(),
+                access: access.clone(),
+                wanted: wanted.clone(),
+                account: account.clone(),
+                request: request.clone(),
+                shown: shown.clone(),
+            };
             if account.offline {
-                publish(
-                    &ui,
-                    a_fence,
-                    r_fence,
-                    account.clone(),
-                    request.clone(),
-                    shown.clone(),
-                    None,
-                    "Offline",
-                    None,
-                );
+                delivery.media(None, "Offline", None);
             } else if satisfied.is_none() {
                 // Bias invalidation before work, including an already queued access change.
                 let projected = tokio::select! {
                     biased;
                     change = scope_changed(&mut access, Some(account)) => { if !change { break } continue; }
                     change = wanted.changed() => { if change.is_err() { break } continue; }
-                    data = load(account, &request.track, request.visible) => data,
+                    data = load(account, &request.track, request.visible, |lyrics| delivery.clone().lyrics(lyrics)) => data,
                 };
                 let status = projected.status;
                 let delivered = projected.settled.then(|| Arc::new(AtomicBool::new(false)));
                 if let Some(delivered) = &delivered {
-                    satisfied = Some((
-                        account.clone(),
-                        request.track.clone(),
-                        request.visible,
-                        status,
-                        delivered.clone(),
-                    ));
+                    satisfied = Some((account.clone(), request.clone(), status, delivered.clone()));
                 }
-                publish(
-                    &ui,
-                    a_fence,
-                    r_fence,
-                    account.clone(),
-                    request.clone(),
-                    shown.clone(),
-                    Some(projected),
-                    status,
-                    delivered,
-                );
-            } else if let Some((_, _, _, status, _)) = &satisfied {
-                publish(
-                    &ui,
-                    a_fence,
-                    r_fence,
-                    account.clone(),
-                    request.clone(),
-                    shown.clone(),
-                    None,
-                    status,
-                    None,
-                );
+                delivery.media(Some(projected), status, delivered);
+            } else if let Some((_, _, status, _)) = &satisfied {
+                delivery.media(None, status, None);
             }
         }
         tokio::select! {
@@ -413,65 +439,143 @@ async fn run(
     }
 }
 
-fn publish(
-    ui: &slint::Weak<AppWindow>,
+#[derive(Clone)]
+struct Delivery {
+    ui: slint::Weak<AppWindow>,
     access: AccessRx,
     wanted: watch::Receiver<Demand>,
     account: Account,
     request: Demand,
     shown: DisplayBinding,
-    projected: Option<Projection>,
-    status: &'static str,
-    delivered: Option<Arc<AtomicBool>>,
-) {
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        if !account.matches(&access)
-            || !matches!(wanted.has_changed(), Ok(false))
-            || demand(&ui) != request
-        {
-            return;
-        }
-        bind_display(&ui, &shown, Some(account), &request.track);
-        let mut complete = true;
-        if let Some(data) = projected {
-            if let Some(art) = data.art {
-                let buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                    &art.rgba, art.width, art.height,
-                );
-                ui.set_cover_art(slint::Image::from_rgba8(buffer));
+}
+
+impl Delivery {
+    fn update(self, allow_hidden: bool, apply: impl FnOnce(AppWindow, String) + Send + 'static) {
+        let Self {
+            ui,
+            access,
+            wanted,
+            account,
+            request,
+            shown,
+        } = self;
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            if !account.matches(&access) {
+                return;
             }
-            if let Some(lyrics) = data.lyrics {
-                ui.set_lyrics_text(lyrics.into());
+            // Record a live track change even if it happened between timer
+            // observations, so a coalesced A → B → A can't reuse the receipt.
+            let live = ui.get_now_track_id();
+            let revision = bind_display(&ui, &shown, Some(account), live.as_str());
+            if live.as_str() == request.track
+                && revision == request.display_revision
+                && (allow_hidden
+                    || (matches!(wanted.has_changed(), Ok(false))
+                        && (ui.get_page_kind() == "now") == request.visible))
+            {
+                apply(ui, request.track);
             }
-            if let Some(envelope) = data.waveform {
-                let actual = Duration::try_from_secs_f32(ui.get_duration()).ok();
-                if actual.is_some_and(|duration| envelope.matches_duration(duration)) {
-                    let waveform = envelope
-                        .bins
-                        .into_iter()
-                        .map(|bin| f32::from(bin) / 255.0)
-                        .collect::<Vec<_>>();
-                    ui.set_waveform(ModelRc::new(VecModel::from(waveform)));
-                } else {
-                    complete = false;
+        });
+    }
+
+    fn lyrics(self, lyrics: LyricProjection) {
+        // Visibility triggers the fetch; it needn't discard same-track text
+        // that arrived just as the reader was closed.
+        self.update(true, move |ui, track| {
+            ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
+            ui.set_lyrics_status(lyrics.status.into());
+            ui.set_lyrics_track_id(track.into());
+        });
+    }
+
+    fn media(
+        self,
+        projected: Option<Projection>,
+        status: &'static str,
+        delivered: Option<Arc<AtomicBool>>,
+    ) {
+        self.update(false, move |ui, _| {
+            let mut complete = true;
+            if let Some(data) = projected {
+                if let Some(art) = data.art {
+                    let buffer = SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                        &art.rgba, art.width, art.height,
+                    );
+                    ui.set_cover_art(slint::Image::from_rgba8(buffer));
+                }
+                if let Some(envelope) = data.waveform {
+                    let actual = Duration::try_from_secs_f32(ui.get_duration()).ok();
+                    if actual.is_some_and(|duration| envelope.matches_duration(duration)) {
+                        let waveform = envelope
+                            .bins
+                            .into_iter()
+                            .map(|bin| f32::from(bin) / 255.0)
+                            .collect::<Vec<_>>();
+                        ui.set_waveform(ModelRc::new(VecModel::from(waveform)));
+                    } else {
+                        complete = false;
+                    }
                 }
             }
-        }
-        ui.set_media_status(if complete || !status.is_empty() {
-            status.into()
-        } else {
-            "Waveform unavailable for this playback duration.".into()
+            ui.set_media_status(if complete || !status.is_empty() {
+                status.into()
+            } else {
+                "Waveform unavailable for this playback duration.".into()
+            });
+            if let Some(delivered) = delivered {
+                delivered.store(complete, Ordering::Release);
+            }
         });
-        if let Some(delivered) = delivered {
-            delivered.store(complete, Ordering::Release);
-        }
-    });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::Origin;
+
+    #[test]
+    fn a_display_rebind_invalidates_receipts_even_when_the_track_returns() {
+        let mut scope = DisplayedScope {
+            account: None,
+            track: "first".into(),
+            revision: 0,
+        };
+        assert!(scope.rebind(None, "second"));
+        assert!(scope.rebind(None, "first"));
+        assert!(!scope.rebind(None, "first"));
+        assert_eq!(scope.revision, 2);
+    }
+
+    #[test]
+    fn lyrics_keep_missing_pending_and_failure_distinct() {
+        let server_lyrics = |state| media::Lyrics {
+            track_id: "track".into(),
+            recording_version: "v1".into(),
+            source_generation: "1".into(),
+            state,
+            plain_text: None,
+            lines: Vec::new(),
+            reason: None,
+            provenance: None,
+            attribution: None,
+        };
+        use media::LyricsState::*;
+        assert_eq!(project_lyrics(None).status, "Lyrics unavailable.");
+        for (state, expected) in [
+            (Error, "Lyrics unavailable."),
+            (Unavailable, "Lyrics unavailable."),
+            (Pending, "Lyrics aren’t ready."),
+            (NotFound, "No lyrics for this track."),
+        ] {
+            let result = project_lyrics(Some(server_lyrics(state)));
+            assert!(result.text.is_none());
+            assert_eq!(result.status, expected);
+        }
+        let result = project_lyrics(Some(server_lyrics(Instrumental)));
+        assert_eq!(result.text.as_deref(), Some("Instrumental"));
+        assert!(result.status.is_empty());
+    }
 
     #[test]
     fn scope_ignores_recent_updates_but_fences_even_quick_offline_roundtrips() {

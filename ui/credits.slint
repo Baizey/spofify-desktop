@@ -63,7 +63,11 @@ export component CreditLine inherits Rectangle {
     in property <bool> interactive: true;
     in property <length> font-size: 13px * Theme.density;
     in property <bool> background-clickable;
+    in property <string> background-click-scope;
+    in property <MouseCursor> background-cursor: MouseCursor.pointer;
+    property <string> background-pressed-scope;
     callback background-clicked();
+    callback background-double-clicked();
     callback activated(string /* id */);
     callback focused();
 
@@ -95,8 +99,18 @@ export component CreditLine inherits Rectangle {
             x: -viewport.content-x;
             width: viewport.width; height: viewport.height;
             enabled: viewport.interactive;
-            mouse-cursor: MouseCursor.pointer;
-            clicked => { root.background-clicked(); }
+            mouse-cursor: root.background-cursor;
+            pointer-event(event) => {
+                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                    root.background-pressed-scope = root.background-click-scope;
+                }
+            }
+            clicked => {
+                if root.background-pressed-scope == root.background-click-scope { root.background-clicked(); }
+            }
+            double-clicked => {
+                if root.background-pressed-scope == root.background-click-scope { root.background-double-clicked(); }
+            }
         }
 
         strip := HorizontalLayout {

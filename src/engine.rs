@@ -9,7 +9,7 @@ mod output;
 use crate::{
     AppWindow, ArtistCredit, DeviceRow, QueueRow,
     api::{Api, ApiError, Item, Session},
-    audio::Audio,
+    audio::{Audio, MasterGain},
     auth::{self, Kind, Success, Write, Writer},
     desk::Access,
     mode::ModeControl,
@@ -145,6 +145,7 @@ struct Engine {
     passive_output: bool,
     output_promotion: Option<OutputPromotion>,
     audio: Option<Audio>,
+    master_gain: MasterGain,
     local: LocalQueue,
     local_store: Option<OfflineStore>,
     crossfade_enabled: Arc<AtomicBool>,
@@ -317,6 +318,7 @@ impl Engine {
                 false,
                 self.shared_epoch.clone(),
                 self.epoch,
+                self.master_gain.clone(),
             ));
             self.socket = socket::spawn(
                 a.api.clone(),
@@ -465,6 +467,7 @@ impl Engine {
                     true,
                     self.shared_epoch.clone(),
                     self.epoch,
+                    self.master_gain.clone(),
                 )
             });
             self.login_view(false, false, "");
@@ -1192,6 +1195,7 @@ impl Engine {
                 .enumerate()
                 .map(|(i, e)| QueueEntryView {
                     key: e.key.to_string(),
+                    track_id: e.track.id.clone(),
                     title: e.track.title.clone(),
                     subtitle: e.track.subtitle.clone(),
                     album_name: e.track.album_name.clone(),
@@ -1237,6 +1241,7 @@ fn credit_model(credits: Vec<CreditView>) -> ModelRc<ArtistCredit> {
 #[derive(Default)]
 struct QueueEntryView {
     key: String,
+    track_id: String,
     title: String,
     subtitle: String,
     credits: Vec<CreditView>,
@@ -1249,6 +1254,7 @@ struct QueueEntryView {
 impl QueueEntryView {
     fn matches(&self, row: &QueueRow) -> bool {
         self.key == row.key.as_str()
+            && self.track_id == row.track_id.as_str()
             && self.title == row.title.as_str()
             && self.subtitle == row.subtitle.as_str()
             && self.album_id == row.album_id.as_str()
@@ -1261,6 +1267,7 @@ impl QueueEntryView {
     fn into_row(self) -> QueueRow {
         QueueRow {
             key: self.key.into(),
+            track_id: self.track_id.into(),
             title: self.title.into(),
             subtitle: self.subtitle.into(),
             credits: credit_model(self.credits),
@@ -1535,6 +1542,11 @@ fn connection(input: &str) -> Result<Api, ApiError> {
     Api::new(crate::api::Origin::parse(input)?)
 }
 
+pub(crate) struct OutputPreferences {
+    pub(crate) crossfade_enabled: Arc<AtomicBool>,
+    pub(crate) master_gain: MasterGain,
+}
+
 pub fn start(
     window: slint::Weak<AppWindow>,
     epoch: Arc<AtomicU64>,
@@ -1542,7 +1554,7 @@ pub fn start(
     mode: ModeControl,
     mut auth_intents: mpsc::UnboundedReceiver<AuthCommand>,
     auth_tx: mpsc::UnboundedSender<AuthCommand>,
-    crossfade_enabled: Arc<AtomicBool>,
+    output: OutputPreferences,
 ) -> (mpsc::Sender<Command>, std::thread::JoinHandle<()>) {
     let (tx, mut commands) = mpsc::channel(32);
     let worker = std::thread::spawn(move || {
@@ -1583,10 +1595,11 @@ pub fn start(
                 passive_output: false,
                 output_promotion: None,
                 audio: None,
+                master_gain: output.master_gain,
                 local: LocalQueue::default(),
                 local_status: Status::Ok,
                 local_store: None,
-                crossfade_enabled,
+                crossfade_enabled: output.crossfade_enabled,
                 local_lookahead: None,
                 local_read_slot: Arc::new(Semaphore::new(1)),
                 local_preview_slot: Arc::new(Semaphore::new(1)),
@@ -1666,9 +1679,10 @@ mod tests {
     }
 
     #[test]
-    fn queue_projection_detects_album_and_credit_only_changes() {
+    fn queue_projection_detects_track_identity_album_and_credit_changes() {
         let entry = || QueueEntryView {
             key: "7".into(),
+            track_id: "recording-1".into(),
             title: "Track".into(),
             subtitle: "Artist".into(),
             credits: vec![CreditView {
@@ -1683,6 +1697,9 @@ mod tests {
         let row = entry().into_row();
         let mut next = entry();
         assert!(next.matches(&row));
+        next.track_id = "recording-2".into();
+        assert!(!next.matches(&row));
+        let mut next = entry();
         next.credits[0].id = "artist/2".into();
         assert!(!next.matches(&row));
         let mut next = entry();
@@ -1716,6 +1733,7 @@ mod tests {
             passive_output: false,
             output_promotion: None,
             audio: None,
+            master_gain: MasterGain::default(),
             local: LocalQueue::default(),
             local_status: Status::Ok,
             socket: None,
@@ -1809,6 +1827,7 @@ mod tests {
             false,
             e.shared_epoch.clone(),
             e.epoch,
+            e.master_gain.clone(),
         ));
         e.account = Some(Account {
             api,

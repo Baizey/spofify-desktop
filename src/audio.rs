@@ -11,7 +11,7 @@ use std::{
     io::Cursor,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -26,6 +26,29 @@ const MAX_GAIN_STEP: f32 = 0.05;
 const GAIN_SETTLE: Duration = Duration::from_millis(10);
 const UNITY: f32 = 1.0;
 
+/// Device-local scalar, shared by every run without involving playback commands.
+#[derive(Clone)]
+pub(crate) struct MasterGain(Arc<AtomicU32>);
+
+impl MasterGain {
+    pub(crate) fn set(&self, gain: f32) {
+        if gain.is_finite() {
+            self.0
+                .store(gain.clamp(0.0, UNITY).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+impl Default for MasterGain {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU32::new(UNITY.to_bits())))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Facts {
     pub elapsed: f64,
@@ -39,6 +62,7 @@ pub struct Audio {
     stream: Option<OutputStream>,
     primary: Option<Run>,
     crossfade: Option<Crossfade>,
+    master_gain: MasterGain,
     cached: Option<(String, Arc<[u8]>)>,
     session: Option<Session>,
     network: Option<(tokio::sync::watch::Receiver<u64>, u64)>,
@@ -96,6 +120,7 @@ impl Audio {
         offline: bool,
         epoch: Arc<AtomicU64>,
         expected: u64,
+        master_gain: MasterGain,
     ) -> Self {
         let network = session.as_ref().map(|s| {
             let changes = s.network_changes();
@@ -106,6 +131,7 @@ impl Audio {
             stream: None,
             primary: None,
             crossfade: None,
+            master_gain,
             cached: None,
             session,
             network,
@@ -177,17 +203,18 @@ impl Audio {
         mixer: &Mixer,
         source: S,
         authority: Authority,
-        gain: f32,
+        envelope: f32,
     ) -> Run {
         let decoded_duration = source.total_duration();
         let sink = Sink::connect_new(mixer);
         sink.pause();
-        sink.set_volume(gain);
+        sink.set_volume(envelope);
         let started = Arc::new(AtomicBool::new(false));
         let exhausted = Arc::new(AtomicBool::new(false));
         let fenced_out = Arc::new(AtomicBool::new(false));
         sink.append(Fenced {
             inner: source,
+            master_gain: self.master_gain.clone(),
             started: started.clone(),
             exhausted: exhausted.clone(),
             fenced_out: fenced_out.clone(),
@@ -369,7 +396,7 @@ impl Audio {
         }
         let progress = (1.0 - remaining / fade.overlap).clamp(0.0, 1.0) as f32;
         // Mostly linear with modest easing near the endpoints. These are
-        // envelope factors only, independent of any future master volume.
+        // envelope factors only; the master gain is applied in the source.
         let eased = progress + 0.25 * (progress * progress * (3.0 - 2.0 * progress) - progress);
         let target = (UNITY - OUTGOING_FLOOR) * eased;
         let attenuation = target
@@ -397,8 +424,8 @@ impl Audio {
         }
         let fade = self.crossfade.as_ref().unwrap();
         if fade.incoming_gain == 0.0 || !fade.incoming.can_continue() {
-            // A run that never became audible should start from zero through
-            // ordinary playback, not inherit its silently consumed samples.
+            // A run whose envelope never opened should start from zero
+            // through ordinary playback, not inherit pre-roll samples.
             self.cancel_crossfade();
             return false;
         }
@@ -469,6 +496,7 @@ fn decoder(bytes: Arc<[u8]>, elapsed: f64) -> Result<Decoder<Cursor<Arc<[u8]>>>,
 }
 struct Fenced<S> {
     inner: S,
+    master_gain: MasterGain,
     started: Arc<AtomicBool>,
     exhausted: Arc<AtomicBool>,
     fenced_out: Arc<AtomicBool>,
@@ -503,7 +531,13 @@ impl<S: Source<Item = f32>> Iterator for Fenced<S> {
             } else if !self.started.load(Ordering::Relaxed) {
                 self.started.store(true, Ordering::Release);
             }
-            sample
+            // Keep consuming samples at zero gain: mute must not change
+            // transport, authority, or natural EOF. The separate Sink
+            // envelope still controls the crossfade and its gain settling.
+            sample.map(|value| {
+                let gain = self.master_gain.get();
+                if gain == 0.0 { 0.0 } else { value * gain }
+            })
         }
     }
 }
@@ -568,6 +602,7 @@ mod tests {
             };
             let mut source = Fenced {
                 inner: decoder(wav(), 0.004).unwrap(),
+                master_gain: MasterGain::default(),
                 started: Arc::new(AtomicBool::new(false)),
                 exhausted: Arc::new(AtomicBool::new(false)),
                 fenced_out: Arc::new(AtomicBool::new(false)),
@@ -594,6 +629,7 @@ mod tests {
         let grant = Authority::online(|| true, move || start.load(Ordering::Acquire));
         let mut source = Fenced {
             inner: decoder(wav(), 0.0).unwrap(),
+            master_gain: MasterGain::default(),
             started: Arc::default(),
             exhausted: Arc::default(),
             fenced_out: Arc::default(),
@@ -628,7 +664,13 @@ mod tests {
         amplitude: i16,
     ) -> (Audio, Mixer, MixerSource, Authority) {
         let (mixer, mut output) = mixer(1, RATE);
-        let mut audio = Audio::new(None, true, Arc::new(AtomicU64::new(1)), 1);
+        let mut audio = Audio::new(
+            None,
+            true,
+            Arc::new(AtomicU64::new(1)),
+            1,
+            MasterGain::default(),
+        );
         let authority = Authority::offline();
         let bytes = wav_samples(9 * RATE, amplitude);
         let run = audio.attach(
@@ -716,6 +758,73 @@ mod tests {
         assert!(audio.cached("old").is_none() && audio.cached("new").is_some());
         assert!((pump(&mut output, 20) - 0.5).abs() < 1e-5);
         assert!(audio.facts().elapsed > facts.elapsed);
+    }
+
+    #[test]
+    fn master_gain_scales_both_envelopes_and_muted_fade_still_hands_off() {
+        let (mut audio, mixer, mut output, old) = playing(6.0);
+        let gain = audio.master_gain.clone();
+        let new = Authority::offline();
+        gain.set(0.4);
+        assert!(begin(&mut audio, &mixer, new.clone()));
+        assert!((pump(&mut output, 100) - 0.1).abs() < 1e-5);
+        for _ in 0..65 {
+            audio.maintain_crossfade();
+            pump(&mut output, 20);
+        }
+        let incoming = audio.crossfade.as_ref().unwrap().incoming_gain;
+        let outgoing = audio.primary.as_ref().unwrap().sink.volume();
+        assert!((0.4..0.6).contains(&incoming));
+        let mix = 0.25 * outgoing + 0.5 * incoming;
+        for level in [0.4, 0.8, 0.0] {
+            gain.set(level);
+            assert!((pump(&mut output, 20) - mix * level).abs() < 1e-5);
+        }
+        assert!(audio.facts().playing && old.is_valid() && new.is_valid());
+        for _ in 0..100 {
+            assert_eq!(pump(&mut output, 20), 0.0);
+            audio.maintain_crossfade();
+            if audio.facts().ended {
+                break;
+            }
+        }
+        let pos = audio.crossfade.as_ref().unwrap().incoming.sink.get_pos();
+        assert!(audio.promote_crossfade());
+        assert_eq!(audio.facts().elapsed, pos.as_secs_f64());
+        assert!(!old.is_valid() && new.is_valid());
+        assert_eq!(pump(&mut output, 20), 0.0);
+        gain.set(0.8);
+        assert!((pump(&mut output, 20) - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn master_gain_survives_cancel_and_recreated_online_and_offline_runs() {
+        let (mut audio, mixer, mut output, old) = playing(6.0);
+        let gain = audio.master_gain.clone();
+        let new = Authority::offline();
+        assert!(begin(&mut audio, &mixer, new.clone()));
+        pump(&mut output, 100);
+        audio.maintain_crossfade();
+        assert!(audio.primary.as_ref().unwrap().sink.volume() < UNITY);
+        gain.set(0.3);
+        audio.cancel_crossfade();
+        assert!(!new.is_valid() && old.is_valid());
+        assert!((pump(&mut output, 20) - 0.075).abs() < 1e-5);
+        audio.clear();
+        assert!(!old.is_valid());
+        for offline in [false, true] {
+            let (mixer, mut output) = rodio::mixer::mixer(1, RATE);
+            let audio = Audio::new(None, offline, Arc::new(AtomicU64::new(2)), 2, gain.clone());
+            let grant = if offline {
+                Authority::offline()
+            } else {
+                Authority::online(|| true, || true)
+            };
+            let source = decoder(wav_samples(RATE, 16384), 0.0).unwrap();
+            let run = audio.attach(&mixer, source, grant, UNITY);
+            run.sink.play();
+            assert!((pump(&mut output, 20) - 0.15).abs() < 1e-5);
+        }
     }
 
     #[test]
@@ -892,7 +1001,13 @@ mod tests {
 
     #[test]
     fn malformed_media_never_opens_an_output() {
-        let mut a = Audio::new(None, false, Arc::new(AtomicU64::new(1)), 1);
+        let mut a = Audio::new(
+            None,
+            false,
+            Arc::new(AtomicU64::new(1)),
+            1,
+            MasterGain::default(),
+        );
         assert_eq!(
             a.play(
                 "bad".into(),

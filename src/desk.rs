@@ -185,7 +185,6 @@ fn label(route: &Route) -> &'static str {
         Route::Artist(_) => "Artist",
         Route::Playlist(_) => "Playlist",
         Route::SavedCollection(_) => "Saved collection",
-        Route::Track(_) => "Track",
     }
 }
 enum Navigation {
@@ -292,6 +291,12 @@ fn repeat_navigation(current: &Route, next: &Route, reading: bool, failed: bool)
 }
 fn saved_route(route: &Route) -> bool {
     matches!(route, Route::Offline | Route::SavedCollection(_))
+}
+fn row_open_target<'a>(route: &Route, row: &'a pages::Row, offline: bool) -> Option<&'a Route> {
+    // Track rows play only through an explicit Play intent, even in Saved.
+    row.route.as_ref().filter(|target| {
+        row.kind != "track" && *target != route && (!offline || saved_route(target))
+    })
 }
 fn strings(v: Vec<&str>) -> ModelRc<slint::SharedString> {
     ModelRc::new(VecModel::from(
@@ -432,6 +437,7 @@ impl Browser {
         let personal_actions = !self.route.personal() || self.personal_ready;
         let write = self.writing;
         let art = self.art.clone();
+        let route = self.route.clone();
         let request = self.access.as_ref().map(|a| crate::artwork::Request {
             epoch: a.epoch,
             generation: token,
@@ -452,11 +458,8 @@ impl Browser {
             ui.set_has_more(p.more && !offline);
             ui.set_form_busy(write);
             if models {
-                let (album_id, album_name) =
-                    projected_music(p.music.album.as_ref(), offline, false);
+                ui.set_browse_model_key(token.to_string().into());
                 ui.set_page_credits(artist_credits(&p.music, offline));
-                ui.set_page_album_id(album_id.into());
-                ui.set_page_album_name(album_name.into());
                 ui.set_browse_rows(ModelRc::new(VecModel::from(
                     p.rows
                         .iter()
@@ -472,9 +475,15 @@ impl Browser {
                                     strings(Vec::new())
                                 },
                                 kind: r.kind.as_str().into(),
+                                track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
                                 title: r.title.as_str().into(),
                                 subtitle: r.subtitle.as_str().into(),
                                 detail: r.detail.as_str().into(),
+                                can_open: if matches!(route, Route::Picker(_)) {
+                                    !offline && personal_actions
+                                } else {
+                                    row_open_target(&route, r, offline).is_some()
+                                },
                                 playable: r.playable
                                     && personal_actions
                                     && (!offline || local_playback),
@@ -1012,7 +1021,7 @@ impl Browser {
         if self.writing {
             return;
         }
-        let (mut op, idx, val) = match i.intent {
+        let (op, idx, val) = match i.intent {
             Intent::Navigate(s) => {
                 if let Some(navigation) = Navigation::named(&s) {
                     self.visit(navigation, false);
@@ -1091,7 +1100,8 @@ impl Browser {
         let offline = a.offline || a.session.is_offline();
         if route.personal()
             && !self.personal_ready
-            && !matches!(op.as_str(), "open" | "album" | "artist" | "track")
+            && !(matches!(op.as_str(), "album" | "artist")
+                || op == "open" && !matches!(route, Route::Picker(_)))
         {
             self.message = "Wait for the current account library before making changes.".into();
             self.render(false);
@@ -1103,13 +1113,10 @@ impl Browser {
             }
             return;
         }
-        if matches!(op.as_str(), "album" | "artist" | "track") {
-            let target = if op == "track" && !offline && idx.is_none() {
-                pages::music_route("track", &val) // Now Playing's explicit track link.
-            } else {
-                metadata_route(&op, &val, offline)
-            };
-            if let Some(target) = target.filter(|target| *target != route) {
+        if matches!(op.as_str(), "album" | "artist") {
+            if let Some(target) =
+                metadata_route(&op, &val, offline).filter(|target| *target != route)
+            {
                 self.visit(Navigation::Follow(target), false);
             }
             return;
@@ -1117,52 +1124,33 @@ impl Browser {
         let saved_page = saved_route(&route);
         let local_results = saved_page || a.offline && matches!(route, Route::Search(_));
         if op == "open" && !matches!(route, Route::Picker(_)) {
-            let target = row.as_ref().and_then(|r| {
-                r.route.clone().or_else(|| {
-                    // Download rows have local playback, not a local Track
-                    // detail. While online they can still open their stored
-                    // track identity on this account's server.
-                    if saved_page
-                        && !offline
-                        && let pages::RowKey::Track(id) = &r.key
-                    {
-                        pages::music_route("track", id)
-                    } else {
-                        None
-                    }
-                })
-            });
-            if let Some(target) = target {
-                if (!offline || saved_route(&target)) && target != route {
-                    self.visit(Navigation::Follow(target), false);
-                }
-                return;
+            if let Some(target) = row
+                .as_ref()
+                .and_then(|r| row_open_target(&route, r, offline))
+            {
+                self.visit(Navigation::Follow(target.clone()), false);
             }
-            if !local_results || !row.as_ref().is_some_and(|r| r.playable) {
-                return;
-            }
-            op = "play".into(); // Saved tracks have no separate offline detail.
+            return;
         }
         if op == "add" && !matches!(route, Route::Picker(_)) {
             if let Some(r) = row
-                && !a.offline
+                && !offline
             {
                 self.visit(Navigation::Follow(Route::Picker(r.id)), false);
             }
             return;
         }
         let local_play = local_results && op == "play";
+        if matches!(op.as_str(), "play" | "queue") && row.as_ref().is_some_and(|r| !r.playable) {
+            return;
+        }
         if matches!(op.as_str(), "play" | "queue") && !local_play {
-            if a.offline {
+            if offline {
                 return;
             }
-            let selection = if let Some(r) = row {
-                if !r.playable {
-                    return;
-                }
-                r.playback
-            } else {
-                page.playback.clone()
+            let selection = match row {
+                Some(r) => r.playback,
+                None => page.playback.clone(),
             };
             if let Some(s) = selection {
                 let selection = s.into();
@@ -1580,7 +1568,6 @@ mod tests {
         let artist = Route::Artist("artist".into());
         let album = Route::Album("album".into());
         let sources = [
-            album.clone(),
             artist.clone(),
             query.clone(),
             playlist.clone(),
@@ -1599,8 +1586,7 @@ mod tests {
             Route::Search("a ranked".into()),
             query.clone(),
             artist.clone(),
-            album.clone(),
-            Route::Track("track".into()),
+            album,
         ] {
             step(&mut route, &mut trail, Navigation::Follow(next));
         }
@@ -1668,6 +1654,28 @@ mod tests {
         p.playlist = Some(m);
         assert!(!draft_matches(&basis, &p, "rename"));
         assert!(!draft_matches(&basis, &p, "delete"));
+    }
+    #[test]
+    fn track_bodies_have_no_destination_but_saved_collection_cards_still_open() {
+        let track = pages::Row {
+            kind: "track".into(),
+            playable: true,
+            ..Default::default()
+        };
+        let target = Route::SavedCollection("collection".into());
+        let collection = pages::Row {
+            kind: "saved-collection".into(),
+            route: Some(target.clone()),
+            ..Default::default()
+        };
+        for offline in [false, true] {
+            assert_eq!(row_open_target(&Route::Offline, &track, offline), None);
+            assert_eq!(row_open_target(&target, &track, offline), None);
+            assert_eq!(
+                row_open_target(&Route::Offline, &collection, offline),
+                Some(&target)
+            );
+        }
     }
     #[test]
     fn offline_does_not_offer_online_mutations() {

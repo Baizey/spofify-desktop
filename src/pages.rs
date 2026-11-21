@@ -33,7 +33,6 @@ pub const MAX_ROWS: usize = 500;
 pub enum Route {
     History,
     Search(String),
-    Track(String),
     Album(String),
     Artist(String),
     Playlists,
@@ -59,7 +58,6 @@ impl Route {
         match self {
             Self::History => "history",
             Self::Search(_) => "search",
-            Self::Track(_) => "track",
             Self::Album(_) => "album",
             Self::Artist(_) => "artist",
             Self::Playlists => "playlists",
@@ -162,8 +160,8 @@ impl MusicMetadata {
     }
 }
 
-/// Go point-detail routes need one addressable segment. Never infer an ID
-/// from a label, nor reinterpret an opaque ID as a path or query string.
+/// Album and artist detail routes need one addressable segment. Never infer an
+/// ID from a label, nor reinterpret an opaque ID as a path or query string.
 pub(crate) fn music_route(kind: &str, id: &str) -> Option<Route> {
     if !catalog::segment_id(id) {
         return None;
@@ -171,7 +169,6 @@ pub(crate) fn music_route(kind: &str, id: &str) -> Option<Route> {
     match kind {
         "artist" => Some(Route::Artist(id.into())),
         "album" => Some(Route::Album(id.into())),
-        "track" => Some(Route::Track(id.into())),
         _ => None,
     }
 }
@@ -484,15 +481,6 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
             )?;
             page.subtitle = count_label(total, "result", "results");
         }
-        Route::Track(id) => {
-            let detail = api.catalog_detail(session, CatalogKind::Track, id).await?;
-            let row = catalog_row(detail.item, None);
-            page.title = row.title.clone();
-            page.subtitle = row.detail.clone();
-            page.music = row.music.clone();
-            page.playback = row.playback.clone();
-            page.rows.push(row);
-        }
         Route::Album(id) | Route::Artist(id) => {
             let album = matches!(route, Route::Album(_));
             let kind = if album {
@@ -546,7 +534,7 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
 }
 
 /// Search the current account’s Downloads projection, not the online query cache.
-/// Keep the original rows so saved collections still open and tracks play locally.
+/// Keep the original rows so saved collections still open and Play uses the local track.
 pub fn search_downloads(downloads: &Page, query: &str) -> Page {
     let query = query.to_lowercase();
     let terms: Vec<_> = query.split_whitespace().collect();
@@ -1193,7 +1181,7 @@ mod tests {
         assert_eq!(row.subtitle, "Name only, Artist, Guest");
         assert_eq!(row.detail, "1:01");
         assert_eq!(row.item.as_ref().unwrap().name, row.title);
-        assert_eq!(row.route, Some(Route::Track("track%2F音".into())));
+        assert!(row.route.is_none());
         assert_eq!(
             selection(&row),
             json!({"kind":"track", "track":{"id":"track%2F音"}})
@@ -1257,6 +1245,7 @@ mod tests {
         assert_eq!(a.id, b.id);
         assert_ne!(a.key, b.key);
         assert_eq!(b.position, Some(1));
+        assert!(a.route.is_none() && b.route.is_none());
         assert_eq!(
             selection(&b),
             json!({"kind":"track", "track":{"id":"track%2F音","entryId":"entry2"},
@@ -1340,6 +1329,7 @@ mod tests {
             track: track(),
         }];
         let page = personal_playlist(&summary, None, &entries, false);
+        assert!(page.rows[0].route.is_none());
         assert_eq!(
             selection(&page.rows[0]),
             json!({"kind":"track",

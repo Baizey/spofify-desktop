@@ -126,7 +126,7 @@ mod tests {
         t.visit(&Route::History, &blank);
         t.visit(&blank, &first);
         t.visit(&first, &query);
-        t.visit(&query, &Route::Track("track".into()));
+        t.visit(&query, &Route::Album("album".into()));
         assert_eq!(t.pop(), Some(query));
         assert_eq!(t.pop(), Some(Route::History));
         for i in 0..100 {

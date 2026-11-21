@@ -1050,6 +1050,7 @@ impl Engine {
                 let credits = credit_views(&t.artists);
                 QueueEntryView {
                     key: t.key.to_string(),
+                    track_id: t.id.clone(),
                     title: t.name.clone(),
                     subtitle: artist_subtitle(&credits),
                     credits,

@@ -61,18 +61,52 @@ export component Transport inherits Rectangle {
     in property <bool> playing;
     in property <bool> available;
     in property <bool> skip-enabled;
+    in property <bool> modes-enabled;
+    in property <bool> shuffle;
+    in property <string> repeat-mode;
     callback previous();
     callback toggle();
     callback next();
-    width: 134px;
+    callback queue-action(string, string);
+    callback focused();
+    width: 214px;
     height: 44px;
     horizontal-stretch: 0;
     HorizontalLayout {
         alignment: center;
         spacing: 5px;
-        Action { width: 39px; height: 42px; icon: "|◀"; quiet: true; accessible-label: "Previous track"; enabled: root.skip-enabled; clicked => { root.previous(); } }
-        Action { width: 42px; height: 42px; primary: true; round: true; icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available; accessible-label: root.playing ? "Pause" : "Play"; clicked => { root.toggle(); } }
-        Action { width: 39px; height: 42px; icon: "▶|"; quiet: true; accessible-label: "Next track"; enabled: root.skip-enabled; clicked => { root.next(); } }
+        Action {
+            width: 36px; height: 36px; icon: "shuffle"; quiet: true; selected: root.shuffle;
+            enabled: root.modes-enabled;
+            accessible-label: "Shuffle"; accessible-description: root.shuffle ? "On" : "Off";
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.queue-action("shuffle", ""); }
+        }
+        Action {
+            width: 39px; height: 42px; icon: "|◀"; quiet: true; accessible-label: "Previous track"; enabled: root.skip-enabled;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.previous(); }
+        }
+        Action {
+            width: 42px; height: 42px; primary: true; round: true; icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available;
+            accessible-label: root.playing ? "Pause" : "Play";
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.toggle(); }
+        }
+        Action {
+            width: 39px; height: 42px; icon: "▶|"; quiet: true; accessible-label: "Next track"; enabled: root.skip-enabled;
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.next(); }
+        }
+        Action {
+            width: 36px; height: 36px; icon: root.repeat-mode == "one" ? "repeat-one" : "repeat";
+            quiet: true; selected: root.repeat-mode == "one" || root.repeat-mode == "all";
+            enabled: root.modes-enabled;
+            accessible-label: "Repeat";
+            accessible-description: root.repeat-mode == "one" ? "Repeat track" : root.repeat-mode == "all" ? "Repeat queue" : "Off";
+            changed has-focus => { if self.has-focus { root.focused(); } }
+            clicked => { root.queue-action("repeat", ""); }
+        }
     }
 }
 
@@ -82,6 +116,41 @@ component Clock inherits Caption {
     property <int> remainder: mod(whole, 60);
     text: floor(whole / 60) + ":" + (remainder < 10 ? "0" : "") + remainder;
     font-family: "JetBrains Mono"; font-size: 11px; width: 41px; horizontal-alignment: center;
+}
+
+component VolumeSlider inherits Rectangle {
+    in property <float> level;
+    in property <bool> muted;
+    callback adjusted(float);
+    height: 38px;
+    changed level => { slider.value = root.level; }
+    slider := Slider {
+        y: 3px; width: parent.width; height: 26px;
+        minimum: 0; maximum: 100; step: 5;
+        value: root.level;
+        accessible-label: "Desktop volume";
+        accessible-description: root.muted ? "This app only · Muted" : "This app only";
+        accessible-action-increment => { root.adjusted(min(100, self.value + self.step)); }
+        accessible-action-decrement => { root.adjusted(max(0, self.value - self.step)); }
+        accessible-action-set-value(value) => { if value.is-float() { root.adjusted(clamp(value.to-float(), 0, 100)); } }
+        changed(value) => { root.adjusted(value); }
+    }
+    Rectangle {
+        y: slider.y; height: slider.height;
+        background: Theme.panel;
+        border-radius: 5px;
+        border-width: slider.has-focus ? 2px : 0px;
+        border-color: Theme.blue;
+        accessible-role: none;
+        Rectangle { x: 6px; y: (parent.height - 3px) / 2; width: parent.width - 12px; height: 3px; border-radius: 2px; background: Theme.line; }
+        Rectangle { x: 6px; y: (parent.height - 3px) / 2; width: (parent.width - 12px) * slider.value / 100; height: 3px; border-radius: 2px; background: root.muted ? Theme.muted : Theme.accent; }
+        Rectangle { x: 2px + (parent.width - 12px) * slider.value / 100; y: (parent.height - 9px) / 2; width: 9px; height: 9px; border-radius: 5px; background: root.muted ? Theme.muted : Theme.accent; }
+    }
+    Caption {
+        y: 26px; height: 12px;
+        text: "Desktop"; font-size: 10px * Theme.density; horizontal-alignment: center;
+        accessible-role: none;
+    }
 }
 
 export component PlayerBar inherits Rectangle {
@@ -97,6 +166,12 @@ export component PlayerBar inherits Rectangle {
     in property <bool> can-toggle;
     in property <bool> can-skip;
     in property <bool> offline;
+    in property <bool> layered;
+    in property <bool> shuffle;
+    in property <string> repeat-mode;
+    in property <bool> modes-enabled;
+    in property <float> volume;
+    in property <bool> muted;
     in property <string> page;
     in property <bool> queue-open;
     in property <[ArtistCredit]> credits;
@@ -109,23 +184,28 @@ export component PlayerBar inherits Rectangle {
     callback toggle();
     callback seek(float);
     callback navigate(string);
+    callback queue-action(string, string);
+    callback volume-change(float);
+    callback mute-toggle();
     public function focus-queue() { queue-trigger.take-focus(); }
-    property <bool> narrow: root.width < 760px;
-    property <length> pad: max(clamp(root.width * 0.04, 16px, 36px), (root.width - 1220px) / 2);
-    property <length> center-width: clamp(root.width * 0.36, 162px, 480px);
+    public function focus-lyrics() { lyrics-trigger.take-focus(); }
+    property <length> pad: max(clamp(root.width * 0.03, 14px, 34px), (root.width - 1220px) / 2);
+    property <length> center-width: root.layered ? min(root.width - 2 * root.pad, 480px) : clamp(root.width * 0.36, 214px, 480px);
+    property <length> top-height: root.layered ? (root.status == "" ? 58px : 72px) : root.height;
     vertical-stretch: 0; background: Theme.panel;
     Divider { y: 0px; }
-    Rectangle {
-        x: root.pad; width: max(0px, (root.width - root.center-width)/2 - root.pad - 10px);
-        height: root.height;
+    track-info := Rectangle {
+        x: root.pad; y: 0px;
+        width: max(0px, (root.layered ? output-tools.x : (root.width - root.center-width) / 2) - root.pad - 10px);
+        height: root.top-height;
         property <bool> show-cover: self.width >= 150px;
         Cover {
             visible: parent.show-cover;
-            x: 0px; width: root.narrow ? 40px : 48px; height: self.width;
+            x: 0px; width: root.layered ? 40px : 48px; height: self.width;
             y: (parent.height - self.height)/2; artwork: root.artwork;
         }
         VerticalLayout {
-            x: parent.show-cover ? (root.narrow ? 49px : 61px) : 0px;
+            x: parent.show-cover ? (root.layered ? 49px : 61px) : 0px;
             width: max(0px, parent.width - self.x); height: parent.height;
             alignment: center;
             TextTarget {
@@ -146,20 +226,48 @@ export component PlayerBar inherits Rectangle {
     }
     Rectangle {
         width: root.center-width; x: (root.width - self.width)/2;
-        Transport { x: (parent.width - self.width)/2; y: root.duration <= 0 ? (root.height - self.height)/2 : 7px;
-            playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip; previous => {root.previous();} toggle => {root.toggle();} next => {root.next();} }
-        if root.duration > 0: HorizontalLayout { y: 52px; height: 22px; spacing: 4px;
-            if root.width >= 540px: Clock { seconds: root.elapsed; }
+        y: root.layered ? root.top-height : 0px; height: root.height - self.y;
+        Transport {
+            x: (parent.width - self.width)/2;
+            y: root.duration <= 0 ? (parent.height - self.height)/2 : root.layered ? 0px : 7px;
+            playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip;
+            shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.modes-enabled;
+            previous => { root.previous(); } toggle => { root.toggle(); } next => { root.next(); }
+            queue-action(op, key) => { root.queue-action(op, key); }
+        }
+        if root.duration > 0: HorizontalLayout { y: root.layered ? 44px : 52px; height: 22px; spacing: 4px;
+            Clock { seconds: root.elapsed; }
             SeekBar { elapsed: root.elapsed; duration: root.duration; enabled: root.can-seek; horizontal-stretch: 1; seek(v) => { root.seek(v); } }
             Clock { seconds: root.duration; }
         }
     }
-    HorizontalLayout { x: root.width - self.width - root.pad; width: self.preferred-width; y: (root.height - self.height)/2; height: 38px; spacing: 6px;
+    output-tools := HorizontalLayout {
+        x: root.width - self.width - root.pad; width: self.preferred-width; y: (root.top-height - self.height)/2; height: 38px; spacing: 2px;
+        lyrics-trigger := Action {
+            width: 36px; icon: "lyrics"; quiet: true; accessible-label: "Lyrics";
+            clicked => { root.navigate("lyrics"); }
+        }
         queue-trigger := Action {
-            width: 37px; icon: "≡"; quiet: true; selected: root.queue-open || root.page == "queue";
+            width: 36px; icon: "≡"; quiet: true; selected: root.queue-open || root.page == "queue";
             accessible-label: "Play queue"; accessible-expanded: root.queue-open;
             clicked => { root.navigate("queue"); }
         }
-        Action { text: root.narrow ? "" : root.offline ? "This computer" : root.output; width: self.text == "" ? 37px : 154px; icon: "◫"; quiet: true; selected: root.page == "devices"; accessible-label: "Playback devices"; accessible-description: root.output; clicked => { root.navigate("devices"); } }
+        Action {
+            width: 36px; icon: "◫"; quiet: true; selected: root.page == "devices";
+            accessible-label: "Playback devices";
+            accessible-description: root.offline ? "This computer" : root.output != "" ? root.output : "No output selected";
+            clicked => { root.navigate("devices"); }
+        }
+        Action {
+            width: 36px; icon: root.muted || root.volume == 0 ? "volume-muted" : "volume";
+            quiet: true; selected: root.muted;
+            accessible-label: root.muted ? "Unmute desktop playback" : "Mute desktop playback";
+            clicked => { root.mute-toggle(); }
+        }
+        VolumeSlider {
+            width: root.layered ? 55px : clamp((root.width - 820px) / 3 + 62px, 62px, 90px);
+            level: root.volume * 100; muted: root.muted;
+            adjusted(value) => { root.volume-change(value / 100); }
+        }
     }
 }

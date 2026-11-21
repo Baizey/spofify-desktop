@@ -1,11 +1,13 @@
 """Pointer and layout contracts for the listening workspace's native window."""
 import json
 import re
+from time import sleep
 
 from fixture import Failure, check
 from native import (ALT, CONTROL, DOWN, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
                     RETURN, TRACK, bounds, element_id, element_type, wait)
-from wire_ui import ALBUM_NAME, ARTIST_NAME, GUEST_NAME, ID_ONLY_RELEASE, NAME_ONLY
+from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
+                     NAME_ONLY, SINGLE_TRACK, SUMMARY)
 
 
 QUEUE_TITLE = "Queue"
@@ -26,8 +28,8 @@ def open_manual(window):
 def manual_detail(window, timeout=10):
     window.title(PLAYLIST, timeout=timeout)
     wait("two distinct playlist occurrences", lambda: sum(
-        window.matches(element, f"Open {TRACK}") and element.get("accessibleRole") == "Button"
-        for element in window.elements()) >= 2, timeout=timeout)
+        window.matches(element, f"Play track: {TRACK}") and element.get("accessibleRole") == "Button"
+        for element in catalog_rows(window)) >= 2, timeout=timeout)
 
 
 def manual_options(window, *, capture=None):
@@ -84,7 +86,7 @@ def playlist_row_menu(window):
     window.find(f"Remove · {TRACK}", timeout=3, roles=("Button",))
     window.click(add)
     window.title("Add to playlist")
-    window.find(f"Open {PLAYLIST}", roles=("Button",))
+    window.find(f"Add to {PLAYLIST}", roles=("Button",))
     window.click("Back")
     window.title(PLAYLIST)
     window.absent(add, roles=("Button",))
@@ -186,8 +188,10 @@ def check_navigation(window):
 
 def search_results(window):
     window.title("Results")
-    for title in (ARTIST_NAME, ALBUM_NAME, TRACK):
+    for title in (ARTIST_NAME, ALBUM_NAME):
         window.find(f"Open {title}", roles=("Button",))
+    track_row(window)
+    window.absent(f"Open {TRACK}", roles=("Button",))
     field = window.find("Search tracks, albums or artists", roles=("TextInput",))
     check(field.get("accessibleValue") == "Synthetic", "Back did not restore the typed search query")
 
@@ -220,48 +224,143 @@ def containing_item(elements, name, target):
                  and bounds(e)[1] <= y < bottom <= bounds(e)[3]), None)
 
 
-def compact_track_row(window):
-    opening = window.find(f"Open {TRACK}", roles=("Button",))
-    row = containing_item(window.elements(), "MediaLine", opening)
-    check(row, "missing compact search-result row for track hit testing")
+def catalog_rows(window):
+    listing = element_id(window.elements(), "catalog-list")
+    check(listing, "missing catalog row list")
+    # Scope to this subtree even when the same track is playable in the queue.
+    # The large Go fixture may fill MCP's cap; callers check the fixture's
+    # first occurrences rather than treating the returned rows as exhaustive.
+    return window.mcp.value("get_element_tree", {
+        "elementHandle": listing["handle"], "maxElements": 1000})["elements"]
+
+
+def track_row(window, title=TRACK, occurrence=0):
+    def body():
+        catalog = catalog_rows(window)
+        matches = sorted((e for e in catalog if e.get("accessibleRole") == "Button"
+                          and window.matches(e, f"Play track: {re.escape(title)}")), key=lambda e: bounds(e)[1])
+        return (catalog, matches[occurrence]) if occurrence < len(matches) else None
+
+    catalog, target = wait(f"catalog track {title}, occurrence {occurrence + 1}", body)
+    row = containing_item(catalog, "MediaLine", target)
+    check(row, "missing rendered MediaLine for track hit testing")
     return row, window.subtree(row)
 
 
-def compact_track_face(window, region):
-    row, elements = compact_track_row(window)
-    # The accessible Open rectangle covers the whole row and its center can
-    # coincide with a credit. Target the rendered title or padding directly.
+def track_face(window, region="title", *, title=TRACK, occurrence=0, double=False):
+    row, elements = track_row(window, title, occurrence)
+    # The accessible row button covers the face; its center could coincide
+    # with an independent credit/control. Hit title or padding deliberately.
     words = element_id(elements, "words")
-    check(words, "missing compact track copy")
+    check(words, "missing track title layout")
     target = (element_type(window.subtree(words), "Text") if region == "title"
               else element_type(elements, "Divider"))
-    links = [e for e in elements if e.get("accessibleRole") == "Button"
-             and window.matches(e, r"Open (artist|album): .+")]
-    check(target and len(links) >= 2, f"missing compact track {region} or its independent metadata links")
-    point = window.pointer_position_for_click(f"compact track {region}", element=target)
-    check(inside(point, target) and inside(point, row) and not any(inside(point, e) for e in links),
-          f"compact track {region} press {point} landed on a metadata link or outside its row")
-    window.title(TRACK, timeout=3)
+    controls = [e for e in elements if e.get("accessibleRole") == "Button"
+                and not window.matches(e, r"Play track: .+")]
+    check(target, f"missing track {region} pointer target")
+    viewport = element_id(window.elements(), "catalog-scroll")
+    x, y, right, bottom = bounds(target)
+    check(viewport and inside(((x + right) / 2, (y + bottom) / 2), viewport), "track hit target is outside the catalog viewport")
+    point = window.pointer_position_for_click(f"track {region}", element=target, double=double)
+    check(inside(point, target) and inside(point, row) and not any(inside(point, e) for e in controls),
+          f"track {region} press {point} landed on a control or outside its row")
 
 
-def compact_track_targets(window):
-    compact_track_face(window, "bottom padding")
-    window.click("Back")
+def search_track_targets(window, width, capture, *, check_padding):
+    track_face(window)
     search_results(window)
-    for link, verify_destination in (
-        (f"Open artist: {ARTIST_NAME}", lambda: artist(window, ARTIST_NAME)),
-        (f"Open album: {ALBUM_NAME}", lambda: window.title(ALBUM_NAME, timeout=3)),
-    ):
-        row, elements = compact_track_row(window)
-        target = next((e for e in elements if e.get("accessibleRole") == "Button" and window.matches(e, re.escape(link))), None)
-        check(target, f"missing compact track row link {link}")
+    if check_padding:
+        track_face(window, "bottom padding")
+        search_results(window)
+    for name in ((ARTIST_NAME, ALBUM_NAME) if check_padding else (ARTIST_NAME, GUEST_NAME, ALBUM_NAME)):
+        is_album = name == ALBUM_NAME
+        link = f"Open {'album' if is_album else 'artist'}: {name}"
+        row, elements = track_row(window)
+        target = next((e for e in elements if e.get("accessibleRole") == "Button"
+                       and window.matches(e, re.escape(link))), None)
+        check(target, f"missing search track link {link}")
         point = window.pointer_position_for_click(link, element=target)
-        check(inside(point, target) and inside(point, row), f"{link} press {point} did not hit the compact row link")
-        verify_destination()
+        check(inside(point, target) and inside(point, row), f"{link} press did not hit the track row link")
+        if is_album:
+            window.title(ALBUM_NAME)
+            window.find(f"Play track: {TRACK}", roles=("Button",))
+            qualified_credits(window)
+            if capture:
+                window.pixels(f"album-{width}", width)
+            window.click(f"Open artist: {ARTIST_NAME}")
+            artist(window, ARTIST_NAME)
+            window.click("Back")
+            window.title(ALBUM_NAME)
+        else:
+            artist(window, name)
         window.click("Back")
         search_results(window)
-    compact_track_face(window, "title")
-    print("PASS compact track title and padding open the track; in-row artist and album links open their own destinations",
+    print("PASS search track title/padding stay on Results; in-row artist and album links open only their destinations",
+          flush=True)
+
+
+def track_play_and_highlight(window, play_requests):
+    # The synthetic peer observes commands and publishes a paused cursor from
+    # those selections; it does not resolve media or execute playback.
+    open_manual(window)
+    check(not play_requests(), "browsing, credits, or overflow sent an unexpected Play")
+    track_face(window, occurrence=1)
+    sleep(0.6)  # Drain any accidental async Play and end the single-click sequence.
+    window.title(PLAYLIST)
+    check(not play_requests(), "single track click sent Play")
+
+    entry = ENTRIES[1]
+    selected = dict(kind="track", track=dict(id=entry["track"]["id"], entryId=entry["id"]),
+                    context=dict(kind="playlist", id=SUMMARY["id"], name=PLAYLIST))
+    expected = []
+
+    def expect(selection):
+        expected.append(selection)
+        check(wait("native Play request", lambda: play_requests() if len(play_requests()) >= len(expected) else None)
+              == expected, "native activation sent duplicate or wrong occurrence Play")
+
+    track_face(window, occurrence=1, double=True)
+    expect(selected)
+    window.title(PLAYLIST)
+    _, elements = track_row(window, occurrence=1)
+    explicit = next((e for e in elements if window.matches(e, f"Play {TRACK}")), None)
+    check(explicit, "missing explicit track Play button")
+    window.click_element(explicit)
+    expect(selected)
+    sleep(0.6)
+    _, elements = track_row(window, occurrence=1)
+    explicit = next((e for e in elements if window.matches(e, f"Play {TRACK}")), None)
+    check(explicit, "missing explicit track Play button after selection")
+    window.pointer_position_for_click("explicit track Play", element=explicit, double=True)
+    expect(selected)
+    track_face(window, occurrence=1)
+    window.key(RETURN)  # Only the focused row face can send this exact entry.
+    expect(selected)
+    window.title(PLAYLIST)
+
+    window.fill("Search tracks, albums or artists", "Synthetic")
+    search_results(window)
+    first = f"Play track: {TRACK}"
+    other = f"Play track: {re.escape(SINGLE_TRACK['name'])}"
+
+    def state(pattern, description):
+        return next((e for e in catalog_rows(window) if window.matches(e, pattern)
+                     and (e.get("accessibleDescription") or "") == description), None)
+
+    a = wait("first current recording in the new catalog", lambda: state(first, "Current track"))
+    b = wait("other track without a marker", lambda: state(other, ""))
+    _, elements = track_row(window, title=SINGLE_TRACK["name"])
+    explicit = next((e for e in elements if window.matches(e, f"Play {re.escape(SINGLE_TRACK['name'])}")), None)
+    check(explicit, "missing other recording's Play button")
+    window.click_element(explicit)
+    expect(dict(kind="track", track=dict(id=SINGLE_TRACK["id"])))
+    a_after = wait("old current track clears", lambda: state(first, ""))
+    b_after = wait("current marker moves to the new recording", lambda: state(other, "Current track"))
+    check(bounds(a) == bounds(a_after) and bounds(b) == bounds(b_after), "highlight moved track hit targets")
+    search_results(window)
+    sleep(0.6)
+    check(play_requests() == expected, "a gesture or metadata link sent more than one Play")
+    print("PASS single click focuses; face double-click, explicit Play (including double-click) and Return select the same occurrence once; highlight follows recording ID",
           flush=True)
 
 
@@ -290,34 +389,11 @@ def typed_catalog(window, width, *, capture=False, via_shortcut=False, check_com
 
     window.click(f"Open {ALBUM_NAME}")
     window.title(ALBUM_NAME)
-    window.find(f"Open {TRACK}", roles=("Button",))
+    window.find(f"Play track: {TRACK}", roles=("Button",))
     window.click("Back")
     search_results(window)
 
-    if check_compact_targets:
-        compact_track_targets(window)
-    else:
-        window.click(f"Open {TRACK}")
-    window.title(TRACK)
-    qualified_credits(window)
-    window.click(f"Open artist: {GUEST_NAME}")
-    artist(window, GUEST_NAME)
-    window.click("Back")
-    window.title(TRACK)
-    window.click(f"Open album: {ALBUM_NAME}")
-    window.title(ALBUM_NAME)
-    window.find(f"Open {TRACK}", roles=("Button",))
-    qualified_credits(window)
-    if capture:
-        window.pixels(f"album-{width}", width)
-    window.click(f"Open artist: {ARTIST_NAME}")
-    artist(window, ARTIST_NAME)
-    window.click("Back")
-    window.title(ALBUM_NAME)
-    window.click("Back")
-    window.title(TRACK)
-    window.click("Back")
-    search_results(window)
+    search_track_targets(window, width, capture, check_padding=check_compact_targets)
     open_playlists(window)
     window.absent("Back", roles=("Button",))
     print(f"PASS at {width}px: typed search, ID-only release, named credit routes and Back", flush=True)
@@ -507,13 +583,6 @@ def playlist_overflow(window):
     window.absent(f"Add to queue · {PLAYLIST}", roles=("Button",))
     print(f"PASS {window.dimensions()[0]:g}px playlist row overflow opens its menu without opening or playing the playlist",
           flush=True)
-
-
-def playlist_play(window):
-    _, play, overflow = playlist_hit_targets(window)
-    check(play.get("accessibleEnabled", True), "playlist row Play is disabled")
-    point = window.pointer_position_for_click("playlist Play", element=play)
-    check(inside(point, play) and not inside(point, overflow), "playlist Play press hit the overflow target")
 
 
 def empty_devices(window, restore, *, wide, observer=False, capture=None):

@@ -15,12 +15,15 @@ component PlayerTime inherits Caption {
 // In the split view lyrics scroll independently; in the stack they run down the page.
 component LyricsReader inherits Rectangle {
     in property <string> lyrics;
+    in property <string> status;
     in property <string> track-id;
     in property <bool> split;
     in property <length> reading-height;
     in property <bool> active;
     callback move-page(string);
     callback reveal();
+    out property <bool> has-reading-focus: reading-focus.has-focus;
+    public function take-focus() { reading-focus.focus(); }
 
     property <length> inset: root.split ? 28px : 0px;
     property <length> heading-height: root.split ? 52px : 46px;
@@ -46,15 +49,16 @@ component LyricsReader inherits Rectangle {
     if root.lyrics == "": Caption {
         x: root.inset; y: root.heading-height;
         width: parent.width - self.x;
-        text: "No lyrics to show for this track.";
+        text: root.status;
         font-size: 14px * Theme.density;
         wrap: word-wrap;
+        accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
     }
     reading-focus := FocusScope {
-        x: root.inset; y: root.heading-height;
-        width: parent.width - self.x; height: parent.height - self.y;
-        visible: root.lyrics != "";
-        enabled: root.active && root.lyrics != "" && (!root.split || root.overflow);
+        x: root.inset; y: 0px;
+        width: parent.width - self.x; height: parent.height;
+        enabled: root.active;
+        accessible-role: groupbox; accessible-label: "Lyrics";
         focus-on-click: false;
         changed has-focus => { if self.has-focus { root.reveal(); } }
         key-pressed(event) => {
@@ -65,15 +69,18 @@ component LyricsReader inherits Rectangle {
                 : event.text == Key.PageUp ? max(32px, reader.visible-height - 28px)
                 : event.text == Key.PageDown ? -max(32px, reader.visible-height - 28px) : 0px;
             if root.split {
-                reader.content-y = event.text == Key.Home ? 0px : event.text == Key.End ? reader.visible-height - reader.content-height
-                    : clamp(reader.content-y + step, reader.visible-height - reader.content-height, 0px);
+                if !root.overflow { return reject; }
+                let end = min(0px, reader.visible-height - reader.content-height);
+                reader.content-y = event.text == Key.Home ? 0px : event.text == Key.End ? end
+                    : clamp(reader.content-y + step, end, 0px);
             } else {
                 root.move-page(event.text);
             }
             return accept;
         }
         reader := ScrollView {
-            width: parent.width; height: parent.height;
+            y: root.heading-height; width: parent.width; height: parent.height - self.y;
+            visible: root.lyrics != "";
             horizontal-scrollbar-policy: always-off;
             vertical-scrollbar-policy: root.split ? as-needed : always-off;
             content-width: self.visible-width;
@@ -90,6 +97,7 @@ component LyricsReader inherits Rectangle {
             }
         }
         if reading-focus.has-focus: Rectangle {
+            x: -5px; y: root.split ? 0px : 9px; width: parent.width + 5px; height: 35px;
             border-width: 2px; border-color: Theme.blue; border-radius: 5px;
         }
     }
@@ -108,6 +116,8 @@ export component NowPlaying inherits Rectangle {
     in property <string> context-name;
     in property <image> artwork;
     in property <string> lyrics-text;
+    in property <string> lyrics-status;
+    in property <bool> offline;
     in property <[float]> waveform;
     in property <float> elapsed;
     in property <float> duration;
@@ -152,11 +162,27 @@ export component NowPlaying inherits Rectangle {
     property <bool> show-album: root.link-album || root.album-label != "";
     property <bool> show-context: root.metadata-interactive && root.has-context && !root.context-is-album;
     property <string> album-label: root.album-name != "" ? root.album-name : root.context-is-album ? root.context-name : "";
-    property <bool> repeats: root.repeat-mode == "one" || root.repeat-mode == "all";
+    public function focus-lyrics() {
+        lyrics.take-focus();
+        root.align-lyrics();
+    }
 
-    changed track-id => { scroll.content-y = 0px; }
-    changed split => { scroll.content-y = 0px; }
+    changed track-id => { root.reset-position(); }
+    changed split => { root.reset-position(); }
+    changed lyrics-text => {
+        // If the icon opened a loading reader, begin at the heading when
+        // the verses expand it, but don't move users who have left the reader.
+        if lyrics.has-reading-focus { root.align-lyrics(); }
+    }
 
+    function align-lyrics() {
+        if !root.split { root.scroll-to(12px - stage.y - lyrics.y); }
+        else { root.reveal(stage.y + lyrics.y, min(92px, scroll.visible-height)); }
+    }
+    function reset-position() {
+        scroll.content-y = 0px;
+        if root.has-track && lyrics.has-reading-focus { root.align-lyrics(); }
+    }
     function scroll-to(y: length) {
         scroll.content-y = clamp(y, scroll.visible-height - scroll.content-height, 0px);
     }
@@ -243,39 +269,15 @@ export component NowPlaying inherits Rectangle {
                 }
                 Rectangle { height: root.short ? 3px : 9px; }
                 playback-row := HorizontalLayout {
-                    height: 44px; spacing: 4px;
-                    Rectangle {
-                        min-width: 0px; horizontal-stretch: 1;
-                        Action {
-                            x: (parent.width - self.width) / 2; y: 5px;
-                            width: min(104px, parent.width); min-width: 0px; height: 34px;
-                            text: root.shuffle ? "Shuffle on" : "Shuffle";
-                            accessible-label: "Shuffle"; accessible-description: root.shuffle ? "On" : "Off";
-                            quiet: true; selected: root.shuffle;
-                            enabled: root.has-track && root.can-change-modes;
-                            changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + playback-row.y, playback-row.height); } }
-                            clicked => { root.queue-action("shuffle", ""); }
-                        }
-                    }
+                    height: 44px; alignment: center;
                     Transport {
                         playing: root.playing; available: root.has-track && root.can-toggle; skip-enabled: root.has-track && root.can-skip;
+                        shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.has-track && root.can-change-modes;
                         previous => { root.previous(); }
                         toggle => { root.toggle(); }
                         next => { root.next(); }
-                    }
-                    Rectangle {
-                        min-width: 0px; horizontal-stretch: 1;
-                        Action {
-                            x: (parent.width - self.width) / 2; y: 5px;
-                            width: min(104px, parent.width); min-width: 0px; height: 34px;
-                            text: root.repeat-mode == "one" ? "Repeat 1" : root.repeat-mode == "all" ? "Repeat all" : "Repeat";
-                            accessible-label: "Repeat";
-                            accessible-description: root.repeat-mode == "one" ? "Repeat track" : root.repeat-mode == "all" ? "Repeat queue" : "Off";
-                            quiet: true; selected: root.repeats;
-                            enabled: root.has-track && root.can-change-modes;
-                            changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + playback-row.y, playback-row.height); } }
-                            clicked => { root.queue-action("repeat", ""); }
-                        }
+                        focused => { root.reveal(stage.y + deck.y + playback-row.y, playback-row.height); }
+                        queue-action(op, key) => { root.queue-action(op, key); }
                     }
                 }
                 if root.show-album || root.show-context: Rectangle { height: root.short ? 4px : 11px; }
@@ -316,8 +318,9 @@ export component NowPlaying inherits Rectangle {
                 height: self.preferred-height;
                 reading-height: max(142px, scroll.visible-height - stage.y - self.y - 78px);
                 split: root.split; active: root.has-track;
-                track-id: root.track-id; lyrics: root.lyrics-text;
-                reveal => { root.reveal(stage.y + self.y, root.split ? min(self.height, scroll.visible-height - 30px) : 76px); }
+                track-id: root.track-id; lyrics: root.offline ? "" : root.lyrics-text;
+                status: root.offline ? "Lyrics unavailable offline." : root.lyrics-status != "" ? root.lyrics-status : "Loading lyrics…";
+                reveal => { root.reveal(stage.y + self.y, root.split ? min(self.height, scroll.visible-height - 30px) : 92px); }
                 move-page(key) => {
                     let page = max(32px, scroll.visible-height - 32px);
                     let step = key == Key.UpArrow ? 28px : key == Key.DownArrow ? -28px : key == Key.PageUp ? page : -page;

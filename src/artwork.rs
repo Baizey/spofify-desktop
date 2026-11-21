@@ -117,24 +117,26 @@ impl Key {
         match route {
             Route::Album(id) => Self::new(CatalogKind::Album, id),
             Route::Artist(id) => Self::new(CatalogKind::Artist, id),
-            Route::Track(id) => Self::new(CatalogKind::Track, id),
             _ => None,
         }
     }
 
     fn for_row(row: &Row) -> Option<Self> {
-        // History and playlist occurrences retain a Track route, while their
-        // RowKey names the occurrence, not the entity. Missing history metadata
-        // has no track route. Never derive a target from kind/title/display text.
-        row.route
-            .as_ref()
-            .and_then(Self::for_route)
-            .or_else(|| match &row.key {
-                RowKey::Album(id) => Self::new(CatalogKind::Album, id),
-                RowKey::Artist(id) => Self::new(CatalogKind::Artist, id),
-                RowKey::Track(id) => Self::new(CatalogKind::Track, id),
-                _ => None,
-            })
+        match &row.key {
+            RowKey::Album(id) => Self::new(CatalogKind::Album, id),
+            RowKey::Artist(id) => Self::new(CatalogKind::Artist, id),
+            RowKey::Track(id) => Self::new(CatalogKind::Track, id),
+            // The row key identifies a playback occurrence, not its recording.
+            // Unavailable history entries have no recording ID.
+            RowKey::HistoryEvent(_)
+            | RowKey::ManualEntry { .. }
+            | RowKey::DerivedOccurrence { .. }
+                if crate::api::catalog::segment_id(&row.id) =>
+            {
+                Self::new(CatalogKind::Track, &row.id)
+            }
+            _ => None,
+        }
     }
 
     fn new(kind: CatalogKind, id: &str) -> Option<Self> {
@@ -577,14 +579,13 @@ mod tests {
                 ..Row::default()
             },
             Row {
-                route: Some(Route::Track("track/id".into())),
+                id: "track%2Fid".into(),
                 key: RowKey::HistoryEvent("event".into()),
                 ..Row::default()
             },
             Row {
                 kind: "track".into(),
                 title: "Not an ID".into(),
-                id: "not-a-target".into(),
                 key: RowKey::HistoryEvent("metadata-missing".into()),
                 ..Row::default()
             },
@@ -599,7 +600,7 @@ mod tests {
         let [album, artist, track] = targets.keys().try_into().unwrap();
         assert_eq!(album, Key(CatalogKind::Album, "shared".into()));
         assert_eq!(artist, Key(CatalogKind::Artist, "shared".into()));
-        assert_eq!(track, Key(CatalogKind::Track, "track/id".into()));
+        assert_eq!(track, Key(CatalogKind::Track, "track%2Fid".into()));
         assert!(targets.rows[3..].iter().all(Option::is_none));
         let mut frame = Frame {
             rows: vec![None; WINDOW],
@@ -761,10 +762,10 @@ mod tests {
         let a = access(1);
         let session = a.session.clone();
         let (access_tx, access_rx) = watch::channel(Some(a));
-        let for_track = |epoch, generation, id: &str| {
-            request(epoch, generation, Route::Track(id.into()), vec![])
+        let for_album = |epoch, generation, id: &str| {
+            request(epoch, generation, Route::Album(id.into()), vec![])
         };
-        let (tx, rx) = watch::channel(Some(for_track(1, 1, "stalled-old")));
+        let (tx, rx) = watch::channel(Some(for_album(1, 1, "stalled-old")));
         let (fetch_tx, mut fetch_rx) = mpsc::unbounded_channel();
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let drive = run(
@@ -792,7 +793,7 @@ mod tests {
                 panic!("missing initial frame")
             };
             assert!(old.current(&access_rx, &rx));
-            tx.send_replace(Some(for_track(1, 2, "stalled-current")));
+            tx.send_replace(Some(for_album(1, 2, "stalled-current")));
             assert!(!old.current(&access_rx, &rx));
             assert_eq!(
                 fetch_rx.recv().await,
@@ -811,7 +812,7 @@ mod tests {
                 fetch_rx.recv().await,
                 Some(FetchEvent::Cancel("stalled-current".into()))
             );
-            tx.send_replace(Some(for_track(1, 3, "cover")));
+            tx.send_replace(Some(for_album(1, 3, "cover")));
             loop {
                 if let Some(Update::Show(frame)) = updates_rx.recv().await
                     && frame.request.generation == 3
@@ -836,7 +837,7 @@ mod tests {
             assert!(delivered.current(&access_rx, &rx));
             access_tx.send_replace(Some(access(2)));
             assert!(!delivered.current(&access_rx, &rx));
-            tx.send_replace(Some(for_track(2, 4, "cover")));
+            tx.send_replace(Some(for_album(2, 4, "cover")));
             assert_eq!(
                 fetch_rx.recv().await,
                 Some(FetchEvent::Start("cover".into()))

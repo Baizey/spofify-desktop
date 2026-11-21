@@ -23,7 +23,7 @@ from time import monotonic, sleep
 sys.dont_write_bytecode = True
 from audio_smoke_wire import audio_fixture, SECONDS, TITLE, TRACK_ID
 from fixture import Failure, check, private_env
-from native import COMPACT, WIDE, desktop, verify, wait
+from native import COMPACT, WIDE, assert_dock_layout, bounds, desktop, element_type, verify, wait
 
 
 @contextmanager
@@ -152,6 +152,54 @@ def admission(admitted, requests, label):
     return peer
 
 
+def check_mini_player(win, peer, cursor, pcm):
+    def control(label, description=None, role="Button"):
+        def find():
+            dock = element_type(win.elements(), "PlayerBar")
+            return dock and next((e for e in win.subtree(dock) if win.matches(e, label) and
+                                  e.get("accessibleRole") == role and
+                                  (description is None or e.get("accessibleDescription") == description)), None)
+        return wait("dock " + label, find, 3)
+
+    win.click_element(control("Shuffle", "Off"))
+    peer.mode("shuffle", True, cursor)
+    win.click_element(control("Shuffle", "On"))
+    peer.mode("shuffle", False, cursor)
+    for before, value in (("Off", "all"), ("Repeat queue", "one"), ("Repeat track", "off")):
+        win.click_element(control("Repeat", before))
+        peer.mode("repeat", value, cursor)
+    control("Repeat", "Off")
+    control("Playback devices", peer.hello["name"])
+
+    def peak():
+        return max(map(abs, pcm_tail(pcm)), default=0)
+
+    full = wait("unscaled PCM on private monitor", lambda: peak() if peak() > 2500 else 0, 2)
+    slider = control("Desktop volume", role="Slider")
+    x, y, right, bottom = bounds(slider)
+    win.mcp.call("drag_element", {"elementHandle": slider["handle"],
+        "target": {"x": x + (right - x) / 4, "y": (y + bottom) / 2}})
+    wait("desktop volume reduces local PCM", lambda: full * 0.13 < peak() < full * 0.42, 2)
+    win.click_element(control("Mute desktop playback"))
+    silence(pcm, "volume mute during playback")
+    win.click_element(control("Unmute desktop playback"))
+    wait("unmute restores the reduced gain", lambda: full * 0.13 < peak() < full * 0.42, 2)
+    win.click_element(control("Desktop volume", role="Slider"))
+    win.key("\uf72b")  # Slint Key.End
+    wait("keyboard volume End restores full gain", lambda: peak() >= full * 0.9, 2)
+    peer.fact(cursor, lambda m: m["playing"], "same playback run after local volume changes")
+    print("PASS repeat modes and shuffle through the selected account; app-only PCM attenuation, mute, and keyboard restore", flush=True)
+
+    win.click_element(control("Playback devices"))
+    win.title("Devices")
+    win.click("Back")
+    win.click_element(control("Lyrics"))
+    win.find(r"Fixture verse[\s\S]*", roles=("Text",))
+    win.click("Back")
+    control("Lyrics")
+    print("PASS dock opens the existing device selector and server-backed Lyrics in Now Playing", flush=True)
+
+
 def run(win, ready, admitted, media, requests, pcm):
     win.fill("Server( origin| URL| address)?", ready["origin"])
     win.fill("Username", ready["username"])
@@ -163,7 +211,7 @@ def run(win, ready, admitted, media, requests, pcm):
     win.section("History")
     print("PASS Slint sign-in; account v1 upgrade, one-use ticket, selected output and presence/grant", flush=True)
     win.fill("Search tracks, albums or artists", TITLE)
-    win.find("Open " + TITLE)
+    win.find("Play " + TITLE)
 
     def play():
         win.click("Play " + TITLE)
@@ -205,10 +253,13 @@ def run(win, ready, admitted, media, requests, pcm):
     wait("PCM from resumed position", lambda: heard_tone(pcm, hz=marker, start=baseline), 3)
     print("PASS canonical Pause, silent monitor, no advancing fact, and Resume from observed position", flush=True)
 
+    check_mini_player(win, peer, active, pcm)
     failures = []
     for label, mode, forward in (("wide", WIDE, 0.60), ("compact", COMPACT, 0.65)):
         if mode == COMPACT:  # Cage already starts in WIDE.
             win.resize(mode)
+        assert_dock_layout(win, "Now playing: " + TITLE)
+        win.pixels("player-controls-" + label, mode[0])
         for direction, fraction, marker in (("forward", forward, 600), ("backward", 0.25, 360)):
             peer.ping(f"before-{label}-{direction}-seek")
             with verify(failures, f"{label} dock {direction} pointer seek"):

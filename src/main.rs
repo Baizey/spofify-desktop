@@ -71,7 +71,9 @@ fn clear(ui: &AppWindow) {
     ui.set_now_credits(Default::default());
     ui.set_cover_art(Default::default());
     ui.set_waveform(Default::default());
-    ui.set_lyrics_text("".into());
+    ui.set_lyrics_track_id(Default::default());
+    ui.set_lyrics_text(Default::default());
+    ui.set_lyrics_status(Default::default());
     ui.set_now_title("Nothing playing".into());
     ui.set_now_detail("".into());
     ui.set_playing(false);
@@ -113,7 +115,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let (auth_tx, auth_rx) = mpsc::unbounded_channel();
     ui.set_busy(true);
     ui.set_restoring_login(true);
-    let crossfade = preferences::install_playback(&ui);
+    let (master_gain, _volume_writer) = preferences::install_local_volume(&ui);
+    let output = engine::OutputPreferences {
+        crossfade_enabled: preferences::install_playback(&ui),
+        master_gain,
+    };
     let (tx, worker) = engine::start(
         ui.as_weak(),
         epoch.clone(),
@@ -121,7 +127,7 @@ fn main() -> Result<(), slint::PlatformError> {
         mode.clone(),
         auth_rx,
         auth_tx.clone(),
-        crossfade,
+        output,
     );
     let (art, pages) = watch::channel(None);
     let _covers = artwork::install(&ui, access.clone(), pages);
