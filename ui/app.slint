@@ -995,6 +995,10 @@ export component AppWindow inherits Window {
                             }
                             catalog-results := VerticalLayout {
                                 visible: catalog-scroll.catalog-results-route && root.browse-rows.length > 0;
+                                accessible-role: list;
+                                accessible-label: root.catalog-title;
+                                accessible-item-count: root.browse-rows.length;
+                                accessible-orientation: vertical;
                                 spacing: 2px;
                                 // Layout slots give the one scroll surface exact geometry. Only
                                 // mount rich row controls around the viewport and keyboard focus.
