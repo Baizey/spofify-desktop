@@ -504,7 +504,7 @@ export component AppWindow inherits Window {
                                     padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;
                                     Hero {
                                         title: root.is-settings ? "Settings" : root.catalog-title;
-                                        subtitle: root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
+                                        subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
                                         section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : root.page-kind == "track" ? "TRACK" : root.is-playlist ? "PLAYLIST" : "";
                                         glyph: Copy.mark(root.page-kind); tint: detail-hero.tint;
                                         artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
@@ -562,7 +562,7 @@ export component AppWindow inherits Window {
                                 sign-out => { root.sign-out(); } toggle-offline => { root.flip-offline(); }
                                 appearance(mode, scale) => { root.appearance-changed(mode, scale, root.appearance-accent); }
                                 select-palette(id) => { root.palette-selected(id); } reset => { root.reset-appearance(); }
-                                focused(y, h) => { catalog-scroll.reveal(catalog.y + self.y + y - self.absolute-position.y, h); }
+                                focused(y, h) => { catalog-scroll.reveal(catalog.y + self.y + y, h); }
                             }
                             if root.page-kind == "devices" && root.device-rows.length > 0 && root.device-status != "": Notice { text: root.device-status; }
                             if root.page-kind == "devices" && root.device-rows.length == 0: EmptyState {
