@@ -11,6 +11,7 @@ component CreditName inherits Rectangle {
     out property <length> text-width: label.preferred-width;
     callback activated(string);
     callback focused();
+    callback keyboard-focus-changed(bool);
 
     property <bool> linked: root.interactive && root.credit.id != "";
     if root.linked: Rectangle {
@@ -37,7 +38,13 @@ component CreditName inherits Rectangle {
             focus-on-click: false;
             property <int> resume: root.focus-serial;
             changed resume => { if self.resume != 0 { self.focus(); } }
-            focus-gained(_) => { root.focused(); }
+            focus-gained(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(true); }
+                root.focused();
+            }
+            focus-lost(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(false); }
+            }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == Key.Space {
                     if !event.repeat { root.activated(root.credit.id); }
@@ -80,6 +87,7 @@ export component CreditLine inherits Rectangle {
     callback background-double-clicked();
     callback activated(string /* id */);
     callback focused();
+    callback keyboard-focus-changed(bool);
 
     min-width: 0px;
     horizontal-stretch: 1;
@@ -142,6 +150,7 @@ export component CreditLine inherits Rectangle {
                     credit: credit; interactive: root.interactive; font-size: root.font-size;
                     restore-focus: root.restore-control == "artist:" + credit.id;
                     focus-serial: root.focus-credit != "" && root.focus-credit == credit.id ? root.focus-serial : 0;
+                    keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns); }
                     activated(id) => { root.activated(id); }
                     focused => {
                         let start = strip.x + slot.x;

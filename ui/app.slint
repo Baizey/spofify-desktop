@@ -409,6 +409,7 @@ export component AppWindow inherits Window {
             self.restoring-key = "";
             self.restoring-row = -1;
             catalog-list.focused-row = -1;
+            catalog-list.focus-owner = -1;
             catalog-list.focus-request = -1;
             catalog-scroll.set-scroll(0px);
             if self.returning {
@@ -863,17 +864,33 @@ export component AppWindow inherits Window {
                                 } : { start: 0, end: 0 };
                                 changed mount-range => {
                                     let range = self.mount-range;
-                                    if root.playlist-detail && catalog-scroll.visible && self.focus-request < 0 && self.focused-body >= 0
-                                        && (self.focused-body < range.start || self.focused-body >= range.end) {
-                                        // A wheel/scrollbar jump can evict the focused delegate. Keep keyboard
-                                        // input on this surface, without moving a focus held by another pane.
-                                        self.focus();
-                                        self.focused-row = -1;
+                                    let owner = self.focus-owner;
+                                    if owner >= 0 && (owner < range.start || owner >= range.end) {
+                                        self.focus-owner = -1;
+                                        // Handoff before removing the row. focused-row is just a
+                                        // navigation anchor, not evidence of live control focus.
+                                        let body-survives = self.focus-owner-on-body && owner < root.browse-rows.length
+                                            && root.browse-rows[owner].kind == "track";
+                                        if self.focus-owner-page == catalog-scroll.scroll-key
+                                            && (self.focus-owner-on-body ? body-survives : self.focus-owner-context == self.focus-context)
+                                            && root.playlist-detail && history-pane.visible && catalog-scroll.visible && self.focus-request < 0 {
+                                            self.focus();
+                                            self.focused-row = -1;
+                                        }
                                     }
                                     root.playlist-viewport-changed(range.start, range.end);
                                 }
                                 property <int> focused-row: -1;
-                                property <int> focused-body: -1;
+                                property <int> focus-owner: -1;
+                                property <bool> focus-owner-on-body;
+                                property <string> focus-owner-page;
+                                // The row body stays mounted on a refresh. Conditional controls
+                                // can disappear without FocusOut when the model or mode changes.
+                                property <string> focus-context: root.browse-model-key + (root.local-mode ? "|local" : "|online");
+                                property <string> focus-owner-context;
+                                changed focus-context => {
+                                    if !self.focus-owner-on-body && self.focus-owner-context != self.focus-context { self.focus-owner = -1; }
+                                }
                                 property <int> focus-request: -1;
                                 property <string> focus-control;
                                 function focus-row(index: int, reveal: bool, control: string) {
@@ -930,9 +947,13 @@ export component AppWindow inherits Window {
                                             interval: 16ms; running: row.focus-requested && row.restore-control != "";
                                             triggered => { row.take-row-focus(); catalog-list.focus-request = -1; }
                                         }
-                                        changed body-focused => {
-                                            if self.body-focused { catalog-list.focused-body = i; }
-                                            else if catalog-list.focused-body == i { catalog-list.focused-body = -1; }
+                                        keyboard-focus-changed(owns, body) => {
+                                            if owns {
+                                                catalog-list.focus-owner = i;
+                                                catalog-list.focus-owner-on-body = body;
+                                                catalog-list.focus-owner-page = catalog-scroll.scroll-key;
+                                                catalog-list.focus-owner-context = catalog-list.focus-context;
+                                            } else if catalog-list.focus-owner == i { catalog-list.focus-owner = -1; }
                                         }
                                         focused => {
                                             catalog-list.focused-row = i;

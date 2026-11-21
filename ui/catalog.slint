@@ -145,7 +145,6 @@ export component MediaLine inherits Rectangle {
     in property <bool> can-open;
     in property <bool> selectable;
     in property <bool> playlist-track-row;
-    out property <bool> body-focused: row-keys.has-focus;
     in property <string> restore-control;
     in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
@@ -170,6 +169,7 @@ export component MediaLine inherits Rectangle {
     callback page-action(string, string);
     callback action(string);
     callback focused();
+    callback keyboard-focus-changed(bool /* owns */, bool /* body */);
     property <string> result-type: !search-result ? ""
         : kind == "artist" ? "Artist" : kind == "album" ? "Album" : kind == "track" ? "Track" : "";
     min-width: 0px;
@@ -242,7 +242,13 @@ export component MediaLine inherits Rectangle {
             enabled: root.body-focusable;
             focus-on-click: false;
             focus-on-tab-navigation: root.body-actionable || root.playlist-track-row;
-            focus-gained(_) => { root.focused(); }
+            focus-gained(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(true, true); }
+                root.focused();
+            }
+            focus-lost(reason) => {
+                if reason != FocusReason.window-activation { root.keyboard-focus-changed(false, true); }
+            }
             key-pressed(event) => {
                 if root.body-actionable && (event.text == Key.Return || event.text == Key.Space) {
                     if !event.repeat { root.activate-row(); }
@@ -337,6 +343,7 @@ export component MediaLine inherits Rectangle {
                         background-double-clicked => { root.double-click-row(); }
                         activated(id) => { root.page-action("artist", id); }
                         focused => { root.focused(); }
+                        keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                     }
                 }
                 if root.album-name != "": AlbumLine {
@@ -346,6 +353,7 @@ export component MediaLine inherits Rectangle {
                     focus-serial: root.resume-part == "album" ? root.resume-serial : 0;
                     activated => { root.page-action("album", root.album-id); }
                     focused => { root.focused(); }
+                    keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                 }
             }
             // Queue text stays on the same edge even as the current cover loads.
@@ -374,6 +382,7 @@ export component MediaLine inherits Rectangle {
                     accessible-description: root.track-state-label;
                     single-pointer-activation: true; click-scope: root.menu-key;
                     changed has-focus => { if self.has-focus { root.focused(); } }
+                    keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                     clicked => { root.action("play"); }
                 }
             }
@@ -386,6 +395,7 @@ export component MediaLine inherits Rectangle {
                     restore-focus: root.restore-control == "menu";
                     property <int> resume: root.resume-part == "menu" ? root.resume-serial : 0;
                     changed resume => { if self.resume != 0 { self.take-focus(); } }
+                    trigger-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                     action(op) => { root.action(op); }
                     focused => { root.focused(); }
                 }
