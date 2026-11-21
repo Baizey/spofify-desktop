@@ -445,10 +445,11 @@ impl AudioBody {
     }
 
     pub(crate) fn live(&self) -> Result<(), ApiError> {
+        self.session.lifetime().check_live()?;
         if *self.changes.borrow() != self.generation {
             return Err(OFFLINE);
         }
-        self.session.lifetime().check_live()
+        Ok(())
     }
 
     pub(crate) async fn chunk(&mut self) -> Result<Option<hyper::body::Bytes>, ApiError> {
@@ -673,22 +674,28 @@ impl Api {
     /// Go pins the descriptor for this GET; Last-Modified is not an identity
     /// suitable for stitching ranges from multiple requests.
     pub(crate) async fn media(&self, session: &Session, id: &str) -> Result<AudioBody, ApiError> {
-        let url = self.track_url(id, "audio")?;
-        let body = self
-            .open_audio(
-                session,
-                url,
-                "audio/*, application/octet-stream",
-                REQUEST_TIMEOUT,
-            )
-            .await?;
-        let media = content_type(&body.response)?;
-        if !(media.starts_with("audio/") && media.len() > "audio/".len())
-            && media != "application/octet-stream"
-        {
-            return Err(error("The server returned an unsupported audio response."));
-        }
-        Ok(body)
+        // Match other authenticated resources: account capability and its
+        // deadline take precedence over the mode fence and route validation.
+        // open_audio separately retains the generation for body consumption.
+        self.with_authenticated_network(session, async {
+            let url = self.track_url(id, "audio")?;
+            let body = self
+                .open_audio(
+                    session,
+                    url,
+                    "audio/*, application/octet-stream",
+                    REQUEST_TIMEOUT,
+                )
+                .await?;
+            let media = content_type(&body.response)?;
+            if !(media.starts_with("audio/") && media.len() > "audio/".len())
+                && media != "application/octet-stream"
+            {
+                return Err(error("The server returned an unsupported audio response."));
+            }
+            Ok(body)
+        })
+        .await
     }
 
     async fn open_audio(
@@ -2779,6 +2786,58 @@ mod tests {
         assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
         assert_eq!(failure(api.account_upgrade(&session).await), EXPIRED);
         assert_eq!(wire.recorded().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_audio_preflight_checks_owner_and_lifetime_before_mode_or_route() {
+        let origin = Origin::parse("https://fixture.invalid").unwrap();
+        let api = Api::new(origin.clone()).unwrap();
+        let foreign = Api::new(origin).unwrap().test_session();
+        let expired = api.test_session_with_deadline(Instant::now());
+        let rolling = api.test_session_with_deadline(Instant::now());
+        rolling.lifetime().deadline.server_expires = Some(OffsetDateTime::now_utc());
+        let revoked = api.test_session();
+        revoked.lifetime().revocation = Some(EXPIRED);
+        let live = api.test_session();
+        let version = format!("sha256:{}", "0".repeat(64));
+        for (session, expected) in [
+            (&foreign, api.check_session_owner(&foreign).unwrap_err()),
+            (&expired, EXPIRED),
+            (&rolling, ROLLING_DEADLINE),
+            (&revoked, EXPIRED),
+            (&live, OFFLINE),
+        ] {
+            session.set_offline(true);
+            for id in ["track", ""] {
+                assert_eq!(api.media(session, id).await.err(), Some(expected));
+                assert_eq!(
+                    api.offline_audio(session, id, &version, "audio/wav", 4)
+                        .await
+                        .err(),
+                    Some(expected)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_body_fences_mode_roundtrips_and_lifetime_before_exposing_bytes() {
+        let api = Api::new(Origin::parse("https://fixture.invalid").unwrap()).unwrap();
+        for revoke in [false, true] {
+            let session = api.test_session();
+            let pending =
+                futures_util::stream::once(async { Ok(hyper::body::Bytes::from_static(b"data")) });
+            let mut body = AudioBody::test_stream(&session, 4, pending);
+            session.set_offline(true);
+            session.set_offline(false);
+            if revoke {
+                session.lifetime().revocation = Some(EXPIRED);
+            }
+            assert_eq!(
+                body.chunk().await.err(),
+                Some(if revoke { EXPIRED } else { OFFLINE })
+            );
+        }
     }
 
     #[tokio::test]
