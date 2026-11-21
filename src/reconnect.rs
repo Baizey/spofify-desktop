@@ -52,7 +52,7 @@ impl Api {
                 let response = self
                     .request_with_method(Method::GET, self.origin.endpoint("/api/auth/session"))?
                     .header(header::CACHE_CONTROL, "no-cache, no-store")
-                    .header(header::COOKIE, session.secrets.cookie.clone())
+                    .header(header::COOKIE, session.cookie()?.clone())
                     .timeout(PROBE_TIMEOUT)
                     .send()
                     .await
@@ -95,7 +95,7 @@ impl Api {
         }
         if !valid_text(&summary.username, 256)
             || !matches!(summary.role.as_str(), "admin" | "user")
-            || summary.csrf_token.as_bytes() != session.secrets.csrf.as_bytes()
+            || summary.csrf_token.as_bytes() != session.csrf()?.as_bytes()
         {
             return Err(INVALID_RESPONSE);
         }
@@ -236,7 +236,7 @@ mod tests {
             assert_eq!(session.network_generation(), generation);
             assert_eq!(session.lifetime().deadline.instant, deadline);
             assert_eq!(
-                session.secrets.cookie.as_bytes(),
+                session.cookie().unwrap().as_bytes(),
                 b"spofify_session=synthetic"
             );
             assert_media_fenced(&api, &clone, if revoked { EXPIRED } else { OFFLINE }).await;
@@ -328,7 +328,7 @@ mod tests {
         let request = || {
             api.request_with_method(Method::GET, api.origin.endpoint("/api/auth/session"))
                 .unwrap()
-                .header(header::COOKIE, session.secrets.cookie.clone())
+                .header(header::COOKIE, session.cookie().unwrap().clone())
         };
         let server = async {
             let mut first = receive_probe(&listener).await;

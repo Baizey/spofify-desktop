@@ -183,9 +183,11 @@ impl Desk {
         ui.on_page_action(move|op,value|{let Some(ui)=w.upgrade()else{return};let op=op.to_string();let mut val=value.to_string();
             if op=="offline" {
                 // Fence new requests immediately, before the engine drops its active transports.
-                let offline=val=="on";let current=access.borrow().clone(); if let Some(a)=current && a.epoch==d.stamp.epoch.load(Ordering::SeqCst){
-                    mode.request(&a,offline);if offline {ui.set_manual_offline(true);} // Until confirmed, local playback and navigation stay offline.
-                }return;
+                let offline = val == "on";
+                if mode.request_current(&access, d.stamp.epoch.load(Ordering::SeqCst), offline) && offline {
+                    ui.set_manual_offline(true);
+                }
+                return;
             }
             if matches!(op.as_str(),"new-manual"|"new-rules"|"rename"|"rules"|"copy") {
                 val=serde_json::json!({"name":ui.get_form_name().as_str(),"description":ui.get_form_description().as_str(),"definition":ui.get_form_value().as_str()}).to_string();

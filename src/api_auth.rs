@@ -15,9 +15,9 @@ use tokio::sync::watch;
 
 use super::{
     Api, ApiError, CredentialDeadline, INVALID_INPUT, INVALID_RESPONSE, LOGIN_BODY, NETWORK,
-    Origin, Session, SessionLifetime, SessionSecrets, SessionSummary, content_type, decode,
-    decode_with, error, parse_session_cookie, session_cookie, session_cookie_name, single_header,
-    valid_id, valid_session_cookie_value, valid_text,
+    NetworkCredentials, Origin, Session, SessionLifetime, SessionSecrets, SessionSummary,
+    content_type, decode, decode_with, error, parse_session_cookie, session_cookie,
+    session_cookie_name, single_header, valid_id, valid_session_cookie_value, valid_text,
 };
 
 const MODE_HEADER: &str = "x-spofify-session-mode";
@@ -36,6 +36,12 @@ impl ApiError {
     pub(crate) fn can_retry_restore(self) -> bool {
         self == TRANSIENT_NETWORK || crate::api_transport::is_transient_status(self.status)
     }
+
+    pub(crate) fn rejects_local_grant(self) -> bool {
+        self.expired
+            || matches!(self.status, 401 | 403)
+            || matches!(self, INVALID_RESPONSE | INVALID_INPUT | WRONG_ORIGIN)
+    }
 }
 
 fn restore_transport(error: reqwest::Error) -> ApiError {
@@ -46,14 +52,110 @@ fn restore_transport(error: reqwest::Error) -> ApiError {
     }
 }
 
-/// Secret-service payload only. No cached summary, CSRF token, password or expiry;
-/// the account is a binding to check against the server, not an authenticated identity.
-#[derive(Clone, Serialize, Deserialize)]
+/// Legacy online keyring record. A bearer and account binding are not local authority.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RememberedCredential {
     origin: String,
     account_id: String,
     cookie: String,
+}
+
+impl RememberedCredential {
+    fn header(&self, origin: &Origin) -> Result<HeaderValue, ApiError> {
+        if self.origin != origin.as_str() {
+            return Err(WRONG_ORIGIN);
+        }
+        if !valid_id(&self.account_id) {
+            return Err(INVALID_INPUT);
+        }
+        let (name, value) = self.cookie.split_once('=').ok_or(INVALID_INPUT)?;
+        if name != session_cookie_name(origin) || !valid_session_cookie_value(value) {
+            return Err(INVALID_INPUT);
+        }
+        let mut cookie = HeaderValue::from_str(&self.cookie).map_err(|_| INVALID_INPUT)?;
+        cookie.set_sensitive(true);
+        Ok(cookie)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum LocalFormat {
+    #[serde(rename = "local-v1")]
+    V1,
+}
+
+/// Written only from an admitted, remembered server session on Work offline.
+/// No password or CSRF is stored; the cookie is only for a separate Go online probe.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LocalGrant {
+    format: LocalFormat,
+    credential: RememberedCredential,
+    username: String,
+    role: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RememberedLogin {
+    Online(RememberedCredential),
+    Offline(LocalGrant),
+}
+
+impl RememberedLogin {
+    pub(crate) fn credential(&self) -> &RememberedCredential {
+        match self {
+            Self::Online(credential) => credential,
+            Self::Offline(grant) => &grant.credential,
+        }
+    }
+}
+
+impl LocalGrant {
+    pub(crate) fn matches_principal(&self, username: &str, account_id: &str) -> bool {
+        self.username == username && self.credential.account_id == account_id
+    }
+
+    pub(crate) fn admit(
+        &self,
+        origin: &Origin,
+        username: &str,
+    ) -> Result<(Api, Session), ApiError> {
+        self.credential.header(origin)?;
+        if self.username != username
+            || !valid_text(&self.username, 256)
+            || !matches!(self.role.as_str(), "admin" | "user")
+        {
+            return Err(INVALID_INPUT);
+        }
+        let api = Api {
+            origin: origin.clone(),
+            client: None,
+            audio_client: None,
+            identity: Arc::new(()),
+        };
+        let session = Session {
+            account_id: self.credential.account_id.clone(),
+            username: self.username.clone(),
+            role: self.role.clone(),
+            secrets: Arc::new(SessionSecrets {
+                owner: api.identity.clone(),
+                account_id: self.credential.account_id.clone(),
+                network: watch::Sender::new(1),
+                credentials: None,
+                lifetime: Mutex::new(SessionLifetime {
+                    // Local authority has no usable network deadline (or transport).
+                    deadline: CredentialDeadline {
+                        instant: Instant::now(),
+                        server_expires: None,
+                    },
+                    revocation: None,
+                }),
+            }),
+        };
+        Ok((api, session))
+    }
 }
 
 #[derive(Deserialize)]
@@ -127,6 +229,20 @@ impl Api {
         }
     }
 
+    pub(crate) fn offline_grant(&self, session: &Session) -> Result<RememberedLogin, ApiError> {
+        if !session.is_offline() {
+            return Err(INVALID_INPUT);
+        }
+        // The grant can outlast the cookie once installed, but only a live,
+        // non-revoked credential can create a new local grant.
+        Ok(RememberedLogin::Offline(LocalGrant {
+            format: LocalFormat::V1,
+            credential: self.remembered_credential(session)?,
+            username: session.username.clone(),
+            role: session.role.clone(),
+        }))
+    }
+
     /// Export only an active, negotiated session owned by this connection.
     pub fn remembered_credential(
         &self,
@@ -142,31 +258,25 @@ impl Api {
             origin: self.origin.as_str().to_owned(),
             account_id: session.secrets.account_id.clone(),
             cookie: session
-                .secrets
-                .cookie
+                .cookie()?
                 .to_str()
                 .map_err(|_| INVALID_RESPONSE)?
                 .to_owned(),
         })
     }
 
-    /// A saved cookie grants no local or network session before this probe succeeds.
+    /// A saved cookie by itself grants no local or network session.
     /// The caller owns cancellation and fences the result against newer sign-in intents.
     pub async fn resume(&self, credential: &RememberedCredential) -> Result<Session, ApiError> {
-        // Require the stored canonical spelling; no origin aliases or scheme/port changes.
-        if credential.origin != self.origin.as_str() {
-            return Err(WRONG_ORIGIN);
-        }
-        if !valid_id(&credential.account_id) {
-            return Err(INVALID_INPUT);
-        }
-        let (name, value) = credential.cookie.split_once('=').ok_or(INVALID_INPUT)?;
-        if name != session_cookie_name(&self.origin) || !valid_session_cookie_value(value) {
-            return Err(INVALID_INPUT);
-        }
-        let mut saved_cookie =
-            HeaderValue::from_str(&credential.cookie).map_err(|_| INVALID_INPUT)?;
-        saved_cookie.set_sensitive(true);
+        self.resume_if(credential, || true).await
+    }
+
+    pub(crate) async fn resume_if(
+        &self,
+        credential: &RememberedCredential,
+        current: impl FnOnce() -> bool,
+    ) -> Result<Session, ApiError> {
+        let saved_cookie = credential.header(&self.origin)?;
         let request = self
             .request_with_method(
                 reqwest::Method::GET,
@@ -176,6 +286,9 @@ impl Api {
             .header(header::COOKIE, saved_cookie.clone());
         // Use the same origin-bound client as other requests, but preserve
         // transport classification for this bounded, replayable GET only.
+        if !current() {
+            return Err(super::OFFLINE);
+        }
         let response = request.send().await.map_err(restore_transport)?;
         if !response.status().is_success() {
             return Err(Self::response_error(response.status().as_u16(), false));
@@ -222,8 +335,7 @@ impl Api {
                 owner: self.identity.clone(),
                 account_id: summary.account_id,
                 network: watch::Sender::new(0),
-                cookie,
-                csrf,
+                credentials: Some(NetworkCredentials { cookie, csrf }),
                 lifetime: Mutex::new(SessionLifetime {
                     deadline,
                     revocation: None,
@@ -238,7 +350,7 @@ impl Api {
         headers: &header::HeaderMap,
     ) -> Result<CredentialDeadline, ApiError> {
         let (cookie, deadline) = parse_rolling_publication(&self.origin, headers)?;
-        if cookie != session.secrets.cookie {
+        if &cookie != session.cookie()? {
             return Err(INVALID_RESPONSE);
         }
         Ok(deadline)
@@ -289,6 +401,70 @@ fn parse_rolling_publication(
             server_expires: Some(expires),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::OFFLINE;
+
+    #[tokio::test]
+    async fn validated_local_grant_is_transportless_and_never_upgrades_in_place() {
+        let origin = Origin::parse("https://music.example").unwrap();
+        let api = Api::new(origin.clone()).unwrap();
+        let cookie = HeaderValue::from_static("__Host-spofify_session=synthetic");
+        let summary = SessionSummary {
+            account_id: "account-one".into(),
+            username: "listener".into(),
+            role: "user".into(),
+            csrf_token: "synthetic-csrf".into(),
+        };
+        let deadline = CredentialDeadline {
+            instant: Instant::now() + Duration::from_secs(10),
+            server_expires: Some(OffsetDateTime::now_utc() + Duration::from_secs(10)),
+        };
+        let server = api.session_from_summary(summary, cookie, deadline).unwrap();
+        assert!(api.offline_grant(&server).is_err());
+        let legacy = serde_json::to_vec(&api.remembered_credential(&server).unwrap()).unwrap();
+        assert!(matches!(
+            serde_json::from_slice(&legacy),
+            Ok(RememberedLogin::Online(_))
+        ));
+        server.set_offline(true);
+        let saved = serde_json::to_vec(&api.offline_grant(&server).unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&saved).contains("synthetic-csrf"));
+        let RememberedLogin::Offline(grant) = serde_json::from_slice(&saved).unwrap() else {
+            panic!("expected a local grant")
+        };
+        assert!(
+            grant
+                .admit(&Origin::parse("https://other.example").unwrap(), "listener")
+                .is_err()
+        );
+        assert!(grant.admit(&origin, "impostor").is_err());
+        let (local_api, local) = grant.admit(&origin, "listener").unwrap();
+        let clone = local.clone();
+        assert!(local_api.client.is_none() && local_api.audio_client.is_none());
+        assert!(local.secrets.credentials.is_none());
+        assert_eq!(
+            local_api.authenticated_account(&local).unwrap().1,
+            "account-one"
+        );
+        assert!(api.authenticated_account(&local).is_err());
+        assert!(local_api.authenticated_account(&server).is_err());
+        local.set_offline(false);
+        assert!(local.is_offline() && local.is_expired() && local.can_access_local());
+        assert_eq!(
+            local_api.resume(&grant.credential).await.err(),
+            Some(OFFLINE)
+        );
+        local.retire_local_grant();
+        assert!(!clone.can_access_local());
+        assert!(local_api.authenticated_account(&clone).is_err());
+        server.lifetime().deadline.instant = Instant::now();
+        assert!(server.can_access_local()); // running local access can outlast its bearer
+        assert!(api.offline_grant(&server).is_err()); // but cannot create a new cold grant now
+    }
 }
 
 #[cfg(test)]

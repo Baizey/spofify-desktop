@@ -22,6 +22,7 @@ use url::Url;
 #[path = "api_auth.rs"]
 mod api_auth;
 pub use api_auth::RememberedCredential;
+pub(crate) use api_auth::RememberedLogin;
 #[path = "catalog.rs"]
 pub mod catalog;
 #[path = "library.rs"]
@@ -242,8 +243,27 @@ impl Session {
         self.secrets.lifetime.lock().unwrap()
     }
 
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.lifetime().revocation.is_some()
+    }
+
+    /// Retire local authority and every clone without opening transport.
+    pub(crate) fn retire_local_grant(&self) -> bool {
+        let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+        let mut lifetime = self.lifetime();
+        let was_revoked = lifetime.revocation.is_some();
+        if !was_revoked {
+            lifetime.revocation = Some(lifetime.deadline.local_expiry());
+        }
+        was_revoked
+    }
+
     /// A session capability and every clone share the same explicit network mode.
     pub fn set_offline(&self, offline: bool) {
+        // A cold local grant can only be replaced, never lifted into a network session.
+        if self.is_local_only() {
+            return;
+        }
         // Serialize mode changes with the final pin rename, not its disk sync.
         let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
         self.secrets.network.send_if_modified(|generation| {
@@ -253,6 +273,18 @@ impl Session {
             *generation = generation.wrapping_add(1);
             true
         });
+    }
+
+    pub(crate) fn is_local_only(&self) -> bool {
+        self.secrets.credentials.is_none()
+    }
+
+    fn cookie(&self) -> Result<&HeaderValue, ApiError> {
+        Ok(&self.secrets.credentials.as_ref().ok_or(OFFLINE)?.cookie)
+    }
+
+    fn csrf(&self) -> Result<&HeaderValue, ApiError> {
+        Ok(&self.secrets.credentials.as_ref().ok_or(OFFLINE)?.csrf)
     }
 
     pub fn is_offline(&self) -> bool {
@@ -274,9 +306,13 @@ struct SessionSecrets {
     owner: Arc<()>,
     account_id: String,
     network: watch::Sender<u64>,
+    credentials: Option<NetworkCredentials>,
+    lifetime: Mutex<SessionLifetime>,
+}
+
+struct NetworkCredentials {
     cookie: HeaderValue,
     csrf: HeaderValue,
-    lifetime: Mutex<SessionLifetime>,
 }
 
 #[derive(Clone, Copy)]
@@ -478,8 +514,8 @@ impl AudioBody {
 
 pub struct Api {
     origin: Origin,
-    client: Client,
-    audio_client: Client,
+    client: Option<Client>,
+    audio_client: Option<Client>,
     identity: Arc<()>,
 }
 
@@ -509,8 +545,8 @@ impl Api {
         let audio_client = builder().build().map_err(init)?;
         Ok(Self {
             origin,
-            client,
-            audio_client,
+            client: Some(client),
+            audio_client: Some(audio_client),
             identity: Arc::new(()),
         })
     }
@@ -530,8 +566,10 @@ impl Api {
                 owner: self.identity.clone(),
                 account_id: "synthetic".into(),
                 network: watch::Sender::new(0),
-                cookie: HeaderValue::from_static("spofify_session=synthetic"),
-                csrf: HeaderValue::from_static("synthetic"),
+                credentials: Some(NetworkCredentials {
+                    cookie: HeaderValue::from_static("spofify_session=synthetic"),
+                    csrf: HeaderValue::from_static("synthetic"),
+                }),
                 lifetime: Mutex::new(SessionLifetime {
                     deadline: CredentialDeadline {
                         instant: deadline,
@@ -570,7 +608,7 @@ impl Api {
                 .append_pair("offset", "0");
             let request = self
                 .request(url)?
-                .header(header::COOKIE, session.secrets.cookie.clone());
+                .header(header::COOKIE, session.cookie()?.clone());
             let response = self.send(request, Some(session), false).await?;
             if response.status() != 200 {
                 return Err(INVALID_RESPONSE);
@@ -618,8 +656,8 @@ impl Api {
                     self.origin.endpoint("/api/me/player/connect"),
                 )?
                 .timeout(SOCKET_TIMEOUT)
-                .header(header::COOKIE, session.secrets.cookie.clone())
-                .header("X-CSRF-Token", session.secrets.csrf.clone())
+                .header(header::COOKIE, session.cookie()?.clone())
+                .header("X-CSRF-Token", session.csrf()?.clone())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body("{}");
             let response = self.send(request, Some(session), false).await?;
@@ -649,7 +687,7 @@ impl Api {
                     self.origin.endpoint("/api/me/player/socket"),
                 )?
                 .timeout(SOCKET_TIMEOUT)
-                .header(header::COOKIE, session.secrets.cookie.clone())
+                .header(header::COOKIE, session.cookie()?.clone())
                 .header(header::CONNECTION, "Upgrade")
                 .header(header::UPGRADE, "websocket")
                 .header(header::SEC_WEBSOCKET_VERSION, "13")
@@ -744,8 +782,13 @@ impl Api {
         budget: Duration,
     ) -> Result<Response, ApiError> {
         let request = self
-            .request_via(&self.audio_client, reqwest::Method::GET, url, accept)?
-            .header(header::COOKIE, session.secrets.cookie.clone());
+            .request_via(
+                self.audio_client.as_ref().ok_or(OFFLINE)?,
+                reqwest::Method::GET,
+                url,
+                accept,
+            )?
+            .header(header::COOKIE, session.cookie()?.clone());
         tokio::time::timeout(budget, self.send(request, Some(session), false))
             .await
             .map_err(|_| NETWORK)?
@@ -799,7 +842,7 @@ impl Api {
             ])?;
             let request = self
                 .request_with_accept(reqwest::Method::GET, url, resource.accept())?
-                .header(header::COOKIE, session.secrets.cookie.clone());
+                .header(header::COOKIE, session.cookie()?.clone());
             match self.fetch_media_resource(session, request, resource).await {
                 Ok(result) => Ok(Some(result)),
                 Err(err) if err.status == 404 => Ok(None),
@@ -957,7 +1000,7 @@ impl Api {
     ) -> Result<Vec<u8>, ApiError> {
         let request = self
             .request_with_method(reqwest::Method::GET, url)?
-            .header(header::COOKIE, session.secrets.cookie.clone());
+            .header(header::COOKIE, session.cookie()?.clone());
         let response = self.send(request, Some(session), false).await?;
         self.offline_json_body(session, response, bound).await
     }
@@ -991,7 +1034,7 @@ impl Api {
         let url = self.track_url(id, suffix)?;
         Ok(self
             .request_with_accept(reqwest::Method::GET, url, accept)?
-            .header(header::COOKIE, session.secrets.cookie.clone()))
+            .header(header::COOKIE, session.cookie()?.clone()))
     }
 
     fn track_url(&self, id: &str, suffix: &'static str) -> Result<Url, ApiError> {
@@ -1050,8 +1093,8 @@ impl Api {
                 }
                 let request = self
                     .request(self.origin.endpoint("/api/auth/logout"))?
-                    .header(header::COOKIE, session.secrets.cookie.clone())
-                    .header("X-CSRF-Token", session.secrets.csrf.clone())
+                    .header(header::COOKIE, session.cookie()?.clone())
+                    .header("X-CSRF-Token", session.csrf()?.clone())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body("{}");
                 let response = self.send(request, None, false).await?;
@@ -1119,7 +1162,7 @@ impl Api {
         url: Url,
         accept: &str,
     ) -> Result<RequestBuilder, ApiError> {
-        self.request_via(&self.client, method, url, accept)
+        self.request_via(self.client.as_ref().ok_or(OFFLINE)?, method, url, accept)
     }
 
     fn request_via(
@@ -1179,6 +1222,12 @@ impl Api {
             // Keep the mode fence held through publication or revocation.
             let current = session.secrets.network.borrow();
             if *current != generation {
+                // A response already observed at the first online→offline
+                // fence must retire the same credential before we can save
+                // local authority. Never reuse results across a full cycle.
+                if status == 401 && *current == generation.wrapping_add(1) {
+                    return Err(session.lifetime().apply_denial(used, EXPIRED));
+                }
                 return Err(OFFLINE);
             }
             let mut lifetime = session.lifetime();
@@ -2911,13 +2960,15 @@ mod tests {
         );
         // Shorten the production deadline for this test, but leave time for
         // the request to reach the peer before its deliberately delayed reply.
-        api.client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_millis(300))
-            .build()
-            .unwrap();
+        api.client = Some(
+            Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .timeout(Duration::from_millis(300))
+                .build()
+                .unwrap(),
+        );
         assert_eq!(failure(api.search(&session, "track").await), NETWORK);
         assert_eq!(wire.recorded().len(), 3);
     }

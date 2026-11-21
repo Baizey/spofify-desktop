@@ -1,15 +1,16 @@
 //! Password and startup auth attempts, and the ordered queue for local login persistence.
 //!
 //! The engine owns admission: no attempt changes the saved profile before its
-//! epoch is accepted, and a saved cookie gives no access until the server validates it.
+//! epoch is accepted. A legacy cookie still requires server validation; only an
+//! explicit local grant from the active keyring slot can authorize cold offline use.
 
 use crate::{
-    api::{Api, Origin, RememberedCredential, Session},
-    login_store::{LoginProfile, LoginStore, StoreError},
+    api::{Api, ApiError, Origin, RememberedCredential, RememberedLogin, Session},
+    login_store::{LoginProfile, LoginStore, StagedMode, StoreError},
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -17,11 +18,13 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 const KEYRING: &str = "The system keyring is unavailable or locked.";
+const BUSY: &str = "Another desktop window is using this saved sign-in.";
 const PREFILL: &str = "The desktop could not read the saved sign-in details.";
 const NOT_SAVED: &str = "This sign-in could not be saved. You may need to sign in next time.";
 const SAVE_KEYRING: &str =
     "The system keyring is unavailable or locked. This sign-in was not remembered.";
 const FORGET_KEYRING: &str = "Automatic sign-in is off. The system keyring is unavailable or locked, so its old entry could not be removed.";
+const MODE_NOT_SAVED: &str = "This mode could not be saved for the next launch.";
 const FORGET_FAILED: &str = "The desktop could not update its saved sign-in settings.";
 const STALE: &str = "The saved session is no longer valid. Sign in again.";
 const RESTORE_FAILED: &str = "Could not restore the saved session. Sign in with your password.";
@@ -75,6 +78,7 @@ pub(crate) async fn password(
 }
 
 pub(crate) async fn restore<F>(
+    store: Result<Arc<LoginStore>, StoreError>,
     epoch: u64,
     current: &AtomicU64,
     prefill: impl FnOnce(String, String) -> F,
@@ -86,7 +90,16 @@ where
         notice: PREFILL,
         ..Fallback::default()
     };
-    let store = LoginStore::open_default().map_err(unreadable)?;
+    let store = store.map_err(|e| {
+        if e == StoreError::Busy {
+            Fallback {
+                notice: BUSY,
+                ..Fallback::default()
+            }
+        } else {
+            unreadable(e)
+        }
+    })?;
     let profile = store.profile().map_err(unreadable)?;
     let Some(profile) = profile else {
         return Err(Fallback::default());
@@ -95,16 +108,14 @@ where
     if !profile.remembered || current.load(Ordering::SeqCst) != epoch {
         return Err(Fallback::default());
     }
-    let origin = profile.origin.clone();
-    let api = Arc::new(Api::new(origin.clone()).map_err(|_| restore_failed())?);
-    let session = with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
-        restore_once(&store, &profile, &api, epoch, current)
+    let (api, session) = with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
+        restore_once(&store, &profile, epoch, current)
     })
     .await?;
     Ok(Success {
         api,
         session,
-        origin,
+        origin: profile.origin.clone(),
         kind: Kind::Restored(profile),
     })
 }
@@ -117,10 +128,9 @@ enum RestoreFailure {
 async fn restore_once(
     store: &LoginStore,
     profile: &LoginProfile,
-    api: &Api,
     epoch: u64,
     current: &AtomicU64,
-) -> Result<Session, RestoreFailure> {
+) -> Result<(Arc<Api>, Session), RestoreFailure> {
     // Re-check the original login slot on each attempt. A changed profile
     // can neither substitute its credential nor reuse the old one here.
     let credential = match store.restore(profile).await {
@@ -141,8 +151,20 @@ async fn restore_once(
     if current.load(Ordering::SeqCst) != epoch {
         return Err(RestoreFailure::Final(Fallback::default()));
     }
+    let credential = match credential {
+        RememberedLogin::Offline(grant) => {
+            return grant
+                .admit(&profile.origin, &profile.username)
+                .map(|(api, session)| (Arc::new(api), session))
+                .map_err(|_| RestoreFailure::Final(stale(profile.clone())));
+        }
+        RememberedLogin::Online(credential) => credential,
+    };
+    let api = Arc::new(
+        Api::new(profile.origin.clone()).map_err(|_| RestoreFailure::Final(restore_failed()))?,
+    );
     match api.resume(&credential).await {
-        Ok(session) if session.username == profile.username => Ok(session),
+        Ok(session) if session.username == profile.username => Ok((api, session)),
         // A renamed or mismatched account still needs explicit sign-in.
         Ok(_) => Err(RestoreFailure::Final(stale(profile.clone()))),
         Err(e) if e.expired || e.status == 401 => {
@@ -151,6 +173,65 @@ async fn restore_once(
         Err(e) if e.can_retry_restore() => Err(RestoreFailure::Transient),
         Err(_) => Err(RestoreFailure::Final(restore_failed())),
     }
+}
+
+const LOST_LOCAL: ApiError = ApiError {
+    message: STALE,
+    expired: true,
+    status: 0,
+};
+
+/// Only the explicit Go online probe may build a transport for a cold local grant.
+/// The engine fences the entire operation and its result against the mode and account epoch.
+pub(crate) async fn reconnect_local(
+    store: &LoginStore,
+    profile: &LoginProfile,
+    local: &Session,
+    current: impl Fn() -> bool,
+) -> Result<(Arc<Api>, Session), ApiError> {
+    let unavailable = ApiError {
+        message: KEYRING,
+        status: 0,
+        expired: false,
+    };
+    let grant = match store.restore(profile).await {
+        Ok(Some(RememberedLogin::Offline(grant)))
+            if grant.matches_principal(&local.username, &local.account_id) =>
+        {
+            grant
+        }
+        Err(StoreError::Busy) => {
+            return Err(ApiError {
+                status: 503,
+                ..unavailable
+            });
+        }
+        Err(StoreError::Config | StoreError::KeyringUnavailable) => return Err(unavailable),
+        _ => return Err(LOST_LOCAL),
+    };
+    if !current() {
+        return Err(unavailable);
+    }
+    if !local.is_local_only() || !local.can_access_local() {
+        return Err(LOST_LOCAL);
+    }
+    let api = Arc::new(Api::new(profile.origin.clone())?);
+    // `resume` requires a same-origin, same-account rolling-v1 response and
+    // constructs a real online session from its fresh summary, cookie and CSRF.
+    let session = api
+        .resume_if(RememberedLogin::Offline(grant).credential(), current)
+        .await
+        .map_err(|error| {
+            if error.rejects_local_grant() {
+                LOST_LOCAL
+            } else {
+                error
+            }
+        })?;
+    if session.username != profile.username {
+        return Err(LOST_LOCAL);
+    }
+    Ok((api, session))
 }
 
 async fn with_restore_backoff<T, F>(
@@ -276,20 +357,88 @@ mod tests {
     }
 }
 
+/// A slot identity shared with the ordered writer, not a credential. Mode
+/// updates replace this only after the new active slot has been committed.
+#[derive(Clone, Default)]
+pub(crate) struct Retention(Arc<RetentionState>);
+
+#[derive(Default)]
+struct RetentionState {
+    slot: Mutex<(Option<LoginProfile>, Option<StagedMode>)>,
+    retired: AtomicBool,
+}
+
+impl Retention {
+    pub(crate) fn new(profile: LoginProfile) -> Self {
+        let retained = Self::default();
+        retained.set(profile);
+        retained
+    }
+
+    pub(crate) fn profile(&self) -> Option<LoginProfile> {
+        self.0.slot.lock().unwrap().0.clone()
+    }
+
+    fn set(&self, profile: LoginProfile) {
+        *self.0.slot.lock().unwrap() = (Some(profile), None);
+    }
+
+    fn staged(&self) -> Option<StagedMode> {
+        self.0.slot.lock().unwrap().1.clone()
+    }
+
+    fn set_staged(&self, staged: StagedMode) {
+        self.0.slot.lock().unwrap().1 = Some(staged);
+    }
+
+    pub(crate) fn retire(&self) {
+        self.0.retired.store(true, Ordering::Release);
+    }
+
+    fn permits(&self, session: &Session) -> bool {
+        !self.0.retired.load(Ordering::Acquire) && !session.is_revoked()
+    }
+}
+
 pub(crate) enum Write {
     Record {
         origin: Origin,
         username: String,
         wanted: bool,
         credential: Option<RememberedCredential>,
-        retained: Arc<AtomicBool>,
+        retained: Retention,
+        session: Session,
     },
+    Mode(Retention, Session, RememberedLogin, Option<StagedMode>),
     Forget(Option<LoginProfile>),
+    ForgetRetained(Retention),
+    Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+// Busy occurs before a mutation acquires its flock, so repeating this case
+// cannot repeat a keyring operation. Most contenders are cancelled reads.
+async fn with_write_admission<T, F>(mut operation: impl FnMut() -> F) -> Result<T, StoreError>
+where
+    F: Future<Output = Result<T, StoreError>>,
+{
+    for delay in RESTORE_BACKOFF {
+        match operation().await {
+            Err(StoreError::Busy) => tokio::time::sleep(delay).await,
+            other => return other,
+        }
+    }
+    operation().await
 }
 
 impl Write {
-    async fn run(self) -> &'static str {
-        let store = LoginStore::open_default();
+    async fn run(self, store: Result<&LoginStore, StoreError>) -> &'static str {
+        if let Self::Barrier(done) = self {
+            let _ = done.send(());
+            return "";
+        }
+        if store.is_err_and(|e| e == StoreError::Busy) {
+            return BUSY;
+        }
         match self {
             Self::Record {
                 origin,
@@ -297,30 +446,95 @@ impl Write {
                 wanted,
                 credential,
                 retained,
+                session,
             } => {
+                let permitted = || retained.permits(&session);
+                if !permitted() {
+                    return "";
+                }
                 let stored = match store {
                     Ok(store) => {
-                        store
-                            .record_login(&origin, &username, credential.as_ref())
-                            .await
+                        with_write_admission(|| {
+                            store.record_login(&origin, &username, credential.as_ref(), &permitted)
+                        })
+                        .await
                     }
                     Err(e) => Err(e),
                 };
                 match stored {
-                    Ok(()) if wanted && credential.is_none() => NOT_SAVED,
-                    Ok(()) => {
-                        retained.store(credential.is_some(), Ordering::Release);
+                    Ok(_) if wanted && credential.is_none() => NOT_SAVED,
+                    Ok(profile) => {
+                        if profile.remembered {
+                            retained.set(profile);
+                        }
                         ""
                     }
+                    Err(_) if !permitted() => "",
                     Err(StoreError::KeyringUnavailable) if wanted => SAVE_KEYRING,
                     Err(StoreError::KeyringUnavailable) => FORGET_KEYRING,
                     Err(_) => NOT_SAVED,
                 }
             }
-            Self::Forget(profile) => {
+            Self::Mode(retained, session, login, staged) => {
+                if let Some(staged) = staged {
+                    retained.set_staged(staged);
+                }
+                let offline = matches!(&login, RememberedLogin::Offline(_));
+                let permitted = || retained.permits(&session) && session.is_offline() == offline;
+                if !permitted() {
+                    return "";
+                }
+                let Some(profile) = retained.profile() else {
+                    return "";
+                };
+                let Ok(store) = store else {
+                    return MODE_NOT_SAVED;
+                };
+                // If an accepted mode change disarmed the slot before a temporary
+                // keyring lock, the same admitted owner can still update that exact
+                // item after unlock. A fresh process cannot adopt the cleanup marker.
+                let staged = match retained.staged() {
+                    Some(staged) => staged,
+                    None => match with_write_admission(|| {
+                        std::future::ready(store.stage_mode(&profile))
+                    })
+                    .await
+                    {
+                        Ok(staged) => staged,
+                        Err(_) => return MODE_NOT_SAVED,
+                    },
+                };
+                retained.set_staged(staged.clone());
+                match with_write_admission(|| {
+                    store.change_mode(&profile, &login, &staged, &permitted)
+                })
+                .await
+                {
+                    Ok(profile) => {
+                        retained.set(profile);
+                        ""
+                    }
+                    Err(_) if !permitted() => "",
+                    Err(_) => MODE_NOT_SAVED,
+                }
+            }
+            Self::Barrier(_) => unreachable!(),
+            intent @ (Self::Forget(_) | Self::ForgetRetained(_)) => {
+                let profile = match intent {
+                    Self::Forget(profile) => profile,
+                    Self::ForgetRetained(retained) => {
+                        let Some(profile) = retained.profile() else {
+                            return "";
+                        };
+                        Some(profile)
+                    }
+                    _ => unreachable!(),
+                };
                 let forgotten = match (store, profile) {
-                    (Ok(store), Some(profile)) => store.forget_profile(&profile).await,
-                    (Ok(store), None) => store.forget().await,
+                    (Ok(store), Some(profile)) => {
+                        with_write_admission(|| store.forget_profile(&profile)).await
+                    }
+                    (Ok(store), None) => with_write_admission(|| store.forget()).await,
                     (Err(e), _) => Err(e),
                 };
                 match forgotten {
@@ -341,17 +555,30 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    pub(crate) fn new(publish: impl Fn(u64, &'static str) + Send + 'static) -> Self {
+    pub(crate) fn new(
+        store: Result<Arc<LoginStore>, StoreError>,
+        publish: impl Fn(u64, &'static str) + Send + 'static,
+    ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<(u64, Write)>();
         let worker = tokio::spawn(async move {
             while let Some((epoch, write)) = rx.recv().await {
-                let notice = write.run().await;
+                let notice = write.run(store.as_deref().map_err(|e| *e)).await;
                 if !notice.is_empty() {
                     publish(epoch, notice);
                 }
             }
         });
         Self { tx, worker }
+    }
+
+    pub(crate) fn barrier(&self, epoch: u64) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.send(epoch, Write::Barrier(tx));
+        rx
+    }
+
+    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<(u64, Write)> {
+        self.tx.clone()
     }
 
     pub(crate) fn send(&self, epoch: u64, write: Write) {

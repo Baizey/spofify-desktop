@@ -593,10 +593,7 @@ async fn run_updates(
     mut requests: mpsc::Receiver<Uuid>,
     shared_epoch: Arc<AtomicU64>,
 ) {
-    let Ok(api) = client().redirect(Policy::none()).build() else {
-        return;
-    };
-    let Ok(assets) = asset_client() else { return };
+    let mut clients = None;
     let live_access = access.clone();
     let mut offers = Offers::default();
     'connection: loop {
@@ -636,6 +633,15 @@ async fn run_updates(
         if !online() {
             continue;
         }
+        // A cold local session must not construct updater transports either.
+        if clients.is_none() {
+            let Ok(api) = client().redirect(Policy::none()).build() else {
+                return;
+            };
+            let Ok(assets) = asset_client() else { return };
+            clients = Some((api, assets));
+        }
+        let (api, assets) = clients.as_ref().unwrap();
         let mut delay = Duration::ZERO;
         loop {
             // Refresh the offer without making the visible action unresponsive.
@@ -643,7 +649,7 @@ async fn run_updates(
             let refresh = async {
                 tokio::time::sleep(wait).await;
                 if online() && current_image(&target).ok() == Some(true) {
-                    check(&api, running, online).await
+                    check(api, running, online).await
                 } else {
                     Ok(None)
                 }
@@ -664,7 +670,7 @@ async fn run_updates(
                             biased;
                             _ = mode.changed() => continue 'connection,
                             _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
-                            installed = download(&assets, &update, &target, online) => installed,
+                            installed = download(assets, &update, &target, online) => installed,
                         };
                         if installed.is_some() {
                             show(&ui, Notice::Ready);
