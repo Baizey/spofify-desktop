@@ -5,6 +5,7 @@ export struct ArtistCredit { id: string, name: string }
 component CreditName inherits Rectangle {
     in property <ArtistCredit> credit;
     in property <bool> interactive;
+    in property <bool> restore-focus;
     in property <length> font-size;
     out property <length> text-width: label.preferred-width;
     callback activated(string);
@@ -29,8 +30,11 @@ component CreditName inherits Rectangle {
             clicked => { key.focus(); root.activated(root.credit.id); }
         }
         key := FocusScope {
+            property <bool> restoring: root.restore-focus;
+            init => { if self.restoring { self.focus(); } }
+            changed restoring => { if self.restoring { self.focus(); } }
             focus-on-click: false;
-            changed has-focus => { if self.has-focus { root.focused(); } }
+            focus-gained(_) => { root.focused(); }
             key-pressed(event) => {
                 if event.text == Key.Return || event.text == Key.Space {
                     if !event.repeat { root.activated(root.credit.id); }
@@ -61,6 +65,7 @@ export component CreditLine inherits Rectangle {
     in property <string> fallback;
     in property <bool> centered;
     in property <bool> interactive: true;
+    in property <string> restore-control;
     in property <length> font-size: 13px * Theme.density;
     in property <bool> background-clickable;
     in property <string> background-click-scope;
@@ -130,6 +135,7 @@ export component CreditLine inherits Rectangle {
                 item := CreditName {
                     x: slot.inset; width: max(0px, slot.width - self.x); height: slot.height;
                     credit: credit; interactive: root.interactive; font-size: root.font-size;
+                    restore-focus: root.restore-control == "artist:" + credit.id;
                     activated(id) => { root.activated(id); }
                     focused => {
                         let start = strip.x + slot.x;

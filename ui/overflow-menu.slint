@@ -29,6 +29,9 @@ export component OverflowMenu inherits Rectangle {
     in property <string> item-context;
     in property <string> context-key;
     in property <length> window-height;
+    in property <bool> restore-focus;
+    init => { if self.restore-focus { self.take-focus(); } }
+    changed restore-focus => { if self.restore-focus { self.take-focus(); } }
     callback action(string);
     callback focused();
     public function take-focus() { if root.visible && root.actions.length > 0 { trigger.take-focus(); } }

@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn large_playlist_detail_keeps_play_and_edit_identity_across_view_pages() {
+    fn large_playlist_detail_keeps_play_and_edit_identity_for_all_occurrences() {
         const SONGS: u64 = 1163;
         let metadata = rule_metadata();
         let mut summary = PlaylistSummary {

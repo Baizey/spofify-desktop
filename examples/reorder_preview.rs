@@ -5,6 +5,9 @@ use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, SharedString, Time
 use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
 slint::include_modules!();
 
+#[path = "../src/playlist_view.rs"]
+mod playlist_view;
+
 fn model<T: Clone + 'static>(rows: Vec<T>) -> ModelRc<T> {
     ModelRc::new(slint::VecModel::from(rows))
 }
@@ -46,6 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir(&output)?;
     let line = args.next().as_deref() == Some("line");
     let ui = AppWindow::new()?;
+    playlist_view::install(&ui);
     ui.set_inspection_width(1280.0);
     ui.set_inspection_height(720.0);
     ui.set_inspection_reorder_line(line);

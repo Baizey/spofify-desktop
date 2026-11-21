@@ -27,6 +27,13 @@ export global Copy {
     public pure function action-mark(action: string) -> string {
         return ActionCopy.mark(action);
     }
+    // Fixed playlist rows fit the same title, credits and album lines as MediaLine.
+    public pure function track-row-height(with-album: bool) -> length {
+        return max(max(48px, 56px * Theme.density), 12px
+            + max(20px, 15px * Theme.density + 7px)
+            + max(20px, 13px * Theme.density + 6px)
+            + (with-album ? max(20px, 12px * Theme.density + 7px) : 0px));
+    }
 }
 
 export component Hero inherits Rectangle {
@@ -93,62 +100,6 @@ export component EmptyState inherits Rectangle {
     }
 }
 
-export component PlaylistPager inherits FlexboxLayout {
-    in property <int> page;
-    in property <int> last-page;
-    in property <int> first-track;
-    in property <int> last-track;
-    in property <int> track-count;
-    in property <bool> announce;
-    in property <string> click-scope;
-    callback turned(int);
-    callback focused();
-    public function focus-page-controls(backward: bool) {
-        if root.page > 0 && (backward || root.page == root.last-page) { previous.take-focus(); }
-        else if root.page < root.last-page { next.take-focus(); }
-    }
-    spacing: 4px;
-    flex-wrap: wrap;
-    cross-axis-alignment: center;
-    vertical-stretch: 0;
-    Caption {
-        text: root.first-track + "–" + root.last-track + " of " + root.track-count;
-        accessible-role: text;
-        accessible-label: "Songs " + self.text;
-        accessible-live-region: root.announce ? polite : off;
-        min-width: self.preferred-width;
-        horizontal-stretch: 1;
-    }
-    HorizontalLayout {
-        spacing: 4px;
-        horizontal-stretch: 0;
-        Action {
-            text: "«"; accessible-label: "First page";
-            enabled: root.page > 0; click-scope: root.click-scope;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.turned(0); }
-        }
-        previous := Action {
-            text: "‹"; accessible-label: "Previous page";
-            enabled: root.page > 0; click-scope: root.click-scope;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.turned(root.page - 1); }
-        }
-        next := Action {
-            text: "›"; accessible-label: "Next page";
-            enabled: root.page < root.last-page; click-scope: root.click-scope;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.turned(root.page + 1); }
-        }
-        Action {
-            text: "»"; accessible-label: "Last page";
-            enabled: root.page < root.last-page; click-scope: root.click-scope;
-            changed has-focus => { if self.has-focus { root.focused(); } }
-            clicked => { root.turned(root.last-page); }
-        }
-    }
-}
-
 component TrackState inherits Rectangle {
     in property <bool> playing;
     width: 16px; height: self.width;
@@ -172,6 +123,9 @@ export component MediaLine inherits Rectangle {
     in property <bool> playable;
     in property <bool> can-open;
     in property <bool> selectable;
+    in property <bool> playlist-track-row;
+    out property <bool> body-focused: row-keys.has-focus;
+    in property <string> restore-control;
     in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
     in property <bool> compact;
@@ -206,6 +160,7 @@ export component MediaLine inherits Rectangle {
     property <string> track-state-label: !root.current-track ? root.occurrence-description
         : (root.occurrence-description == "" ? "" : root.occurrence-description + ", ")
             + (root.playing-track ? "Playing" : "Current track");
+    public function take-row-focus() { row-keys.focus(); }
     function activate-row() {
         if root.can-open { root.action("open"); }
         else if root.play-on-activate { root.action("play"); }
@@ -249,7 +204,7 @@ export component MediaLine inherits Rectangle {
         row-keys := FocusScope {
             enabled: root.body-focusable;
             focus-on-click: false;
-            focus-on-tab-navigation: root.body-actionable;
+            focus-on-tab-navigation: root.body-actionable || root.playlist-track-row;
             focus-gained(_) => { root.focused(); }
             key-pressed(event) => {
                 if root.body-actionable && (event.text == Key.Return || event.text == Key.Space) {
@@ -337,9 +292,10 @@ export component MediaLine inherits Rectangle {
                     height: artist-line.preferred-height;
                     artist-line := CreditLine {
                         // Credit names already have a 2px text inset; the fallback has none.
-                        x: !root.queue-columns ? 0px : root.credits.length > 0 ? 2px : 4px;
+                        x: root.queue-columns || root.playlist-track-row ? (root.credits.length > 0 ? 2px : 4px) : 0px;
                         width: max(0px, parent.width - 2 * self.x); height: parent.height;
                         credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                        restore-control: root.restore-control;
                         background-clickable: root.body-focusable;
                         background-click-scope: root.menu-key;
                         background-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
@@ -352,12 +308,14 @@ export component MediaLine inherits Rectangle {
                 if root.album-name != "": AlbumLine {
                     text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
                     fit-link: true;
+                    restore-focus: root.restore-control == "album:" + root.album-id;
                     activated => { root.page-action("album", root.album-id); }
                     focused => { root.focused(); }
                 }
             }
             if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
-                width: root.sequence > 0 ? (root.compact ? 42px : 64px) : 126px;
+                property <length> column-width: root.sequence > 0 ? (root.compact ? 42px : 64px) : 126px;
+                width: root.playlist-track-row && !root.playable ? max(self.column-width, min(180px, self.preferred-width)) : self.column-width;
                 text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
             }
             if root.playable: Rectangle {
@@ -377,6 +335,7 @@ export component MediaLine inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
                     item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+                    restore-focus: root.restore-control == "menu";
                     action(op) => { root.action(op); }
                     focused => { root.focused(); }
                 }

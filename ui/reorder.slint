@@ -78,6 +78,7 @@ export component ReorderList inherits Rectangle {
     // Index in the complete model, read on mount or when an inactive scope
     // becomes active. This also supports adapters that keep the viewport mounted.
     in property <int> initial-index;
+    in property <bool> align-initial-top;
     out property <int> focused-index: root.selection;
     callback placed(string, string);
 
@@ -165,7 +166,14 @@ export component ReorderList inherits Rectangle {
         root.sync-scope();
         if root.selection < 0 { root.select-row(root.initial-index, false); }
         keys.focus();
-        root.reveal(root.selection);
+        if root.initial-reveal { root.reveal-initial(); }
+        else { root.reveal(root.selection); }
+    }
+
+    function reveal-initial() {
+        if root.align-initial-top && root.has-row(root.selection) {
+            root.scroll-to(-root.selection * root.pitch);
+        } else { root.reveal(root.selection); }
     }
 
     function sync-scope() {
@@ -377,7 +385,7 @@ export component ReorderList inherits Rectangle {
     Timer {
         interval: 1ms;
         running: root.initial-reveal && scroll.visible-height > 0px;
-        triggered => { root.initial-reveal = false; root.reveal(root.selection); }
+        triggered => { root.initial-reveal = false; root.reveal-initial(); }
     }
     Timer {
         // Native Flickable gives touch panning priority for the first 500ms,

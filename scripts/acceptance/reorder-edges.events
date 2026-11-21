@@ -19,8 +19,8 @@
 # Keyboard last, first, and stale-scope cancellation.
 20 down 1188 28
 15 up 1188 28
-100 down 280 289
-15 up 280 289
+100 down 900 92
+15 up 900 92
 130 key space
 30 key end
 140 frame keyboard-last
@@ -38,8 +38,8 @@
 140 frame revision-cancelled
 100 down 923 93
 15 up 923 93
-100 down 280 289
-15 up 280 289
+100 down 900 92
+15 up 900 92
 140 key home
 # Select track 98 solely to start a pointer drag just before the old page edge.
 4 repeat 98 key down

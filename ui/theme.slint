@@ -213,6 +213,7 @@ export component TextTarget inherits Rectangle {
     in property <bool> interactive: true;
     in property <bool> link;
     in property <bool> fit-link;
+    in property <bool> restore-focus;
     in property <color> ink: Theme.text;
     in property <length> font-size: 15px * Theme.density;
     in property <int> font-weight: 600;
@@ -245,6 +246,9 @@ export component TextTarget inherits Rectangle {
             clicked => { key.focus(); root.activated(); }
         }
         key := FocusScope {
+            property <bool> restoring: root.restore-focus;
+            init => { if self.restoring { self.focus(); } }
+            changed restoring => { if self.restoring { self.focus(); } }
             focus-on-click: false;
             focus-gained(_) => { root.focused(); }
             key-pressed(event) => {

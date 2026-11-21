@@ -22,6 +22,7 @@ mod player;
 mod playlist_browser;
 mod playlist_pin_store;
 mod playlist_pins;
+mod playlist_view;
 use api::preferences;
 mod presentation;
 mod replica;
@@ -98,6 +99,7 @@ fn main() -> Result<(), slint::PlatformError> {
         std::process::exit(2);
     }
     let ui = AppWindow::new()?;
+    playlist_view::install(&ui);
     motion::install(&ui);
     if cfg!(debug_assertions) && std::env::var_os("SLINT_MCP_PORT").is_some() {
         ui.set_inspection_reorder_line(std::env::var_os("SPOFIFY_INSPECT_REORDER_LINE").is_some());

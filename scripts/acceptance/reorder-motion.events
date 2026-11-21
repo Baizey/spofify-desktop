@@ -20,17 +20,18 @@
 175 frame 08-settled
 20 down 1188 28
 15 up 1188 28
-100 down 280 289
-15 up 280 289
+# Edit order lives in the persistent strip above the continuous browse list.
+100 down 900 92
+15 up 900 92
 130 frame 09-playlist
-10 down 504 309
+10 down 504 355
 260 frame 10-playlist-grab
-25 move 515 458
+25 move 515 504
 25 frame 11-playlist-cross
-85 move 515 231
+85 move 515 277
 25 frame 12-playlist-cross-back
 100 frame 13-playlist-destination
-15 up 515 231
+15 up 515 277
 25 frame 14-playlist-settling
 190 frame 15-playlist-settled
 0 quit

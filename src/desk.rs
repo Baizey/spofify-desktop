@@ -4,7 +4,7 @@ use crate::{
     AppWindow, ArtistCredit, BrowseRow, PlaylistActions, ReorderRow, actions,
     api::{Api, ApiError, Session},
     engine::Command,
-    pages::{self, Page, Route},
+    pages::{self, Page, Route, RowKey},
     personal_bridge::{Effect, Link, Mutation, PersonalAccess, Status},
     player, playlist_browser, playlist_pins,
     replica::{Replica, Trail},
@@ -816,6 +816,16 @@ impl Browser {
                                 )),
                                 kind: r.kind.as_str().into(),
                                 track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
+                                occurrence_key: match &r.key {
+                                    RowKey::ManualEntry { entry_id, .. } => entry_id.as_str(),
+                                    RowKey::DerivedOccurrence { occurrence_id, .. } => {
+                                        occurrence_id.as_str()
+                                    }
+                                    // Saved membership is fixed, and the UI also matches its position.
+                                    RowKey::Track(id) if kind == "saved-collection" => id.as_str(),
+                                    _ => "",
+                                }
+                                .into(),
                                 title: r.title.as_str().into(),
                                 subtitle: pin_subtitle(r, status),
                                 playlist_pinned: status.is_some(),
