@@ -41,6 +41,25 @@ pub(super) struct Execution {
     last_fact: Option<Instant>,
 }
 
+#[cfg(target_os = "linux")]
+impl Execution {
+    /// A detached run may still be audible under the existing grace permit.
+    pub(super) fn media_pause_token(
+        &self,
+        displayed: &Cursor,
+        room: u64,
+        revision: u64,
+    ) -> Option<String> {
+        (output::same_execution(&self.cursor, displayed) && self.permit.granted()).then(|| {
+            let cursor = &self.cursor;
+            format!(
+                "detached:{room}:{revision}:{}:{}:{}:{}",
+                cursor.key, cursor.chain, cursor.visit, cursor.run
+            )
+        })
+    }
+}
+
 struct PreviewKey {
     generation: Generation,
     from: Cursor,
@@ -373,6 +392,20 @@ impl Engine {
             return self.action_status.is_empty();
         }
         true
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn pause_detached_media(&mut self) {
+        let Some(execution) = &self.online.execution else {
+            return;
+        };
+        // This path must never submit a room Pause: the transport can
+        // reattach concurrently while this actor is stopping its old run.
+        self.online.stopped = Some(execution.cursor.clone());
+        self.cancel_work();
+        self.stop();
+        if let (Some(grant), Some(socket)) = (self.grant(), &self.socket) {
+            let _ = socket.observe_local(grant.generation, Cursor::default());
+        }
     }
     pub(super) fn online_action(&mut self, action: Action) {
         if !self.network_allowed() {
@@ -1067,6 +1100,30 @@ mod tests {
             desired: true,
             ..Cursor::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detached_media_cannot_pause_a_projected_successor() {
+        let old = cursor(5, 2, 1);
+        let next = cursor(6, 3, 0);
+        let grant = OutputAuthority {
+            generation: 8,
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+            attached: false,
+        };
+        let (authority, receiver) = tokio::sync::watch::channel(Some(grant));
+        let execution = Execution {
+            cursor: old.clone(),
+            permit: output::RunPermit::new(receiver, grant),
+            pending_crossfade: None,
+            status: Status::Ok,
+            last_fact: None,
+        };
+        assert!(execution.media_pause_token(&old, 5, 3).is_some());
+        assert!(execution.media_pause_token(&next, 5, 3).is_none());
+        authority.send_replace(None);
+        assert!(execution.media_pause_token(&old, 5, 3).is_none());
     }
 
     #[test]

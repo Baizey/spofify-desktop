@@ -183,6 +183,20 @@ impl Engine {
             .as_ref()
             .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
     }
+    #[cfg(target_os = "linux")]
+    fn detached_media_token(&self) -> Option<String> {
+        if !self.network_allowed()
+            || self.local_store.is_some()
+            || self.online_generation().is_some()
+        {
+            return None;
+        }
+        self.online.execution.as_ref()?.media_pause_token(
+            self.online.cursor()?,
+            self.room_incarnation,
+            self.online.revision,
+        )
+    }
     fn network_allowed(&self) -> bool {
         self.current()
             && !self.offline
@@ -630,6 +644,13 @@ impl Engine {
                     self.local_revision = self.local_revision.wrapping_add(1);
                     self.start_saved(Some(input));
                 }
+            }
+            #[cfg(target_os = "linux")]
+            Command::Guarded(token, Action::Pause) | Command::GuardedToggle(token)
+                if token.starts_with("detached:")
+                    && self.detached_media_token().as_deref() == Some(token.as_str()) =>
+            {
+                self.pause_detached_media();
             }
             Command::Guarded(token, action) => {
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
@@ -1108,6 +1129,10 @@ impl Engine {
         };
         if !self.offline {
             self.project_online(&mut p);
+            #[cfg(target_os = "linux")]
+            if p.room_token.is_empty() && p.control {
+                p.room_token = self.detached_media_token().unwrap_or_default();
+            }
             if let Some(cursor) = self.online.cursor().filter(|_| !p.track.is_empty()) {
                 p.media_track_token =
                     format!("online:{}:{}:{}", cursor.key, cursor.chain, cursor.visit);

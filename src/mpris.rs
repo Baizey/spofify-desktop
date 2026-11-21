@@ -33,6 +33,9 @@ struct View {
     seek: bool,
 }
 impl View {
+    fn can_play(&self) -> bool {
+        self.control && !self.room_token.starts_with("detached:")
+    }
     fn status(&self) -> &'static str {
         if self.track_token.is_empty() {
             "Stopped"
@@ -96,7 +99,7 @@ impl Tap {
             // The engine's Pause stops output without discarding the shared
             // queue. Its Close command is destructive, not a transport stop.
             Action::Stop | Action::Pause if view.control => return Some(player::Action::Pause),
-            Action::Play if view.control => return Some(player::Action::Resume),
+            Action::Play if view.can_play() => return Some(player::Action::Resume),
             Action::Next if view.skip => return Some(player::Action::Next),
             Action::Previous if view.skip => return Some(player::Action::Previous),
             Action::Seek(offset) if view.seek => {
@@ -154,6 +157,7 @@ impl Snapshot {
             || previous.duration_us != next.duration_us
             || previous.playing != next.playing
             || previous.control != next.control
+            || previous.can_play() != next.can_play()
             || previous.skip != next.skip
             || previous.seek != next.seek;
         self.view = next;
@@ -182,6 +186,7 @@ impl Player {
         let permitted = match action {
             Action::Next | Action::Previous => v.skip,
             Action::Seek(_) => v.seek,
+            Action::Play => v.can_play(),
             Action::Stop => v.control && !v.room_token.is_empty(),
             _ => v.control,
         };
@@ -205,7 +210,7 @@ impl Player {
             let properties = Values::from([
                 ("PlaybackStatus", Str::from(v.status()).into()),
                 ("Metadata", v.metadata().into()),
-                ("CanPlay", v.control.into()),
+                ("CanPlay", v.can_play().into()),
                 ("CanPause", v.control.into()),
                 ("CanGoNext", v.skip.into()),
                 ("CanGoPrevious", v.skip.into()),
@@ -298,7 +303,7 @@ impl Player {
     }
     #[zbus(property)]
     fn can_play(&self) -> bool {
-        self.current().0.control
+        self.current().0.can_play()
     }
     #[zbus(property)]
     fn can_pause(&self) -> bool {
@@ -671,6 +676,37 @@ mod tests {
             tap.guarded_action(&v, pos),
             Some(player::Action::Pause)
         ));
+    }
+
+    #[test]
+    fn detached_execution_can_pause_but_not_start_or_seek() {
+        let view = View {
+            room_token: "detached:5:3:1:chain:2:4".into(),
+            skip: false,
+            seek: false,
+            ..fixture()
+        };
+        let mut tap = Tap {
+            epoch: view.epoch,
+            when: Instant::now(),
+            action: Action::Pause,
+            room_token: view.room_token.clone(),
+        };
+        assert!(matches!(
+            tap.guarded_action(&view, 0),
+            Some(player::Action::Pause)
+        ));
+        for action in [
+            Action::Play,
+            Action::Next,
+            Action::Previous,
+            Action::Seek(10),
+            Action::SetPosition(10),
+        ] {
+            tap.action = action;
+            assert!(tap.guarded_action(&view, 0).is_none());
+        }
+        assert!(tap.guarded_action(&fixture(), 0).is_none());
     }
 
     #[test]
