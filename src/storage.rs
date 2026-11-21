@@ -73,7 +73,11 @@ fn open_data_dir(base: &Path, app_dir: &str, create: bool) -> Result<OwnedFd> {
     }
     let mut dir = walk(&canonical, false)?;
     for name in missing.into_iter().rev() {
-        dir = open_child(&dir, name, true)?;
+        let child = open_child(&dir, name, true)?;
+        // The child must survive a crash before an app can acknowledge a
+        // durable write made under this newly created data base.
+        fs::fsync(&dir)?;
+        dir = child;
     }
     let dir = open_child(&dir, leaf, create)?;
     private_dir(&dir)?;

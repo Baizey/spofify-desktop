@@ -324,6 +324,28 @@ impl OfflineStore {
         })
     }
 
+    /// Hold the shared directory lock across playlist publication. Each
+    /// required recording was already verified during transfer; no other
+    /// cooperating process can remove an entry between this check and commit.
+    pub(crate) fn lock_members(
+        &self,
+        api: &Api,
+        session: &Session,
+        ids: &[String],
+    ) -> Result<OwnedFd, Error> {
+        let scope = Scope::new(api, session)?;
+        let dir = self.lock_dir(false)?;
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if seen.insert(id) {
+                api.authenticated_account(session)?;
+                open_entry(&dir, &scope.name(id)?, &scope)?;
+            }
+        }
+        api.authenticated_account(session)?;
+        Ok(dir)
+    }
+
     /// Remove only the requested key in the active account/origin namespace.
     /// Unlink by descriptor; even a damaged entry is never dereferenced here.
     /// Returns false if it was already absent.

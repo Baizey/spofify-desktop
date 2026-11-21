@@ -27,6 +27,7 @@ use crate::{
     desk::Access,
     offline::{self, OfflineStore},
     pages::{Page, Route, Row, RowKey},
+    playlist_pin_store::{Membership, Target as PinTarget},
     storage as local_storage,
 };
 
@@ -58,6 +59,7 @@ const NOT_DURABLE: ApiError =
 const INVALID: ApiError = error("The server returned an incompatible collection manifest.");
 const UNSUPPORTED: ApiError = error("This page cannot be saved as a collection.");
 const EMPTY: ApiError = error("No tracks in this collection could be saved.");
+const UNRECORDED: ApiError = error("This playlist contains songs without recorded audio.");
 const OFFLINE: ApiError = error("Work online to save a collection.");
 const CANCELLED: ApiError = error("The collection save was cancelled.");
 const CHANGED: ApiError = ApiError {
@@ -71,12 +73,17 @@ const NOT_FOUND: ApiError = ApiError {
     status: 404,
 };
 
-pub async fn list(access: &Access) -> Result<Vec<Row>, ApiError> {
+pub async fn list(access: &Access, include_playlists: bool) -> Result<Vec<Row>, ApiError> {
     let access = access.clone();
     blocking(move || {
         let scope = scope(&access)?;
         let index = IndexDir::open_default()?.read()?;
-        let mut entries: Vec<_> = index.in_scope(&scope).collect();
+        let mut entries: Vec<_> = index
+            .in_scope(&scope)
+            .filter(|entry| {
+                include_playlists || !matches!(entry.kind, Kind::Manual | Kind::Derived)
+            })
+            .collect();
         entries.sort_unstable_by(|a, b| a.title.cmp(&b.title).then_with(|| a.key.cmp(&b.key)));
         let available = if entries.is_empty() {
             HashMap::new()
@@ -109,7 +116,7 @@ pub async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> {
         let store = OfflineStore::open_default().map_err(audio_error)?;
         let available = available_tracks(&access, &store)?;
         check_live(&access)?;
-        Ok(detail_page(entry, &available))
+        Ok(entry.detail_page(&available))
     })
     .await
 }
@@ -128,23 +135,60 @@ fn available_tracks(
         .collect())
 }
 
+pub(crate) fn saved_playlist_row(
+    key: &str,
+    title: &str,
+    kind: PlaylistKind,
+    status: String,
+) -> Row {
+    collection_row(key.into(), title.into(), kind.into(), status)
+}
+
+/// Disk I/O only; call on a blocking worker. Missing audio leaves the ordered
+/// membership in place, just as it does for a saved album or artist.
+pub(crate) fn saved_playlist_page(
+    access: &Access,
+    title: String,
+    kind: PlaylistKind,
+    tracks: Vec<String>,
+) -> Result<Page, ApiError> {
+    check_live(access)?;
+    let available = if tracks.is_empty() {
+        HashMap::new()
+    } else if let Some(store) = OfflineStore::open_existing().map_err(audio_error)? {
+        available_tracks(access, &store)?
+    } else {
+        HashMap::new()
+    };
+    check_live(access)?;
+    Ok(detail_page(title, kind.into(), &tracks, &available))
+}
+
 fn list_row(entry: StoredCollection, available: &HashMap<String, Item>) -> Row {
     let detail = entry.summary(available).label();
+    collection_row(entry.key, entry.title, entry.kind, detail)
+}
+
+fn collection_row(key: String, title: String, kind: Kind, detail: String) -> Row {
     Row {
         kind: "saved-collection".into(),
-        id: entry.key.clone(),
-        route: Some(Route::SavedCollection(entry.key)),
-        title: entry.title,
-        subtitle: entry.kind.label().into(),
+        id: key.clone(),
+        route: Some(Route::SavedCollection(key)),
+        title,
+        subtitle: kind.label().into(),
         detail,
         ..Row::default()
     }
 }
 
-fn detail_page(entry: StoredCollection, available: &HashMap<String, Item>) -> Page {
-    let summary = entry.summary(available);
-    let rows = entry
-        .tracks
+fn detail_page(
+    title: String,
+    kind: Kind,
+    tracks: &[String],
+    available: &HashMap<String, Item>,
+) -> Page {
+    let summary = SaveSummary::from_tracks(tracks, available);
+    let rows = tracks
         .iter()
         .enumerate()
         .map(|(position, id)| {
@@ -170,8 +214,8 @@ fn detail_page(entry: StoredCollection, available: &HashMap<String, Item>) -> Pa
         .collect();
     let missing = summary.total - summary.present;
     Page {
-        title: entry.title,
-        subtitle: format!("{} · {}", entry.kind.label(), summary.label()),
+        title,
+        subtitle: format!("{} · {}", kind.label(), summary.label()),
         kind: "saved-collection".into(),
         total: Some(summary.total as u64),
         status: if missing > 0 {
@@ -219,6 +263,16 @@ pub struct SaveSummary {
     pub total: usize,
 }
 impl SaveSummary {
+    fn from_tracks(tracks: &[String], available: &HashMap<String, Item>) -> Self {
+        Self {
+            present: tracks
+                .iter()
+                .filter(|id| available.contains_key(*id))
+                .count(),
+            total: tracks.len(),
+        }
+    }
+
     fn label(self) -> String {
         format!("{} of {} available", self.present, song_count(self.total))
     }
@@ -266,7 +320,7 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
                     }
                 }
             }
-            let key = hash_fields(b"spofify-collection-key-v1", &[&scope, target.domain(), target.id()]);
+            let key = collection_key(&scope, target.domain(), target.id());
             let entry = StoredCollection {
                 scope, key, kind, title,
                 tracks: tracks.into_iter().map(|t| t.id).collect(),
@@ -292,6 +346,91 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
     }
 }
 
+/// Transfer a complete fenced snapshot. Only the caller can publish the
+/// membership; verified audio survives a failed or cancelled pin.
+pub(crate) async fn complete_playlist(
+    access: &Access,
+    target: &PinTarget,
+    progress: impl FnMut(usize, usize) + Send,
+    live: impl Fn() -> Result<(), ApiError> + Send + Sync,
+) -> Result<Membership, ApiError> {
+    if access.offline {
+        return Err(OFFLINE);
+    }
+    if !valid_id(&target.id) {
+        return Err(UNSUPPORTED);
+    }
+    let mut network = access.session.network_changes();
+    let generation = *network.borrow_and_update();
+    if generation & 1 != 0 {
+        return Err(OFFLINE);
+    }
+    let fence = network.clone();
+    let live = || {
+        live()?;
+        if *fence.borrow() != generation {
+            return Err(OFFLINE);
+        }
+        check_live(access)
+    };
+    let target = Target::Playlist {
+        id: &target.id,
+        kind: target.kind,
+        revision: None,
+    };
+    tokio::select! {
+        biased;
+        _ = network.changed() => Err(OFFLINE),
+        result = async {
+            let state = fetch_manifest::<PlaylistTracks>(access, target, &live).await?;
+            state.complete(access, progress, &live, OfflineStore::open_default).await
+        } => result,
+    }
+}
+
+/// Call on a blocking worker. Check that required entries still exist under
+/// the audio directory's shared lock. Keep the guard through the pin store's
+/// commit and do not take an exclusive audio lock while holding it.
+pub(crate) fn lock_playlist_members(
+    access: &Access,
+    membership: &Membership,
+) -> Result<Option<OwnedFd>, ApiError> {
+    lock_playlist_members_with(access, membership, OfflineStore::open_existing)
+}
+
+fn lock_playlist_members_with(
+    access: &Access,
+    membership: &Membership,
+    open: impl FnOnce() -> Result<Option<OfflineStore>, offline::Error>,
+) -> Result<Option<OwnedFd>, ApiError> {
+    check_live(access)?;
+    let guard = if membership.tracks.is_empty() {
+        None
+    } else {
+        let store = open()
+            .map_err(audio_error)?
+            .ok_or_else(|| audio_error(offline::Error::NotDownloaded))?;
+        Some(
+            store
+                .lock_members(&access.api, &access.session, &membership.tracks)
+                .map_err(audio_error)?,
+        )
+    };
+    check_live(access)?;
+    Ok(guard)
+}
+
+async fn verify_track(
+    store: &OfflineStore,
+    access: &Access,
+    id: &str,
+) -> Result<(), offline::Error> {
+    let (store, access, id) = (store.clone(), access.clone(), id.to_owned());
+    tokio::task::spawn_blocking(move || store.read(&access.api, &access.session, &id).map(|_| ()))
+        .await
+        .map_err(|_| offline::Error::Storage)?
+}
+
 fn handle_track_error(err: offline::Error) -> Result<(), ApiError> {
     match err {
         offline::Error::AlreadyDownloaded
@@ -311,7 +450,8 @@ enum Target<'a> {
     Artist(&'a str),
     Playlist {
         id: &'a str,
-        expected: Option<(PlaylistKind, u64)>,
+        kind: PlaylistKind,
+        revision: Option<u64>,
     },
 }
 impl<'a> Target<'a> {
@@ -329,7 +469,8 @@ impl<'a> Target<'a> {
                     .ok_or(CHANGED)?;
                 Ok(Self::Playlist {
                     id,
-                    expected: Some((playlist.kind, playlist.revision)),
+                    kind: playlist.kind,
+                    revision: Some(playlist.revision),
                 })
             }
             _ => Err(UNSUPPORTED),
@@ -371,6 +512,15 @@ impl Kind {
     }
 }
 
+impl From<PlaylistKind> for Kind {
+    fn from(kind: PlaylistKind) -> Self {
+        match kind {
+            PlaylistKind::Manual => Self::Manual,
+            PlaylistKind::Derived => Self::Derived,
+        }
+    }
+}
+
 struct Snapshot {
     kind: Kind,
     title: String,
@@ -378,9 +528,20 @@ struct Snapshot {
 }
 
 async fn snapshot(access: &Access, target: Target<'_>) -> Result<Snapshot, ApiError> {
+    fetch_manifest::<Vec<Item>>(access, target, || Ok(()))
+        .await?
+        .finish()
+}
+
+async fn fetch_manifest<T: ManifestTracks>(
+    access: &Access,
+    target: Target<'_>,
+    live: impl Fn() -> Result<(), ApiError>,
+) -> Result<ManifestState<T>, ApiError> {
     let mut state = ManifestState::default();
     let mut cursor = None;
     loop {
+        live()?;
         let wire = access
             .api
             .offline_collection_manifest(
@@ -390,9 +551,10 @@ async fn snapshot(access: &Access, target: Target<'_>) -> Result<Snapshot, ApiEr
                 cursor.as_deref(),
             )
             .await?;
+        live()?;
         cursor = state.append(target, &wire)?;
         if cursor.is_none() {
-            return state.finish();
+            return Ok(state);
         }
     }
 }
@@ -486,13 +648,26 @@ impl WireTrack {
 }
 
 #[derive(Default)]
-struct ManifestState {
+struct ManifestState<T = Vec<Item>> {
     metadata: Option<(Header, String, u64, u64, Kind)>,
-    tracks: Vec<Item>,
+    tracks: T,
     occurrences: HashSet<String>,
     cursors: HashSet<String>,
+    position: u64,
+    recorded: u64,
 }
-impl ManifestState {
+trait ManifestTracks: Default {
+    fn push_track(&mut self, item: Item) -> Result<(), ApiError>;
+}
+
+impl ManifestTracks for Vec<Item> {
+    fn push_track(&mut self, item: Item) -> Result<(), ApiError> {
+        self.push(item);
+        Ok(())
+    }
+}
+
+impl<T: ManifestTracks> ManifestState<T> {
     fn append(&mut self, target: Target<'_>, body: &[u8]) -> Result<Option<String>, ApiError> {
         if body.len() > MAX_PAGE_BYTES {
             return Err(INVALID);
@@ -509,20 +684,20 @@ impl ManifestState {
             {
                 (header, Kind::Artist, "ofc1_")
             }
-            (Target::Playlist { expected, .. }, None, Some(header)) => {
-                let (kind, playlist_kind) = match header.kind.as_str() {
-                    "manual" => (Kind::Manual, PlaylistKind::Manual),
-                    "derived" => (Kind::Derived, PlaylistKind::Derived),
+            (Target::Playlist { kind, revision, .. }, None, Some(header)) => {
+                let playlist_kind = match header.kind.as_str() {
+                    "manual" => PlaylistKind::Manual,
+                    "derived" => PlaylistKind::Derived,
                     _ => return Err(INVALID),
                 };
-                let revision = header
+                let actual = header
                     .revision
                     .filter(|r| (1..=9_007_199_254_740_991).contains(r))
                     .ok_or(INVALID)?;
-                if expected.is_some_and(|value| value != (playlist_kind, revision)) {
+                if playlist_kind != kind || revision.is_some_and(|expected| expected != actual) {
                     return Err(CHANGED);
                 }
-                (header, kind, "of1_")
+                (header, playlist_kind.into(), "of1_")
             }
             _ => return Err(INVALID),
         };
@@ -544,7 +719,7 @@ impl ManifestState {
                 return Err(CHANGED);
             }
         }
-        let offset = self.tracks.len() as u64;
+        let offset = self.position;
         let remaining = wire.total.checked_sub(offset).ok_or(INVALID)?;
         let count = wire.items.len() as u64;
         if count != remaining.min(u64::from(PAGE_SIZE))
@@ -564,7 +739,11 @@ impl ManifestState {
             {
                 return Err(INVALID);
             }
-            self.tracks.push(occurrence.track.project()?);
+            let item = occurrence.track.project()?;
+            let recorded = u64::from(item.has_audio);
+            self.tracks.push_track(item)?;
+            self.position += 1;
+            self.recorded += recorded;
         }
         self.metadata = Some((
             header,
@@ -575,17 +754,114 @@ impl ManifestState {
         ));
         Ok(wire.next_cursor)
     }
-    fn finish(self) -> Result<Snapshot, ApiError> {
+    fn finish_parts(self) -> Result<(Header, Kind, T), ApiError> {
         let (header, _, total, recorded, kind) = self.metadata.ok_or(INVALID)?;
-        if total != self.tracks.len() as u64
-            || recorded != self.tracks.iter().filter(|t| t.has_audio).count() as u64
-        {
+        if total != self.position || recorded != self.recorded {
             return Err(INVALID);
         }
+        Ok((header, kind, self.tracks))
+    }
+}
+
+impl ManifestState {
+    fn finish(self) -> Result<Snapshot, ApiError> {
+        let (header, kind, tracks) = self.finish_parts()?;
         Ok(Snapshot {
             kind,
             title: header.name,
-            tracks: self.tracks,
+            tracks,
+        })
+    }
+}
+
+#[derive(Default)]
+struct PlaylistTracks {
+    order: Vec<usize>,
+    unique: Vec<(Item, usize)>,
+    by_id: HashMap<String, usize>,
+}
+impl ManifestTracks for PlaylistTracks {
+    fn push_track(&mut self, item: Item) -> Result<(), ApiError> {
+        let index = if let Some(&i) = self.by_id.get(&item.id) {
+            let (previous, count) = &mut self.unique[i];
+            if *previous != item {
+                return Err(INVALID);
+            }
+            *count += 1;
+            i
+        } else {
+            let i = self.unique.len();
+            self.by_id.insert(item.id.clone(), i);
+            self.unique.push((item, 1));
+            i
+        };
+        self.order.push(index);
+        Ok(())
+    }
+}
+
+impl ManifestState<PlaylistTracks> {
+    async fn complete(
+        self,
+        access: &Access,
+        mut progress: impl FnMut(usize, usize),
+        live: impl Fn() -> Result<(), ApiError>,
+        open: impl FnOnce() -> Result<OfflineStore, offline::Error> + Send + 'static,
+    ) -> Result<Membership, ApiError> {
+        let all_recorded = self.position == self.recorded;
+        let (
+            header,
+            _,
+            PlaylistTracks {
+                order,
+                unique,
+                by_id,
+            },
+        ) = self.finish_parts()?;
+        drop(by_id);
+        live()?;
+        let total = order.len();
+        progress(0, total);
+        live()?;
+        if !all_recorded {
+            return Err(UNRECORDED);
+        }
+        if total != 0 {
+            let store = blocking(move || open().map_err(audio_error)).await?;
+            let mut verified = 0;
+            for (item, count) in &unique {
+                live()?;
+                let local = verify_track(&store, access, &item.id).await;
+                live()?;
+                match local {
+                    Ok(()) => (),
+                    Err(offline::Error::NotDownloaded) => {
+                        // Only absence permits a transfer. A winner of the
+                        // no-overwrite download race must still pass the read.
+                        let download = store.download(&access.api, &access.session, item).await;
+                        live()?;
+                        match download {
+                            Ok(_) => (), // Download already verified, probed and committed.
+                            Err(offline::Error::AlreadyDownloaded) => {
+                                verify_track(&store, access, &item.id)
+                                    .await
+                                    .map_err(audio_error)?;
+                            }
+                            Err(err) => return Err(audio_error(err)),
+                        }
+                    }
+                    Err(err) => return Err(audio_error(err)),
+                }
+                live()?;
+                verified += *count;
+                progress(verified, total);
+            }
+        }
+        let tracks = order.into_iter().map(|i| unique[i].0.id.clone()).collect();
+        live()?;
+        Ok(Membership {
+            title: header.name,
+            tracks,
         })
     }
 }
@@ -604,14 +880,11 @@ struct StoredCollection {
 }
 impl StoredCollection {
     fn summary(&self, available: &HashMap<String, Item>) -> SaveSummary {
-        SaveSummary {
-            present: self
-                .tracks
-                .iter()
-                .filter(|id| available.contains_key(*id))
-                .count(),
-            total: self.tracks.len(),
-        }
+        SaveSummary::from_tracks(&self.tracks, available)
+    }
+
+    fn detail_page(self, available: &HashMap<String, Item>) -> Page {
+        detail_page(self.title, self.kind, &self.tracks, available)
     }
 }
 
@@ -835,6 +1108,17 @@ fn scope(access: &Access) -> Result<String, ApiError> {
         &[origin, principal],
     ))
 }
+pub(crate) fn playlist_key(access: &Access, id: &str) -> Result<String, ApiError> {
+    if !valid_id(id) {
+        return Err(UNSUPPORTED);
+    }
+    Ok(collection_key(&scope(access)?, "playlists", id))
+}
+
+fn collection_key(scope: &str, domain: &str, id: &str) -> String {
+    hash_fields(b"spofify-collection-key-v1", &[scope, domain, id])
+}
+
 fn hash_fields(domain: &[u8], parts: &[&str]) -> String {
     use std::fmt::Write as _;
     let mut hash = Context::new(&SHA256);
@@ -968,7 +1252,8 @@ mod tests {
         ] {
             let target = Target::Playlist {
                 id: "fixture",
-                expected: Some((playlist_kind, 7)),
+                kind: playlist_kind,
+                revision: Some(7),
             };
             let page_size = PAGE_SIZE as usize;
             let total = 2 * page_size + 1;
@@ -1025,7 +1310,8 @@ mod tests {
         ] {
             let target = Target::Playlist {
                 id: "fixture",
-                expected: Some((playlist_kind, 7)),
+                kind: playlist_kind,
+                revision: Some(7),
             };
             let mut state = ManifestState::default();
             let page_size = PAGE_SIZE as usize;
@@ -1061,7 +1347,8 @@ mod tests {
     fn unavailable_manifest_members_and_per_track_failures_are_partial() {
         let target = Target::Playlist {
             id: "fixture",
-            expected: Some((PlaylistKind::Manual, 7)),
+            kind: PlaylistKind::Manual,
+            revision: Some(7),
         };
         let mut body = wire_page("manual", 3, 0..3, None);
         body["recordedAudioTotal"] = json!(1);
@@ -1135,6 +1422,281 @@ mod tests {
         }
     }
 
+    fn pin_target(kind: PlaylistKind) -> Target<'static> {
+        Target::Playlist {
+            id: "fixture",
+            kind,
+            revision: None,
+        }
+    }
+
+    fn append_pin(
+        state: &mut ManifestState<PlaylistTracks>,
+        kind: PlaylistKind,
+        body: Value,
+    ) -> Result<Option<String>, ApiError> {
+        state.append(pin_target(kind), &serde_json::to_vec(&body).unwrap())
+    }
+
+    #[test]
+    fn queued_playlist_needs_no_online_revision_but_fences_kind_and_manifest_revision() {
+        let mut state = ManifestState::default();
+        let total = PAGE_SIZE as usize + 1;
+        let first = wire_page("derived", total, 0..total - 1, Some("of1_next.signature"));
+        let last = wire_page("derived", total, total - 1..total, None);
+        assert_eq!(
+            append_pin(&mut state, PlaylistKind::Manual, first.clone()),
+            Err(CHANGED)
+        );
+        let mut invalid = first.clone();
+        invalid["playlist"]["revision"] = json!(0);
+        assert_eq!(
+            append_pin(&mut state, PlaylistKind::Derived, invalid),
+            Err(INVALID)
+        );
+        assert!(
+            append_pin(&mut state, PlaylistKind::Derived, first)
+                .unwrap()
+                .is_some()
+        );
+        let mut changed_revision = last.clone();
+        changed_revision["playlist"]["revision"] = json!(8);
+        assert_eq!(
+            append_pin(&mut state, PlaylistKind::Derived, changed_revision),
+            Err(CHANGED)
+        );
+        assert_eq!(
+            append_pin(&mut state, PlaylistKind::Derived, last),
+            Ok(None)
+        );
+        assert!(state.finish_parts().is_ok());
+    }
+
+    #[test]
+    fn queued_playlist_rejects_conflicting_track_metadata_across_pages() {
+        let total = PAGE_SIZE as usize + 1;
+        let first = wire_page("manual", total, 0..total - 1, Some("of1_next.signature"));
+        let mut last = wire_page("manual", total, total - 1..total, None);
+        last["items"][0]["track"] = first["items"][0]["track"].clone();
+        last["items"][0]["track"]["name"] = json!("Conflicting name");
+        let mut state = ManifestState::default();
+        assert!(
+            append_pin(&mut state, PlaylistKind::Manual, first)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            append_pin(&mut state, PlaylistKind::Manual, last),
+            Err(INVALID)
+        );
+        assert_eq!(state.finish_parts().err(), Some(INVALID));
+    }
+
+    #[tokio::test]
+    async fn empty_pin_needs_no_audio_store_and_unrecorded_occurrences_do_not_transfer() {
+        let access = account("https://fixture.invalid");
+        let mut state = ManifestState::default();
+        append_pin(
+            &mut state,
+            PlaylistKind::Manual,
+            wire_page("manual", 0, 0..0, None),
+        )
+        .unwrap();
+        let mut milestones = Vec::new();
+        let membership = state
+            .complete(
+                &access,
+                |n, total| milestones.push((n, total)),
+                || Ok(()),
+                || panic!("empty playlist must not open the audio store"),
+            )
+            .await
+            .unwrap();
+        assert!(membership.tracks.is_empty());
+        assert_eq!(milestones, [(0, 0)]);
+        assert!(
+            lock_playlist_members_with(&access, &membership, || {
+                panic!("empty playlist must not open the audio store at commit")
+            })
+            .unwrap()
+            .is_none()
+        );
+        let page = saved_playlist_page(
+            &access,
+            membership.title,
+            PlaylistKind::Manual,
+            membership.tracks,
+        )
+        .unwrap();
+        assert_eq!(page.total, Some(0));
+        assert!(page.rows.is_empty());
+
+        let mut body = wire_page("manual", 3, 0..3, None);
+        body["items"][0]["track"]["hasAudio"] = json!(false);
+        body["items"][2]["track"] = body["items"][0]["track"].clone();
+        let mut state = ManifestState::default();
+        append_pin(&mut state, PlaylistKind::Manual, body.clone()).unwrap();
+        let result = state
+            .complete(&access, |_, _| {}, || Ok(()), || panic!("wrong wire count"))
+            .await;
+        assert_eq!(result.err(), Some(INVALID));
+        body["recordedAudioTotal"] = json!(1);
+        let mut state = ManifestState::default();
+        append_pin(&mut state, PlaylistKind::Manual, body).unwrap();
+        milestones.clear();
+        let result = state
+            .complete(
+                &access,
+                |n, total| milestones.push((n, total)),
+                || Ok(()),
+                || panic!("every occurrence must be recorded before any audio I/O"),
+            )
+            .await;
+        assert_eq!(result.err(), Some(UNRECORDED));
+        assert_eq!(milestones, [(0, 3)]);
+    }
+
+    // Write the v1 audio record format directly for network-free digest tests.
+    fn install_audio(root: &std::path::Path, access: &Access, id: &str, audio: &[u8]) -> PathBuf {
+        fn digest(bytes: &[u8]) -> String {
+            ring::digest::digest(&SHA256, bytes)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+        let (origin, principal) = access.api.authenticated_account(&access.session).unwrap();
+        let scope = hash_fields(b"spofify-download-scope-v1\0", &[origin, principal]);
+        let path = root.join(format!("{scope}.{}", digest(id.as_bytes())));
+        let head = serde_json::to_vec(&json!({"scope": scope,
+            "track": {"id": id, "name": id, "artists": "", "album_name": "",
+                "duration_ms": 0, "track_number": 0, "disc_number": 0},
+            "bytes": audio.len(), "audio_hash": digest(audio),
+        }))
+        .unwrap();
+        let mut file = stdfs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"SPOFDL01").unwrap();
+        file.write_all(&(head.len() as u32).to_le_bytes()).unwrap();
+        file.write_all(&head).unwrap();
+        file.write_all(audio).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn queued_transfer_verifies_unique_files_and_preserves_large_ordered_membership() {
+        const TOTAL: usize = 1161;
+        let access = account("https://fixture.invalid");
+        access.session.set_offline(true); // Even a fixture failure cannot trigger HTTP.
+        let scratch = Scratch::new();
+        let root = scratch.0.join("audio");
+        let store = OfflineStore::open(&root).unwrap();
+        install_audio(&root, &access, "repeat", b"verified fixture audio");
+        install_audio(&root, &access, "track", b"different fixture audio");
+        let mut state = ManifestState::default();
+        let page_size = PAGE_SIZE as usize;
+        for start in (0..TOTAL).step_by(page_size) {
+            let end = (start + page_size).min(TOTAL);
+            let next = (end < TOTAL).then(|| format!("of1_page_{end}.signature"));
+            assert_eq!(
+                append_pin(
+                    &mut state,
+                    PlaylistKind::Derived,
+                    wire_page("derived", TOTAL, start..end, next.as_deref())
+                ),
+                Ok(next)
+            );
+        }
+        assert_eq!(state.tracks.unique.len(), 2);
+        let mut milestones = Vec::new();
+        let test_store = store.clone();
+        let membership = state
+            .complete(
+                &access,
+                |n, total| milestones.push((n, total)),
+                || Ok(()),
+                move || Ok(test_store),
+            )
+            .await
+            .unwrap();
+        assert_eq!(membership.title, "Fixture playlist");
+        assert_eq!(membership.tracks.len(), TOTAL);
+        for (index, id) in membership.tracks.iter().enumerate() {
+            assert_eq!(
+                id,
+                if matches!(index, 0 | 20) {
+                    "repeat"
+                } else {
+                    "track"
+                }
+            );
+        }
+        assert_eq!(milestones, [(0, TOTAL), (2, TOTAL), (TOTAL, TOTAL)]);
+
+        let key = playlist_key(&access, "fixture").unwrap();
+        assert_eq!(
+            key,
+            "054c3638d07b51addb399dcad039d58d44ab9a4d7dd9a2e209cf5fa7729a7055"
+        );
+        let row = saved_playlist_row(
+            &key,
+            &membership.title,
+            PlaylistKind::Derived,
+            "Saved".into(),
+        );
+        assert_eq!(row.route, Some(Route::SavedCollection(key)));
+        assert_eq!(row.subtitle, "Rule playlist");
+        assert_eq!(row.detail, "Saved");
+        let guard =
+            lock_playlist_members_with(&access, &membership, || Ok(Some(store.clone()))).unwrap();
+        assert_eq!(
+            store.remove(&access.api, &access.session, "track"),
+            Err(offline::Error::Busy)
+        );
+        drop(guard);
+        assert!(store.remove(&access.api, &access.session, "track").unwrap());
+        assert_eq!(
+            lock_playlist_members_with(&access, &membership, || Ok(Some(store.clone()))).err(),
+            Some(audio_error(offline::Error::NotDownloaded))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digest_failure_never_advances_progress_or_overwrites_existing_audio() {
+        let access = account("https://fixture.invalid");
+        access.session.set_offline(true);
+        let scratch = Scratch::new();
+        let root = scratch.0.join("audio");
+        let store = OfflineStore::open(&root).unwrap();
+        install_audio(&root, &access, "repeat", b"good");
+        let path = install_audio(&root, &access, "track", b"four");
+        let mut damaged = stdfs::read(&path).unwrap();
+        *damaged.last_mut().unwrap() = b'!';
+        stdfs::write(&path, &damaged).unwrap();
+        assert_eq!(store.list(&access.api, &access.session).unwrap().len(), 2);
+
+        let mut body = wire_page("manual", 3, 0..3, None);
+        body["items"][2]["track"] = body["items"][0]["track"].clone();
+        let mut state = ManifestState::default();
+        append_pin(&mut state, PlaylistKind::Manual, body).unwrap();
+        let mut milestones = Vec::new();
+        let result = state
+            .complete(
+                &access,
+                |n, total| milestones.push((n, total)),
+                || Ok(()),
+                move || Ok(store),
+            )
+            .await;
+        assert_eq!(result.err(), Some(audio_error(offline::Error::Damaged)));
+        assert_eq!(milestones, [(0, 3), (2, 3)]);
+        assert_eq!(stdfs::read(path).unwrap(), damaged);
+    }
+
     fn create_v1_fixture(path: &std::path::Path, fixture: &Value) {
         let file = stdfs::OpenOptions::new()
             .write(true)
@@ -1184,7 +1746,7 @@ mod tests {
         assert_eq!(entries[1].key, derived);
         assert!(matches!(entries[1].kind, Kind::Derived));
         for entry in entries {
-            let page = detail_page(entry, &HashMap::new());
+            let page = entry.detail_page(&HashMap::new());
             assert_eq!(page.total, Some(0));
             assert!(page.rows.is_empty());
         }
@@ -1232,7 +1794,7 @@ mod tests {
             list_row(entry.clone(), &available).detail,
             "581 of 1161 songs available"
         );
-        let page = detail_page(entry, &available);
+        let page = entry.detail_page(&available);
         assert_eq!(page.total, Some(TOTAL as u64));
         assert_eq!(page.status, "580 songs not available on this device.");
         assert_eq!(page.rows.len(), TOTAL);
@@ -1426,7 +1988,7 @@ mod tests {
             list_row(entry.clone(), &available).detail,
             "3 of 3 songs available"
         );
-        assert!(detail_page(entry.clone(), &available).status.is_empty());
+        assert!(entry.clone().detail_page(&available).status.is_empty());
         available.remove("two"); // A single removal invalidates both duplicate slots.
         assert_eq!(
             entry.summary(&available),
@@ -1439,7 +2001,7 @@ mod tests {
             list_row(entry.clone(), &available).detail,
             "1 of 3 songs available"
         );
-        let page = detail_page(entry, &available);
+        let page = entry.detail_page(&available);
         assert_eq!(page.subtitle, "Album · 1 of 3 songs available");
         assert_eq!(page.total, Some(3));
         assert_eq!(

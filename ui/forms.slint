@@ -97,12 +97,12 @@ export component Editor inherits Rectangle {
                         padding: 15px; spacing: 10px;
                         Eyebrow { text: root.mode == "device-rename" ? "PLAYBACK DEVICES" : root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }
                         Text {
-                            text: root.mode == "remove-saved" ? "Remove this download?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
+                            text: root.mode == "remove-saved" ? "Remove this saved collection?" : root.mode == "delete" ? "Delete this playlist?" : root.mode == "rename" ? "Rename playlist"
                                 : root.mode == "rules" ? "Edit playlist rules" : root.mode == "new-rules" ? "New rules playlist"
                                 : root.mode == "device-rename" ? "Rename playback device" : "New playlist";
                             color: Theme.text; font-weight: 700; font-size: 25px; wrap: word-wrap;
                         }
-                        if root.deleting: Caption { text: root.mode == "remove-saved" ? "This removes the saved download from this computer, not the collection from your library." : "The playlist will be deleted. Tracks in your library won’t be affected."; wrap: word-wrap; }
+                        if root.deleting: Caption { text: root.mode == "remove-saved" ? "This removes the collection from Saved offline. Its audio files stay on this computer." : "The playlist will be deleted. Tracks in your library won’t be affected."; wrap: word-wrap; }
                         if root.editing-name: Caption { text: root.mode == "device-rename" ? "Device name" : "Playlist name"; color: Theme.text; }
                         if root.editing-name: Field {
                             text <=> root.name;
@@ -133,7 +133,7 @@ export component Editor inherits Rectangle {
                             }
                             Rectangle { horizontal-stretch: 1; }
                             Action {
-                                text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove download" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
+                                text: root.busy ? "Working…" : root.mode == "remove-saved" ? "Remove from Saved" : root.deleting ? "Delete playlist" : root.creating ? "Create playlist" : "Save changes";
                                 enabled: root.ready; primary: !root.deleting; danger: root.deleting;
                                 clicked => { root.save(); }
                             }

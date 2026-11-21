@@ -75,6 +75,8 @@ impl Api {
 
         // Serialize the decision with changes to the transport fence. Repeated Work
         // offline (no generation change) is covered by the caller's intent token.
+        // An authoritative denial also fences final local pin publication.
+        let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
         let current = changes.borrow();
         if *current != generation {
             return Err(OFFLINE);

@@ -222,6 +222,8 @@ impl Session {
 
     /// A session capability and every clone share the same explicit network mode.
     pub fn set_offline(&self, offline: bool) {
+        // Serialize mode changes with the final pin rename, not its disk sync.
+        let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
         self.secrets.network.send_if_modified(|generation| {
             if (*generation & 1 != 0) == offline {
                 return false;
@@ -863,6 +865,7 @@ impl Api {
         self.check_session_owner(session)?;
         let fence = NetworkFence::new(session);
         let deadline = {
+            let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
             let mut lifetime = session.lifetime();
             lifetime.check_revocation()?;
             let deadline = lifetime.deadline;
@@ -991,6 +994,8 @@ impl Api {
         let response = request.send().await.map_err(|_| NETWORK)?;
         let status = response.status();
         if let Some((session, generation, used)) = request_scope {
+            let _publication = (status == 401)
+                .then(|| crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap());
             // Keep the mode fence held through publication or revocation.
             let current = session.secrets.network.borrow();
             if *current != generation {

@@ -266,10 +266,7 @@ impl Engine {
         self.publish_access();
     }
     async fn shutdown(&mut self) {
-        let epoch = self
-            .shared_epoch
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
+        let epoch = crate::advance_account_epoch(&self.shared_epoch);
         let account = self.account.take();
         let retained = self.retained.take();
         self.retire_pending(false);

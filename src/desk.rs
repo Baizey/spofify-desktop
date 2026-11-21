@@ -6,12 +6,13 @@ use crate::{
     engine::Command,
     pages::{self, Page, Route},
     personal_bridge::{Effect, Link, Mutation, PersonalAccess, Status},
-    player,
+    player, playlist_browser, playlist_pins,
     replica::{Replica, Trail},
     saved,
 };
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
+    collections::HashMap,
     hash::{BuildHasher, RandomState},
     sync::{
         Arc,
@@ -121,6 +122,7 @@ enum Update {
     Changed(Result<Option<Route>, ApiError>),
     Local(Result<Command, ApiError>),
     CollectionSaved(Result<crate::collections::SaveSummary, ApiError>),
+    PinChanged(Result<(), ApiError>),
 }
 struct Delivery {
     serial: u64,
@@ -160,6 +162,9 @@ struct Browser {
     task: Option<JoinHandle<()>>,
     results: mpsc::Sender<Delivery>,
     art: watch::Sender<Option<crate::artwork::Request>>,
+    pins: playlist_pins::Controller,
+    pin_view: playlist_pins::View,
+    saved_reload_due: bool,
 }
 /// Opaque, account-session-local identity for the shell's scroll position.
 /// Hash the exact typed route, not its display title or refresh generation, and
@@ -343,6 +348,42 @@ fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'stati
     }
     v
 }
+// Only the playlist list and Saved rows need the keyed pin state. Playlist
+// detail uses its own status line so the track model stays stable as it saves.
+struct PinDisplay<'a> {
+    view: Option<&'a playlist_pins::View>,
+    sources: HashMap<&'a str, &'a playlist_pins::Status>,
+}
+impl<'a> PinDisplay<'a> {
+    fn new(view: &'a playlist_pins::View, access: Option<&Access>) -> Self {
+        let view = access.filter(|a| Some(a.epoch) == view.epoch).map(|_| view);
+        Self {
+            sources: view
+                .into_iter()
+                .flat_map(|v| v.records.values())
+                .filter(|r| r.wanted)
+                .map(|r| (r.target.id.as_str(), r))
+                .collect(),
+            view,
+        }
+    }
+    fn row(&self, row: &pages::Row) -> Option<&'a playlist_pins::Status> {
+        match &row.route {
+            Some(Route::Playlist(id)) if row.playlist.is_some() => {
+                self.sources.get(id.as_str()).copied()
+            }
+            Some(Route::SavedCollection(key)) => self.view?.records.get(key).filter(|r| r.wanted),
+            _ => None,
+        }
+    }
+    fn page(&self, route: &Route) -> Option<&'a playlist_pins::Status> {
+        match route {
+            Route::Playlist(id) => self.sources.get(id.as_str()).copied(),
+            Route::SavedCollection(key) => self.view?.records.get(key).filter(|r| r.wanted),
+            _ => None,
+        }
+    }
+}
 fn unavailable(message: &'static str) -> ApiError {
     ApiError {
         message,
@@ -405,6 +446,10 @@ impl Browser {
         let token = self.generation;
         let shown = self.shown.clone();
         let p = self.page.clone();
+        let route = self.route.clone();
+        let access = self.access.clone();
+        let pin_view = self.pin_view.clone();
+        let pin = PinDisplay::new(&pin_view, access.as_ref());
         let kind = if p.kind.is_empty() {
             self.route.kind().into()
         } else {
@@ -416,10 +461,16 @@ impl Browser {
         } else {
             p.title.clone()
         };
-        let message = if self.message.is_empty() {
-            p.status.clone()
-        } else {
+        let message = if !self.message.is_empty() {
             self.message.clone()
+        } else if let Some(status) = pin.page(&route) {
+            if p.status.is_empty() || p.status == "Pending" {
+                status.label()
+            } else {
+                format!("{} · {}", status.label(), p.status)
+            }
+        } else {
+            p.status.clone()
         };
         let (busy, error, back) = (
             self.busy && !self.silent_read,
@@ -459,6 +510,7 @@ impl Browser {
             ui.set_form_busy(write);
             if models {
                 ui.set_browse_model_key(token.to_string().into());
+                let pin = PinDisplay::new(&pin_view, access.as_ref());
                 ui.set_page_credits(artist_credits(&p.music, offline));
                 ui.set_browse_rows(ModelRc::new(VecModel::from(
                     p.rows
@@ -467,17 +519,33 @@ impl Browser {
                         .map(|(i, r)| {
                             let (album_id, album_name) =
                                 projected_music(r.music.album.as_ref(), offline, false);
+                            let status = if matches!(kind.as_str(), "playlists" | "offline") {
+                                pin.row(r)
+                            } else {
+                                None
+                            };
                             BrowseRow {
                                 section: Default::default(),
                                 actions: if personal_actions {
-                                    strings(row_actions(&p, r, i, offline))
+                                    let mut acts = row_actions(&p, r, i, offline);
+                                    if !offline && kind == "playlists" && r.playlist.is_some() {
+                                        acts.push(if status.is_some() {
+                                            "unpin-playlist"
+                                        } else {
+                                            "save"
+                                        });
+                                    }
+                                    strings(acts)
                                 } else {
                                     strings(Vec::new())
                                 },
                                 kind: r.kind.as_str().into(),
                                 track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
                                 title: r.title.as_str().into(),
-                                subtitle: r.subtitle.as_str().into(),
+                                subtitle: status.map_or_else(
+                                    || r.subtitle.as_str().into(),
+                                    |r| r.label().into(),
+                                ),
                                 detail: r.detail.as_str().into(),
                                 can_open: if matches!(route, Route::Picker(_)) {
                                     !offline && personal_actions
@@ -507,11 +575,15 @@ impl Browser {
                     if p.playback.is_some() {
                         actions.extend(["play", "queue"]);
                     }
-                    if matches!(
-                        kind.as_str(),
-                        "album" | "artist" | "playlist-manual" | "playlist-rules"
-                    ) {
+                    if matches!(kind.as_str(), "album" | "artist") {
                         actions.push("save");
+                    }
+                    if matches!(route, Route::Playlist(_)) && p.playlist.is_some() {
+                        actions.push(if pin.page(&route).is_some() {
+                            "unpin-playlist"
+                        } else {
+                            "save"
+                        });
                     }
                     match kind.as_str() {
                         "playlists" => actions.extend(["new-manual", "new-rules"]),
@@ -544,8 +616,69 @@ impl Browser {
             }
         });
     }
+    fn pins_changed(&mut self, view: playlist_pins::View) {
+        let old = std::mem::replace(&mut self.pin_view, view);
+        if self.access.as_ref().map(|a| a.epoch) != self.pin_view.epoch {
+            return;
+        }
+        let structural = old.epoch != self.pin_view.epoch || old.revision != self.pin_view.revision;
+        if structural {
+            self.cache.saved_changed();
+            if saved_route(&self.route) {
+                if self.writing {
+                    self.saved_reload_due = true;
+                } else {
+                    self.visit(Navigation::Untracked(self.route.clone()), false);
+                }
+                return;
+            }
+            if self.route.personal() {
+                self.render(true);
+            }
+        } else if matches!(&self.route, Route::Playlists | Route::Playlist(_))
+            || saved_route(&self.route)
+        {
+            // Update only the visible labels. Replacing the entire model here
+            // would reset menus/focus and restart artwork for every progress tick.
+            let prev = PinDisplay::new(&old, self.access.as_ref());
+            let next = PinDisplay::new(&self.pin_view, self.access.as_ref());
+            let changes: Vec<_> = self
+                .page
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    let old = prev.row(row).map(|r| r.label());
+                    let new = next.row(row).map(|r| r.label());
+                    (old != new).then(|| (i, new.unwrap_or_else(|| row.subtitle.clone())))
+                })
+                .collect();
+            if !changes.is_empty() {
+                let generation = self.generation;
+                let shown = self.shown.clone();
+                self.scoped_ui(move |ui| {
+                    if shown.load(Ordering::SeqCst) != generation {
+                        return;
+                    }
+                    let rows = ui.get_browse_rows();
+                    for (index, text) in changes {
+                        if let Some(mut row) = rows.row_data(index) {
+                            row.subtitle = text.into();
+                            rows.set_row_data(index, row);
+                        }
+                    }
+                });
+            }
+            if prev.page(&self.route).map(|r| r.label())
+                != next.page(&self.route).map(|r| r.label())
+            {
+                self.render(false);
+            }
+        }
+    }
     fn reset(&mut self, access: Option<Access>) {
         self.cancel();
+        self.saved_reload_due = false;
         self.personal_due = None;
         self.personal_ready = false;
         self.personal_view = None;
@@ -969,7 +1102,7 @@ impl Browser {
                 }
                 let mut result = match &next {
                     Route::Offline => downloads_page(&a).await,
-                    Route::SavedCollection(id) => crate::collections::detail(&a, id).await,
+                    Route::SavedCollection(id) => playlist_browser::detail(&a, id).await,
                     _ if rebuilding => rebuild_for(&a, &next, depth).await,
                     _ => pages::load(&a, &next, prior.as_deref()).await,
                 };
@@ -1165,6 +1298,26 @@ impl Browser {
             }
             return;
         }
+        if matches!(op.as_str(), "save" | "unpin-playlist")
+            && let Some(target) = playlist_browser::target(&route, &page, row.as_ref())
+        {
+            let wanted = op == "save";
+            if wanted && offline {
+                return;
+            }
+            let pins = self.pins.clone();
+            self.cancel();
+            self.writing = true;
+            self.error = false;
+            self.message.clear();
+            self.render(false);
+            let (tx, serial) = (self.results.clone(), self.serial);
+            self.task = Some(tokio::spawn(async move {
+                let result = Update::PinChanged(pins.set(&a, target, wanted).await);
+                let _ = tx.send(Delivery { serial, result }).await;
+            }));
+            return;
+        }
         let remove_saved = op == "remove" && saved_page;
         let save = op == "save";
         if a.offline && !local_play && !remove_saved {
@@ -1202,6 +1355,7 @@ impl Browser {
         self.render(false);
         let tx = self.results.clone();
         let serial = self.serial;
+        let pins = self.pins.clone();
         self.task = Some(tokio::spawn(async move {
             let result = if local_play {
                 let i = idx
@@ -1216,14 +1370,14 @@ impl Browser {
                     && row.is_none()
                 {
                     Update::Changed(
-                        crate::collections::remove(&a, id)
+                        playlist_browser::remove(&a, &pins, id)
                             .await
                             .map(|_| Some(Route::Offline)),
                     )
                 } else {
                     let res = if let Some(r) = row.as_ref() {
                         if remove_saved && matches!(r.route, Some(Route::SavedCollection(_))) {
-                            crate::collections::remove(&a, &r.id).await
+                            playlist_browser::remove(&a, &pins, &r.id).await
                         } else {
                             if save {
                                 saved::save(&a, r).await
@@ -1335,6 +1489,13 @@ impl Browser {
                 }
                 self.render(false);
             }
+            Update::PinChanged(result) => {
+                if let Err(e) = result {
+                    self.message = readable(&e);
+                    self.error = true;
+                }
+                self.render(false);
+            }
             Update::Changed(Err(e)) => {
                 // A removal can be visible even if the final disk sync failed.
                 self.cache.saved_changed();
@@ -1349,7 +1510,11 @@ impl Browser {
             }
             Update::Local(Ok(command)) => {
                 self.playback(command);
-                self.render(false);
+                if std::mem::take(&mut self.saved_reload_due) && saved_route(&self.route) {
+                    self.visit(Navigation::Untracked(self.route.clone()), false);
+                } else {
+                    self.render(false);
+                }
             }
             Update::Local(Err(e)) => {
                 self.message = readable(&e);
@@ -1363,7 +1528,10 @@ const SEARCH_DELAY: Duration = Duration::from_millis(240);
 
 async fn downloads_page(access: &Access) -> Result<Page, ApiError> {
     let mut page = saved::page(access).await?;
-    let mut groups = crate::collections::list(access).await?;
+    let (mut groups, warning) = playlist_browser::saved_rows(access).await?;
+    if let Some(error) = warning {
+        page.status = readable(&error);
+    }
     groups.append(&mut page.rows);
     page.total = Some(groups.len() as u64);
     page.rows = groups;
@@ -1732,7 +1900,8 @@ pub fn start(
             .build()
             .expect("browser runtime");
         runtime.block_on(async move {
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art};
+            let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);
@@ -1749,6 +1918,7 @@ pub fn start(
                     },
                     _=async {match due{Some(t)=>tokio::time::sleep_until(t).await,None=>std::future::pending().await}}=>b.personal_timeout(),
                     _=async { match &mut personal_updates { Some(w) => { let _ = w.changed().await; }, None => std::future::pending().await } }=>b.personal_changed(false),
+                    Ok(())=pin_updates.changed()=>b.pins_changed(pin_updates.borrow_and_update().clone()),
                     Some(u)=updates.recv()=>b.result(u),
                     input=inputs.recv()=>{let Some(i)=input else{break;};b.input(i);},
                 }

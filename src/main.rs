@@ -16,6 +16,9 @@ mod pages;
 mod personal;
 mod personal_bridge;
 mod player;
+mod playlist_browser;
+mod playlist_pin_store;
+mod playlist_pins;
 use api::preferences;
 mod presentation;
 mod replica;
@@ -270,6 +273,12 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     result
 }
+fn advance_account_epoch(epoch: &AtomicU64) -> u64 {
+    // Only the final local pin rename shares this lock, never a download or fsync.
+    let _publication = playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+    epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+}
+
 fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Arc<AtomicU64>) {
     for retry in [false, true] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
@@ -278,7 +287,7 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
             if ui.get_busy() || ui.get_signed_in() || (retry && !ui.get_can_retry_session()) {
                 return;
             }
-            let epoch = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            let epoch = advance_account_epoch(&epoch);
             let origin = ui.get_origin().into();
             let username = ui.get_username().into();
             let command = if retry {
@@ -336,7 +345,7 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
             if !interrupt {
                 return;
             }
-            let epoch = epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            let epoch = advance_account_epoch(&epoch);
             ui.set_signed_in(false);
             ui.set_busy(false);
             ui.set_restoring_login(false);

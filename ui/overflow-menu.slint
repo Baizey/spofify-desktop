@@ -3,14 +3,14 @@ import { Action, Theme } from "theme.slint";
 export global ActionCopy {
     public pure function label(action: string) -> string {
         return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
-            : action == "save" ? "Save offline"
+            : action == "save" ? "Save offline" : action == "unpin-playlist" ? "Remove offline save"
             : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
             : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
             : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
             : action == "new-rules" ? "New rules playlist" : action;
     }
     public pure function mark(action: string) -> string {
-        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" ? "↓" : action == "remove" ? "−" : action == "up" ? "↑"
+        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" ? "↓" : action == "remove" || action == "unpin-playlist" ? "−" : action == "up" ? "↑"
             : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
     }
 }
