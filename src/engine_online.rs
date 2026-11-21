@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -87,10 +87,50 @@ struct Advance {
     to: Cursor,
 }
 
+const ORDER_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+struct OrderEcho {
+    key: u64,
+    after: Option<u64>,
+    refresh_due: Option<Instant>,
+    refresh_attempts: u8,
+    refresh_id: Option<u64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncRead {
+    Repair,
+    Order(u64),
+}
+impl OrderEcho {
+    fn placement_observed(&self, state: &socket::State) -> bool {
+        let Some(current) = state
+            .queue
+            .iter()
+            .position(|row| row.key == state.cursor.key)
+        else {
+            return false;
+        };
+        state
+            .queue
+            .iter()
+            .skip(current + 1)
+            .scan(None, |previous, row| {
+                let pair = (*previous, row.key);
+                *previous = Some(row.key);
+                Some(pair)
+            })
+            .any(|(predecessor, occurrence)| occurrence == self.key && predecessor == self.after)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Online {
     pub state: Option<State>,
     pub revision: u64,
+    order_echo: Option<OrderEcho>,
+    // Go responds to sync on the same connection in request order. Retain
+    // older repairs so their replies cannot release a later move fence.
+    sync_reads: VecDeque<SyncRead>,
+    sync_serial: u64,
     pub work: Option<Work>,
     pub execution: Option<Execution>,
     connection: String,
@@ -113,6 +153,14 @@ impl Online {
             .map(|advance| &advance.to)
             .or_else(|| self.state.as_ref().map(|s| &s.cursor))
     }
+    pub(super) fn queue_order_pending(&self) -> bool {
+        self.order_echo.is_some()
+    }
+
+    pub(super) fn has_provisional_cursor(&self) -> bool {
+        self.advance.is_some()
+    }
+
     pub fn wants_pause(&self) -> bool {
         self.cursor().is_some_and(|cursor| {
             cursor.desired
@@ -199,6 +247,35 @@ impl Engine {
             self.personal.refused(epoch, generation);
         }
     }
+    pub(super) fn send_playlist_order(
+        &self,
+        observed: super::PersonalStatus,
+        mode_stamp: u64,
+        command: &PersonalCommand,
+    ) -> bool {
+        let generation = observed.generation;
+        let (Some(account), Some(socket)) = (&self.account, &self.socket) else {
+            return false;
+        };
+        if self.online_generation() != Some(generation)
+            || self.online.personal_generation != Some(generation)
+            || !socket.events.is_empty()
+        {
+            return false;
+        }
+        let mode = *account.session.network_changes().borrow();
+        // Do not hold this read lock: socket admission also checks mode, and
+        // its writer-owning actor independently fences any stamp change.
+        if mode != mode_stamp {
+            return false;
+        }
+        self.personal.admit_move(observed, command, || {
+            socket
+                .personal_order(generation, mode_stamp, command)
+                .is_ok()
+        })
+    }
+
     fn repair(&mut self, generation: Generation) {
         // One repair per socket generation. Do not spin on a malformed peer
         // or repeat any user mutation while waiting for a fresh projection.
@@ -206,8 +283,12 @@ impl Engine {
             return;
         }
         self.online.repair = Some(generation);
-        if let Some(socket) = &self.socket {
-            let _ = socket.sync(generation);
+        if self
+            .socket
+            .as_ref()
+            .is_some_and(|socket| socket.sync(generation).is_ok())
+        {
+            self.online.sync_reads.push_back(SyncRead::Repair);
         }
     }
     fn player_gap(&mut self, generation: Generation) {
@@ -247,6 +328,12 @@ impl Engine {
                 outputs,
             } => {
                 let fresh = self.online.generation != Some(generation);
+                let read = if fresh {
+                    self.online.sync_reads.clear();
+                    None
+                } else {
+                    self.online.sync_reads.pop_front()
+                };
                 if fresh {
                     self.disconnect_personal();
                     self.online.generation = Some(generation);
@@ -262,6 +349,16 @@ impl Engine {
                     self.action_status = "";
                 }
                 self.online.player_gap = false;
+                if self.online.order_echo.as_ref().is_some_and(|echo| {
+                    fresh
+                        || echo
+                            .refresh_id
+                            .is_some_and(|id| read == Some(SyncRead::Order(id)))
+                        || echo.placement_observed(&player)
+                }) {
+                    self.online.order_echo = None;
+                    self.action_status = "";
+                }
                 self.online.revision = self.online.revision.wrapping_add(1);
                 // While awaiting actual reattach confirmation, the opening
                 // snapshot may still contain the pre-EOF base. Keep the local
@@ -291,6 +388,18 @@ impl Engine {
                     self.player_gap(generation);
                     return;
                 };
+                if delta.queue.is_some()
+                    && self
+                        .online
+                        .order_echo
+                        .as_ref()
+                        .is_some_and(|echo| echo.placement_observed(state))
+                {
+                    self.online.order_echo = None;
+                    if self.action_status == "The queue order is unconfirmed." {
+                        self.action_status = "";
+                    }
+                }
                 if changed {
                     self.online.revision = self.online.revision.wrapping_add(1);
                 }
@@ -345,6 +454,7 @@ impl Engine {
             return;
         }
         self.drain_online_events(first);
+        self.refresh_queue_order();
         self.finish_initial_play();
         if self.local_store.is_some() {
             let room_needs_output = self.attached().is_some()
@@ -424,6 +534,62 @@ impl Engine {
         self.finish_initial_play();
         self.send_online_command(command);
     }
+    pub(super) fn send_queue_order(&mut self, action: Action, mode_stamp: u64) {
+        let Some(generation) = self.online_generation() else {
+            return;
+        };
+        let Action::Move { key, after } = action else {
+            return;
+        };
+        let Some(command) = action.wire(&self.device_id) else {
+            return;
+        };
+        if self
+            .socket
+            .as_ref()
+            .is_some_and(|s| s.reorder(generation, mode_stamp, command).is_ok())
+        {
+            self.online.order_echo = Some(OrderEcho {
+                key,
+                after,
+                refresh_due: Some(Instant::now() + ORDER_REFRESH_DELAY),
+                refresh_attempts: 0,
+                refresh_id: None,
+            });
+            self.action_status = "";
+        } else {
+            self.action_status = "The queue order was not sent.";
+        }
+    }
+
+    fn refresh_queue_order(&mut self) {
+        let Some((socket, generation)) = self.socket.as_ref().zip(self.online_generation()) else {
+            return;
+        };
+        let Some(echo) = self.online.order_echo.as_mut() else {
+            return;
+        };
+        if echo.refresh_due.is_none_or(|due| Instant::now() < due) {
+            return;
+        }
+        // Admit at most one refresh. Back off a few times only if the read
+        // couldn't enter the local buffer; never repeat the order write.
+        echo.refresh_due = None;
+        echo.refresh_attempts += 1;
+        self.action_status = "The queue order is unconfirmed.";
+        if self.online.sync_reads.len() < 4 && socket.sync(generation).is_ok() {
+            self.online.sync_serial = self.online.sync_serial.wrapping_add(1);
+            let id = self.online.sync_serial;
+            echo.refresh_id = Some(id);
+            self.online.sync_reads.push_back(SyncRead::Order(id));
+        } else if echo.refresh_attempts < 3 {
+            echo.refresh_due = Some(
+                Instant::now()
+                    + std::time::Duration::from_millis(250 * u64::from(echo.refresh_attempts)),
+            );
+        }
+    }
+
     fn send_online_command(&mut self, command: socket::Command) {
         if matches!(command, socket::Command::Pause | socket::Command::Close)
             && (self.online.is_owner()

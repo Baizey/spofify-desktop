@@ -85,6 +85,8 @@ pub(crate) struct Status {
     pub interruption: u64,
     /// Changes only when a validated playlist part advances the scoped pull.
     pub playlist_progress: u64,
+    /// Changes when the watched route or authoritative playlist detail changes.
+    pub playlist_detail: u64,
     sequence: u64,
 }
 
@@ -116,6 +118,7 @@ impl Default for State {
                 refused: 0,
                 interruption: 0,
                 playlist_progress: 0,
+                playlist_detail: 0,
                 sequence: 0,
             },
             replica: Replica::default(),
@@ -159,13 +162,26 @@ impl PersonalAccess {
         if state.status.epoch != epoch {
             return None;
         }
+        let previous = state.replica.watched_playlist().map(str::to_owned);
         let command = state.replica.watch(id);
+        if previous.as_deref() != state.replica.watched_playlist() {
+            state.status.playlist_detail = state.status.playlist_detail.wrapping_add(1);
+            self.signal();
+        }
         if state.status.link == Link::Ready {
             Some((state.status.generation, command?))
         } else {
             None
         }
     }
+    pub(crate) fn refresh_playlist(&self, epoch: u64) -> Option<(u64, PersonalCommand)> {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch != epoch || state.status.link != Link::Ready {
+            return None;
+        }
+        Some((state.status.generation, state.replica.refresh_playlist()?))
+    }
+
     /// Return evidence of matching server state, never a command receipt. A
     /// concurrent client can produce the same change; do not attribute it here.
     pub(crate) fn observed(
@@ -339,6 +355,12 @@ impl PersonalHub {
             self.0.signal();
             return Err(PersonalGap);
         }
+        let final_part = match &update {
+            PersonalUpdate::Part(part) if !part.more => {
+                Some((part.summary.id.clone(), part.token.clone()))
+            }
+            _ => None,
+        };
         let observation = if let PersonalUpdate::Change(change) = &update {
             let current = state.replica.snapshot();
             let entries = change.entries.as_ref();
@@ -378,6 +400,23 @@ impl PersonalHub {
                 {
                     state.status.playlist_progress = state.status.playlist_progress.wrapping_add(1);
                 }
+                let watched_changed = state.replica.watched_playlist().is_some_and(|id| {
+                    observation.as_ref().is_some_and(|item| {
+                        item.deleted.as_deref() == Some(id)
+                            || item.playlist.as_ref().is_some_and(|p| p.id == id)
+                    })
+                });
+                if snapshot
+                    || watched_changed
+                    || final_part.is_some_and(|(id, token)| {
+                        state
+                            .replica
+                            .playlist()
+                            .is_some_and(|p| !p.stale && p.summary.id == id && p.token == token)
+                    })
+                {
+                    state.status.playlist_detail = state.status.playlist_detail.wrapping_add(1);
+                }
                 if let Some(observation) = observation {
                     state.status.sequence = observation.sequence;
                     if state.observations.len() >= 32 {
@@ -405,6 +444,50 @@ impl PersonalHub {
             self.0.signal();
         }
     }
+    // Validate the exact observed detail and occurrence pair all the way to
+    // transport admission. The live wire has no expected revision field.
+    pub(crate) fn admit_move(
+        &self,
+        observed: Status,
+        command: &PersonalCommand,
+        send: impl FnOnce() -> bool,
+    ) -> bool {
+        let state = self.0.state.lock().expect("personal state");
+        let PersonalCommand::MoveEntry {
+            playlist_id,
+            entry_id,
+            after,
+        } = command
+        else {
+            return false;
+        };
+        if state.status != observed || observed.link != Link::Ready || !command.valid() {
+            return false;
+        }
+        let Some(playlist) = state.replica.playlist().filter(|p| {
+            !p.stale
+                && p.summary.id == *playlist_id
+                && p.summary.kind == PlaylistKind::Manual
+                && p.summary.capabilities.edit_entries
+        }) else {
+            return false;
+        };
+        let Some(index) = playlist.rows.iter().position(|row| row.id == *entry_id) else {
+            return false;
+        };
+        let original = index
+            .checked_sub(1)
+            .map(|i| playlist.rows[i].id.as_str())
+            .unwrap_or_default();
+        if after == original
+            || after == entry_id
+            || !after.is_empty() && !playlist.rows.iter().any(|row| row.id == *after)
+        {
+            return false;
+        }
+        send()
+    }
+
     pub fn authorizes(&self, epoch: u64, generation: u64, command: &PersonalCommand) -> bool {
         let state = self.0.state.lock().expect("personal state");
         state.scoped(epoch, generation)
@@ -484,6 +567,47 @@ mod tests {
         hub.receive(1, 3, serde_json::from_value(json!({"change":{}})).unwrap())
             .unwrap();
         assert_eq!(progress(), 1);
+    }
+
+    #[test]
+    fn move_admission_rejects_same_revision_detail_replacement() {
+        let hub = PersonalHub::default();
+        let access = hub.access();
+        hub.begin(7, 3);
+        hub.receive(7, 3, empty()).unwrap();
+        assert!(access.watch_playlist(7, Some("mix".into())).is_some());
+        let part = |token: &str, keys: [&str; 3]| {
+            let rows: Vec<_> = keys.into_iter().enumerate().map(|(i, key)| json!({
+                "id":key, "position":i, "track":{"kind":"track","id":"same-song","name":"Song","artists":[],
+                    "hasAudio":true,"coverage":{"tracks":1,"inLibrary":1,"albums":1}}})).collect();
+            serde_json::from_value(json!({"part":{
+                "summary":{"id":"mix","name":"Mix","description":"","kind":"manual","countState":"exact",
+                    "trackCount":3,"availableCount":3,"revision":4,"createdAt":"2026-08-03T00:00:00Z",
+                    "updatedAt":"2026-08-03T00:00:00Z","capabilities":{"editMetadata":true,"editEntries":true,
+                    "editDefinition":false,"play":true,"copyToManual":false,"delete":true,"addTracks":true}},
+                "token":token,"offset":0,"more":false,"rows":rows}})).unwrap()
+        };
+        hub.receive(7, 3, part("first", ["a", "b", "c"])).unwrap();
+        let before = access.read(|s, _| s);
+        let order = PersonalCommand::MoveEntry {
+            playlist_id: "mix".into(),
+            entry_id: "a".into(),
+            after: "c".into(),
+        };
+        assert!(hub.admit_move(before, &order, || true));
+        let past = PersonalCommand::MoveEntry {
+            playlist_id: "mix".into(),
+            entry_id: "b".into(),
+            after: "a".into(),
+        };
+        assert!(!hub.admit_move(before, &past, || panic!("same-slot drop submitted")));
+        assert!(access.refresh_playlist(7).is_some());
+        assert!(!hub.admit_move(before, &order, || panic!("stale detail submitted")));
+        hub.receive(7, 3, part("other", ["b", "a", "c"])).unwrap();
+        let after = access.read(|s, _| s);
+        assert_ne!(after.playlist_detail, before.playlist_detail);
+        assert!(!hub.admit_move(before, &order, || panic!("old observation submitted")));
+        assert!(hub.admit_move(after, &order, || true));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Desktop browsing controller. A single owner accepts navigation and writes;
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
-    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, actions,
+    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, ReorderRow, actions,
     api::{Api, ApiError, Session},
     engine::Command,
     pages::{self, Page, Route},
@@ -44,6 +44,11 @@ enum Intent {
     Search(String),
     Row(String, usize),
     Page(String, String),
+    PlaylistOrderDrop {
+        scope: String,
+        grabbed: String,
+        after: String,
+    },
 }
 struct Input {
     epoch: u64,
@@ -100,6 +105,19 @@ impl Desk {
             }
         });
         let (d, w) = (self.clone(), ui.as_weak());
+        ui.on_playlist_order_drop(move |scope, grabbed, after| {
+            if let Some(ui) = w.upgrade() {
+                d.submit(
+                    &ui,
+                    Intent::PlaylistOrderDrop {
+                        scope: scope.into(),
+                        grabbed: grabbed.into(),
+                        after: after.into(),
+                    },
+                );
+            }
+        });
+        let (d, w) = (self.clone(), ui.as_weak());
         ui.on_page_action(move|op,value|{let Some(ui)=w.upgrade()else{return};let op=op.to_string();let mut val=value.to_string();
             if op=="offline" {
                 // Fence new requests immediately, before the engine drops its active transports.
@@ -133,6 +151,53 @@ struct Pending {
     before: Status,
     due: tokio::time::Instant,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlaylistOrderBasis {
+    page_generation: u64,
+    network_mode: u64,
+    // Includes the authority generation, interruption and observed change sequence.
+    status: Status,
+}
+impl PlaylistOrderBasis {
+    fn current(
+        epoch: u64,
+        page_generation: u64,
+        network_mode: u64,
+        status: Status,
+    ) -> Option<Self> {
+        (network_mode & 1 == 0 && status.epoch == epoch && status.link == Link::Ready).then_some(
+            Self {
+                page_generation,
+                network_mode,
+                status,
+            },
+        )
+    }
+}
+
+struct PlaylistOrderScope {
+    key: String,
+    basis: PlaylistOrderBasis,
+}
+struct UnconfirmedOrder {
+    epoch: u64,
+    socket_generation: u64,
+    revision: u64,
+}
+impl UnconfirmedOrder {
+    fn blocks(&self, status: Status, revision: u64) -> bool {
+        // A terminal part may belong to a read sent before the move. A new
+        // detail stamp alone is not evidence that the playlist advanced.
+        status.epoch == self.epoch
+            && status.generation <= self.socket_generation
+            && revision <= self.revision
+    }
+}
+struct PlaylistOrderPublication {
+    scope: String,
+    rows: Option<Vec<ReorderRow>>, // None keeps the current row model on a scope-only update.
+}
+
 const INITIAL_ROUTE: Route = Route::History;
 const PERSONAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const PERSONAL_WRITE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -154,6 +219,10 @@ struct Browser {
     personal_ready: bool,
     personal_due: Option<tokio::time::Instant>,
     personal_view: Option<Status>,
+    playlist_order: Option<PlaylistOrderScope>,
+    playlist_order_model_generation: Option<u64>,
+    playlist_order_serial: u64,
+    unconfirmed_orders: HashMap<String, UnconfirmedOrder>,
     pending: Option<Pending>,
     edit_basis: Option<(String, String, u64)>, // form, playlist, original revision
     row_editor: Option<RowEditor>,
@@ -367,7 +436,6 @@ impl RowEditor {
 fn row_actions(
     p: &Page,
     r: &pages::Row,
-    i: usize,
     offline: bool,
     personal_actions: bool,
     pinned: bool,
@@ -415,12 +483,6 @@ fn row_actions(
             .is_some_and(|m| m.capabilities.edit_entries)
     {
         v.push("remove");
-        if i > 0 {
-            v.push("up");
-        }
-        if i + 1 < p.rows.len() {
-            v.push("down");
-        }
     }
     v
 }
@@ -566,10 +628,90 @@ impl Browser {
             }
         });
     }
+    fn order_timeout_blocks(&self, status: Status, id: &str, revision: u64) -> bool {
+        self.unconfirmed_orders
+            .get(id)
+            .is_some_and(|unconfirmed| unconfirmed.blocks(status, revision))
+    }
+
+    fn refresh_playlist_order(&mut self) -> Option<PlaylistOrderPublication> {
+        let current = self.access.as_ref().and_then(|a| {
+            if !matches!(self.route, Route::Playlist(_))
+                || !self.personal_ready
+                || a.offline
+                || !a.usable()
+            {
+                return None;
+            }
+            let mode = *a.session.network_changes().borrow();
+            a.personal.read(|status, replica| {
+                // This page must come from the same observation as its authority stamp.
+                if self.personal_view != Some(status) {
+                    return None;
+                }
+                let basis = PlaylistOrderBasis::current(a.epoch, self.generation, mode, status)?;
+                let detail = replica.playlist()?;
+                let order = actions::PlaylistOrder::current(&self.route, &self.page, detail)?;
+                let blocked =
+                    self.order_timeout_blocks(status, &detail.summary.id, detail.summary.revision);
+                Some((basis, order, blocked))
+            })
+        });
+        let before = self.playlist_order.as_ref().map(|scope| scope.basis);
+        // Preserve the just-dropped gesture's readback preview without granting a
+        // new scope during a write. Admission still rejects input while writing.
+        let after = current
+            .as_ref()
+            .filter(|(basis, _, blocked)| {
+                !blocked
+                    && (!self.writing
+                        || (before == Some(*basis)
+                            && self.pending.as_ref().is_some_and(|pending| {
+                                pending.before == basis.status
+                                    && matches!(&pending.effect, Effect::Move { .. })
+                            })))
+            })
+            .map(|(basis, _, _)| *basis);
+        let model_generation = current.as_ref().map(|(basis, _, _)| basis.page_generation);
+        let models_changed = self.playlist_order_model_generation != model_generation;
+        if before == after && !models_changed {
+            return None;
+        }
+        let rows = models_changed.then(|| {
+            current.map_or_else(Vec::new, |(_, order, _)| {
+                order
+                    .rows()
+                    .map(|(key, row)| ReorderRow {
+                        key: key.into(),
+                        title: row.title.as_str().into(),
+                        subtitle: row.subtitle.as_str().into(),
+                        reorderable: true,
+                        section: Default::default(),
+                    })
+                    .collect()
+            })
+        });
+        self.playlist_order_model_generation = model_generation;
+        self.playlist_order = after.map(|basis| {
+            self.playlist_order_serial += 1;
+            PlaylistOrderScope {
+                key: format!("order-{:016x}", self.playlist_order_serial),
+                basis,
+            }
+        });
+        let scope = self
+            .playlist_order
+            .as_ref()
+            .map(|scope| scope.key.clone())
+            .unwrap_or_default();
+        Some(PlaylistOrderPublication { scope, rows })
+    }
+
     fn render(&mut self, models: bool) {
         if models {
             self.generation += 1;
         }
+        let order = self.refresh_playlist_order();
         let token = self.generation;
         let shown = self.shown.clone();
         let p = self.page.clone();
@@ -623,6 +765,11 @@ impl Browser {
             page: p.clone(),
         });
         self.scoped_ui(move |ui| {
+            // Invalidate a captured gesture before changing its view, then publish the
+            // new scope after both row models and the shown generation are installed.
+            if order.is_some() {
+                ui.set_playlist_order_scope(Default::default());
+            }
             ui.set_account_label(account.into());
             ui.set_manual_offline(offline);
             if kind == "now" && ui.get_page_kind() != "now" {
@@ -646,8 +793,7 @@ impl Browser {
                 ui.set_browse_rows(ModelRc::new(VecModel::from(
                     p.rows
                         .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
+                        .map(|r| {
                             let (album_id, album_name) =
                                 projected_music(r.music.album.as_ref(), offline, false);
                             let status = if matches!(kind.as_str(), "playlists" | "offline") {
@@ -660,7 +806,6 @@ impl Browser {
                                 actions: strings(row_actions(
                                     &p,
                                     r,
-                                    i,
                                     offline,
                                     personal_actions,
                                     status.is_some(),
@@ -719,6 +864,12 @@ impl Browser {
                 ui.set_browse_artwork(Default::default());
                 art.send_replace(request);
             }
+            if let Some(order) = order {
+                if let Some(rows) = order.rows {
+                    ui.set_playlist_order_rows(ModelRc::new(VecModel::from(rows)));
+                }
+                ui.set_playlist_order_scope(order.scope.into());
+            }
         });
     }
     fn pins_changed(&mut self, view: playlist_pins::View) {
@@ -758,7 +909,7 @@ impl Browser {
                     let actions = (old.is_some() != new.is_some()).then(|| {
                         let pinned = new.is_some();
                         (
-                            row_actions(&self.page, row, i, offline, personal_actions, pinned),
+                            row_actions(&self.page, row, offline, personal_actions, pinned),
                             pinned,
                         )
                     });
@@ -812,6 +963,7 @@ impl Browser {
         self.personal_ready = false;
         self.personal_view = None;
         self.pending = None;
+        self.unconfirmed_orders.clear();
         self.edit_basis = None;
         self.row_editor = None;
         self.cache = Replica::default();
@@ -855,7 +1007,7 @@ impl Browser {
                 self.render(true);
                 return;
             }
-            let interrupted = self.pending.take().is_some();
+            let interrupted = self.pending.take();
             self.cancel();
             self.personal_due = None;
             self.personal_view = None;
@@ -873,22 +1025,30 @@ impl Browser {
                 },
                 false,
             );
-            if interrupted {
-                self.message =
-                    "You went offline before the playlist change could be confirmed.".into();
+            if let Some(pending) = interrupted {
+                self.message = if matches!(pending.effect, Effect::Move { .. }) {
+                    "You went offline before the playlist order change was confirmed."
+                } else {
+                    "You went offline before the playlist change could be confirmed."
+                }
+                .into();
                 self.error = true;
                 self.render(false);
             }
         }
     }
     fn personal_write_error(&mut self, message: String) {
+        self.personal_write_error_render(message, false);
+    }
+
+    fn personal_write_error_render(&mut self, message: String, models: bool) {
         self.pending = None;
         self.writing = false;
         self.busy = false;
         self.error = true;
         self.message = message.clone();
         self.scoped_ui(move |ui| ui.set_form_error(message.into()));
-        self.render(false);
+        self.render(models);
     }
 
     fn personal_mutation(&mut self, access: &Access, mutation: Mutation, op: &str) {
@@ -927,8 +1087,58 @@ impl Browser {
             self.personal_write_error("The change was not sent. Please try again.".into());
             return;
         }
+        self.personal_sent(before, mutation.effect);
+    }
+
+    fn playlist_order_drop(&mut self, access: &Access, scope: &str, grabbed: &str, after: &str) {
+        let Some(published) = self.playlist_order.as_ref().filter(|p| p.key == scope) else {
+            return;
+        };
+        if !self.personal_ready || self.writing || access.offline {
+            return;
+        }
+        // Copy the stamp before locking the replica. Engine checks it again.
+        let network_mode = *access.session.network_changes().borrow();
+        let sent = access.personal.read(|status, replica| {
+            // The watch notification can lag behind the authoritative replica. Validate
+            // both occurrences here; Engine rechecks the observed stamp at socket
+            // admission. Go has no expected-revision field for server-side CAS.
+            let detail = replica.playlist()?;
+            if self.order_timeout_blocks(status, &detail.summary.id, detail.summary.revision) {
+                return None;
+            }
+            let order = actions::PlaylistOrder::current(&self.route, &self.page, detail)?;
+            let Mutation { command, effect } = order.movement(grabbed, after)?;
+            if Some(published.basis)
+                != PlaylistOrderBasis::current(access.epoch, self.generation, network_mode, status)
+                || self.epoch.load(Ordering::SeqCst) != access.epoch
+            {
+                return None;
+            }
+            Some((
+                status,
+                effect,
+                self.engine
+                    .try_send(Command::ReorderPlaylist {
+                        observed: status,
+                        mode_stamp: network_mode,
+                        command,
+                    })
+                    .is_ok(),
+            ))
+        });
+        match sent {
+            Some((before, effect, true)) => self.personal_sent(before, effect),
+            Some((_, _, false)) => {
+                self.personal_write_error("The playlist order change was not sent.".into())
+            }
+            None => {} // A stale, invalid, or same-slot drop makes no change.
+        }
+    }
+
+    fn personal_sent(&mut self, before: Status, effect: Effect) {
         self.pending = Some(Pending {
-            effect: mutation.effect,
+            effect,
             before,
             due: tokio::time::Instant::now() + PERSONAL_WRITE_TIMEOUT,
         });
@@ -991,13 +1201,21 @@ impl Browser {
                 || status.interruption != before.interruption
                 || status.link != Link::Ready
             {
-                self.personal_write_error("The connection was interrupted. The change was not confirmed; check the current library before retrying.".into());
-                self.render(render_models);
+                let message = if matches!(&pending.effect, Effect::Move { .. }) {
+                    "The connection was interrupted before the playlist order change was confirmed."
+                } else {
+                    "The connection was interrupted. The change was not confirmed; check the current library before retrying."
+                };
+                self.personal_write_error_render(message.into(), render_models);
                 return;
             }
             if status.refused != before.refused {
-                self.personal_write_error("The connection could not take the change. Check the current library before retrying.".into());
-                self.render(render_models);
+                let message = if matches!(&pending.effect, Effect::Move { .. }) {
+                    "The playlist order change was not sent."
+                } else {
+                    "The connection could not take the change. Check the current library before retrying."
+                };
+                self.personal_write_error_render(message.into(), render_models);
                 return;
             }
             if let Some(observed) = a.personal.observed(before, &pending.effect) {
@@ -1095,7 +1313,47 @@ impl Browser {
             .as_ref()
             .is_some_and(|pending| pending.due <= now)
         {
-            self.personal_write_error("The server did not confirm this change. Check the current library before retrying.".into());
+            // The timer may win a select against a ready personal watch. Apply the
+            // latest observation before treating the write as unconfirmed.
+            self.personal_changed(false);
+            if let Some(pending) = self.pending.as_ref().filter(|pending| pending.due <= now) {
+                if let Effect::Move { id, revision, .. } = &pending.effect {
+                    let observed = self.personal_view.unwrap_or(pending.before);
+                    let revision = self
+                        .page
+                        .playlist
+                        .as_ref()
+                        .filter(|playlist| playlist.id == *id)
+                        .map_or(*revision, |playlist| playlist.revision.max(*revision));
+                    self.unconfirmed_orders.insert(
+                        id.clone(),
+                        UnconfirmedOrder {
+                            epoch: observed.epoch,
+                            socket_generation: observed.generation,
+                            revision,
+                        },
+                    );
+                    // Read-only recovery: never resend the move. Refresh marks the
+                    // old detail stale before attempting to queue a fresh read.
+                    if let Some(a) = self.access.as_ref()
+                        && let Some((generation, command)) = a.personal.refresh_playlist(a.epoch)
+                        && !a.offline
+                        && !a.session.is_offline()
+                    {
+                        let _ = self.engine.try_send(Command::Personal {
+                            epoch: a.epoch,
+                            generation,
+                            command,
+                        });
+                    }
+                    self.personal_write_error(
+                        "The server did not confirm the playlist order change.".into(),
+                    );
+                    self.personal_changed(false);
+                } else {
+                    self.personal_write_error("The server did not confirm this change. Check the current library before retrying.".into());
+                }
+            }
         }
         if self.personal_due.is_some_and(|due| due <= now) {
             self.personal_due = None;
@@ -1388,6 +1646,14 @@ impl Browser {
                 (op, Some(idx), String::new())
             }
             Intent::Page(op, val) if i.generation == self.generation => (op, None, val),
+            Intent::PlaylistOrderDrop {
+                scope,
+                grabbed,
+                after,
+            } if i.generation == self.generation => {
+                self.playlist_order_drop(&a, &scope, &grabbed, &after);
+                return;
+            }
             _ => return,
         };
         self.row_editor = None;
@@ -1875,6 +2141,92 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_order_basis_preserves_only_the_original_online_authority() {
+        use crate::{
+            personal::{Change, PersonalUpdate, Snapshot},
+            personal_bridge::PersonalHub,
+        };
+        let hub = PersonalHub::default();
+        let access = hub.access();
+        let snapshot = || {
+            PersonalUpdate::Snapshot(Snapshot {
+                playlists: Vec::new(),
+                recent: Vec::new(),
+            })
+        };
+        hub.begin(1, 2);
+        hub.receive(1, 2, snapshot()).unwrap();
+        let status = access.read(|status, _| status);
+        let basis = PlaylistOrderBasis::current(1, 3, 0, status).unwrap();
+        assert_eq!(Some(basis), PlaylistOrderBasis::current(1, 3, 0, status));
+        assert_ne!(Some(basis), PlaylistOrderBasis::current(1, 4, 0, status));
+        assert_eq!(None, PlaylistOrderBasis::current(7, 3, 0, status));
+        assert_eq!(None, PlaylistOrderBasis::current(1, 3, 1, status));
+        assert_ne!(Some(basis), PlaylistOrderBasis::current(1, 3, 2, status));
+
+        hub.receive(1, 2, PersonalUpdate::Change(Change::default()))
+            .unwrap();
+        let newest = access.read(|status, _| status);
+        assert_ne!(Some(basis), PlaylistOrderBasis::current(1, 3, 0, newest));
+        let renewed = PlaylistOrderBasis::current(1, 3, 0, newest).unwrap();
+        hub.gap(1, 2);
+        assert_eq!(
+            None,
+            access.read(|status, _| PlaylistOrderBasis::current(1, 3, 0, status))
+        );
+        hub.receive(1, 2, snapshot()).unwrap();
+        assert_ne!(
+            Some(renewed),
+            access.read(|status, _| PlaylistOrderBasis::current(1, 3, 0, status))
+        );
+
+        hub.begin(1, 5);
+        hub.receive(1, 5, snapshot()).unwrap();
+        let new_socket = access.read(|status, _| PlaylistOrderBasis::current(1, 3, 0, status));
+        assert!(new_socket.is_some());
+        assert_ne!(Some(renewed), new_socket);
+    }
+
+    #[test]
+    fn unconfirmed_order_stays_blocked_until_fresh_playlist_authority() {
+        use crate::{
+            personal::{Change, PersonalUpdate, Snapshot},
+            personal_bridge::PersonalHub,
+        };
+        let hub = PersonalHub::default();
+        let access = hub.access();
+        hub.begin(1, 2);
+        let snapshot = || {
+            PersonalUpdate::Snapshot(Snapshot {
+                playlists: Vec::new(),
+                recent: Vec::new(),
+            })
+        };
+        hub.receive(1, 2, snapshot()).unwrap();
+        let _ = access.watch_playlist(1, Some("manual".into()));
+        let before = access.read(|status, _| status);
+        let fence = UnconfirmedOrder {
+            epoch: before.epoch,
+            socket_generation: before.generation,
+            revision: 10,
+        };
+        assert!(fence.blocks(before, 10));
+        hub.receive(1, 2, PersonalUpdate::Change(Change::default()))
+            .unwrap();
+        assert!(access.read(|status, _| fence.blocks(status, 10)));
+        hub.receive(1, 2, snapshot()).unwrap();
+        let updated = access.read(|status, _| status);
+        assert_ne!(before.playlist_detail, updated.playlist_detail);
+        assert!(fence.blocks(updated, 9));
+        assert!(fence.blocks(updated, 10));
+        assert!(!fence.blocks(updated, 11));
+        hub.begin(1, 3);
+        hub.receive(1, 3, snapshot()).unwrap();
+        assert!(!access.read(|status, _| fence.blocks(status, 10)));
+    }
+
     #[tokio::test]
     async fn expired_continuation_rebuilds_previous_depth_plus_one_new_page() {
         let mut offsets = Vec::new();
@@ -2163,7 +2515,7 @@ mod tests {
             playable: true,
             ..Default::default()
         };
-        assert!(row_actions(&p, &r, 0, true, true, false).is_empty());
+        assert!(row_actions(&p, &r, true, true, false).is_empty());
     }
 
     fn editable_playlist() -> crate::api::library::PlaylistSummary {
@@ -2200,16 +2552,16 @@ mod tests {
         let list = pages::personal_list(&Route::Playlists, &[editable_playlist()]);
         let row = &list.rows[0];
         assert_eq!(
-            row_actions(&list, row, 0, false, true, false),
+            row_actions(&list, row, false, true, false),
             ["queue", "pin-playlist", "rename", "rules", "delete"]
         );
         assert_eq!(
-            row_actions(&list, row, 0, false, true, true),
+            row_actions(&list, row, false, true, true),
             ["queue", "unpin-playlist", "rename", "rules", "delete"]
         );
-        assert!(row_actions(&list, row, 0, false, false, false).is_empty());
+        assert!(row_actions(&list, row, false, false, false).is_empty());
         assert_eq!(
-            row_actions(&list, row, 0, true, false, true),
+            row_actions(&list, row, true, false, true),
             ["unpin-playlist"]
         );
 
@@ -2220,7 +2572,7 @@ mod tests {
         unavailable.capabilities.delete = false;
         let list = pages::personal_list(&Route::Playlists, &[unavailable]);
         assert_eq!(
-            row_actions(&list, &list.rows[0], 0, false, true, false),
+            row_actions(&list, &list.rows[0], false, true, false),
             ["pin-playlist"]
         );
     }
@@ -2346,7 +2698,7 @@ pub fn start(
             .expect("browser runtime");
         runtime.block_on(async move {
             let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);

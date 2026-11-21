@@ -1497,13 +1497,20 @@ mod tests {
                 route
             );
             if kind == PlaylistKind::Manual {
-                for (op, index, anchor) in [
-                    ("down", 1099, "occurrence-1100"),
-                    ("up", 1100, "occurrence-1098"),
-                    ("down", 1161, "occurrence-1162"),
+                let detail = personal::Playlist {
+                    summary: summary.clone(),
+                    definition: None,
+                    token: "complete".into(),
+                    rows: entries.clone(),
+                    stale: false,
+                };
+                let order = crate::actions::PlaylistOrder::current(&route, &page, &detail).unwrap();
+                for (index, anchor) in [
+                    (1099, "occurrence-1100"),
+                    (1100, ""),
+                    (2, "occurrence-1162"),
                 ] {
-                    let change =
-                        crate::actions::mutation(&route, &page, op, Some(index), "").unwrap();
+                    let change = order.movement(&entries[index].id, anchor).unwrap();
                     assert_eq!(
                         change.command,
                         personal::Command::MoveEntry {

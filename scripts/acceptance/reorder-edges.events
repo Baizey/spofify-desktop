@@ -1,0 +1,56 @@
+# Native AppWindow fixture at 1280 × 685 client pixels (1280 × 720 Cage output).
+# Normal playback, quick and same-slot holds, immutable current, and cancel.
+0 down 1201 295
+15 up 1201 295
+100 down 1164 27
+15 up 1164 27
+100 down 1145 95
+285 move 1145 260
+30 up 1145 260
+100 down 1120 145
+15 up 1120 145
+100 down 1120 145
+280 up 1120 145
+100 down 1120 248
+280 move 1120 145
+50 key escape
+40 up 1120 145
+130 frame queue-cancelled
+# Keyboard last, first, and stale-scope cancellation.
+20 down 1188 28
+15 up 1188 28
+100 down 280 289
+15 up 280 289
+130 key space
+30 key end
+140 frame keyboard-last
+25 key enter
+200 frame keyboard-last-settled
+25 key space
+30 key home
+140 frame keyboard-first
+25 key enter
+200 frame keyboard-first-settled
+25 key space
+30 key down
+100 revise
+20 key escape
+140 frame revision-cancelled
+100 down 923 93
+15 up 923 93
+100 down 280 289
+15 up 280 289
+140 key home
+# Select track 98 solely to start a pointer drag just before the old page edge.
+4 repeat 98 key down
+130 frame 098-visible
+25 down 507 558
+280 frame 098-lifted
+15 move 507 582
+120 frame crossing-100
+570 frame after-100
+1300 frame edge-end
+15 up 507 582
+35 frame settling-at-end
+210 frame settled-at-end
+0 quit

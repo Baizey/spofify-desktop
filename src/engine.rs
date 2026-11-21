@@ -16,8 +16,8 @@ use crate::{
     offline::{self, OfflineStore, PlaybackInput},
     output_identity::Installation,
     personal::Command as PersonalCommand,
-    personal_bridge::PersonalHub,
-    player::{Action, Authority, Change, LocalQueue, LocalTrack, Status},
+    personal_bridge::{PersonalHub, Status as PersonalStatus},
+    player::{self, Action, Authority, Change, LocalQueue, LocalTrack, Status},
     socket::{self, Link},
 };
 use online::Online;
@@ -59,7 +59,17 @@ pub enum Command {
         generation: u64,
         command: PersonalCommand,
     },
+    ReorderPlaylist {
+        observed: PersonalStatus,
+        mode_stamp: u64,
+        command: PersonalCommand,
+    },
     Guarded(String, Action),
+    ReorderQueue {
+        basis: String,
+        key: u64,
+        after: Option<u64>,
+    },
     #[cfg(target_os = "linux")]
     GuardedToggle(String),
     #[cfg(test)]
@@ -173,6 +183,88 @@ impl Engine {
             .as_ref()
             .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
     }
+    fn queue_order_token(&self) -> Option<String> {
+        if self.reconnect.is_some() {
+            return None;
+        }
+        let has_targets = if self.offline || self.local_store.is_some() {
+            self.local
+                .entries
+                .len()
+                .saturating_sub(self.local.position? + 1)
+                > 1
+        } else {
+            // The output engine may be auditioning a provisional successor.
+            // Only Go's canonical cursor defines the editable upcoming range.
+            if self.online.has_provisional_cursor() || self.pending_initial_play.is_some() {
+                return None;
+            }
+            let state = self.online.state.as_ref()?;
+            let current = state.queue.iter().position(|r| r.key == state.cursor.key)?;
+            state.queue.len().saturating_sub(current + 1) > 1
+        };
+        if !has_targets {
+            return None;
+        }
+        let mode = *self.account.as_ref()?.session.network_changes().borrow();
+        Some(format!("{}:{mode}", self.room_token()?))
+    }
+
+    fn reorder_queue(&mut self, basis: &str, key: u64, after: Option<u64>) {
+        // The normal command drain is bounded. Do not write against the
+        // projection if newer events still await validation.
+        if !self.offline && self.socket.as_ref().is_some_and(|s| !s.events.is_empty()) {
+            return;
+        }
+        let local = self.offline || self.local_store.is_some();
+        if (!local && self.online.queue_order_pending())
+            || self.queue_order_token().as_deref() != Some(basis)
+        {
+            return;
+        }
+        let valid = if local {
+            self.local.position.is_some_and(|pos| {
+                queue_destination(
+                    self.local.entries.iter().skip(pos + 1).map(|r| r.key),
+                    key,
+                    after,
+                )
+            })
+        } else {
+            self.online.state.as_ref().is_some_and(|s| {
+                s.queue
+                    .iter()
+                    .position(|r| r.key == s.cursor.key)
+                    .is_some_and(|pos| {
+                        queue_destination(s.queue.iter().skip(pos + 1).map(|r| r.key), key, after)
+                    })
+            })
+        };
+        if valid {
+            let Some(mode_stamp) = basis
+                .rsplit(':')
+                .next()
+                .and_then(|stamp| stamp.parse().ok())
+            else {
+                return;
+            };
+            let action = Action::Move { key, after };
+            if local {
+                // Ordering doesn't sample or alter the running Saved output.
+                let Some(account) = &self.account else { return };
+                let mode = account.session.network_changes();
+                let mode = mode.borrow();
+                if *mode != mode_stamp {
+                    return;
+                }
+                let change = self.local.action(action);
+                self.local_change(change);
+            } else {
+                self.send_queue_order(action, mode_stamp);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn detached_media_token(&self) -> Option<String> {
         if !self.network_allowed()
@@ -559,6 +651,19 @@ impl Engine {
                 self.apply_mode();
                 self.send_personal(epoch, generation, &command);
             }
+            Command::ReorderPlaylist {
+                observed,
+                mode_stamp,
+                command,
+            } if observed.epoch == self.epoch && self.current() => {
+                self.apply_mode();
+                if !self.offline {
+                    self.drain_online_events(None);
+                }
+                if !self.send_playlist_order(observed, mode_stamp, &command) {
+                    self.personal.refused(observed.epoch, observed.generation);
+                }
+            }
             Command::Scoped(epoch, command) if epoch == self.epoch && self.current() => {
                 self.apply_mode();
                 self.scoped(*command)
@@ -631,6 +736,7 @@ impl Engine {
             {
                 self.pause_detached_media();
             }
+            Command::ReorderQueue { basis, key, after } => self.reorder_queue(&basis, key, after),
             Command::Guarded(token, action) => {
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
                     match action {
@@ -1111,6 +1217,7 @@ impl Engine {
             reconnecting: self.reconnect.is_some(),
             status: self.action_status,
             room_token: self.room_token().unwrap_or_default(),
+            queue_order_token: self.queue_order_token().unwrap_or_default(),
             ..PlayerView::default()
         };
         if !self.offline {
@@ -1188,8 +1295,57 @@ impl Engine {
                 })
                 .collect();
         }
+        p.queue_order_writable = !p.queue_order_token.is_empty()
+            && (p.local_playback || !self.online.queue_order_pending());
         p.publish(self.window.clone(), self.shared_epoch.clone(), self.epoch);
     }
+}
+
+// Validate occurrence keys and reject a same-slot drop against the live region.
+// An empty predecessor is the start of Up Next, never the start of the room.
+fn queue_destination(keys: impl Iterator<Item = u64>, key: u64, after: Option<u64>) -> bool {
+    if !player::key(key) || after.is_some_and(|a| !player::key(a) || a == key) {
+        return false;
+    }
+    let mut previous = None;
+    let mut moving = None;
+    let mut anchor_exists = after.is_none();
+    for entry in keys {
+        if Some(entry) == after {
+            anchor_exists = true;
+        }
+        if entry == key {
+            moving = Some(previous);
+        }
+        previous = Some(entry);
+    }
+    anchor_exists && moving.is_some_and(|original| original != after)
+}
+
+fn queue_order_rows(queue: &[QueueEntryView]) -> Vec<crate::ReorderRow> {
+    let mut rows = Vec::with_capacity(queue.len());
+    for (phase, section) in [(0, "NOW PLAYING"), (1, "UP NEXT"), (2, "PLAYED")] {
+        let mut first = true;
+        for row in queue.iter().filter(|r| {
+            (if r.current {
+                0
+            } else if r.upcoming {
+                1
+            } else {
+                2
+            }) == phase
+        }) {
+            rows.push(crate::ReorderRow {
+                key: row.key.as_str().into(),
+                title: row.title.as_str().into(),
+                subtitle: row.subtitle.as_str().into(),
+                reorderable: phase == 1,
+                section: if first { section.into() } else { "".into() },
+            });
+            first = false;
+        }
+    }
+    rows
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1273,6 +1429,8 @@ struct PlayerView {
     repeat: &'static str,
     status: &'static str,
     room_token: String,
+    queue_order_token: String,
+    queue_order_writable: bool,
     media_track_token: String,
     playing: bool,
     control: bool,
@@ -1378,6 +1536,9 @@ impl PlayerView {
                     .zip(queue.iter())
                     .all(|(entry, row)| entry.matches(&row))
             {
+                ui.set_queue_order_rows(ModelRc::new(VecModel::from(queue_order_rows(
+                    &self.queue,
+                ))));
                 ui.set_queue_rows(ModelRc::new(VecModel::from(
                     self.queue
                         .into_iter()
@@ -1385,6 +1546,8 @@ impl PlayerView {
                         .collect::<Vec<_>>(),
                 )));
             }
+            ui.set_queue_order_token(self.queue_order_token.into());
+            ui.set_queue_order_writable(self.queue_order_writable);
             let devices = ui.get_device_rows();
             if devices.row_count() != self.devices.len()
                 || self.devices.iter().enumerate().any(|(i, row)| {
@@ -1691,6 +1854,63 @@ mod tests {
         let mut next = entry();
         next.album_name = "New album name".into();
         assert!(!next.matches(&row));
+    }
+
+    #[tokio::test]
+    async fn saved_queue_drop_uses_exact_upcoming_occurrences_and_rejects_stale_basis() {
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        e.account = Some(Account {
+            session: api.test_session(),
+            api,
+        });
+        e.command(Command::Offline(true).scoped(7));
+        let track = LocalTrack {
+            id: "same-song".into(),
+            title: "Fixture".into(),
+            subtitle: String::new(),
+            album_name: String::new(),
+            duration: 25.0,
+        };
+        assert_eq!(e.local.replace(vec![track; 4], 0, false), Change::Start);
+        let keys = |e: &Engine| {
+            e.local
+                .entries
+                .iter()
+                .map(|row| row.key)
+                .collect::<Vec<_>>()
+        };
+        let before = keys(&e);
+        let basis = e.queue_order_token().unwrap();
+        e.local.elapsed = 4.5;
+        assert_eq!(e.queue_order_token().as_deref(), Some(basis.as_str()));
+        let drop = |basis: &str, key, after| {
+            Command::ReorderQueue {
+                basis: basis.into(),
+                key,
+                after,
+            }
+            .scoped(7)
+        };
+        for (key, after) in [
+            (before[0], Some(before[2])),
+            (before[2], Some(before[0])),
+            (before[2], Some(before[1])),
+            (before[1], None),
+            (before[3], Some(u64::MAX)),
+        ] {
+            e.command(drop(&basis, key, after));
+            assert_eq!(keys(&e), before);
+            assert_eq!(e.queue_order_token().as_deref(), Some(basis.as_str()));
+        }
+        e.command(drop(&basis, before[3], None));
+        assert_eq!(keys(&e), [before[0], before[3], before[1], before[2]]);
+        assert_eq!(e.local.elapsed, 4.5);
+        e.command(drop(&basis, before[3], Some(before[2])));
+        assert_eq!(keys(&e), [before[0], before[3], before[1], before[2]]);
+        let updated = e.queue_order_token().unwrap();
+        e.command(drop(&updated, before[3], Some(before[2])));
+        assert_eq!(keys(&e), before);
     }
 
     pub(super) fn engine() -> Engine {
