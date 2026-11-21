@@ -800,10 +800,20 @@ impl Api {
         &'a self,
         session: &'s Session,
     ) -> Result<(&'a str, &'s str), ApiError> {
-        self.check_session_owner(session)?;
+        let account = self.bound_account(session)?;
         if !session.can_access_local() {
             return Err(EXPIRED);
         }
+        Ok(account)
+    }
+
+    /// Compare identities across an authenticated transport replacement. A
+    /// retired session still has a binding, but it grants no read or write access.
+    pub(crate) fn bound_account<'a, 's>(
+        &'a self,
+        session: &'s Session,
+    ) -> Result<(&'a str, &'s str), ApiError> {
+        self.check_session_owner(session)?;
         Ok((self.origin.as_str(), &session.secrets.account_id))
     }
 

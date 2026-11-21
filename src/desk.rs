@@ -43,6 +43,20 @@ impl Access {
     fn local(&self) -> bool {
         self.offline || self.session.is_offline()
     }
+
+    fn same_browse_account(&self, next: &Self) -> bool {
+        self.epoch == next.epoch
+            && (Arc::ptr_eq(&self.api, &next.api)
+                || self.offline
+                    && self.session.is_local_only()
+                    && !next.local()
+                    && !next.session.is_local_only()
+                    && self.api.bound_account(&self.session).is_ok_and(|old| {
+                        next.api
+                            .authenticated_account(&next.session)
+                            .is_ok_and(|new| old == new)
+                    }))
+    }
 }
 enum Intent {
     Navigate(String),
@@ -1234,7 +1248,7 @@ impl Browser {
             .access
             .as_ref()
             .zip(next.as_ref())
-            .is_some_and(|(a, b)| a.epoch == b.epoch && Arc::ptr_eq(&a.api, &b.api));
+            .is_some_and(|(a, b)| a.same_browse_account(b));
         if !same {
             self.reset(next);
             return;

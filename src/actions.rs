@@ -880,11 +880,15 @@ impl<'a> PlaylistOrder<'a> {
             || playlist.track_count != count
             || summary.track_count != count
             || page.rows.len() != detail.rows.len()
-            || !page.rows.iter().zip(detail.rows.iter()).all(|(row, entry)| {
-                entry_id(row, &playlist.id).ok() == Some(entry.id.as_str())
-                    && row.position == Some(entry.position)
-                    && row.id == entry.track.id
-            })
+            || !page
+                .rows
+                .iter()
+                .zip(detail.rows.iter())
+                .all(|(row, entry)| {
+                    entry_id(row, &playlist.id).ok() == Some(entry.id.as_str())
+                        && row.position == Some(entry.position)
+                        && row.id == entry.track.id
+                })
         {
             return None;
         }
