@@ -180,6 +180,7 @@ impl ObservedPlaylists {
 
     /// An invalidation is sticky until a fresh complete detail. A later
     /// ready summary alone does not prove its rows match that evaluation.
+    #[cfg(test)]
     pub(crate) fn membership_is_current(&self, id: &str) -> bool {
         matches!(
             self.0.get(id),

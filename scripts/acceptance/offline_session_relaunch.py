@@ -9,8 +9,11 @@ sound device. Optional --pixels-dir retains authenticated synthetic scenes.
 import argparse
 from contextlib import contextmanager
 from email.utils import formatdate
+from hashlib import sha256
 from http import server as http_server
+from io import BytesIO
 import json
+import os
 from pathlib import Path
 import selectors
 import shutil
@@ -26,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import URLError
 from urllib.parse import urlsplit
+import wave
 from xml.sax.saxutils import escape
 
 sys.dont_write_bytecode = True
@@ -40,8 +44,9 @@ from workspace_checks import open_manual, open_playlists
 LOGIN, SESSION = "/api/auth/login", "/api/auth/session"
 MODE = "X-Spofify-Session-Mode"
 ROLLING = "rolling-v1"
+TRACK_ART = f"/api/library/tracks/{wire_ui.TRACK['id']}/artwork"
 KNOWN_ROUTES = {LOGIN, SESSION, "/api/auth/logout", wire_ui.TICKET_PATH, wire_ui.SOCKET_PATH,
-                "/api/library", "/search"}
+                "/api/library", "/search", TRACK_ART}
 SEEDED_SLOT = "00000000000040008000000000000001"
 SEEDED_USER = "synthetic-wire"
 SEEDED_ACCOUNT = "wire-account-01"
@@ -261,14 +266,17 @@ def assert_online(receipt, mark):
     http = [r[1:] for r in rows if r[0] == "http"]
     check(http and http[0] == ("GET", SESSION) and http.count(("GET", SESSION)) == 1,
           f"expected exactly one initial session probe, got {http}")
-    check(all(r in {("GET", SESSION), ("POST", wire_ui.TICKET_PATH), ("GET", wire_ui.SOCKET_PATH)} for r in http),
+    allowed = {("GET", SESSION), ("POST", wire_ui.TICKET_PATH), ("GET", wire_ui.SOCKET_PATH), ("GET", TRACK_ART)}
+    check(all(r in allowed for r in http),
           f"unexpected HTTP during reconnect (including audio/output requests): {http}")
     check(all(event in rows for event in (("status", SESSION, 200), ("http", "POST", wire_ui.TICKET_PATH),
                                           ("status", wire_ui.SOCKET_PATH, 101), ("client", "hello"),
                                           ("client", "syncPlaylist"))),
           "missing successful session probe, account connection or normal playlist read")
-    check(rows.index(("status", SESSION, 200)) < rows.index(("http", "POST", wire_ui.TICKET_PATH)),
+    validated = rows.index(("status", SESSION, 200))
+    check(validated < rows.index(("http", "POST", wire_ui.TICKET_PATH)),
           "account ticket requested before successful session response")
+    check(("http", "GET", TRACK_ART) not in rows[:validated], "artwork requested before validation")
     commands = [r[1] for r in rows if r[0] == "client"]
     check(all(c in {"hello", "presence", "sync", "syncPlaylist"} for c in commands),
           f"unexpected reconnect commands (including output selection or resume): {commands}")
@@ -308,6 +316,30 @@ def closeable_desktop(binary, root, env, pixels, mcp_port):
         if code != 0:
             log = (root / "cage.log").read_bytes()[-2048:].decode(errors="replace").splitlines()
             raise Failure(f"owned Cage/desktop exited {code} after CloseRequested: {' | '.join(log[-8:])}")
+
+
+def seed_saved_track(env, origin, account):
+    """An existing v1 download in the fixture’s private data directory."""
+    root = Path(env["XDG_DATA_HOME"]) / "spofify-downloads-v1"
+    root.mkdir(mode=0o700, exist_ok=True)
+    pcm = BytesIO()
+    with wave.open(pcm, "wb") as stream:
+        stream.setparams((1, 2, 8000, 8000, "NONE", "not compressed"))
+        stream.writeframes(b"\0\0" * 8000)
+    audio = pcm.getvalue()
+    identity = sha256(b"spofify-download-scope-v1\0")
+    for field in (origin, account):
+        data = field.encode()
+        identity.update(len(data).to_bytes(8, "big") + data)
+    scope = identity.hexdigest()
+    track_id = wire_ui.TRACK["id"]
+    header = json.dumps(dict(scope=scope, bytes=len(audio), audio_hash=sha256(audio).hexdigest(),
+                             track=dict(id=track_id, name=wire_ui.TRACK_NAME, artists="Synthetic Artist",
+                                        album_name="Synthetic Album", duration_ms=1000,
+                                        track_number=1, disc_number=1))).encode()
+    path = root / f"{scope}.{sha256(track_id.encode()).hexdigest()}"
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
+        file.write(b"SPOFDL01" + len(header).to_bytes(4, "little") + header + audio)
 
 
 def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
@@ -374,6 +406,10 @@ def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
 
     with launch() as window:
         login(window, remember=True)
+        seed_saved_track(env, ready["origin"], ready["userId"])
+        open_playlists(window)
+        open_manual(window)  # Observe real membership; a download alone cannot establish it.
+        window.find(f"Play track: {wire_ui.TRACK_NAME}", roles=("Button",))
         work_offline(window, remember=True)
         mark = len(receipt.events())
         quiet(receipt, mark, "explicit Work offline before close")
@@ -390,11 +426,17 @@ def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
         window.click(SAVED)
         window.section(SAVED)
         window.absent("Offline mode", roles=("Text",))
+        window.find(f"Play track: {wire_ui.TRACK_NAME}", roles=("Button",))
         if pixels:
             window.pixels("02-cold-saved-offline")
+        open_playlists(window)
+        open_manual(window)
+        window.find(f"Play track: {wire_ui.TRACK_NAME}", roles=("Button",))
+        if pixels:
+            window.pixels("02b-cold-normal-playlist")
         offline_settings(window)
         quiet(receipt, mark, "cold offline admission")
-        print("PASS cold offline relaunch shows the same synthetic account, without HTTP/account/audio wire traffic", flush=True)
+        print("PASS cold offline relaunch opens the same account, Saved track and ordinary playlist without wire traffic", flush=True)
 
         receipt.probe_pending.clear()
         receipt.probe_release.clear()
