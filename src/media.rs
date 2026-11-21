@@ -190,27 +190,48 @@ pub struct Lyrics {
     pub attribution: Option<Attribution>,
 }
 
-impl Lyrics {
-    /// Last authored line at or before the observed native playback position.
-    /// Suppress sync if actual playback duration is unknown or the text extends
-    /// outside it. Plain lyrics and unverified audio never gain an active line.
-    #[cfg(test)]
-    pub fn active_line(
-        &self,
-        position: Duration,
-        actual_duration: Option<Duration>,
-    ) -> Option<usize> {
-        let duration = actual_duration?;
-        if self.state != LyricsState::Timed
-            || duration.is_zero()
-            || position > duration
-            || Duration::from_millis(self.lines.last()?.start_ms) > duration
-        {
-            return None;
+/// Last authored line at or before the observed playback position. The caller
+/// supplies the validated, ordered starts; an empty timeline (e.g. plain text)
+/// never gains an active line. Reject the entire timeline if it exceeds the
+/// playback duration, even if the current line would otherwise be in bounds.
+pub(crate) fn active_lyric_line(
+    line_count: usize,
+    start_ms: impl Fn(usize) -> Option<u64>,
+    position: f32,
+    duration: f32,
+) -> Option<usize> {
+    if !duration.is_finite()
+        || duration <= 0.0
+        || !position.is_finite()
+        || position < 0.0
+        || position > duration
+        || start_ms(line_count.checked_sub(1)?)? > displayed_millis(duration)
+    {
+        return None;
+    }
+    let position = displayed_millis(position);
+    let (mut lo, mut hi) = (0, line_count);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if start_ms(mid)? <= position {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        self.lines
-            .partition_point(|line| Duration::from_millis(line.start_ms) <= position)
-            .checked_sub(1)
+    }
+    lo.checked_sub(1)
+}
+
+// Restore an exact authored millisecond boundary (e.g. 0.900 s) if it
+// round-trips to the displayed clock value. Don't round arbitrary fractions
+// up or cast line starts to f32: distinct authored times can then collapse.
+fn displayed_millis(seconds: f32) -> u64 {
+    let millis = f64::from(seconds) * 1000.0;
+    let nearest = millis.round();
+    if (nearest / 1000.0) as f32 == seconds {
+        nearest as u64
+    } else {
+        millis as u64
     }
 }
 
@@ -520,13 +541,42 @@ mod tests {
         let data = timed();
         let body = serde_json::to_vec(&data).unwrap();
         let model = parse_lyrics(&body, "track").unwrap();
-        let ms = Duration::from_millis;
-        assert_eq!(model.active_line(ms(249), Some(ms(1000))), None);
-        assert_eq!(model.active_line(ms(250), Some(ms(1000))), Some(1));
-        assert_eq!(model.active_line(ms(900), Some(ms(1000))), Some(2));
-        assert_eq!(model.active_line(ms(250), None), None);
-        assert_eq!(model.active_line(ms(250), Some(ms(899))), None);
+        let active = |position, duration| {
+            active_lyric_line(
+                model.lines.len(),
+                |i| Some(model.lines[i].start_ms),
+                position,
+                duration,
+            )
+        };
+        assert_eq!(active(0.249, 1.0), None);
+        assert_eq!(active(0.250, 1.0), Some(1));
+        assert_eq!(active(0.900, 1.0), Some(2));
+        assert_eq!(active(1.0, 1.0), Some(2));
+        assert_eq!(active(1.001, 1.0), None);
+        assert_eq!(active(0.250, f32::NAN), None);
+        assert_eq!(active(0.0, 0.0), None);
+        assert_eq!(active(0.250, 0.899), None);
+        assert_eq!(active(0.89999, 1.0), Some(1));
+        assert_eq!(active(0.900, 0.900), Some(2));
+        assert_eq!(active(f32::INFINITY, 1.0), None);
+        assert_eq!(active(-0.1, 1.0), None);
         assert!(parse_lyrics(&body, "other").is_err());
+        let mut invalid = data;
+        invalid["lines"][2]["startMs"] = 249.into();
+        assert!(parse_lyrics(&serde_json::to_vec(&invalid).unwrap(), "track").is_err());
+        invalid["lines"][2]["startMs"] = 86_400_001.into();
+        assert!(parse_lyrics(&serde_json::to_vec(&invalid).unwrap(), "track").is_err());
+    }
+
+    #[test]
+    fn distinct_timed_lyric_boundaries_do_not_collapse_in_long_playback() {
+        let starts = [36_000_000, 36_000_001];
+        let active = |duration| {
+            active_lyric_line(starts.len(), |i| starts.get(i).copied(), 36_000.0, duration)
+        };
+        assert_eq!(active(36_001.0), Some(0));
+        assert_eq!(active(36_000.0), None);
     }
 
     #[test]
@@ -543,7 +593,7 @@ mod tests {
         let model = parse(&data).unwrap();
         assert!(model.lines.is_empty());
         assert_eq!(
-            model.active_line(Duration::ZERO, Some(Duration::from_secs(1))),
+            active_lyric_line(model.lines.len(), |_| unreachable!(), 0.0, 1.0),
             None
         );
         assert_eq!(model.attribution.unwrap().url, None);

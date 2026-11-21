@@ -3,12 +3,12 @@
 //! offline fence. The worker never infers a track ID from presentation text.
 
 use crate::{
-    AppWindow,
+    AppWindow, TimedLyricLine,
     api::{Api, ApiError, Session},
     desk::Access,
     media,
 };
-use slint::{ComponentHandle, ModelRc, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedPixelBuffer, Timer, TimerMode, VecModel};
 use std::{
     future::Future,
     sync::{
@@ -170,13 +170,30 @@ pub(crate) struct Presentation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Demand {
     track: String,
+    occurrence: String,
     visible: bool,
     display_revision: u64,
+}
+
+impl Demand {
+    fn replace(&mut self, next: Self, lyrics_settled: bool) -> bool {
+        let same_view = self.track == next.track
+            && self.display_revision == next.display_revision
+            && self.visible == next.visible;
+        let notify = !same_view || (!lyrics_settled && self.occurrence != next.occurrence);
+        *self = next;
+        notify
+    }
+
+    fn lyrics_settled(&self, lyrics_track: &str, settled: bool) -> bool {
+        settled && !self.track.is_empty() && self.track == lyrics_track
+    }
 }
 
 fn demand(ui: &AppWindow, display_revision: u64) -> Demand {
     Demand {
         track: ui.get_now_track_id().to_string(),
+        occurrence: ui.get_media_track_token().to_string(),
         visible: ui.get_page_kind() == "now",
         display_revision,
     }
@@ -186,7 +203,10 @@ fn clear(ui: &AppWindow) {
     ui.set_cover_art(Default::default());
     ui.set_lyrics_track_id(Default::default());
     ui.set_lyrics_text(Default::default());
+    ui.set_lyrics_lines(Default::default());
+    ui.set_lyrics_attribution(Default::default());
     ui.set_lyrics_status(Default::default());
+    ui.set_lyrics_settled(false);
     ui.set_waveform(Default::default());
     ui.set_media_status(Default::default());
 }
@@ -196,6 +216,7 @@ fn clear(ui: &AppWindow) {
 /// observation interval can never let data from a different track publish.
 pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     clear(ui);
+    ui.on_resolve_active_lyric(displayed_lyric_line);
     let initial = demand(ui, 0);
     let (tx, rx) = watch::channel(initial.clone());
     let weak = ui.as_weak();
@@ -207,17 +228,16 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     }));
     {
         let (access, shown) = (access.clone(), shown.clone());
-        let previous = std::cell::RefCell::new(initial);
         observer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut next = demand(&ui, 0);
             next.display_revision =
                 bind_display(&ui, &shown, Account::current(&access), &next.track);
-            let mut previous = previous.borrow_mut();
-            if next != *previous {
-                tx.send_replace(next.clone());
-                *previous = next;
-            }
+            let lyrics_settled =
+                next.lyrics_settled(&ui.get_lyrics_track_id(), ui.get_lyrics_settled());
+            // Always record the live occurrence, but a repeat doesn't need to
+            // restart the worker if settled lyrics already published independently.
+            tx.send_if_modified(|current| current.replace(next, lyrics_settled));
         });
     }
     let weak = ui.as_weak();
@@ -299,16 +319,13 @@ async fn load(
             let lyrics =
                 read_with_backoff(async || media::lyrics(&account.api, &account.session, id).await)
                     .await;
-            let settled = lyrics.as_ref().is_ok_and(|v| {
-                !matches!(
-                    v.state,
-                    media::LyricsState::Pending | media::LyricsState::Error
-                )
-            });
             let projected = project_lyrics(lyrics.ok());
-            let usable = projected.text.is_some();
+            let result = (
+                projected.settled,
+                projected.text.is_some() || !projected.lines.is_empty(),
+            );
             deliver_lyrics(projected);
-            (settled, usable)
+            result
         },
         read_with_backoff(async || media::waveform(&account.api, &account.session, id).await),
     );
@@ -341,40 +358,66 @@ async fn load(
     }
 }
 
+#[derive(Default)]
 struct LyricProjection {
     text: Option<String>,
+    lines: Vec<media::LyricLine>,
+    attribution: String,
     status: &'static str,
+    settled: bool,
 }
 
 fn project_lyrics(lyrics: Option<media::Lyrics>) -> LyricProjection {
     use media::LyricsState::*;
-    let status = match lyrics.as_ref().map(|lyrics| lyrics.state) {
+    let mut projected = LyricProjection::default();
+    projected.status = match lyrics.as_ref().map(|lyrics| lyrics.state) {
         Some(NotFound) => "No lyrics for this track.",
         Some(Pending) => "Lyrics aren’t ready.",
         Some(Plain | Timed | Instrumental) => "",
         Some(Unavailable | Error) | None => "Lyrics unavailable.",
     };
-    let text = lyrics.and_then(lyric_text);
-    LyricProjection { text, status }
+    if let Some(lyrics) = lyrics {
+        projected.settled = !matches!(lyrics.state, Pending | Error);
+        match lyrics.state {
+            Timed => projected.lines = lyrics.lines,
+            Plain => projected.text = lyrics.plain_text,
+            Instrumental => projected.text = Some("Instrumental".into()),
+            _ => return projected,
+        }
+        if let Some(attribution) = lyrics.attribution {
+            let credit = format!("Lyrics source: {}", attribution.name);
+            if let Some(text) = &mut projected.text {
+                text.push_str("\n\n");
+                text.push_str(&credit);
+            } else {
+                projected.attribution = credit;
+            }
+        }
+    }
+    projected
 }
 
-fn lyric_text(lyrics: media::Lyrics) -> Option<String> {
-    let mut text = match lyrics.state {
-        media::LyricsState::Plain => lyrics.plain_text?,
-        media::LyricsState::Timed => lyrics
-            .lines
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        media::LyricsState::Instrumental => "Instrumental".to_owned(),
-        _ => return None,
-    };
-    if let Some(attribution) = lyrics.attribution {
-        text.push_str("\n\nLyrics source: ");
-        text.push_str(&attribution.name);
-    }
-    Some(text)
+fn lyric_model(lines: Vec<media::LyricLine>) -> ModelRc<TimedLyricLine> {
+    let lines = lines
+        .into_iter()
+        .map(|line| TimedLyricLine {
+            start_ms: line.start_ms as i32, // bounded by parse_lyrics
+            text: line.text.into(),
+        })
+        .collect::<Vec<_>>();
+    ModelRc::new(VecModel::from(lines))
+}
+
+// Called from the reader's binding with the same projection as the seek bar.
+// The immutable row model is constructed only on delivery, not on clock ticks.
+fn displayed_lyric_line(lines: ModelRc<TimedLyricLine>, elapsed: f32, duration: f32) -> i32 {
+    media::active_lyric_line(
+        lines.row_count(),
+        |i| u64::try_from(lines.row_data(i)?.start_ms).ok(),
+        elapsed,
+        duration,
+    )
+    .map_or(-1, |i| i as i32)
 }
 
 async fn run(
@@ -383,8 +426,9 @@ async fn run(
     mut wanted: watch::Receiver<Demand>,
     shown: DisplayBinding,
 ) {
-    // This key keeps the last complete/missing response for this track while
-    // the pane is hidden. No catalog-wide or on-disk media cache exists here.
+    // Keep the last complete/missing response for this displayed track while
+    // the pane is hidden or the same track repeats. In-flight receipts still
+    // match the exact occurrence. No catalog-wide or on-disk cache exists here.
     let mut satisfied: Option<(Account, Demand, &'static str, Arc<AtomicBool>)> = None;
     loop {
         access.mark_unchanged();
@@ -463,11 +507,15 @@ impl Delivery {
             // observations, so a coalesced A → B → A can't reuse the receipt.
             let live = ui.get_now_track_id();
             let revision = bind_display(&ui, &shown, Some(account), live.as_str());
+            let current_request = if allow_hidden {
+                ui.get_media_track_token() == request.occurrence
+            } else {
+                matches!(wanted.has_changed(), Ok(false))
+                    && (ui.get_page_kind() == "now") == request.visible
+            };
             if live.as_str() == request.track
                 && revision == request.display_revision
-                && (allow_hidden
-                    || (matches!(wanted.has_changed(), Ok(false))
-                        && (ui.get_page_kind() == "now") == request.visible))
+                && current_request
             {
                 apply(ui, request.track);
             }
@@ -479,7 +527,10 @@ impl Delivery {
         // that arrived just as the reader was closed.
         self.update(true, move |ui, track| {
             ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
+            ui.set_lyrics_lines(lyric_model(lyrics.lines));
+            ui.set_lyrics_attribution(lyrics.attribution.into());
             ui.set_lyrics_status(lyrics.status.into());
+            ui.set_lyrics_settled(lyrics.settled);
             ui.set_lyrics_track_id(track.into());
         });
     }
@@ -490,6 +541,7 @@ impl Delivery {
         status: &'static str,
         delivered: Option<Arc<AtomicBool>>,
     ) {
+        let request = self.request.clone();
         self.update(false, move |ui, _| {
             let mut complete = true;
             if let Some(data) = projected {
@@ -519,7 +571,14 @@ impl Delivery {
                 "Waveform unavailable for this playback duration.".into()
             });
             if let Some(delivered) = delivered {
-                delivered.store(complete, Ordering::Release);
+                // On repeat, art/waveform may still publish even if the
+                // in-flight lyric receipt belonged to the previous visit.
+                let lyrics_settled =
+                    request.lyrics_settled(&ui.get_lyrics_track_id(), ui.get_lyrics_settled());
+                delivered.store(
+                    complete && (!request.visible || lyrics_settled),
+                    Ordering::Release,
+                );
             }
         });
     }
@@ -541,6 +600,36 @@ mod tests {
         assert!(scope.rebind(None, "first"));
         assert!(!scope.rebind(None, "first"));
         assert_eq!(scope.revision, 2);
+    }
+
+    #[test]
+    fn a_repeat_invalidates_pending_lyrics_without_refetching_accepted_lyrics() {
+        let first = Demand {
+            track: "same-track".into(),
+            occurrence: "online:1:chain:1".into(),
+            visible: true,
+            display_revision: 1,
+        };
+        let repeated = Demand {
+            occurrence: "online:1:chain:2".into(),
+            ..first.clone()
+        };
+        assert!(first.clone().replace(repeated.clone(), false));
+        // Completing art/waveform before the observer notices the repeat
+        // must not cache the load if its lyrics receipt was rejected.
+        assert!(!first.lyrics_settled("", false));
+        assert!(!first.lyrics_settled("same-track", false));
+        assert!(first.lyrics_settled("same-track", true));
+        let mut accepted = first;
+        assert!(!accepted.replace(repeated.clone(), true));
+        assert_eq!(accepted, repeated);
+        assert!(accepted.replace(
+            Demand {
+                display_revision: 2,
+                ..repeated
+            },
+            true
+        ));
     }
 
     #[test]
@@ -567,10 +656,63 @@ mod tests {
             let result = project_lyrics(Some(server_lyrics(state)));
             assert!(result.text.is_none());
             assert_eq!(result.status, expected);
+            assert_eq!(result.settled, matches!(state, Unavailable | NotFound));
         }
         let result = project_lyrics(Some(server_lyrics(Instrumental)));
         assert_eq!(result.text.as_deref(), Some("Instrumental"));
         assert!(result.status.is_empty());
+    }
+
+    #[test]
+    fn lyrics_project_clock_changes_and_replace_timed_rows_with_plain() {
+        let mut lyrics = media::Lyrics {
+            track_id: "track".into(),
+            recording_version: "v1".into(),
+            source_generation: "local-v1".into(),
+            state: media::LyricsState::Timed,
+            plain_text: None,
+            lines: ["First", "Second"]
+                .into_iter()
+                .zip([500, 1500])
+                .map(|(text, start_ms)| media::LyricLine {
+                    start_ms,
+                    text: text.into(),
+                })
+                .collect(),
+            reason: None,
+            provenance: None,
+            attribution: Some(media::Attribution {
+                name: "Fixture".into(),
+                ownership: media::AttributionOwnership::Library,
+                url: None,
+            }),
+        };
+        let timed = project_lyrics(Some(lyrics.clone()));
+        assert!(timed.text.is_none());
+        assert_eq!(timed.attribution, "Lyrics source: Fixture");
+        let rows = lyric_model(timed.lines);
+        for (position, active) in [
+            (0.0, -1),
+            (0.5, 0),
+            (1.5, 1),
+            (1.5, 1),
+            (0.75, 0),
+            (0.0, -1),
+        ] {
+            assert_eq!(displayed_lyric_line(rows.clone(), position, 2.0), active);
+        }
+        assert_eq!(rows.row_data(1).unwrap().text, "Second");
+
+        lyrics.state = media::LyricsState::Plain;
+        lyrics.lines.clear();
+        lyrics.plain_text = Some("Plain verse".into());
+        let plain = project_lyrics(Some(lyrics));
+        assert_eq!(
+            plain.text.as_deref(),
+            Some("Plain verse\n\nLyrics source: Fixture")
+        );
+        assert!(plain.attribution.is_empty());
+        assert_eq!(displayed_lyric_line(lyric_model(plain.lines), 1.5, 2.0), -1);
     }
 
     #[test]

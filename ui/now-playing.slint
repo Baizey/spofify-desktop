@@ -12,9 +12,14 @@ component PlayerTime inherits Caption {
     font-size: 11px * Theme.density;
 }
 
+export struct TimedLyricLine { start-ms: int, text: string }
+
 // In the split view lyrics scroll independently; in the stack they run down the page.
 component LyricsReader inherits Rectangle {
     in property <string> lyrics;
+    in property <[TimedLyricLine]> lines;
+    in property <string> attribution;
+    in property <int> active-line: -1;
     in property <string> status;
     in property <string> track-id;
     in property <bool> split;
@@ -28,7 +33,9 @@ component LyricsReader inherits Rectangle {
     property <length> inset: root.split ? 28px : 0px;
     property <length> heading-height: root.split ? 52px : 46px;
     property <bool> overflow: reader.content-height > reader.visible-height;
-    preferred-height: root.heading-height + (root.lyrics == "" ? 42px : root.split ? root.reading-height : verse.height + 10px);
+    property <bool> has-lyrics: root.lyrics != "" || root.lines.length > 0;
+    property <length> verse-size: (root.split ? 19px : 17px) * Theme.density;
+    preferred-height: root.heading-height + (!root.has-lyrics ? 42px : root.split ? root.reading-height : verses.height + 10px);
     changed track-id => { reader.content-y = 0px; }
     changed split => { reader.content-y = 0px; }
 
@@ -46,7 +53,7 @@ component LyricsReader inherits Rectangle {
         font-weight: 700;
         vertical-alignment: center;
     }
-    if root.lyrics == "": Caption {
+    if !root.has-lyrics: Caption {
         x: root.inset; y: root.heading-height;
         width: parent.width - self.x;
         text: root.status;
@@ -80,20 +87,47 @@ component LyricsReader inherits Rectangle {
         }
         reader := ScrollView {
             y: root.heading-height; width: parent.width; height: parent.height - self.y;
-            visible: root.lyrics != "";
+            visible: root.has-lyrics;
             horizontal-scrollbar-policy: always-off;
             vertical-scrollbar-policy: root.split ? as-needed : always-off;
             content-width: self.visible-width;
-            content-height: max(self.visible-height, verse.height + 10px);
-            verse := Text {
+            content-height: max(self.visible-height, verses.height + 10px);
+            verses := VerticalLayout {
                 x: 2px; y: 3px;
                 width: min(560px, max(0px, reader.visible-width - (root.split ? 24px : 7px)));
                 height: self.preferred-height;
-                text: root.lyrics;
-                color: Theme.text;
-                font-size: (root.split ? 19px : 17px) * Theme.density;
-                font-weight: 500;
-                wrap: word-wrap;
+                alignment: start;
+                if root.lyrics != "": Text {
+                    text: root.lyrics; color: Theme.text;
+                    font-size: root.verse-size; font-weight: 500; wrap: word-wrap;
+                    accessible-role: text; accessible-label: self.text;
+                }
+                for line[index] in root.lines: Rectangle {
+                    property <bool> current: index == root.active-line;
+                    height: max(root.verse-size, words.preferred-height) + 6px;
+                    background: self.current ? Theme.primary.with-alpha(0.14) : transparent;
+                    border-radius: 4px;
+                    accessible-role: text; accessible-label: line.text;
+                    accessible-description: self.current ? "Current line" : "";
+                    if self.current: Rectangle {
+                        x: 0px; y: 3px; width: 3px; height: parent.height - 6px;
+                        border-radius: 1.5px; background: Theme.primary;
+                    }
+                    words := Text {
+                        x: 10px; width: max(0px, parent.width - 17px);
+                        height: parent.height; vertical-alignment: center;
+                        text: line.text; color: Theme.text;
+                        font-size: root.verse-size; font-weight: 500; wrap: word-wrap;
+                        accessible-role: none;
+                    }
+                }
+                if root.attribution != "": VerticalLayout {
+                    padding-top: 10px;
+                    Caption {
+                        text: root.attribution; font-size: 13px * Theme.density; wrap: word-wrap;
+                        accessible-role: text; accessible-label: self.text;
+                    }
+                }
             }
         }
         if reading-focus.has-focus: Rectangle {
@@ -116,6 +150,9 @@ export component NowPlaying inherits Rectangle {
     in property <string> context-name;
     in property <image> artwork;
     in property <string> lyrics-text;
+    in property <[TimedLyricLine]> lyrics-lines;
+    in property <string> lyrics-attribution;
+    in property <int> active-lyric-line: -1;
     in property <string> lyrics-status;
     in property <bool> offline;
     in property <[float]> waveform;
@@ -169,10 +206,10 @@ export component NowPlaying inherits Rectangle {
 
     changed track-id => { root.reset-position(); }
     changed split => { root.reset-position(); }
-    changed lyrics-text => {
-        // If the icon opened a loading reader, begin at the heading when
-        // the verses expand it, but don't move users who have left the reader.
-        if lyrics.has-reading-focus { root.align-lyrics(); }
+    property <bool> has-lyrics: !root.offline && (root.lyrics-text != "" || root.lyrics-lines.length > 0);
+    changed has-lyrics => {
+        // Align after initial delivery only; playback must never drive scrolling.
+        if root.has-lyrics && lyrics.has-reading-focus { root.align-lyrics(); }
     }
 
     function align-lyrics() {
@@ -319,6 +356,9 @@ export component NowPlaying inherits Rectangle {
                 reading-height: max(142px, scroll.visible-height - stage.y - self.y - 78px);
                 split: root.split; active: root.has-track;
                 track-id: root.track-id; lyrics: root.offline ? "" : root.lyrics-text;
+                lines: root.offline ? [] : root.lyrics-lines;
+                attribution: root.offline ? "" : root.lyrics-attribution;
+                active-line: root.active-lyric-line;
                 status: root.offline ? "Lyrics unavailable offline." : root.lyrics-status != "" ? root.lyrics-status : "Loading lyrics…";
                 reveal => { root.reveal(stage.y + self.y, root.split ? min(self.height, scroll.visible-height - 30px) : 92px); }
                 move-page(key) => {

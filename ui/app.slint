@@ -5,7 +5,7 @@ import { OverflowMenu } from "overflow-menu.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
 import { PlayerBar } from "playback.slint";
-import { NowPlaying } from "now-playing.slint";
+import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings, SettingCard } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
@@ -115,7 +115,11 @@ export component AppWindow inherits Window {
     in property <image> cover-art;
     in property <string> lyrics-track-id;
     in property <string> lyrics-text;
+    in property <[TimedLyricLine]> lyrics-lines;
+    in property <string> lyrics-attribution;
     in property <string> lyrics-status;
+    in property <bool> lyrics-settled;
+    pure callback resolve-active-lyric([TimedLyricLine], float, float) -> int;
     in property <[float]> waveform;
     in property <string> media-status;
     in property <string> account-label;
@@ -466,9 +470,13 @@ export component AppWindow inherits Window {
                         artwork: root.cover-art;
                         property <bool> lyrics-current: root.lyrics-track-id == root.now-track-id;
                         lyrics-text: self.lyrics-current ? root.lyrics-text : "";
+                        lyrics-lines: self.lyrics-current ? root.lyrics-lines : [];
+                        lyrics-attribution: self.lyrics-current ? root.lyrics-attribution : "";
                         lyrics-status: self.lyrics-current ? root.lyrics-status : "";
                         offline: root.local-mode;
                         waveform: root.waveform; elapsed: root.elapsed; duration: root.duration;
+                        active-lyric-line: !self.offline && self.lyrics-lines.length > 0
+                            ? root.resolve-active-lyric(self.lyrics-lines, self.elapsed, self.duration) : -1;
                         playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.local-playback); can-toggle: root.can-control && (!root.local-mode || root.local-playback);
                         can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
                         shuffle: root.shuffle; repeat-mode: root.repeat-mode; can-change-modes: root.queue-controls;
