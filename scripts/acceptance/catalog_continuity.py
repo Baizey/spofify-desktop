@@ -38,7 +38,7 @@ PAGE = 20
 TRACK_COUNT = 523
 STOP = "More results couldn’t be loaded."
 GOLD = bytes.fromhex("dfbd78")
-FORBIDDEN = re.compile(r"\b(?:load more|show more|more results|next page|previous page|retry|try again)\b", re.I)
+FORBIDDEN = re.compile(r"\b(?:load more|show more|more results|(?:first|next|previous|last) page|retry|try again)\b", re.I)
 CREDIT = [{"id": base.ARTIST["id"], "name": base.ARTIST_NAME}]
 
 
@@ -59,7 +59,10 @@ QUERIES = {key: numbered("artist", key, f"Continuity {key} artist", count)
                               ("intermediate", 1), ("final", 1), ("permanent", 41), ("stuck", 41))}
 QUERIES["wheel"][0] = base.ARTIST
 QUERIES["keyboard"][PAGE] = base.GUEST
-QUERIES["final"][0] = base.GUEST
+# The keyboard journey leaves Guest Artist open. Following that same Artist
+# from the final search would pop the prior trail entry (a direct return),
+# so Back would correctly restore the earlier keyboard Search instead.
+QUERIES["final"][0] = base.ARTIST
 EXPIRY = "2099-01-01T00:00:00Z"
 
 
@@ -272,6 +275,39 @@ class View:
             return sum(rgb[i:i + 3] == GOLD for i in range(start, start + width * 3, 3)) >= width * .8
         return any(edge(i) for i in range(3)) and any(edge(height - 1 - i) for i in range(3))
 
+    def dom_items(self, element_id):
+        # Target the native node directly instead of relying on the window's
+        # root tree budget or on the copy used to present its state.
+        mcp = self.window.mcp
+        result = mcp.value("find_elements_by_id", {"windowHandle": self.window.handle,
+                                                   "elementsId": element_id})
+        return [mcp.value("get_element_properties", {"elementHandle": handle}) | {"handle": handle}
+                for handle in result.get("elementHandles", [])]
+
+    def accepted_results(self, expected, *, label="Search"):
+        lists = self.dom_items("AppWindow::catalog-results")
+        check(len(lists) == 1, f"expected one visible catalog results list, got {len(lists)}")
+        result = lists[0]
+        check((result.get("accessibleRole"), result.get("accessibleLabel"), result.get("accessibleItemCount"))
+              == ("List", label, expected), f"unexpected accepted {label} results list: {result}")
+        return result
+
+    def visible_terminal_notice(self, last):
+        row = self.row(last)
+        if not row:
+            return None
+        # Notice text is a Text node, not a button or the wrapping Rectangle.
+        # Require it to be within the catalog viewport, after the last row.
+        left, top, right, bottom = self.viewport()
+        row_bottom = bounds(row)[3]
+        for message in self.dom_items("Notice::message"):
+            if message.get("accessibleRole") != "Text" or not self.window.matches(message, re.escape(STOP)):
+                continue
+            x, y, x2, y2 = bounds(message)
+            if left <= x < x2 <= right and max(top, row_bottom) <= y < y2 <= bottom:
+                return message
+        return None
+
     def no_pagers(self):
         for element in self.window.elements():
             if element.get("accessibleRole") == "Button":
@@ -422,19 +458,26 @@ def stale_journey(view, wire):
     view.frame("race-held-old-search")
     query(window, "intermediate")
     query(window, "final")
-    view.visible(base.GUEST)
-    window.click_element(view.visible(base.GUEST))
-    window.title(base.GUEST_NAME)
+    final_item = QUERIES["final"][0]
+    final_row = view.visible(final_item)
+    view.accepted_results(1)
+    window.click_element(final_row)
+    window.title(final_item["name"])
     view.frame("race-navigated-before-release")
     wire.release("race")
     check(wire.race_replied.wait(5), "fixture did not attempt to send the stale response")
     sleep(.4)
-    window.title(base.GUEST_NAME)
+    window.title(final_item["name"])
     view.frame("race-navigated-after-release")
     window.shortcut(ALT, LEFT)
-    view.visible(base.GUEST)
-    window.find("1 result", roles=("Text",))
-    window.absent(r"Open Continuity race artist .*", roles=("Button",))
+    final_row = view.visible(final_item)
+    result = view.accepted_results(len(QUERIES["final"]))
+    row_actions = [element for element in window.subtree(result)
+                   if element.get("accessibleRole") == "Button"
+                   and (element.get("accessibleLabel") or "").startswith("Open ")]
+    check([element.get("handle") for element in row_actions] == [final_row["handle"]],
+          f"Back did not restore precisely the final result: {row_actions}")
+    window.absent(r"Open Continuity (race|intermediate) artist .*", roles=("Button",))
     view.frame("race-back-current-search")
     wire.expect("race", [0, PAGE])
     wire.expect("final", [0])
@@ -448,20 +491,24 @@ def stops(view, wire, route, *, attempts, timeout):
     view.visible(rows[0])
     next_request(view, wire, route, PAGE)
     view.frame(f"{route}-requested")
+    last = rows[PAGE - 1]
     def stopped():
         view.scroll()
-        return any(view.window.matches(e, re.escape(STOP)) for e in view.window.elements())
-    wait(f"{route} shows terminal continuation notice", stopped, timeout=timeout)
+        return view.visible_terminal_notice(last)
+    wait(f"{route} shows a terminal notice below the accepted rows", stopped, timeout=timeout)
     view.frame(f"{route}-stopped")
     view.no_pagers()
-    view.visible(rows[PAGE - 1])
+    view.accepted_results(PAGE)
+    view.visible(last)
     view.window.absent(re.escape("Open " + rows[PAGE]["name"]), roles=("Button",))
     start = monotonic()
     while monotonic() - start < 2:
         view.scroll(460)
         view.scroll()
         sleep(.25)
-    view.visible(rows[PAGE - 1])
+    view.visible(last)
+    view.accepted_results(PAGE)
+    check(view.visible_terminal_notice(last), f"{route} lost its terminal notice after scrolling")
     view.no_pagers()
     wire.expect(route, [0] + [PAGE] * attempts)
     view.frame(f"{route}-stopped-after-wheel")
