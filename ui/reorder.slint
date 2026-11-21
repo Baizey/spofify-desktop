@@ -1,0 +1,601 @@
+import { ListView, ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+export struct ReorderRow {
+    key: string,
+    title: string,
+    subtitle: string,
+    reorderable: bool,
+    section: string,
+}
+
+// Queue and playlist adapters supply unique occurrence keys, and at most one
+// contiguous reorderable block. Section names describe the fixed list lanes.
+enum Grab { idle, pending, pointer, keyboard, settling }
+struct Bounds { inside: int, outside: int }
+
+component ReorderCard inherits Rectangle {
+    in property <ReorderRow> entry;
+    in property <bool> focused;
+    in property <bool> hovered;
+    in property <bool> prepared;
+    in property <bool> lifted;
+    in property <bool> line-variant;
+    in property <bool> reduced-motion;
+    accessible-role: none;
+    border-radius: root.lifted && root.line-variant ? 5px : Theme.control-radius;
+    border-width: root.focused || root.lifted ? 2px : root.prepared ? 1px : 0px;
+    border-color: root.focused ? Theme.tertiary : Theme.primary.with-alpha(root.lifted ? 0.88 : 0.58);
+    background: root.lifted ? (root.line-variant ? Theme.bg : Theme.raised)
+        : root.prepared ? Theme.raised : root.hovered || root.focused ? Theme.panel : transparent;
+    drop-shadow-color: root.lifted ? #000000ae : transparent;
+    drop-shadow-offset-y: root.line-variant ? 3px : 5px;
+    drop-shadow-blur: root.lifted ? (root.line-variant ? 7px : 13px) : 0px;
+    animate background { duration: root.reduced-motion ? 0ms : 100ms; }
+
+    if root.lifted && root.line-variant: Rectangle {
+        x: 2px; y: 7px; width: 3px; height: parent.height - 14px;
+        border-radius: 1px; background: Theme.primary; accessible-role: none;
+    }
+    Text {
+        x: 11px; y: root.entry.subtitle == "" ? 0px : parent.height / 2 - self.height;
+        width: max(0px, parent.width - self.x - (root.entry.reorderable && !root.lifted ? 31px : 9px));
+        height: root.entry.subtitle == "" ? parent.height : 20px * Theme.density;
+        text: root.entry.title; color: Theme.text;
+        font-size: 14px * Theme.density; font-weight: 650;
+        vertical-alignment: center; overflow: elide;
+        accessible-role: none;
+    }
+    if root.entry.subtitle != "": Text {
+        x: 11px; y: parent.height / 2 + 1px;
+        width: max(0px, parent.width - self.x - (root.entry.reorderable && !root.lifted ? 31px : 9px));
+        height: 18px * Theme.density;
+        text: root.entry.subtitle; color: Theme.muted;
+        font-size: 12px * Theme.density;
+        vertical-alignment: center; overflow: elide;
+        accessible-role: none;
+    }
+    if root.entry.reorderable && !root.lifted: Rectangle {
+        x: parent.width - 25px; y: (parent.height - 14px) / 2;
+        width: 14px; height: 14px; accessible-role: none;
+        for dot in 6: Rectangle {
+            x: mod(dot, 2) * 5px + 3px; y: floor(dot / 2) * 5px + 1px;
+            width: 2px; height: 2px; border-radius: 1px;
+            background: root.prepared ? Theme.primary : Theme.subtle;
+            accessible-role: none;
+        }
+    }
+}
+
+export component ReorderList inherits Rectangle {
+    in property <[ReorderRow]> rows;
+    in property <string> scope-key;
+    in property <bool> line-variant;
+    in property <bool> reduced-motion;
+    in property <bool> writable: true;
+    // True only while the adapter is waiting for this scope's move result.
+    in property <bool> commit-pending;
+    // Index in the complete model, read on mount or when an inactive scope
+    // becomes active. This also supports adapters that keep the viewport mounted.
+    in property <int> initial-index;
+    out property <int> focused-index: root.selection;
+    callback placed(string, string);
+
+    min-width: 0px;
+    min-height: 0px;
+    horizontal-stretch: 1;
+    vertical-stretch: 1;
+    clip: true;
+    forward-focus: keys;
+    accessible-role: AccessibleRole.list;
+    accessible-label: "Reorder list";
+    accessible-orientation: vertical;
+    accessible-item-count: root.rows.length;
+    // AccessKit resolves the index among instantiated descendants, not rows
+    // preceding the current virtualized window.
+    accessible-delegate-focus: root.selection >= 0
+            && root.selection * root.pitch + scroll.content-y < scroll.visible-height
+        ? root.selection - max(0, root.index-at(0px)) : -1;
+
+    private property <int> selection: -1;
+    private property <string> selected-key;
+    private property <string> observed-scope;
+    private property <int> expected-index: -1;
+    private property <string> last-row-readback;
+    private property <int> scan-from: -1;
+    private property <bool> initial-reveal: true;
+    private property <Grab> grab;
+    private property <int> source: -1;
+    private property <int> first-slot: -1;
+    private property <int> last-slot: -1;
+    private property <int> slot: -1;
+    private property <string> captured-scope;
+    private property <int> captured-length;
+    private property <ReorderRow> carried;
+    private property <int> finger;
+    private property <bool> hold-eligible;
+    private property <length> down-x;
+    private property <length> down-y;
+    private property <length> down-scroll;
+    private property <length> pointer-y;
+    private property <length> grab-offset;
+    private property <bool> can-write: root.writable && root.scope-key != "";
+    private property <bool> lifted: root.grab == Grab.pointer || root.grab == Grab.keyboard;
+    private property <bool> preview: (root.lifted || root.grab == Grab.settling) && root.source-is-current();
+    private property <length> pitch: round(52px * Theme.density / 1px) * 1px;
+    private property <length> gutter: root.rows.length * root.pitch > scroll.visible-height ? 20px : 4px;
+    private property <length> lane-width: max(0px, min(scroll.visible-width, scroll.width - root.gutter));
+    private property <bool> has-sections: root.rows.length > 0 && root.rows[0].section != "";
+    private property <length> section-width: root.has-sections
+        ? min(root.lane-width * 0.26, 62px * Theme.density) : 0px;
+    private property <length> card-left: root.section-width + 3px;
+    private property <length> card-width: max(0px, root.lane-width - root.card-left - 4px);
+    private property <length> carried-height: root.pitch - (root.line-variant ? 10px : 6px);
+    private property <length> slot-top: root.slot * root.pitch + scroll.content-y;
+    private property <bool> slot-in-view: root.slot-top + root.pitch > 0px && root.slot-top < scroll.visible-height;
+    // Animate in content coordinates so scrolling does not restart the settle.
+    private property <length> carried-top: root.grab == Grab.pointer
+        ? clamp(root.pointer-y - root.grab-offset + 3px, 1px, max(1px, scroll.visible-height - root.carried-height - 1px)) - scroll.content-y
+        : root.slot * root.pitch + 3px;
+    animate carried-top { duration: root.grab == Grab.settling && !root.reduced-motion ? 115ms : 0ms; easing: ease-out; }
+    private property <length> edge-size: min(52px, scroll.visible-height / 4);
+    private property <length> auto-delta: root.grab != Grab.pointer
+            || pointer.mouse-x < 0px || pointer.mouse-x > root.lane-width || root.edge-size == 0px ? 0px
+        : root.pointer-y < root.edge-size && scroll.content-y < -root.first-slot * root.pitch
+            ? min(16px, (root.edge-size - root.pointer-y) * 0.29 + 1px)
+        : root.pointer-y > scroll.visible-height - root.edge-size
+            && scroll.content-y > min(0px, scroll.visible-height - (root.last-slot + 1) * root.pitch)
+            ? -min(16px, (root.pointer-y - scroll.visible-height + root.edge-size) * 0.29 + 1px)
+        : 0px;
+
+    init => { root.select-row(root.initial-index, false); }
+    changed scope-key => { root.sync-scope(); }
+    changed commit-pending => {
+        if !root.commit-pending { root.finish-settling(); }
+    }
+    changed can-write => { if !root.can-write && root.grab != Grab.settling { root.cancel-grab(); } }
+    changed rows => {
+        // A replacement model may only update display text. The adapters
+        // change scope when authority, occurrence order or eligibility changes.
+        if root.grab == Grab.idle || !root.source-is-current() { root.refresh-selection(); }
+    }
+    changed visible => { if !root.visible { root.cancel-grab(); } }
+
+    public function focus-list() {
+        root.sync-scope();
+        if root.selection < 0 { root.select-row(root.initial-index, false); }
+        keys.focus();
+        root.reveal(root.selection);
+    }
+
+    function sync-scope() {
+        if root.observed-scope == root.scope-key { return; }
+        let entering = root.observed-scope == "" && root.scope-key != "";
+        root.observed-scope = root.scope-key;
+        root.cancel-grab();
+        if entering {
+            root.select-row(root.initial-index, false);
+            root.initial-reveal = true;
+        } else { root.refresh-selection(); }
+    }
+
+    public function cancel-grab() -> bool {
+        let cancelled = root.grab != Grab.idle && root.grab != Grab.settling;
+        root.grab = Grab.idle;
+        root.source = -1;
+        root.slot = -1;
+        return cancelled;
+    }
+
+    pure function has-row(index: int) -> bool { return index >= 0 && index < root.rows.length; }
+    pure function can-lift(index: int) -> bool {
+        return root.has-row(index) && root.rows[index].key != "" && root.rows[index].reorderable;
+    }
+    pure function index-at(y: length) -> int { return floor((y - scroll.content-y) / root.pitch); }
+    pure function source-is-current() -> bool {
+        return root.captured-scope == root.scope-key && root.captured-length == root.rows.length
+            && root.has-row(root.source) && root.rows[root.source].key == root.carried.key
+            && root.rows[root.source].reorderable == root.carried.reorderable;
+    }
+
+    function scroll-to(y: length) {
+        scroll.content-y = clamp(y, min(0px, scroll.visible-height - root.rows.length * root.pitch), 0px);
+    }
+
+    function reveal(index: int) {
+        if !root.has-row(index) || scroll.visible-height <= 0px { return; }
+        let top = index * root.pitch;
+        if top + scroll.content-y < 0px || root.pitch > scroll.visible-height { root.scroll-to(-top); }
+        else if top + root.pitch + scroll.content-y > scroll.visible-height {
+            root.scroll-to(scroll.visible-height - top - root.pitch);
+        }
+    }
+
+    function select-row(index: int, show: bool) {
+        root.selection = root.rows.length == 0 ? -1 : clamp(index, 0, root.rows.length - 1);
+        root.selected-key = root.selection < 0 ? "" : root.rows[root.selection].key;
+        root.expected-index = -1;
+        root.scan-from = -1;
+        if show { root.reveal(root.selection); }
+    }
+
+    function refresh-selection() {
+        root.cancel-grab();
+        if root.has-row(root.selection) && root.rows[root.selection].key == root.selected-key {
+            root.scan-from = -1; return;
+        }
+        if root.selected-key != "" && root.has-row(root.expected-index)
+            && root.rows[root.expected-index].key == root.selected-key {
+            let at-end = root.expected-index == root.rows.length - 1;
+            root.select-row(root.expected-index, at-end || keys.has-focus);
+            // Replacing the model rebuilds ListView's virtual window, which can
+            // snap its shared scroll offset to a row boundary on the first pass.
+            if at-end { root.last-row-readback = root.selected-key; }
+        } else if root.selected-key != "" && root.rows.length > 0 {
+            // External reorder: keep the occurrence key and search bounded
+            // batches without building delegates or blocking the input thread.
+            root.scan-from = 0;
+        } else { root.select-row(root.initial-index, keys.has-focus); }
+    }
+
+    pure function scan-pair(start: int) -> int {
+        if root.has-row(start) && root.rows[start].key == root.selected-key { return start; }
+        if root.has-row(start + 1) && root.rows[start + 1].key == root.selected-key { return start + 1; }
+        return -1;
+    }
+    pure function scan-4(start: int) -> int {
+        let result = root.scan-pair(start); return result >= 0 ? result : root.scan-pair(start + 2);
+    }
+    pure function scan-8(start: int) -> int {
+        let result = root.scan-4(start); return result >= 0 ? result : root.scan-4(start + 4);
+    }
+    pure function scan-16(start: int) -> int {
+        let result = root.scan-8(start); return result >= 0 ? result : root.scan-8(start + 8);
+    }
+    pure function scan-32(start: int) -> int {
+        let result = root.scan-16(start); return result >= 0 ? result : root.scan-16(start + 16);
+    }
+    pure function scan-64(start: int) -> int {
+        let result = root.scan-32(start); return result >= 0 ? result : root.scan-32(start + 32);
+    }
+    pure function scan-128(start: int) -> int {
+        let result = root.scan-64(start); return result >= 0 ? result : root.scan-64(start + 64);
+    }
+
+    // Slint has no statement loops. Compose up to 32 bisections (one per
+    // index bit) to find the edges without scanning or creating delegates.
+    pure function bisect(b: Bounds) -> Bounds {
+        if abs(b.outside - b.inside) <= 1 { return b; }
+        let mid = floor(b.inside + (b.outside - b.inside) / 2);
+        return root.can-lift(mid) ? { inside: mid, outside: b.outside } : { inside: b.inside, outside: mid };
+    }
+    pure function bisect-2(b: Bounds) -> Bounds { return root.bisect(root.bisect(b)); }
+    pure function bisect-4(b: Bounds) -> Bounds { return root.bisect-2(root.bisect-2(b)); }
+    pure function bisect-8(b: Bounds) -> Bounds { return root.bisect-4(root.bisect-4(b)); }
+    pure function bisect-16(b: Bounds) -> Bounds { return root.bisect-8(root.bisect-8(b)); }
+    pure function block-edge(inside: int, outside: int) -> int {
+        return root.bisect-16(root.bisect-16({ inside: inside, outside: outside })).inside;
+    }
+
+    function lift(index: int, mode: Grab) {
+        if !root.can-write || !root.can-lift(index) { root.cancel-grab(); return; }
+        root.select-row(index, false);
+        root.source = index;
+        root.first-slot = root.block-edge(index, -1);
+        root.last-slot = root.block-edge(index, root.rows.length);
+        root.slot = index;
+        root.carried = root.rows[index];
+        root.captured-scope = root.scope-key;
+        root.captured-length = root.rows.length;
+        root.grab = mode;
+    }
+
+    function track-pointer(y: length) {
+        if !root.can-write || !root.source-is-current() { return; }
+        root.pointer-y = y;
+        let edge = min(12px, scroll.visible-height / 4);
+        let first-top = root.first-slot * root.pitch + scroll.content-y;
+        let last-bottom = (root.last-slot + 1) * root.pitch + scroll.content-y;
+        // Once the eligible edge is visible, reaching the viewport edge must
+        // allow that slot regardless of where in the card the press began.
+        if y <= edge && first-top >= -1px && first-top < scroll.visible-height { root.slot = root.first-slot; }
+        else if y >= scroll.visible-height - edge && last-bottom <= scroll.visible-height + 1px && last-bottom > 0px {
+            root.slot = root.last-slot;
+        } else {
+            root.slot = clamp(round((y - root.grab-offset - scroll.content-y) / root.pitch), root.first-slot, root.last-slot);
+        }
+    }
+
+    // A slot is a final index, not a boundary in the original order.
+    pure function preceding-index() -> int {
+        return root.slot <= root.first-slot ? -1 : root.slot > root.source ? root.slot : root.slot - 1;
+    }
+
+    function place() {
+        if !root.lifted || !root.can-write || !root.source-is-current() || !root.can-lift(root.source) || !root.can-lift(root.slot) {
+            root.refresh-selection(); return;
+        }
+        let from = root.source;
+        let to = root.slot;
+        let key = root.carried.key;
+        let preceding = root.preceding-index();
+        let predecessor = preceding < 0 ? "" : root.rows[preceding].key;
+        if to == from { root.cancel-grab(); return; }
+        // Retain the derived visual ordering, not a rewritten model. A scope
+        // change or source mismatch drops it; selection follows readback.
+        root.expected-index = to;
+        root.grab = Grab.settling;
+        root.placed(key, predecessor);
+    }
+
+    function activate-row(index: int) {
+        if root.grab == Grab.settling { return; }
+        if root.grab == Grab.keyboard && index == root.source { root.place(); }
+        else {
+            root.cancel-grab();
+            root.select-row(index, true);
+            keys.focus();
+            if root.can-write && root.can-lift(index) { root.lift(index, Grab.keyboard); }
+        }
+    }
+
+    Timer {
+        interval: 32ms;
+        running: root.last-row-readback != "";
+        triggered => {
+            let key = root.last-row-readback;
+            root.last-row-readback = "";
+            if root.grab == Grab.idle && root.scope-key != "" && root.has-row(root.selection)
+                && root.selection == root.rows.length - 1 && root.rows[root.selection].key == key {
+                root.reveal(root.selection);
+            }
+        }
+    }
+    function finish-settling() {
+        if root.grab != Grab.settling { return; }
+        root.refresh-selection();
+        if keys.has-focus { root.reveal(root.selection); }
+    }
+
+    Timer {
+        // Covers a drop that was never admitted. An admitted drop uses the
+        // adapter's result or timeout instead of snapping to the old order.
+        interval: 400ms;
+        running: root.grab == Grab.settling && !root.commit-pending;
+        triggered => { if !root.commit-pending { root.finish-settling(); } }
+    }
+    Timer {
+        interval: 1ms;
+        running: root.scan-from >= 0;
+        triggered => {
+            let found = root.scan-128(root.scan-from);
+            if found >= 0 { root.select-row(found, keys.has-focus); }
+            else if root.scan-from + 128 >= root.rows.length { root.select-row(root.selection, keys.has-focus); }
+            else { root.scan-from += 128; }
+        }
+    }
+    Timer {
+        interval: 1ms;
+        running: root.initial-reveal && scroll.visible-height > 0px;
+        triggered => { root.initial-reveal = false; root.reveal(root.selection); }
+    }
+    Timer {
+        // Native Flickable gives touch panning priority for the first 500ms,
+        // including its press-forwarding delay. Mouse presses need no delay.
+        interval: root.finger == 0 ? 255ms : 450ms;
+        running: root.grab == Grab.pending && root.hold-eligible && root.can-write;
+        triggered => {
+            if root.grab != Grab.pending || !root.hold-eligible || !root.can-write { return; }
+            if pointer.pressed && keys.has-focus && root.source-is-current()
+                && abs(root.down-scroll - scroll.content-y) <= 6px {
+                root.grab-offset = clamp(root.down-y - scroll.content-y - root.source * root.pitch, 0px, root.pitch);
+                root.lift(root.source, Grab.pointer);
+                root.track-pointer(pointer.mouse-y);
+            } else { root.cancel-grab(); }
+        }
+    }
+    Timer {
+        interval: 16ms;
+        running: root.grab == Grab.pointer && root.can-write && root.auto-delta != 0px;
+        triggered => {
+            if root.grab != Grab.pointer || !root.can-write || root.auto-delta == 0px { return; }
+            if !root.source-is-current() || !pointer.pressed || !keys.has-focus {
+                root.refresh-selection(); return;
+            }
+            let limit = root.auto-delta > 0px ? min(0px, -root.first-slot * root.pitch)
+                : min(0px, scroll.visible-height - (root.last-slot + 1) * root.pitch);
+            let proposal = scroll.content-y + root.auto-delta;
+            root.scroll-to(root.auto-delta > 0px ? min(limit, proposal) : max(limit, proposal));
+            root.track-pointer(root.pointer-y);
+        }
+    }
+
+    keys := FocusScope {
+        x: 0px; y: 0px; width: 100%; height: 100%;
+        focus-on-click: false;
+        focus-gained(reason) => {
+            if reason == FocusReason.tab-navigation { root.reveal(root.selection); }
+        }
+        focus-lost(_) => { if root.grab != Grab.settling { root.cancel-grab(); } }
+        key-pressed(event) => {
+            if root.grab == Grab.settling {
+                if event.text == Key.Space || event.text == Key.Return || event.text == Key.UpArrow
+                    || event.text == Key.DownArrow || event.text == Key.Home || event.text == Key.End
+                    || event.text == Key.PageUp || event.text == Key.PageDown { return accept; }
+                return reject;
+            }
+            if event.text == Key.Escape && root.grab != Grab.idle {
+                root.cancel-grab(); root.reveal(root.selection); return accept;
+            }
+            if event.text == Key.Tab || event.text == Key.Backtab { root.cancel-grab(); return reject; }
+            if root.grab == Grab.pointer || root.grab == Grab.pending || root.rows.length == 0
+                || event.modifiers.control || event.modifiers.alt || event.modifiers.meta { return reject; }
+            if event.text == Key.Space || event.text == Key.Return {
+                if !event.repeat {
+                    if root.grab == Grab.keyboard { root.place(); }
+                    else if root.scan-from < 0 && root.can-lift(root.selection) { root.activate-row(root.selection); }
+                }
+                return accept;
+            }
+            let base = root.grab == Grab.keyboard ? root.slot : max(0, root.selection);
+            let page = max(1, floor(scroll.visible-height / root.pitch) - 1);
+            let next = event.text == Key.UpArrow ? base - 1
+                : event.text == Key.DownArrow ? base + 1
+                : event.text == Key.Home ? 0 : event.text == Key.End ? root.rows.length - 1
+                : event.text == Key.PageUp ? base - page : event.text == Key.PageDown ? base + page : -2;
+            if next == -2 && event.text != Key.PageUp { return reject; }
+            if root.grab == Grab.keyboard {
+                if !root.can-write || !root.source-is-current() { root.refresh-selection(); return accept; }
+                root.slot = clamp(next, root.first-slot, root.last-slot);
+                root.reveal(root.slot);
+            } else { root.select-row(next, true); }
+            return accept;
+        }
+
+        list := ListView {
+            x: 0px; y: 0px; width: scroll.visible-width; height: scroll.visible-height;
+            vertical-scrollbar-policy: always-off;
+            horizontal-scrollbar-policy: always-off;
+            content-y <=> scroll.content-y;
+            accessible-role: none;
+
+            // ListView virtualizes the unmodified input model. Animating only
+            // the child offset leaves the measured pitch and scroll extent fixed.
+            for row[i] in root.rows: Rectangle {
+                width: list.visible-width; height: root.pitch;
+                accessible-role: list-item;
+                accessible-item-index: i;
+                accessible-label: (row.section == "" ? "" : row.section + ": ") + row.title
+                    + (row.subtitle == "" ? "" : ", " + row.subtitle);
+                accessible-description: !root.lifted || i != root.source ? ""
+                    : root.preceding-index() < 0 ? "Lifted, at start"
+                    : "Lifted, after " + root.rows[root.preceding-index()].title;
+                accessible-action-default => { root.activate-row(i); }
+                if row.section != "" && (i == 0 || root.rows[i - 1].section != row.section): Text {
+                    x: 3px; width: max(0px, root.section-width - 8px); height: parent.height;
+                    text: row.section; color: Theme.muted;
+                    font-weight: 700; font-size: 11px * Theme.density;
+                    vertical-alignment: center; wrap: word-wrap; overflow: elide;
+                    accessible-role: none;
+                }
+                card := ReorderCard {
+                    x: root.card-left;
+                    y: 3px + (root.preview && i > root.source && i <= root.slot ? -root.pitch
+                        : root.preview && i < root.source && i >= root.slot ? root.pitch : 0px);
+                    width: root.card-width; height: root.pitch - 6px;
+                    visible: !root.preview || i != root.source;
+                    entry: row;
+                    focused: keys.has-focus && i == root.selection;
+                    hovered: root.can-write && !root.preview && row.reorderable && pointer.has-hover && root.index-at(pointer.mouse-y) == i;
+                    prepared: root.grab == Grab.pending && root.hold-eligible && row.reorderable && i == root.source;
+                    reduced-motion: root.reduced-motion;
+                    animate y { duration: root.reduced-motion ? 0ms : 125ms; easing: ease-out; }
+                }
+            }
+        }
+
+        // Neither the held row nor the input surface is a recycled delegate.
+        if root.preview: Rectangle {
+            x: root.card-left;
+            y: clamp(root.slot-top + 3px, 3px, max(3px, scroll.visible-height - (root.line-variant ? 6px : self.height + 1px)));
+            width: root.card-width; height: root.pitch - 6px;
+            visible: root.slot-in-view;
+            accessible-role: none;
+            if root.line-variant: Rectangle {
+                x: 0px; y: 0px; width: parent.width - 5px; height: 3px;
+                border-radius: 1.5px; background: Theme.primary; accessible-role: none;
+                Rectangle {
+                    x: parent.width - 5px; y: -3px; width: 9px; height: 9px;
+                    border-radius: 4.5px; background: Theme.primary; accessible-role: none;
+                }
+            }
+            if !root.line-variant: Rectangle {
+                width: 100%; height: 100%; border-radius: Theme.control-radius;
+                background: Theme.primary.with-alpha(0.18); accessible-role: none;
+                Rectangle {
+                    x: parent.width - 10px; y: (parent.height - self.height) / 2;
+                    width: 5px; height: 21px; border-radius: 3px;
+                    background: Theme.primary; accessible-role: none;
+                }
+            }
+        }
+        if root.preview: carried-card := ReorderCard {
+            x: root.card-left + (root.has-sections ? 4px : root.line-variant ? 5px : 8px);
+            y: clamp(root.carried-top + scroll.content-y, 1px, max(1px, scroll.visible-height - self.height - 1px));
+            visible: root.grab == Grab.pointer || root.slot-in-view;
+            width: max(0px, root.card-width - (root.has-sections ? 18px : root.line-variant ? 29px : 39px));
+            height: root.carried-height;
+            entry: root.rows[root.source];
+            lifted: true; line-variant: root.line-variant;
+            focused: keys.has-focus && (root.grab == Grab.keyboard || root.grab == Grab.settling);
+            reduced-motion: root.reduced-motion;
+        }
+
+        // Native scrolling (wheel, scrollbar and touch pan) stays in front of
+        // the virtualized render layer. Only the input surface negates scroll.
+        scroll := ScrollView {
+            x: 0px; y: 0px; width: 100%; height: 100%;
+            horizontal-scrollbar-policy: always-off;
+            mouse-drag-pan-enabled: false;
+            content-width: self.visible-width;
+            content-height: root.rows.length * root.pitch;
+            scrolled => {
+                root.last-row-readback = "";
+                if root.grab == Grab.pointer { root.track-pointer(root.pointer-y); }
+                else if root.grab == Grab.pending { root.cancel-grab(); }
+            }
+            pointer := TouchArea {
+                x: 0px; y: -scroll.content-y; width: root.lane-width; height: scroll.visible-height;
+                mouse-cursor: root.grab == Grab.pointer ? MouseCursor.grabbing
+                    : root.can-write && root.can-lift(root.index-at(self.mouse-y)) ? MouseCursor.grab : MouseCursor.default;
+                scroll-event(event) => {
+                    if root.grab != Grab.pointer && root.grab != Grab.pending { return reject; }
+                    if root.grab == Grab.pending { root.cancel-grab(); }
+                    root.scroll-to(scroll.content-y + event.delta-y);
+                    if root.grab == Grab.pointer { root.track-pointer(root.pointer-y); }
+                    return accept;
+                }
+                pointer-event(event) => {
+                    if root.grab == Grab.settling { return; }
+                    if event.kind == PointerEventKind.cancel { root.cancel-grab(); return; }
+                    if event.kind == PointerEventKind.down {
+                        root.cancel-grab();
+                        let index = root.index-at(self.mouse-y);
+                        if event.button != PointerEventButton.left || !root.has-row(index) { return; }
+                        keys.focus();
+                        root.source = index;
+                        root.carried = root.rows[index];
+                        root.captured-scope = root.scope-key;
+                        root.captured-length = root.rows.length;
+                        root.finger = event.touch-finger-id;
+                        root.hold-eligible = root.can-write && root.can-lift(index);
+                        root.down-x = self.mouse-x;
+                        root.down-y = self.mouse-y;
+                        root.down-scroll = scroll.content-y;
+                        root.grab = Grab.pending;
+                    } else if event.touch-finger-id == root.finger {
+                        if event.kind == PointerEventKind.move {
+                            if root.grab == Grab.pointer { root.track-pointer(self.mouse-y); }
+                            else if root.grab == Grab.pending
+                                && (abs(self.mouse-x - root.down-x) > 7px || abs(self.mouse-y - root.down-y) > 7px) {
+                                root.cancel-grab();
+                            }
+                        } else if event.kind == PointerEventKind.up && event.button == PointerEventButton.left {
+                            let inside = self.mouse-x >= 0px && self.mouse-x < self.width
+                                && self.mouse-y >= 0px && self.mouse-y < self.height;
+                            if inside && root.grab == Grab.pointer {
+                                root.track-pointer(self.mouse-y);
+                                root.place();
+                                return;
+                            } else if inside && root.grab == Grab.pending && root.source-is-current()
+                                && root.index-at(self.mouse-y) == root.source {
+                                root.select-row(root.source, false);
+                            }
+                            root.cancel-grab();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

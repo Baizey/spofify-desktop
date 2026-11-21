@@ -13,7 +13,7 @@ use std::{
     future::{Future, pending},
     io::{self, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -155,6 +155,7 @@ pub(crate) struct Socket {
     pub(crate) events: mpsc::Receiver<Event>,
     outbound: mpsc::Sender<WriteFrame>,
     resume_sequence: AtomicU64,
+    order_gate: Arc<Mutex<()>>,
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
@@ -174,7 +175,9 @@ pub(crate) fn spawn(
     let (authority_out, authority) = watch::channel(None);
     let (actual, _) = watch::channel(None);
     let direct_start: Arc<DirectStartFence> = Arc::default();
+    let order_gate = Arc::new(Mutex::new(()));
     let signals = Signals {
+        order_gate: order_gate.clone(),
         link: link_out,
         authority: authority_out,
         direct_start: direct_start.clone(),
@@ -195,6 +198,7 @@ pub(crate) fn spawn(
         events,
         outbound,
         resume_sequence: AtomicU64::new(0),
+        order_gate,
         actual,
         session,
         task,
@@ -220,6 +224,18 @@ impl Socket {
             .then(|| self.resume_sequence.fetch_add(1, Ordering::Relaxed) + 1);
         self.submit(generation, class, &command, resume)?;
         Ok(resume)
+    }
+
+    pub(crate) fn reorder(
+        &self,
+        generation: Generation,
+        mode_stamp: u64,
+        command: Command,
+    ) -> Result<(), SocketError> {
+        if !matches!(command, Command::Move { .. }) || !command.valid() {
+            return Err(SocketError::Invalid);
+        }
+        self.submit_order(generation, mode_stamp, &command)
     }
 
     pub(crate) fn fact(&self, generation: Generation, fact: Fact) -> Result<(), SocketError> {
@@ -256,6 +272,15 @@ impl Socket {
         )
     }
 
+    pub(crate) fn personal_order(
+        &self,
+        generation: Generation,
+        mode_stamp: u64,
+        command: &(impl Serialize + ?Sized),
+    ) -> Result<(), SocketError> {
+        self.submit_order(generation, mode_stamp, &Outgoing::Personal { command })
+    }
+
     /// The server responds with a fresh player snapshot and personal initial
     /// projection. Scoped playlist repairs are personal `syncPlaylist` writes.
     pub(crate) fn sync(&self, generation: Generation) -> Result<(), SocketError> {
@@ -288,12 +313,41 @@ impl Socket {
         frame: &(impl Serialize + ?Sized),
         resume: Option<u64>,
     ) -> Result<(), SocketError> {
+        self.submit_fenced(generation, class, frame, resume, None)
+    }
+
+    fn submit_order(
+        &self,
+        generation: Generation,
+        mode_stamp: u64,
+        frame: &(impl Serialize + ?Sized),
+    ) -> Result<(), SocketError> {
+        // The engine owns the reducer; only the socket reader can publish a
+        // new fact during this check. No waiting or I/O while holding this gate.
+        let _gate = self.order_gate.lock().expect("socket order admission gate");
+        if !self.events.is_empty() {
+            return Err(SocketError::Busy);
+        }
+        self.submit_fenced(generation, Class::Choice, frame, None, Some(mode_stamp))
+    }
+
+    fn submit_fenced(
+        &self,
+        generation: Generation,
+        class: Class,
+        frame: &(impl Serialize + ?Sized),
+        resume: Option<u64>,
+        expected_mode: Option<u64>,
+    ) -> Result<(), SocketError> {
         let raw = encode(frame)?;
-        // Admission holds the watch read lock. Once the actor publishes loss,
-        // draining the old queue cannot race another admission to that socket.
+        // Hold the lock through bounded admission. The socket's writer also
+        // retires work on loss of link or any mode-stamp change.
         let link = self.link.borrow();
+        let mode = self.session.network_changes();
+        let mode = mode.borrow();
         if *link != Link::Connected(generation)
-            || self.session.is_offline()
+            || (*mode & 1) != 0
+            || expected_mode.is_some_and(|expected| expected != *mode)
             || self.session.is_expired()
         {
             return Err(SocketError::NotConnected);
@@ -344,6 +398,7 @@ impl Socket {
             events,
             outbound,
             resume_sequence: AtomicU64::new(0),
+            order_gate: Arc::default(),
             actual,
             session,
             task: tokio::spawn(pending()),
@@ -414,6 +469,7 @@ enum End {
 }
 
 struct Signals {
+    order_gate: Arc<Mutex<()>>,
     link: watch::Sender<Link>,
     authority: watch::Sender<Option<OutputAuthority>>,
     direct_start: Arc<DirectStartFence>,
@@ -422,6 +478,7 @@ struct Signals {
 
 impl Signals {
     fn event(&self, generation: Generation, kind: EventKind, first: bool) -> Result<(), End> {
+        let _gate = self.order_gate.lock().expect("socket order admission gate");
         let permit = self.events.try_reserve().map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => End::Backpressure,
             mpsc::error::TrySendError::Closed(_) => End::Closed,

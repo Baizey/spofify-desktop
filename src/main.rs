@@ -10,6 +10,7 @@ mod engine;
 mod login_store;
 mod media;
 mod mode;
+mod motion;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod offline;
@@ -55,6 +56,9 @@ fn scope(epoch: &AtomicU64, c: Command) -> Command {
 fn clear(ui: &AppWindow) {
     ui.set_query("".into());
     ui.set_browse_rows(Default::default());
+    ui.set_queue_order_token("".into());
+    ui.set_queue_order_writable(false);
+    ui.set_queue_order_rows(Default::default());
     ui.set_queue_rows(Default::default());
     ui.set_device_rows(Default::default());
     ui.set_account_label("".into());
@@ -94,6 +98,10 @@ fn main() -> Result<(), slint::PlatformError> {
         std::process::exit(2);
     }
     let ui = AppWindow::new()?;
+    motion::install(&ui);
+    if cfg!(debug_assertions) && std::env::var_os("SLINT_MCP_PORT").is_some() {
+        ui.set_inspection_reorder_line(std::env::var_os("SPOFIFY_INSPECT_REORDER_LINE").is_some());
+    }
     if cfg!(debug_assertions)
         && std::env::var_os("SLINT_MCP_PORT").is_some()
         && let Ok(size) = std::env::var("SPOFIFY_DEV_SIZE")
@@ -189,15 +197,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             let key = key.parse::<u64>().ok();
-            let model = ui.get_queue_rows();
-            let rows = upcoming_keys(model.iter());
             use player::Action as A;
             let action = match op.as_str() {
                 "play" | "jump" => key.map(A::Jump),
                 "remove" => key.map(A::Remove),
-                "up" | "down" => key.and_then(|k| {
-                    move_after(&rows, k, op == "down").map(|after| A::Move { key: k, after })
-                }),
                 "clear" => Some(A::Clear),
                 "close" => Some(A::Close),
                 "shuffle" => Some(A::Shuffle(!ui.get_shuffle())),
@@ -214,6 +217,36 @@ fn main() -> Result<(), slint::PlatformError> {
                     scope(&epoch, Command::Guarded(ui.get_room_token().into(), a)),
                     &ui,
                 );
+            }
+        });
+    }
+    {
+        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
+        ui.on_queue_order_drop(move |basis, id, predecessor| {
+            let Some(ui) = w.upgrade() else { return };
+            if !ui.get_signed_in() || basis.is_empty() || basis != ui.get_queue_order_token() {
+                return;
+            }
+            let Ok(key) = id.parse::<u64>() else { return };
+            let after = if predecessor.is_empty() {
+                None
+            } else if let Ok(anchor) = predecessor.parse::<u64>() {
+                Some(anchor)
+            } else {
+                return;
+            };
+            if tx
+                .try_send(scope(
+                    &epoch,
+                    Command::ReorderQueue {
+                        basis: basis.into(),
+                        key,
+                        after,
+                    },
+                ))
+                .is_err()
+            {
+                ui.set_player_status("The queue order was not sent.".into());
             }
         });
     }
@@ -329,51 +362,5 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
             "server" => ui.on_server_edited(callback),
             _ => ui.on_username_edited(callback),
         }
-    }
-}
-fn upcoming_keys(rows: impl Iterator<Item = QueueRow>) -> Vec<u64> {
-    rows.filter(|r| r.upcoming)
-        .filter_map(|r| r.key.parse().ok())
-        .collect()
-}
-/// Convert a one-step upcoming move to the server's stable predecessor key.
-fn move_after(rows: &[u64], key: u64, down: bool) -> Option<Option<u64>> {
-    let i = rows.iter().position(|k| *k == key)?;
-    if down {
-        Some(Some(*rows.get(i + 1)?))
-    } else if i == 0 {
-        None
-    } else {
-        Some(i.checked_sub(2).map(|j| rows[j]))
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn queue_move_uses_identity_not_position() {
-        let rows = [
-            (3, false, false),
-            (7, true, false),
-            (12, false, true),
-            (41, false, true),
-        ]
-        .into_iter()
-        .map(|(k, current, upcoming)| QueueRow {
-            key: k.to_string().into(),
-            current,
-            upcoming,
-            ..Default::default()
-        });
-        let keys = upcoming_keys(rows);
-        assert_eq!(keys, vec![12, 41]);
-        assert_eq!(move_after(&keys, 41, false), Some(None));
-        assert_eq!(move_after(&keys, 12, false), None);
-        assert_eq!(move_after(&keys, 41, true), None);
-        let q = [91, 10, 42];
-        assert_eq!(move_after(&q, 10, false), Some(None));
-        assert_eq!(move_after(&q, 10, true), Some(Some(42)));
-        assert_eq!(move_after(&q, 42, true), None);
-        assert_eq!(move_after(&q, 63, false), None);
     }
 }

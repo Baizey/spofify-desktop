@@ -4,15 +4,14 @@ export global ActionCopy {
     public pure function label(action: string) -> string {
         return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
             : action == "save" || action == "pin-playlist" ? "Save offline" : action == "unpin-playlist" ? "Remove offline save"
-            : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
+            : action == "remove" ? "Remove"
             : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
             : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
             : action == "new-rules" ? "New rules playlist" : action;
     }
     public pure function mark(action: string) -> string {
         return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" || self.offline-toggle(action) ? "↓"
-            : action == "remove" || action == "delete" ? "−" : action == "up" ? "↑"
-            : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+            : action == "remove" || action == "delete" ? "−" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
     }
     public pure function offline-toggle(action: string) -> bool {
         return action == "pin-playlist" || action == "unpin-playlist";

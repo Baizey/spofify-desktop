@@ -1,0 +1,36 @@
+# Native AppWindow fixture at 1280 × 685 client pixels (1280 × 720 Cage output).
+# Each line waits the given milliseconds before dispatching the next event.
+0 down 1164 27
+15 up 1164 27
+120 frame 00-queue
+10 down 1140 248
+260 frame 01-grab
+10 move 1140 217
+20 frame 02-early
+60 move 1133 144
+25 frame 03-first
+90 move 1126 391
+35 frame 04-cross-down
+100 move 1133 144
+25 frame 05-cross-back
+70 progress
+90 frame 06-first-held
+15 up 1133 141
+28 frame 07-settling
+175 frame 08-settled
+20 down 1188 28
+15 up 1188 28
+100 down 280 289
+15 up 280 289
+130 frame 09-playlist
+10 down 504 309
+260 frame 10-playlist-grab
+25 move 515 458
+25 frame 11-playlist-cross
+85 move 515 231
+25 frame 12-playlist-cross-back
+100 frame 13-playlist-destination
+15 up 515 231
+25 frame 14-playlist-settling
+190 frame 15-playlist-settled
+0 quit

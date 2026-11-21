@@ -33,6 +33,7 @@ fn signals() -> (
     let (event_tx, events) = mpsc::channel(EVENT_CAPACITY);
     (
         Signals {
+            order_gate: Arc::default(),
             link: link_tx,
             authority: authority_tx,
             direct_start: Arc::default(),
@@ -42,6 +43,54 @@ fn signals() -> (
         authority,
         events,
     )
+}
+
+#[tokio::test]
+async fn order_admission_rejects_published_updates_and_retired_mode() {
+    let (signals, link, authority, events) = signals();
+    let (outbound, mut written) = mpsc::channel(2);
+    let (actual, _) = watch::channel(None);
+    let api = Api::new(crate::api::Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
+    let session = api.test_session();
+    let mut socket = Socket {
+        link,
+        authority,
+        direct_start: signals.direct_start.clone(),
+        events,
+        outbound,
+        actual,
+        resume_sequence: AtomicU64::new(0),
+        order_gate: signals.order_gate.clone(),
+        session: session.clone(),
+        task: tokio::spawn(pending()),
+    };
+    let command = || Command::Move { key: 9, after: 0 };
+    signals
+        .event(2, EventKind::Outputs(Outputs::default()), true)
+        .unwrap();
+    assert_eq!(socket.reorder(2, 0, command()), Err(SocketError::Busy));
+    assert_eq!(
+        socket.personal_order(2, 0, &json!({"type":"moveEntry"})),
+        Err(SocketError::Busy)
+    );
+    assert!(written.try_recv().is_err());
+    socket.events.try_recv().unwrap();
+    session.set_offline(true);
+    session.set_offline(false);
+    assert_eq!(
+        socket.reorder(2, 0, command()),
+        Err(SocketError::NotConnected)
+    );
+    assert_eq!(
+        socket.personal_order(2, 0, &json!({"type":"moveEntry"})),
+        Err(SocketError::NotConnected)
+    );
+    assert!(written.try_recv().is_err());
+    assert_eq!(socket.reorder(2, 2, command()), Ok(()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&written.try_recv().unwrap().raw).unwrap(),
+        json!({"type":"move","key":9,"after":0})
+    );
 }
 
 fn output_state() -> (watch::Sender<ActualSample>, OutputState) {

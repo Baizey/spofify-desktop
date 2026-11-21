@@ -736,42 +736,25 @@ pub fn mutation(
                 },
             )
         }
-        "remove" | "up" | "down" => {
+        "remove" => {
             let playlist = current_playlist(route, page)?;
             require(
                 playlist.kind == PlaylistKind::Manual && playlist.capabilities.edit_entries,
-                "Only tracks in a manual playlist can be removed or moved.",
+                "Only tracks in a manual playlist can be removed.",
             )?;
-            let (index, row) = selected(page, index)?;
+            let (_, row) = selected(page, index)?;
             let entry = entry_id(row, &playlist.id)?;
-            if op == "remove" {
-                (
-                    PersonalCommand::RemoveEntry {
-                        playlist_id: playlist.id.clone(),
-                        entry_id: entry.into(),
-                    },
-                    Effect::Remove {
-                        id: playlist.id.clone(),
-                        entry_id: entry.into(),
-                        revision: playlist.revision,
-                    },
-                )
-            } else {
-                let after = move_anchor(page, &playlist.id, index, entry, op == "up")?;
-                (
-                    PersonalCommand::MoveEntry {
-                        playlist_id: playlist.id.clone(),
-                        entry_id: entry.into(),
-                        after: after.into(),
-                    },
-                    Effect::Move {
-                        id: playlist.id.clone(),
-                        entry_id: entry.into(),
-                        after: after.into(),
-                        revision: playlist.revision,
-                    },
-                )
-            }
+            (
+                PersonalCommand::RemoveEntry {
+                    playlist_id: playlist.id.clone(),
+                    entry_id: entry.into(),
+                },
+                Effect::Remove {
+                    id: playlist.id.clone(),
+                    entry_id: entry.into(),
+                    revision: playlist.revision,
+                },
+            )
         }
         "clear-history" if matches!(route, Route::History) => {
             (PersonalCommand::ClearHistory, Effect::ClearHistory)
@@ -870,45 +853,83 @@ fn entry_id<'a>(row: &'a Row, list_id: &str) -> Result<&'a str, ApiError> {
     }
 }
 
-/// One v3 move places the selected occurrence *after* its new predecessor.
-/// Moving up skips the previous row; moving down uses the next row as the anchor.
-fn move_anchor<'a>(
-    page: &'a Page,
-    playlist_id: &str,
-    index: usize,
-    entry: &str,
-    up: bool,
-) -> Result<&'a str, ApiError> {
-    let anchor = if up {
-        if index == 0 {
-            return Err(error("This track is already first in the playlist."));
+/// An editable manual page whose full occurrence order agrees with the live replica.
+/// Stored positions may have gaps; drops use occurrence IDs, never track IDs or slots.
+pub(crate) struct PlaylistOrder<'a> {
+    playlist: &'a PlaylistMetadata,
+    rows: &'a [Row],
+}
+
+impl<'a> PlaylistOrder<'a> {
+    pub(crate) fn current(
+        route: &Route,
+        page: &'a Page,
+        detail: &crate::personal::Playlist,
+    ) -> Option<Self> {
+        let playlist = current_playlist(route, page).ok()?;
+        let summary = &detail.summary;
+        let count = Some(page.rows.len() as u64);
+        if page.more
+            || detail.stale
+            || playlist.id != summary.id
+            || playlist.revision != summary.revision
+            || playlist.kind != PlaylistKind::Manual
+            || summary.kind != PlaylistKind::Manual
+            || !playlist.capabilities.edit_entries
+            || !summary.capabilities.edit_entries
+            || playlist.track_count != count
+            || summary.track_count != count
+            || page.rows.len() != detail.rows.len()
+            || !page.rows.iter().zip(&detail.rows).all(|(row, entry)| {
+                entry_id(row, &playlist.id).ok() == Some(entry.id.as_str())
+                    && row.position == Some(entry.position)
+                    && row.id == entry.track.id
+            })
+        {
+            return None;
         }
-        let preceding = entry_id(&page.rows[index - 1], playlist_id)?;
-        if preceding == entry {
-            return Err(STALE_VIEW);
-        }
-        if index == 1 {
-            return Ok(""); // An explicit empty anchor is required by the wire protocol.
-        }
-        let anchor = entry_id(&page.rows[index - 2], playlist_id)?;
-        if anchor == preceding {
-            return Err(STALE_VIEW);
-        }
-        anchor
-    } else {
-        let next = page.rows.get(index + 1).ok_or_else(|| {
-            if page.more {
-                error("Load more tracks before moving this one down.")
-            } else {
-                error("This track is already last in the playlist.")
-            }
-        })?;
-        entry_id(next, playlist_id)?
-    };
-    if anchor == entry {
-        return Err(STALE_VIEW);
+        Some(Self {
+            playlist,
+            rows: &page.rows,
+        })
     }
-    Ok(anchor)
+
+    pub(crate) fn rows(&self) -> impl Iterator<Item = (&str, &Row)> {
+        self.rows.iter().map(|row| {
+            let entry = entry_id(row, &self.playlist.id).expect("validated manual occurrence");
+            (entry, row)
+        })
+    }
+
+    /// Place the exact entry after its new predecessor, or first when `after` is empty.
+    /// The current predecessor is a no-op, not a write. No fallback anchor is allowed.
+    pub(crate) fn movement(&self, grabbed: &str, after: &str) -> Option<Mutation> {
+        if grabbed == after {
+            return None;
+        }
+        let from = self.rows().position(|(key, _)| key == grabbed)?;
+        let previous = from
+            .checked_sub(1)
+            .and_then(|index| entry_id(&self.rows[index], &self.playlist.id).ok())
+            .unwrap_or_default();
+        if after == previous || !after.is_empty() && !self.rows().any(|(key, _)| key == after) {
+            return None;
+        }
+        let command = PersonalCommand::MoveEntry {
+            playlist_id: self.playlist.id.clone(),
+            entry_id: grabbed.into(),
+            after: after.into(),
+        };
+        command.valid().then(|| Mutation {
+            command,
+            effect: Effect::Move {
+                id: self.playlist.id.clone(),
+                entry_id: grabbed.into(),
+                after: after.into(),
+                revision: self.playlist.revision,
+            },
+        })
+    }
 }
 
 fn write_condition(out: &mut String, level: usize, condition: &RulePredicate) {
@@ -1131,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_commands_target_occurrences_even_when_tracks_repeat() {
+    fn remove_targets_the_occurrence_even_when_tracks_repeat() {
         let row = |id: &str| Row {
             id: "same-track".into(),
             key: RowKey::ManualEntry {
@@ -1147,12 +1168,91 @@ mod tests {
             more: true,
             ..Page::default()
         };
-        for (op, index, entry, after) in [
-            ("up", 1, "entry-2", ""),
-            ("up", 2, "entry-3", "entry-1"),
-            ("down", 1, "entry-2", "entry-3"),
+        let removal = mutation(&route, &page, "remove", Some(1), "").unwrap();
+        assert_eq!(
+            wire(&removal),
+            json!({"type":"removeEntry", "playlistId":"list", "entryId":"entry-2"})
+        );
+        page.rows[1].key = RowKey::ManualEntry {
+            playlist_id: "another".into(),
+            entry_id: "entry-2".into(),
+        };
+        assert!(mutation(&route, &page, "remove", Some(1), "").is_err());
+    }
+
+    fn order_fixture(count: u64) -> (Route, Page, crate::personal::Playlist) {
+        use crate::api::{
+            catalog::{CatalogItem, CatalogKind, Coverage},
+            library::{CountState, ManualEntry, PlaylistSummary},
+        };
+        let metadata = playlist(PlaylistKind::Manual);
+        let track = CatalogItem {
+            kind: CatalogKind::Track,
+            id: "same-track".into(),
+            name: "Same track".into(),
+            artists: Vec::new(),
+            genres: Vec::new(),
+            album_id: String::new(),
+            album_name: String::new(),
+            album_type: String::new(),
+            release_date: String::new(),
+            relation: String::new(),
+            duration_ms: 0,
+            disc_number: 0,
+            track_number: 0,
+            has_audio: true,
+            coverage: Coverage::default(),
+        };
+        let detail = crate::personal::Playlist {
+            summary: PlaylistSummary {
+                id: metadata.id,
+                name: metadata.name,
+                description: String::new(),
+                kind: metadata.kind,
+                count_state: CountState::Exact,
+                evaluation_state: None,
+                evaluation_error_code: None,
+                track_count: Some(count),
+                available_count: Some(count),
+                capabilities: metadata.capabilities,
+                revision: metadata.revision,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            definition: None,
+            token: String::new(),
+            rows: (0..count)
+                .map(|index| ManualEntry {
+                    id: format!("entry-{index}"),
+                    position: 2 * index,
+                    track: track.clone(),
+                })
+                .collect(),
+            stale: false,
+        };
+        (
+            Route::Playlist(detail.summary.id.clone()),
+            crate::pages::personal_playlist(&detail.summary, None, &detail.rows),
+            detail,
+        )
+    }
+
+    #[test]
+    fn exact_drops_move_duplicate_occurrences_anywhere_in_the_complete_page() {
+        let (route, page, detail) = order_fixture(600);
+        let order = PlaylistOrder::current(&route, &page, &detail).unwrap();
+        assert_eq!(order.rows().count(), 600);
+        for (index, (key, row)) in order.rows().enumerate() {
+            assert_eq!(key, format!("entry-{index}"));
+            assert_eq!(row.position, Some(2 * index as u64));
+            assert_eq!(row.id, "same-track");
+        }
+        for (entry, after) in [
+            ("entry-599", ""),
+            ("entry-599", "entry-2"),
+            ("entry-0", "entry-599"),
         ] {
-            let edit = mutation(&route, &page, op, Some(index), "").unwrap();
+            let edit = order.movement(entry, after).unwrap();
             assert_eq!(
                 wire(&edit),
                 json!({
@@ -1164,19 +1264,62 @@ mod tests {
                 if id == "list" && entry_id == entry && anchor == after)
             );
         }
-        assert!(mutation(&route, &page, "up", Some(0), "").is_err());
-        assert!(mutation(&route, &page, "down", Some(2), "").is_err());
-        let removal = mutation(&route, &page, "remove", Some(1), "").unwrap();
-        assert_eq!(
-            wire(&removal),
-            json!({"type":"removeEntry", "playlistId":"list", "entryId":"entry-2"})
-        );
-        page.rows[1].key = RowKey::ManualEntry {
-            playlist_id: "another".into(),
-            entry_id: "entry-2".into(),
+        for (entry, after) in [
+            ("entry-0", ""),
+            ("entry-10", "entry-9"),
+            ("entry-599", "entry-598"),
+            ("entry-2", "entry-2"),
+            ("entry-2", "same-track"),
+            ("same-track", ""),
+            ("entry-2", "missing"),
+            ("", "entry-1"),
+        ] {
+            assert!(order.movement(entry, after).is_none());
+        }
+    }
+
+    #[test]
+    fn order_rejects_a_noneditable_incomplete_or_superseded_projection() {
+        let (route, page, detail) = order_fixture(3);
+        let current = |page: &Page, detail: &crate::personal::Playlist| {
+            PlaylistOrder::current(&route, page, detail).is_some()
         };
-        assert!(mutation(&route, &page, "remove", Some(1), "").is_err());
-        assert!(mutation(&route, &page, "down", Some(0), "").is_err());
+        assert!(current(&page, &detail));
+        assert!(PlaylistOrder::current(&Route::Playlists, &page, &detail).is_none());
+        for stale in [
+            crate::personal::Playlist {
+                stale: true,
+                ..detail.clone()
+            },
+            crate::personal::Playlist {
+                summary: crate::api::library::PlaylistSummary {
+                    revision: detail.summary.revision + 1,
+                    ..detail.summary.clone()
+                },
+                ..detail.clone()
+            },
+        ] {
+            assert!(!current(&page, &stale));
+        }
+        let mut moved = detail.clone();
+        let (first, last) = (moved.rows[0].id.clone(), moved.rows[2].id.clone());
+        moved.rows[0].id = last;
+        moved.rows[2].id = first;
+        // Even same-revision structural replacement cannot borrow the old row order.
+        assert!(!current(&page, &moved));
+        let mut wrong_slots = detail.clone();
+        wrong_slots.rows[1].position += 1;
+        assert!(!current(&page, &wrong_slots));
+        let mut partial = page.clone();
+        partial.rows.pop();
+        assert!(!current(&partial, &detail));
+        let mut read_only = detail.clone();
+        read_only.summary.capabilities.edit_entries = false;
+        assert!(!current(&page, &read_only));
+        let mut derived = detail.clone();
+        derived.summary.kind = PlaylistKind::Derived;
+        let rules = crate::pages::personal_playlist(&derived.summary, None, &derived.rows);
+        assert!(!current(&rules, &derived));
     }
 
     #[test]

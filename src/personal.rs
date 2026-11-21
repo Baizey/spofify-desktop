@@ -447,6 +447,20 @@ impl Replica {
             .then_some(command)
     }
 
+    pub(crate) fn watched_playlist(&self) -> Option<&str> {
+        self.desired.as_deref()
+    }
+
+    pub(crate) fn refresh_playlist(&mut self) -> Option<Command> {
+        if !self.ready || self.unavailable {
+            return None;
+        }
+        let id = self.desired.clone()?;
+        self.reset_pull();
+        self.mark_stale(&id);
+        Some(self.sync(id, None, 0))
+    }
+
     pub fn watch(&mut self, id: Option<String>) -> Option<Command> {
         let id = id.filter(|id| id_ok(id));
         if self.desired == id {

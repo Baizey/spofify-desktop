@@ -1,6 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 import { Copy, EmptyState, Hero, MediaLine, PlaylistPager } from "catalog.slint";
+import { ReorderList, ReorderRow } from "reorder.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
 import { DockLayout, PlayerBar } from "playback.slint";
@@ -9,7 +10,7 @@ import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { ArtistCredit, DeviceRow }
+export { ArtistCredit, DeviceRow, ReorderRow }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
@@ -35,6 +36,8 @@ export component AppWindow inherits Window {
     icon: @image-url("../assets/spofify-logo.svg");
     in property <length> inspection-width: 0px;
     in property <length> inspection-height: 0px;
+    in property <bool> inspection-reorder-line;
+    in property <bool> reduced-motion;
     preferred-width: 1280px;
     preferred-height: 790px;
     min-width: root.inspection-width > 0px ? root.inspection-width : 480px;
@@ -97,6 +100,10 @@ export component AppWindow inherits Window {
     in property <bool> can-back;
     in property <[string]> page-actions;
     in property <PlaylistActions> playlist-actions;
+    in property <[ReorderRow]> playlist-order-rows;
+    in property <string> playlist-order-scope;
+    in property <bool> playlist-order-pending;
+    callback playlist-order-drop(string, string, string);
     in property <int> saved-pin-focus-serial;
     callback navigate(string);
     callback row-action(string, int);
@@ -144,6 +151,11 @@ export component AppWindow inherits Window {
     in property <string> room-token;
     in property <string> media-track-token;
     in property <[QueueRow]> queue-rows;
+    in property <[ReorderRow]> queue-order-rows;
+    in property <string> queue-order-token;
+    in property <bool> queue-order-writable;
+    in property <bool> queue-order-awaiting-echo;
+    callback queue-order-drop(string, string, string);
     in property <[DeviceRow]> device-rows;
     in property <string> queue-status;
     in property <string> device-status;
@@ -184,7 +196,7 @@ export component AppWindow inherits Window {
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
     property <bool> local-mode: manual-offline || reconnecting;
     property <bool> can-play-local: root.saved-view || (root.manual-offline && root.is-search);
-    property <bool> queue-controls: local-mode ? local-playback && can-control : remote-controls;
+    property <bool> queue-controls: local-playback ? can-control : !local-mode && remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
     in-out property <string> form-return;
@@ -290,6 +302,23 @@ export component AppWindow inherits Window {
         property <bool> dock-queue-pointer-focus;
         property <bool> lyrics-entry;
         property <bool> restore-lyrics-focus;
+        property <bool> queue-order-edit;
+        property <bool> playlist-order-edit;
+        property <int> restore-order-focus;
+        property <bool> queue-visible: root.queue-shown;
+        property <bool> local-mode: root.local-mode;
+        property <bool> local-playback: root.local-playback;
+        property <string> order-route: root.page-kind + "|" + root.page-key;
+        changed queue-visible => {
+            if !self.queue-visible { queue-order.cancel-grab(); self.queue-order-edit = false; }
+        }
+        changed local-mode => { self.leave-orders(); }
+        changed local-playback => { queue-order.cancel-grab(); self.queue-order-edit = false; }
+        changed order-route => { self.leave-orders(); }
+        function leave-orders() {
+            queue-order.cancel-grab(); playlist-order.cancel-grab();
+            self.queue-order-edit = false; self.playlist-order-edit = false;
+        }
         init => { self.focus(); }
         changed account-scope => {
             self.search-return-key = "";
@@ -319,6 +348,7 @@ export component AppWindow inherits Window {
             root.row-action(op, index);
         }
         function edited-search() {
+            self.leave-orders();
             root.compact-queue-open = false;
             self.returning = false;
             self.restoring-key = "";
@@ -355,6 +385,7 @@ export component AppWindow inherits Window {
             }
         }
         changed editing => {
+            if self.editing { self.leave-orders(); }
             if !self.editing {
                 // The browse view is still mounted. Focus the action that opened the editor if it survived.
                 if back-row.visible { back-button.take-focus(); }
@@ -378,6 +409,8 @@ export component AppWindow inherits Window {
             }
         }
         function hide-queue(by-pointer: bool) {
+            queue-order.cancel-grab();
+            self.queue-order-edit = false;
             if root.wide { root.wide-queue-open = false; }
             else { root.compact-queue-open = false; }
             if root.dock-visible {
@@ -390,6 +423,7 @@ export component AppWindow inherits Window {
             if target == "queue" {
                 self.toggle-queue(false);
             } else {
+                self.leave-orders();
                 self.returning = target == "back";
                 if !self.returning { self.remember-scroll(); }
                 self.restoring-key = "";
@@ -403,6 +437,7 @@ export component AppWindow inherits Window {
         }
         function entity(kind: string, id: string) {
             if !root.local-mode && !root.editor-open && id != "" {
+                self.leave-orders();
                 self.remember-scroll();
                 if root.compact-queue-open { root.compact-queue-open = false; self.focus(); }
                 root.page-action(kind, id);
@@ -413,6 +448,9 @@ export component AppWindow inherits Window {
             if event.modifiers.control && (event.text == "f" || event.text == "l" || event.text == "F" || event.text == "L") {
                 root.compact-queue-open = false;
                 search.take-focus(); return accept;
+            }
+            if event.text == Key.Escape {
+                if queue-order.cancel-grab() || playlist-order.cancel-grab() { return accept; }
             }
             if event.text == Key.Escape || (event.modifiers.alt && event.text == Key.LeftArrow) {
                 if root.compact-queue-open {
@@ -547,7 +585,7 @@ export component AppWindow inherits Window {
                         page-action(op, id) => { shell.entity(op, id); } queue-action(op, key) => { root.queue-action(op, key); }
                     }
                     catalog-scroll := ScrollView {
-                        visible: !root.is-now;
+                        visible: !root.is-now && !shell.playlist-order-edit;
                         x: 0px; y: 0px; width: parent.width; height: parent.height;
                         horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
                         property <string> scroll-key: root.is-search ? "search|" + root.query
@@ -608,7 +646,21 @@ export component AppWindow inherits Window {
                                 property <bool> rules: root.playlist-actions.rules && self.online;
                                 property <string> offline-action: root.playlist-actions.offline-action == "unpin-playlist" || self.online ? root.playlist-actions.offline-action : "";
                                 property <string> remove-action: self.online || root.page-kind == "saved-collection" ? root.playlist-actions.remove-action : "";
-                                visible: self.play || self.queue || self.rename || self.rules || self.offline-action != "" || self.remove-action != "";
+                                visible: self.play || self.queue || self.rename || self.rules || self.offline-action != "" || self.remove-action != "" || edit-playlist-order.visible;
+                                edit-playlist-order := Action {
+                                    text: "Edit order";
+                                    visible: root.playlist-order-scope != "";
+                                    enabled: self.visible && !shell.playlist-order-edit;
+                                    property <int> return-focus: shell.restore-order-focus;
+                                    changed return-focus => { if self.enabled { self.take-focus(); } }
+                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
+                                    clicked => {
+                                        queue-order.cancel-grab();
+                                        shell.queue-order-edit = false;
+                                        shell.playlist-order-edit = true;
+                                        playlist-order.focus-list();
+                                    }
+                                }
                                 if playlist-tools.play: Action {
                                     text: "Play"; icon: "▶"; primary: true;
                                     click-scope: playlist-tools.scope;
@@ -788,6 +840,41 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                    playlist-order-pane := VerticalLayout {
+                        x: main.inset; y: 0px; width: parent.width - 2 * main.inset; height: parent.height;
+                        visible: root.is-playlist && shell.playlist-order-edit;
+                        padding-top: 8px; spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: root.catalog-title; font-size: 22px * Theme.density; font-weight: 750;
+                                color: Theme.text; vertical-alignment: center; overflow: elide; horizontal-stretch: 1;
+                            }
+                            Action {
+                                text: "Done";
+                                enabled: playlist-order-pane.visible;
+                                clicked => {
+                                    playlist-order.cancel-grab();
+                                    shell.playlist-order-edit = false;
+                                    shell.restore-order-focus += 1;
+                                }
+                            }
+                        }
+                        Divider { }
+                        if root.page-error && root.page-status != "": Notice { text: root.page-status; }
+                        playlist-order := ReorderList {
+                            rows: root.playlist-order-rows;
+                            initial-index: shell.browse-start;
+                            scope-key: playlist-order-pane.visible && !root.compact-queue-open ? root.playlist-order-scope : "";
+                            writable: !root.form-busy;
+                            commit-pending: root.playlist-order-pending;
+                            line-variant: root.inspection-reorder-line;
+                            reduced-motion: root.reduced-motion;
+                            placed(key, after) => {
+                                if self.scope-key != "" { root.playlist-order-drop(self.scope-key, key, after); }
+                            }
+                        }
+                    }
                 }
                 if root.editor-open: Editor {
                     x: 0px; y: root.toolbar-height; width: parent.width; height: parent.height - self.y;
@@ -812,22 +899,58 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         height: 41px; spacing: 8px;
                         Text { text: "Queue"; color: Theme.text; font-size: 22px * Theme.density; font-weight: 750; vertical-alignment: center; horizontal-stretch: 1; }
+                        Action {
+                            text: shell.queue-order-edit ? "Done" : "Edit order";
+                            visible: root.queue-order-token != "" || shell.queue-order-edit;
+                            enabled: root.queue-shown && !root.editor-open && self.visible && (shell.queue-order-edit || root.queue-order-writable);
+                            selected: shell.queue-order-edit;
+                            clicked => {
+                                if shell.queue-order-edit {
+                                    queue-order.cancel-grab();
+                                    shell.queue-order-edit = false;
+                                    self.take-focus();
+                                } else if root.queue-order-writable {
+                                    playlist-order.cancel-grab();
+                                    shell.playlist-order-edit = false;
+                                    shell.queue-order-edit = true;
+                                    queue-order.focus-list();
+                                }
+                            }
+                        }
                         queue-close := Action {
                             width: 36px; quiet: true; icon: "×"; enabled: root.queue-shown && !root.editor-open;
                             pointer-focus-visible: false;
                             accessible-label: "Close play queue"; clicked => { shell.hide-queue(self.pointer-focused); }
                         }
                     }
-                    if root.queue-rows.length > 0: FlexboxLayout {
+                    if root.queue-rows.length > 0 && !shell.queue-order-edit: FlexboxLayout {
                         flex-wrap: wrap; spacing: 6px;
                         Action { text: "Shuffle"; height: 32px; selected: root.shuffle; enabled: root.queue-controls && !root.editor-open; accessible-description: root.shuffle ? "On" : "Off"; clicked => { root.queue-action("shuffle", ""); } }
                         Action { text: root.repeat-mode == "one" ? "Repeat: one" : root.repeat-mode == "all" ? "Repeat: all" : "Repeat: off"; height: 32px; selected: root.repeat-mode != "off"; enabled: root.queue-controls && !root.editor-open; clicked => { root.queue-action("repeat", ""); } }
                         if root.queue-has-upcoming: Action { text: "Clear upcoming"; height: 32px; quiet: true; enabled: root.queue-controls && !root.editor-open; clicked => { root.queue-action("clear", ""); } }
                     }
                     Divider { }
+                    queue-order := ReorderList {
+                        visible: shell.queue-order-edit;
+                        vertical-stretch: self.visible ? 1 : 0;
+                        min-height: 0px;
+                        max-height: self.visible ? 65535px : 0px;
+                        rows: root.queue-order-rows;
+                        initial-index: 1;
+                        writable: root.queue-order-writable;
+                        commit-pending: root.queue-order-awaiting-echo;
+                        scope-key: self.visible && root.queue-shown ? root.queue-order-token : "";
+                        line-variant: root.inspection-reorder-line;
+                        reduced-motion: root.reduced-motion;
+                        placed(key, after) => {
+                            if self.scope-key != "" { root.queue-order-drop(self.scope-key, key, after); }
+                        }
+                    }
                     queue-lane := Rectangle {
+                        visible: !shell.queue-order-edit;
+                        max-height: self.visible ? 65535px : 0px;
                         min-width: queue-scroll.min-width;
-                        min-height: 0px; preferred-height: 100%; vertical-stretch: 1;
+                        min-height: 0px; vertical-stretch: self.visible ? 1 : 0;
                         // Use a pane-wide paint clip but keep the stock scroll input and
                         // scrollbar on their original inset lane, in front of the list.
                         Rectangle {
@@ -863,16 +986,13 @@ export component AppWindow inherits Window {
                                             credits: row.credits; metadata-enabled: !root.local-mode && !root.editor-open;
                                             album-id: row.album-id; album-name: row.album-name;
                                             artwork: row.current ? root.cover-art : root.no-artwork;
-                                            property <bool> can-up: i > 0 && root.queue-rows[i - 1].upcoming;
-                                            property <bool> can-down: i + 1 < root.queue-rows.length && root.queue-rows[i + 1].upcoming;
                                             can-open: false; compact: !row.current;
                                             queue-columns: true;
                                             paint-left: queue-pane.inset-left; paint-right: queue-pane.inset-right;
                                             paint-surface: Theme.rail;
                                             playable: row.upcoming && root.queue-controls && !root.editor-open;
                                             selectable: self.playable;
-                                            actions: !root.queue-shown || !self.playable ? [] : self.can-up && self.can-down ? ["up", "down", "remove"]
-                                                : self.can-up ? ["up", "remove"] : self.can-down ? ["down", "remove"] : ["remove"];
+                                            actions: !root.queue-shown || !self.playable ? [] : ["remove"];
                                             window-height: root.height; menu-key: row.key;
                                             focused => { queue-scroll.reveal(phase-list.y + queue-group.y + self.y, self.height); }
                                             action(op) => { if op != "open" { root.queue-action(op, row.key); } }
