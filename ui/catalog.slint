@@ -178,6 +178,9 @@ export component MediaLine inherits Rectangle {
     in property <bool> queue-columns;
     in property <bool> search-result;
     in property <bool> selected;
+    in property <length> paint-left;
+    in property <length> paint-right;
+    in property <color> paint-surface: transparent;
     in property <bool> current-track;
     in property <bool> playing-track;
     in property <[string]> actions;
@@ -195,8 +198,6 @@ export component MediaLine inherits Rectangle {
     min-width: 0px;
     min-height: max(max(48px, 56px * Theme.density), words.min-height + 12px);
     vertical-stretch: 0;
-    border-radius: Theme.container-radius;
-    background: selected || (selectable && row-keys.has-focus) ? Theme.panel : transparent;
     property <bool> play-on-activate: root.selectable && root.playable && !root.can-open;
     property <bool> body-actionable: root.can-open || root.play-on-activate;
     property <bool> body-focusable: root.can-open || root.selectable;
@@ -217,14 +218,25 @@ export component MediaLine inherits Rectangle {
         if root.play-on-activate { root.activate-row(); }
     }
 
+    // Both paint layers reach the pane edges without changing the row's
+    // layout, interactive face, accessibility bounds or divider.
+    Rectangle {
+        x: -root.paint-left; y: 0px;
+        width: root.width + root.paint-left + root.paint-right; height: root.height;
+        property <bool> engaged: root.body-focusable && (row-face.pressed || row-face.has-hover || row-keys.has-focus);
+        background: root.selected || (root.selectable && row-keys.has-focus) ? Theme.panel
+            : self.engaged ? root.paint-surface : transparent;
+
+        Rectangle {
+            width: parent.width; height: parent.height;
+            border-width: row-keys.has-focus ? 2px : 0px;
+            border-color: Theme.tertiary;
+            background: !parent.engaged ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
+                : Theme.raised.with-alpha(0.55);
+        }
+    }
     Rectangle {
         width: parent.width; height: parent.height;
-        border-radius: root.border-radius;
-        border-width: row-keys.has-focus ? 2px : 0px;
-        border-color: Theme.tertiary;
-        background: !root.body-focusable ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
-            : row-face.has-hover || row-keys.has-focus ? Theme.raised.with-alpha(0.55) : transparent;
-
         if root.body-actionable: Rectangle {
             width: parent.width; height: parent.height;
             accessible-role: button;
