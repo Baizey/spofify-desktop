@@ -605,9 +605,9 @@ export component AppWindow inherits Window {
                                     detail: device.selected ? "Selected output" : !device.available ? "Not available" : device.can-play ? "Available for playback" : "Cannot play audio";
                                     FlexboxLayout {
                                         flex-wrap: wrap; spacing: 6px;
-                                        Action {
-                                            text: device.selected ? "Deselect" : "Select output"; enabled: !root.local-mode && (device.selected || (device.available && device.can-play));
-                                            primary: !device.selected; clicked => { root.device-action(device.selected ? "deselect" : "select", device.id); }
+                                        if !device.selected: Action {
+                                            text: "Select output"; enabled: !root.local-mode && device.available && device.can-play;
+                                            primary: true; clicked => { root.device-action("select", device.id); }
                                         }
                                         if device.selected: Action {
                                             text: "Rename device"; enabled: !root.local-mode;

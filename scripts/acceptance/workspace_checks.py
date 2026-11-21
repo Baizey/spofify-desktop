@@ -850,8 +850,8 @@ def empty_devices(window, restore, *, wide, observer=False, capture=None):
     window.click("Playback devices")
     window.title("Devices")
     if observer:
-        deselect = window.find("Deselect", roles=("Button",))
-        check(deselect.get("accessibleEnabled"), "the selected desktop output cannot be deselected")
+        window.find("Selected output")
+        window.absent("Deselect", roles=("Button",))
         name = window.title("Acceptance observer")
         card = containing_item(window.elements(), "SettingCard", name)
         check(card, "missing Devices card for the real Go observer")

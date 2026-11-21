@@ -152,7 +152,6 @@ pub enum Action {
     Shuffle(bool),
     Repeat(Repeat),
     SelectDevice(String),
-    DeselectDevice,
     RenameDevice {
         device_id: Option<String>,
         name: String,
@@ -291,7 +290,6 @@ impl Action {
                 },
             },
             Self::SelectDevice(device_id) if id(&device_id, 128) => C::Select { device_id },
-            Self::DeselectDevice => C::Release,
             Self::RenameDevice { device_id, name } => {
                 let device_id = device_id.as_deref().unwrap_or(own_device);
                 let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');

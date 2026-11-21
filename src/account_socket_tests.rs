@@ -329,6 +329,45 @@ async fn send_json(peer: &mut WebSocketStream<tokio::io::DuplexStream>, data: Va
 }
 
 #[tokio::test]
+async fn fresh_process_reattach_waits_for_its_own_grant_and_exports_no_cursor() {
+    let (signals, _, authority, _events) = signals();
+    let (_, mut output) = output_state();
+    let mut conn = begin(NEW, OLD, &mut output, &signals);
+    let (client, peer) = tokio::io::duplex(1024);
+    let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+    conn.pulse(&mut client, &output).await.unwrap();
+    let pulse = read_json(&mut peer).await;
+    // A fresh process never fabricates proof of the old handle or actual
+    // cursor. Going through the same device's grace is Go's decision.
+    assert_eq!(pulse, json!({"type":"presence","basis":1}));
+    let grant = || Incoming::Grant {
+        basis: 1,
+        ms: 8000,
+        handle: "server-handle".into(),
+    };
+    conn.receive(grant(), &mut output, &signals).unwrap();
+    assert!(authority.borrow().is_none());
+    conn.receive(
+        decode(&snapshot(NEW, NEW).to_string(), DEVICE).unwrap(),
+        &mut output,
+        &signals,
+    )
+    .unwrap();
+    assert!(authority.borrow().is_none());
+    conn.receive(grant(), &mut output, &signals).unwrap();
+    assert!(
+        authority
+            .borrow()
+            .is_some_and(|a| a.attached && a.generation == conn.generation)
+    );
+    assert_eq!(
+        conn.canonical,
+        serde_json::from_value(cursor_json()).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices() {
     let (signals, link, authority, mut events) = signals();
     let (actual, mut output) = output_state();

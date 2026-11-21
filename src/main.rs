@@ -13,6 +13,7 @@ mod mode;
 #[cfg(target_os = "linux")]
 mod mpris;
 mod offline;
+mod output_identity;
 mod pages;
 mod personal;
 mod personal_bridge;
@@ -232,7 +233,6 @@ fn main() -> Result<(), slint::PlatformError> {
             use player::Action as A;
             let action = match op.as_str() {
                 "select" => A::SelectDevice(value.into()),
-                "deselect" => A::DeselectDevice,
                 "prepare-rename" => {
                     renaming.replace(Some((e, value.into())));
                     return;

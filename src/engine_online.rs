@@ -153,16 +153,6 @@ impl Online {
     }
 }
 
-fn output_intent(command: &socket::Command, own_device: &str) -> bool {
-    match command {
-        socket::Command::Select { device_id } => device_id == own_device,
-        socket::Command::Play { .. } | socket::Command::Resume | socket::Command::Jump { .. } => {
-            true
-        }
-        _ => false,
-    }
-}
-
 impl Engine {
     pub(super) fn online_generation(&self) -> Option<Generation> {
         let generation = self.online.generation?;
@@ -355,10 +345,7 @@ impl Engine {
             return;
         }
         self.drain_online_events(first);
-        self.finish_output_promotion();
-        if self.output_promotion.is_some() {
-            return;
-        }
+        self.finish_initial_play();
         if self.local_store.is_some() {
             let room_needs_output = self.attached().is_some()
                 && self
@@ -378,10 +365,6 @@ impl Engine {
         }
     }
     pub(super) fn pause_room_for_saved(&mut self) -> bool {
-        if self.output_promotion.is_some() {
-            self.action_status = "Connecting this output…";
-            return false;
-        }
         if self.online.is_owner()
             && self
                 .online
@@ -414,41 +397,41 @@ impl Engine {
         let Some(command) = action.wire(&self.device_id) else {
             return;
         };
-        if self.output_promotion.is_some() {
-            return;
-        }
-        if self.passive_output && output_intent(&command, &self.device_id) {
-            let awaiting_room = self.online_generation().is_none();
-            if awaiting_room || self.should_promote_output(&command) {
-                let resume_key = if matches!(&command, socket::Command::Resume) {
-                    self.online.cursor().map(|cursor| cursor.key)
-                } else {
-                    None
-                };
-                let pending = super::OutputPromotion {
-                    command,
-                    deadline: Instant::now() + super::PROMOTION_TIMEOUT,
-                    resume_key,
-                    awaiting_room,
-                };
-                if awaiting_room {
-                    self.output_promotion = Some(pending);
-                    self.action_status = "Connecting playback controls…";
-                } else {
-                    self.promote_output(pending);
-                }
-                return;
-            }
-        }
         if matches!(
             command,
-            socket::Command::Pause | socket::Command::Close | socket::Command::Release
-        ) && (self.online.is_owner()
-            || self.online.execution.is_some()
-            || self.online.work.is_some())
+            socket::Command::Play { .. }
+                | socket::Command::Resume
+                | socket::Command::Pause
+                | socket::Command::Close
+                | socket::Command::Jump { .. }
+                | socket::Command::Select { .. }
+        ) {
+            self.pending_initial_play = None;
+        }
+        // Keep one explicit catalog Play that arrived before the first hello.
+        // Never defer selection/transport or replay a command on reconnect.
+        if self.link() == Link::Connecting
+            && self.online.generation.is_none()
+            && matches!(command, socket::Command::Play { .. })
+        {
+            self.pending_initial_play =
+                Some((Instant::now() + super::INITIAL_PLAY_TIMEOUT, command));
+            self.action_status = "Connecting playback controls…";
+            return;
+        }
+        // A later queue edit can itself drain the opening snapshot. Send any
+        // deferred Play first so it cannot erase that edit by arriving later.
+        self.finish_initial_play();
+        self.send_online_command(command);
+    }
+    fn send_online_command(&mut self, command: socket::Command) {
+        if matches!(command, socket::Command::Pause | socket::Command::Close)
+            && (self.online.is_owner()
+                || self.online.execution.is_some()
+                || self.online.work.is_some())
         {
             // Preserve the real playback tail before Pause. Never send an end
-            // as a consequence of a physical stop or a release.
+            // as a consequence of a physical stop.
             self.sample_online(false, true);
             self.online.stopped = self.online.cursor().cloned();
             self.cancel_work();
@@ -486,75 +469,18 @@ impl Engine {
             "The playback action was not sent."
         };
     }
-    fn should_promote_output(&self, command: &socket::Command) -> bool {
-        output_intent(command, &self.device_id)
-            && (matches!(command, socket::Command::Select { .. })
-                || self.online.outputs.owner.is_empty())
-    }
-    fn promote_output(&mut self, mut pending: super::OutputPromotion) {
-        self.clear_output();
-        self.passive_output = false;
-        pending.awaiting_room = false;
-        pending.deadline = Instant::now() + super::PROMOTION_TIMEOUT;
-        self.output_promotion = Some(pending);
-        self.action_status = "Connecting this output…";
-        self.connect();
-    }
-    fn abandon_output_promotion(&mut self, message: &'static str) {
-        self.clear_output();
-        self.passive_output = true;
-        self.connect();
-        self.action_status = message;
-    }
-    fn finish_output_promotion(&mut self) {
-        let Some(pending) = &self.output_promotion else {
+    fn finish_initial_play(&mut self) {
+        let Some((deadline, _)) = self.pending_initial_play.as_ref() else {
             return;
         };
-        if Instant::now() >= pending.deadline {
-            self.abandon_output_promotion("This output could not connect. Try again.");
-            return;
-        }
-        let Some(generation) = self.online_generation() else {
-            return;
-        };
-        let pending = self.output_promotion.take().unwrap();
-        if pending.awaiting_room && self.should_promote_output(&pending.command) {
-            self.promote_output(pending);
-            return;
-        }
-        let command = pending.command;
-        let valid = match &command {
-            socket::Command::Resume => self.online.cursor().map(|c| c.key) == pending.resume_key,
-            socket::Command::Jump { key } => self
-                .online
-                .state
-                .as_ref()
-                .is_some_and(|s| s.queue.iter().any(|t| t.key == *key)),
-            _ => true,
-        };
-        if !valid {
-            self.abandon_output_promotion("The queue changed. Choose what to play again.");
-            return;
-        }
-        let Some(socket) = &self.socket else { return };
-        // Only explicit Select may transfer an existing owner. Go handles the
-        // atomic claim-if-unowned for Play; other transport intents preserve
-        // the existing owner even if it changed after the snapshot.
-        let replacing = !self.passive_output
-            && (self.online.is_owner() || self.online.outputs.owner.is_empty())
-            && matches!(
-                &command,
-                socket::Command::Play { .. } | socket::Command::Jump { .. }
-            );
-        if socket.command(generation, command).is_err() {
-            self.abandon_output_promotion("The playback action was not sent. Try again.");
-        } else {
-            // Do not render the old queue cursor while a requested selection
-            // is resolving. A fresh execution will replace the stop marker.
-            if replacing {
-                self.online.stopped = self.online.cursor().cloned();
-            }
-            self.action_status = "";
+        if Instant::now() >= *deadline
+            || !matches!(self.link(), Link::Connecting | Link::Connected(_))
+        {
+            self.pending_initial_play = None;
+            self.action_status = "The playback action was not sent.";
+        } else if self.online_generation().is_some() {
+            let (_, command) = self.pending_initial_play.take().unwrap();
+            self.send_online_command(command);
         }
     }
     fn reconcile_online(&mut self) {
@@ -967,16 +893,21 @@ impl Engine {
         false
     }
     pub(super) fn project_online(&self, p: &mut PlayerView) {
+        let live = self.online_generation().is_some();
+        let outputs = &self.online.outputs;
+        let active = outputs
+            .devices
+            .iter()
+            .find(|d| live && d.id == outputs.owner);
+        p.output = match active {
+            Some(device) => device.name.clone(),
+            None if !live => "Output unavailable".into(),
+            None if !outputs.owner.is_empty() => "Output disconnected".into(),
+            None => "No output selected".into(),
+        };
         let Some(state) = &self.online.state else {
             return;
         };
-        let live = self.online_generation().is_some();
-        let active = self
-            .online
-            .outputs
-            .devices
-            .iter()
-            .find(|d| d.id == self.online.outputs.owner);
         let cursor = self.online.cursor().unwrap_or(&state.cursor);
         let position = state.queue.iter().position(|t| t.key == cursor.key);
         p.shuffle = state.shuffle;
@@ -992,13 +923,6 @@ impl Engine {
                 .execution
                 .as_ref()
                 .is_some_and(|e| e.permit.granted());
-        p.output = active.map(|d| d.name.clone()).unwrap_or_else(|| {
-            if self.grant().is_some() {
-                "This desktop".into()
-            } else {
-                "No output selected".into()
-            }
-        });
         p.elapsed = cursor.elapsed;
         if let Some(track) = position.and_then(|i| state.queue.get(i)) {
             p.title = track.name.clone();
@@ -1034,7 +958,7 @@ impl Engine {
                     _ => "",
                 };
             }
-        } else if live && !self.online.is_owner() && cursor.playing {
+        } else if active.is_some() && !self.online.is_owner() && cursor.playing {
             p.playing = true;
             if let Some(at) = self.online.observed_at
                 && p.duration > 0.0
@@ -1076,9 +1000,7 @@ impl Engine {
                     name: shown.name.clone().into(),
                     selected,
                     available: live,
-                    // A restored desktop only becomes an output on selection.
-                    can_play: shown.can_play
-                        || (self.passive_output && d.device_id == self.device_id),
+                    can_play: shown.can_play,
                 }
             })
             .collect();
@@ -1101,6 +1023,32 @@ mod tests {
             desired: true,
             ..Cursor::default()
         }
+    }
+
+    #[test]
+    fn disconnected_projection_does_not_keep_the_cached_device_selected() {
+        let mut engine = super::super::tests::engine();
+        engine.online.state = Some(State {
+            collection_first: 0,
+            queue: vec![],
+            cursor: Cursor::default(),
+            repeat: socket::Repeat::Off,
+            shuffle: false,
+        });
+        engine.online.outputs = serde_json::from_value(serde_json::json!({
+            "owner": "remote-connection",
+            "devices": [{
+                "id": "remote-connection", "deviceId": "remote",
+                "name": "Remote speaker", "canPlay": true
+            }],
+        }))
+        .unwrap();
+        let mut view = PlayerView::default();
+        engine.project_online(&mut view);
+        assert_eq!(view.output, "Output unavailable");
+        assert_eq!(view.devices.len(), 1);
+        assert!(!view.devices[0].selected && !view.devices[0].available);
+        assert!(!view.playing && !view.transport);
     }
 
     #[cfg(target_os = "linux")]

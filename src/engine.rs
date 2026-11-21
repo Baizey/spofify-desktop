@@ -14,6 +14,7 @@ use crate::{
     desk::Access,
     mode::ModeControl,
     offline::{self, OfflineStore, PlaybackInput},
+    output_identity::Installation,
     personal::Command as PersonalCommand,
     personal_bridge::PersonalHub,
     player::{Action, Authority, Change, LocalQueue, LocalTrack, Status},
@@ -83,15 +84,7 @@ const TICK: Duration = Duration::from_millis(25);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
 const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
-const PROMOTION_TIMEOUT: Duration = Duration::from_secs(10);
-
-struct OutputPromotion {
-    deadline: Instant,
-    command: socket::Command,
-    resume_key: Option<u64>,
-    // Explicit Play can arrive before the first passive room snapshot.
-    awaiting_room: bool,
-}
+const INITIAL_PLAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Account {
     api: Arc<Api>,
@@ -137,8 +130,7 @@ struct Engine {
     logouts: Vec<JoinHandle<()>>,
     account: Option<Account>,
     offline: bool,
-    passive_output: bool,
-    output_promotion: Option<OutputPromotion>,
+    pending_initial_play: Option<(Instant, socket::Command)>,
     audio: Option<Audio>,
     master_gain: MasterGain,
     local: LocalQueue,
@@ -157,6 +149,8 @@ struct Engine {
     local_revision: u64,
     local_queue_instance: u64,
     action_status: &'static str,
+    // Declared after the socket and audio: their teardown precedes unlock.
+    installation: Option<Installation>,
 }
 impl Engine {
     fn current(&self) -> bool {
@@ -249,7 +243,6 @@ impl Engine {
         self.cancel_reconnect();
         self.cancel_login();
         self.clear_output();
-        self.passive_output = false;
         self.retained = None;
         if let Some(a) = self.account.take() {
             self.revoke(a);
@@ -284,9 +277,7 @@ impl Engine {
         }
     }
     fn clear_output(&mut self) {
-        if self.output_promotion.take().is_some() {
-            self.passive_output = true;
-        }
+        self.pending_initial_play = None;
         self.room_incarnation = self.room_incarnation.wrapping_add(1);
         self.local_revision = 0;
         self.cancel_work();
@@ -318,7 +309,7 @@ impl Engine {
                 socket::DeviceIdentity {
                     device_id: self.device_id.clone(),
                     name: "Spofify Desktop".into(),
-                    can_play: !self.passive_output,
+                    can_play: true,
                 },
             )
             .ok();
@@ -622,6 +613,9 @@ impl Engine {
                     return;
                 }
                 if self.local.replace(tracks, index, false) == Change::Start {
+                    // A newer explicit Saved Play supersedes a catalog Play
+                    // still waiting for the first account snapshot.
+                    self.pending_initial_play = None;
                     self.cancel_work();
                     self.stop();
                     self.local_store = Some(store);
@@ -679,7 +673,7 @@ impl Engine {
     fn action(&mut self, action: Action) {
         if !self.offline {
             match action {
-                Action::Play { .. } | Action::SelectDevice(_) | Action::DeselectDevice => {
+                Action::Play { .. } | Action::SelectDevice(_) => {
                     self.leave_saved_queue();
                     self.online_action(action);
                     return;
@@ -921,7 +915,19 @@ impl Engine {
                 kind,
             },
         ) = self.auth_ready.take().unwrap();
-        self.passive_output = matches!(&kind, Kind::Restored(_));
+        // Both sign-in paths announce capability, not a selection or transport
+        // command. Only Go may elect a vacant output or rebind its same device.
+        if self.installation.is_none() {
+            self.installation = Installation::open().ok();
+        }
+        self.device_id = self
+            .installation
+            .as_ref()
+            .and_then(|installation| {
+                let (origin, principal) = api.authenticated_account(&session).ok()?;
+                Some(installation.device_id(origin, principal))
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.retained = match kind {
             Kind::Restored(profile) => Some((Arc::new(AtomicBool::new(true)), Some(profile))),
             Kind::Password { remember } => {
@@ -943,9 +949,6 @@ impl Engine {
             }
         };
         self.account = Some(Account { api, session });
-        // A restored account joins as a fresh, passive controller. No output
-        // capability, ownership choice or playback action is sent on restore.
-        self.device_id = uuid::Uuid::new_v4().to_string();
         self.publish_access();
         self.connect();
     }
@@ -1572,8 +1575,7 @@ pub fn start(
                 logouts: vec![],
                 account: None,
                 offline: false,
-                passive_output: false,
-                output_promotion: None,
+                pending_initial_play: None,
                 audio: None,
                 master_gain: output.master_gain,
                 local: LocalQueue::default(),
@@ -1592,6 +1594,7 @@ pub fn start(
                 local_revision: 0,
                 local_queue_instance: 0,
                 action_status: "",
+                installation: None,
             };
             e.start_restore();
             let mut cadence = tokio::time::interval(TICK);
@@ -1690,7 +1693,7 @@ mod tests {
         assert!(!next.matches(&row));
     }
 
-    fn engine() -> Engine {
+    pub(super) fn engine() -> Engine {
         let (results, _) = mpsc::channel(2);
         let (access, _) = watch::channel(None);
         Engine {
@@ -1710,8 +1713,7 @@ mod tests {
             logouts: vec![],
             account: None,
             offline: false,
-            passive_output: false,
-            output_promotion: None,
+            pending_initial_play: None,
             audio: None,
             master_gain: MasterGain::default(),
             local: LocalQueue::default(),
@@ -1730,6 +1732,7 @@ mod tests {
             local_revision: 0,
             local_queue_instance: 0,
             action_status: "",
+            installation: None,
         }
     }
     #[test]
