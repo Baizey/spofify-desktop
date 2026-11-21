@@ -34,6 +34,10 @@ BLOCK = RATE * BLOCK_MS // 1000
 MARK_MS = 240
 HOLD = 0.600
 GRANT_DELAY = 0.180
+CANONICAL_PCM_TIMEOUT = 1.25
+# A new canonical sink can report buffering before Rodio's first callback.
+# Desktop emits its next ordinary fact on the two-second reporting cadence.
+CANONICAL_FACT_TIMEOUT = 3.5
 START_WINDOW = 1.200
 DEADLINE_DRAIN_MS = 180
 STOP_BUDGET_MS = 360
@@ -242,6 +246,22 @@ def tick(peer, monitor, until=None, seconds=0):
         sleep(min(0.010, max(0, deadline - monotonic())))
 
 
+def expect_canonical_start(peer, monitor, label):
+    tick(peer, monitor, until=peer.sent_grant + CANONICAL_PCM_TIMEOUT)
+    marks = monitor.markers()
+    check(marks and marks[0][0] == 0,
+          f"{label}: grant basis {peer.basis} did not produce the intro PCM; "
+          f"peak {max((p for _, p, _ in monitor.blocks), default=0)}, "
+          f"facts (playing, buffering): {[(m['playing'], m['buffering']) for m in peer.facts]}")
+    first = (marks[0][2] - peer.sent_grant) * 1000
+    while not any(m["playing"] and not m["buffering"] for m in peer.facts):
+        check(monotonic() < peer.sent_grant + CANONICAL_FACT_TIMEOUT,
+              f"{label}: intro PCM heard +{first:.0f}ms after grant but no non-buffering playing fact; "
+              f"facts (playing, buffering): {[(m['playing'], m['buffering']) for m in peer.facts]}")
+        tick(peer, monitor, seconds=0.04)
+    return first
+
+
 def selected_in_window(win, name):
     wait(f"projected output {name!r}", lambda: any(
         win.matches(e, "Playback devices") and e.get("accessibleDescription") == name for e in win.elements()), 4)
@@ -329,16 +349,18 @@ def exercise(case, win, ready, admitted, requests, connections, pcm):
         if case == "startup-drain":
             # The virtual startup drain expires: Go bumps Run before Outputs,
             # then answers an eligible local presence with an attached grant.
+            peer.ping("before-drain-end-election")
+            last_basis = max(peer.bases)
             current = peer.assign(peer.id)
             check(current["run"] == cursor["run"] + 1, "missing drain-end cursor")
-            peer.expect("local presence after startup drain", lambda m: m["type"] == "presence")
+            peer.expect("local presence after startup drain",
+                        lambda m: m["type"] == "presence" and m["basis"] > last_basis)
             tick(peer, monitor, seconds=GRANT_DELAY)
             monitor.quiet("startup-drain election published, attached grant still withheld")
             peer.grant()
-            tick(peer, monitor, seconds=1.0)
-            check(monitor.markers() and any(m["playing"] for m in peer.facts),
-                  "startup-drain positive control did not play after election and grant")
-            print("PASS startup-drain: silent even after Play resolved; PCM/facts only after election and grant", flush=True)
+            first = expect_canonical_start(peer, monitor, "startup-drain")
+            print(f"PASS startup-drain: silent even after Play resolved; intro PCM +{first:.0f}ms "
+                  "after election and grant, then playing facts on the canonical run", flush=True)
         else:
             print("PASS remote: no Desktop PCM/facts before or after Play resolved under the remote owner", flush=True)
         return
@@ -366,10 +388,9 @@ def exercise(case, win, ready, admitted, requests, connections, pcm):
         late = Monitor(pcm)
         peer.play(command)
         peer.grant()
-        tick(peer, late, seconds=1.25)
-        check(late.markers() and late.markers()[0][0] == 0 and any(m["playing"] for m in peer.facts),
-              "late canonical Play + grant did not start a fresh authorized intro")
-        print("PASS deadline: PCM expired without confirmation; late Go resolution played from the intro", flush=True)
+        first = expect_canonical_start(peer, late, "deadline")
+        print(f"PASS deadline: PCM expired without confirmation; late Go resolution played a fresh intro "
+              f"+{first:.0f}ms after grant, then playing facts on the canonical run", flush=True)
         return
 
     if case in ("selected", "vacancy"):

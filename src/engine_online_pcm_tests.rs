@@ -166,11 +166,7 @@ async fn play_before_confirm(vacant: bool) {
     assert_eq!(pcm.nth((RATE / 2) as usize).map(f32::abs), Some(0.5));
     assert!(e.online.execution.is_none() && peer.read().is_none());
     let before_confirm = click.elapsed();
-    let delta = serde_json::from_value(json!({
-        "source":"desktop", "cursor":{"key":1,"chain":"confirmed","visit":0,"run":0,"elapsed":0,"desired":true,"playing":false},
-        "queue":{"kind":"replace","rows":[{"id":"tone","key":1,"order":1,"duration":2.0,"intent":"low"}]}
-    })).unwrap();
-    update(&peer, EventKind::Player(delta));
+    confirm_play(&peer);
     e.tick_online(None);
     tokio::time::sleep(Duration::from_millis(220)).await;
     assert!(e.online.execution.is_none() && peer.read().is_none());
@@ -197,6 +193,87 @@ async fn play_before_confirm(vacant: bool) {
     println!(
         "headless engine + Rodio (non-output vacancy: {vacant}) first PCM {first:?}; cursor {before_confirm:?}; grant {grant_at:?} retained decoder"
     );
+}
+
+fn confirm_play(peer: &TestPeer) {
+    let delta = serde_json::from_value(json!({
+        "source":"desktop", "cursor":{"key":1,"chain":"confirmed","visit":0,"run":0,"elapsed":0,"desired":true,"playing":false},
+        "queue":{"kind":"replace","rows":[{"id":"tone","key":1,"order":1,"duration":2.0,"intent":"low"}]}
+    })).unwrap();
+    update(peer, EventKind::Player(delta));
+}
+
+#[tokio::test]
+async fn canonical_fallback_plays_after_startup_drain_or_preview_deadline() {
+    for startup_drain in [true, false] {
+        let (mut e, mut peer, mut pcm) = fixture(if startup_drain { "" } else { "desktop" });
+        play(&mut e, &mut peer);
+        e.tick_online(None);
+        if startup_drain {
+            assert_eq!(first_pcm(&mut pcm), None);
+        } else {
+            assert_eq!(first_pcm(&mut pcm), Some(0.25));
+            assert_eq!(pcm.nth((RATE / 2) as usize).map(f32::abs), Some(0.5));
+            tokio::time::sleep(Duration::from_millis(1250)).await;
+            assert_eq!(first_pcm(&mut pcm), None, "the expired body must be fenced");
+            e.tick_online(None);
+            assert!(!e.online.starting_locally());
+        }
+        confirm_play(&peer);
+        if startup_drain {
+            let cursor = Cursor {
+                key: 1,
+                chain: "confirmed".into(),
+                run: 1,
+                desired: true,
+                ..Cursor::default()
+            };
+            update(
+                &peer,
+                EventKind::Player(socket::PlayerDelta {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                }),
+            );
+            update(&peer, EventKind::Outputs(outputs("desktop")));
+        }
+        e.tick_online(None);
+        assert_eq!(first_pcm(&mut pcm), None);
+        assert!(e.media.is_none() && peer.read().is_none());
+        peer.authority.send_replace(Some(OutputAuthority {
+            generation: GEN,
+            deadline: Instant::now() + Duration::from_secs(10),
+            attached: true,
+            resume_through: 0,
+        }));
+        e.tick_online(None);
+        e.media.take().expect("canonical load after grant").abort();
+        e.complete_online(
+            e.operation,
+            Ok(OnlineMedia {
+                bytes: media(),
+                downloaded: false,
+            }),
+        );
+        e.tick_online(None);
+        let first_fact = peer.read().expect("canonical initial buffering fact");
+        assert_eq!(first_fact["buffering"], true);
+        assert_eq!(first_fact["playing"], false);
+        assert_eq!(first_fact["run"], u64::from(startup_drain));
+        assert_eq!(
+            first_pcm(&mut pcm),
+            Some(0.25),
+            "authorized decoder starts on the intro"
+        );
+        e.tick_online(None);
+        assert!(
+            peer.read().is_none(),
+            "playing fact waits for the report cadence, not PCM"
+        );
+        e.online.execution.as_mut().unwrap().last_fact = Some(Instant::now() - REPORT_INTERVAL);
+        e.tick_online(None);
+        assert_eq!(peer.read().unwrap()["playing"], true);
+    }
 }
 
 #[tokio::test]
