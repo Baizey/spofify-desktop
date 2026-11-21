@@ -3,11 +3,13 @@
 //! socket frame before readers see it, including frames coalesced by the watch.
 use crate::{
     api::library::{PlaylistKind, PlaylistSummary, RuleDefinition},
+    desk::Access,
     personal::{PersonalCommand, PersonalUpdate, Replica},
+    playlist_observations::Writer,
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU64},
 };
 use tokio::sync::watch;
 
@@ -107,6 +109,8 @@ struct State {
     status: Status,
     replica: Replica,
     observations: VecDeque<Observation>,
+    observation_writer: Option<Writer>,
+    observation_mode: Option<u64>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -123,6 +127,8 @@ impl Default for State {
             },
             replica: Replica::default(),
             observations: VecDeque::new(),
+            observation_writer: None,
+            observation_mode: None,
         }
     }
 }
@@ -146,6 +152,12 @@ impl Default for PersonalAccess {
     }
 }
 impl PersonalAccess {
+    pub(crate) fn playlist_observations(&self, access: &Access) -> Option<Writer> {
+        let state = self.state.lock().expect("personal state");
+        let writer = state.observation_writer.as_ref()?;
+        (state.status.epoch == access.epoch && writer.matches(access)).then(|| writer.clone())
+    }
+
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -292,6 +304,55 @@ impl PersonalHub {
     pub fn access(&self) -> PersonalAccess {
         self.0.clone()
     }
+    /// Bind before publishing Access. Neither binding nor accepting frames
+    /// opens storage. Retire same-epoch writers too when a grant disappears.
+    pub(crate) fn bind_observations(
+        &self,
+        access: Option<&Access>,
+        current_epoch: &Arc<AtomicU64>,
+    ) {
+        if let Some(access) = access {
+            self.reset(access.epoch);
+        }
+        let mut state = self.0.state.lock().expect("personal state");
+        if let Some(access) = access.filter(|a| a.epoch == state.status.epoch) {
+            if !state
+                .observation_writer
+                .as_ref()
+                .is_some_and(|w| w.matches(access))
+            {
+                state.observation_mode = None;
+                state.observation_writer = Writer::start(access, current_epoch.clone()).ok();
+            }
+        } else if access.is_none() {
+            state.observation_mode = None;
+            state.observation_writer = None;
+        }
+    }
+
+    /// Give already accepted local evidence a chance to reach disk on normal
+    /// exit. Account switches/logout do not wait or weaken their fences.
+    pub(crate) async fn flush_observations(&self) {
+        let writer = self
+            .0
+            .state
+            .lock()
+            .expect("personal state")
+            .observation_writer
+            .clone();
+        if let Some(writer) = writer
+            && let Err(err) = writer.flush().await
+        {
+            eprintln!("{err}");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_observation_writer(&self, epoch: u64, writer: Writer) {
+        self.reset(epoch);
+        self.0.state.lock().unwrap().observation_writer = Some(writer);
+    }
+
     pub fn reset(&self, epoch: u64) {
         let mut state = self.0.state.lock().expect("personal state");
         if epoch > state.status.epoch {
@@ -311,6 +372,10 @@ impl PersonalHub {
         }
         state.status.generation = generation;
         state.status.link = Link::Waiting;
+        state.observation_mode = state
+            .observation_writer
+            .as_ref()
+            .and_then(Writer::online_mode);
         state.replica.disconnected();
         self.0.signal();
     }
@@ -391,7 +456,12 @@ impl PersonalHub {
         } else {
             None
         };
-        let result = match state.replica.receive(update) {
+        let writer = state.observation_writer.clone().zip(state.observation_mode);
+        let result = match state.replica.receive_observed(update, |event| {
+            if let Some((writer, mode)) = &writer {
+                writer.observe(*mode, event);
+            }
+        }) {
             Ok(command) => {
                 if snapshot {
                     state.status.link = Link::Ready;

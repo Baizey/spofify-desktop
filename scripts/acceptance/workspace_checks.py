@@ -310,6 +310,37 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
 
         wait("Saved offline listing after durable playlist change", open_section)
 
+    def work_offline():
+        window.click("Settings")
+        window.section("Settings")
+        window.click("Work offline")
+        window.find("Go online", roles=("Button",))
+        window.section("Settings")
+
+    def saved_detail_actions(remove_action, *, offline):
+        buttons = detail_actions(window, (remove_action,), optional=("Play", "Add to queue"))
+        playback = {label for label in ("Play", "Add to queue") if label in buttons}
+        check(not playback or playback == {"Play", "Add to queue"},
+              f"Saved detail exposes only one local playback action: {playback}")
+        check(all(buttons[label].get("accessibleEnabled", True) for label in playback),
+              "Saved detail has a disabled local playback action")
+        if not offline or not playback:
+            return  # Pending pins need not have usable local audio; online rows need no local menu.
+        # A real downloadable occurrence has the local queue option. Exercise
+        # its menu without queuing or mutating the fixture during removal checks.
+        rows = window.elements()
+        viewport = element_id(rows, "catalog-scroll")
+        face = next((row for row in rows if row.get("accessibleRole") == "Button"
+                     and (row.get("accessibleLabel") or "").startswith("Play track: ")
+                     and viewport and contains(viewport, row)), None)
+        check(face, "expected a visible playable Saved occurrence")
+        track = face["accessibleLabel"].removeprefix("Play track: ")
+        window.click(playlist_option_trigger(track))
+        window.find(playlist_option("Add to queue", track), roles=("Button",))
+        window.absent(rf"(?:Add to playlist|Save offline|Remove|Delete) · {re.escape(track)}", roles=("Button",))
+        window.key(ESCAPE)
+        window.absent(playlist_option("Add to queue", track), roles=("Button",))
+
     def row_toggle(saved):
         window.click(playlist_option_trigger(name))
         row_offline_option(window, name, saved=saved)
@@ -327,7 +358,10 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
 
     visit_saved()
     window.find(f"Open {label}", roles=("Button",))
-    print("PASS playlist Save created durable intent visible in Saved offline", flush=True)
+    window.click(f"Open {label}")
+    window.title(name)
+    saved_detail_actions("Remove offline save", offline=False)
+    print("PASS playlist Save created durable intent visible in Saved offline and its online detail", flush=True)
     open_playlists(window)
     row_toggle(saved=True)
     detail_toggle(saved=True)
@@ -335,20 +369,16 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
     detail_actions(window, ("Play", "Add to queue", "Remove offline save", "Rename", "Edit rules", "Delete"))
     print("PASS online row reflects durable pin; direct detail removal asks for confirmation with Cancel first", flush=True)
 
-    window.click("Settings")
-    window.title("Settings")
-    window.click("Work offline")
+    work_offline()
     visit_saved()
     window.resize(offline_mode)
     check(window.dimensions()[0] == offline_mode[0], f"expected {offline_mode[0]} logical px for Saved detail")
-    window.title("Offline mode")
     window.click(f"Show actions for {label}")
     row_offline_option(window, name, saved=True)
     window.key(ESCAPE)
     window.click(f"Open {label}")
     window.title(name)
-    window.title("Offline mode")
-    detail_actions(window, ("Remove offline save",), optional=("Play",))
+    saved_detail_actions("Remove offline save", offline=True)
     print("PASS explicit Work offline keeps the checked Saved row action and direct detail removal", flush=True)
     if window.output:
         window.pixels("playlist-actions-real-offline-detail-saved")
@@ -366,12 +396,12 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
                 and not any(window.matches(e, f"Open {label}") for e in buttons))
 
     wait("offline listing drops playlist but keeps the independently saved track", only_independent_save_remains)
-    window.title("Offline mode")
     print("PASS offline detail unpin removed the playlist and retained the independent track", flush=True)
     window.click("Settings")
+    window.section("Settings")
     window.click("Go online")
     window.find("Work offline", roles=("Button",))
-    window.absent("Offline mode", roles=("Text",))
+    window.section("Settings")
     open_playlists(window)
     row_toggle(saved=False)
     detail_toggle(saved=False)
@@ -389,12 +419,15 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
     window.click("Save offline")
     window.find(r"Saved (?:all \d+ tracks on this device\.|\d+ of \d+ tracks\. Some audio is unavailable\.)",
                 roles=("Text",), timeout=60)
-    window.click("Settings")
-    window.click("Work offline")
     visit_saved()
     window.click(f"Open {album_label}")
     window.title(album)
-    detail_actions(window, ("Remove from Saved",), optional=("Play",))
+    saved_detail_actions("Remove from Saved", offline=False)
+    work_offline()
+    visit_saved()
+    window.click(f"Open {album_label}")
+    window.title(album)
+    saved_detail_actions("Remove from Saved", offline=True)
     cancel_remove_confirmation(window, album, "Remove from Saved")
     window.key(RETURN)
     window.title("Remove this saved collection?")

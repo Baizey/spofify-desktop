@@ -880,7 +880,7 @@ impl<'a> PlaylistOrder<'a> {
             || playlist.track_count != count
             || summary.track_count != count
             || page.rows.len() != detail.rows.len()
-            || !page.rows.iter().zip(&detail.rows).all(|(row, entry)| {
+            || !page.rows.iter().zip(detail.rows.iter()).all(|(row, entry)| {
                 entry_id(row, &playlist.id).ok() == Some(entry.id.as_str())
                     && row.position == Some(entry.position)
                     && row.id == entry.track.id
@@ -1227,7 +1227,8 @@ mod tests {
                     position: 2 * index,
                     track: track.clone(),
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             stale: false,
         };
         (
@@ -1303,12 +1304,13 @@ mod tests {
         }
         let mut moved = detail.clone();
         let (first, last) = (moved.rows[0].id.clone(), moved.rows[2].id.clone());
-        moved.rows[0].id = last;
-        moved.rows[2].id = first;
+        let rows = std::sync::Arc::make_mut(&mut moved.rows);
+        rows[0].id = last;
+        rows[2].id = first;
         // Even same-revision structural replacement cannot borrow the old row order.
         assert!(!current(&page, &moved));
         let mut wrong_slots = detail.clone();
-        wrong_slots.rows[1].position += 1;
+        std::sync::Arc::make_mut(&mut wrong_slots.rows)[1].position += 1;
         assert!(!current(&page, &wrong_slots));
         let mut partial = page.clone();
         partial.rows.pop();

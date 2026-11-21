@@ -53,6 +53,14 @@ impl Replica {
             self.0.pop_front();
         }
     }
+    pub fn catalog_pages(&self) -> Vec<(Route, Arc<Page>)> {
+        self.0
+            .iter()
+            .filter(|e| e.route.catalog_continuity() || matches!(e.route, Route::Playlist(_)))
+            .map(|e| (e.route.clone(), e.value.clone()))
+            .collect()
+    }
+
     pub fn saved_changed(&mut self) {
         for e in &mut self.0 {
             if matches!(e.route, Route::Offline | Route::SavedCollection(_)) {

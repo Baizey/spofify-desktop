@@ -187,6 +187,8 @@ pub struct Row {
     pub playlist: Option<PlaylistMetadata>,
     pub position: Option<u64>,
     pub item: Option<Item>,
+    /// Exact v1 recording identity from the same scoped inventory record as `item`.
+    pub(crate) local_recording: Option<crate::offline::Recording>,
     pub playback: Option<PlaybackSelection>,
 }
 
@@ -201,6 +203,13 @@ pub struct Page {
     pub definition: Option<RuleDefinition>,
     pub playlist: Option<PlaylistMetadata>,
     pub playback: Option<PlaybackSelection>,
+    /// This page's playable occurrences come from the local download store, not the account.
+    pub local_audio: bool,
+    /// A local album/artist context resolves to at least one actual track.
+    pub(crate) local_collection_playable: bool,
+    /// Revision of the actual retained membership, separate from the latest summary.
+    /// Legacy saved manifests do not record this value.
+    pub(crate) playlist_membership_revision: Option<u64>,
     /// Local status for unavailable evaluation or incomplete views.
     pub status: String,
     pub(crate) playlist_evaluation_failed: bool,
@@ -602,35 +611,6 @@ async fn fetch_catalog(
     })
 }
 
-/// Search the current account’s Downloads projection, not the online query cache.
-/// Keep the original rows so saved collections still open and Play uses the local track.
-pub fn search_downloads(downloads: &Page, query: &str) -> Page {
-    let query = query.to_lowercase();
-    let terms: Vec<_> = query.split_whitespace().collect();
-    let rows: Vec<_> = downloads
-        .rows
-        .iter()
-        .filter(|row| {
-            let text = if let Some(item) = &row.item {
-                format!("{} {} {}", row.title, item.artists, item.album_name)
-            } else {
-                row.title.clone()
-            }
-            .to_lowercase();
-            !terms.is_empty() && terms.iter().all(|term| text.contains(term))
-        })
-        .cloned()
-        .collect();
-    Page {
-        kind: "search".into(),
-        title: "Search downloads".into(),
-        subtitle: "Searching only music saved on this device.".into(),
-        total: Some(rows.len() as u64),
-        rows,
-        ..Page::default()
-    }
-}
-
 impl Page {
     /// Commit only validated progress. Stable keys deliberately distinguish repeated
     /// songs in History and in playlists, while disallowing overlapping windows.
@@ -1025,11 +1005,12 @@ pub(crate) fn playlist_detail_copy(page: &Page) -> (String, String) {
     } else {
         ""
     };
-    let count = page
-        .playlist
-        .as_ref()
-        .and_then(|m| m.track_count)
-        .map(|n| count_label(n, "song", "songs"));
+    let count = if page.local_audio {
+        Some(page.rows.len() as u64)
+    } else {
+        page.playlist.as_ref().and_then(|m| m.track_count)
+    }
+    .map(|n| count_label(n, "song", "songs"));
     let metadata = join_labels(kind, count.as_deref().unwrap_or(""));
     let description = ui_text(
         &page
@@ -1117,7 +1098,7 @@ fn opaque(value: &str, max: usize) -> bool {
 
 // Use plain, byte-bounded labels. Strip terminal controls and direction
 // overrides/isolate markers without changing the opaque identifiers we send.
-fn ui_text(input: &str) -> String {
+pub(crate) fn ui_text(input: &str) -> String {
     const TEXT_BYTES: usize = 256;
     let mut text = String::new();
     for ch in input.trim().chars() {
@@ -1154,7 +1135,7 @@ fn list_label<'a>(items: impl Iterator<Item = &'a str>) -> String {
     ui_text(&joined)
 }
 
-fn join_labels(left: &str, right: &str) -> String {
+pub(crate) fn join_labels(left: &str, right: &str) -> String {
     if left.is_empty() {
         return ui_text(right);
     }
@@ -1164,11 +1145,11 @@ fn join_labels(left: &str, right: &str) -> String {
     ui_text(&format!("{left} · {right}"))
 }
 
-fn count_label(n: u64, singular: &str, plural: &str) -> String {
+pub(crate) fn count_label(n: u64, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
 
-fn duration_label(ms: u64) -> String {
+pub(crate) fn duration_label(ms: u64) -> String {
     if ms == 0 {
         return String::new();
     }
@@ -1576,7 +1557,7 @@ mod tests {
                     summary: summary.clone(),
                     definition: None,
                     token: "complete".into(),
-                    rows: entries.clone(),
+                    rows: entries.clone().into(),
                     stale: false,
                 };
                 let order = crate::actions::PlaylistOrder::current(&route, &page, &detail).unwrap();
@@ -1608,29 +1589,6 @@ mod tests {
                 assert!(crate::actions::mutation(&route, &page, "remove", Some(1162), "").is_err());
             }
         }
-    }
-
-    #[test]
-    fn offline_search_matches_download_metadata_and_collects_only_local_rows() {
-        let mut row = catalog_row(track(), None);
-        row.route = None;
-        row.playback = None;
-        let group = Row {
-            title: "Road trip".into(),
-            route: Some(Route::SavedCollection("local".into())),
-            ..Row::default()
-        };
-        let downloads = Page {
-            rows: vec![group.clone(), row.clone()],
-            ..Page::default()
-        };
-        let matches = search_downloads(&downloads, "ALBUM artist");
-        assert_eq!(matches.rows, [row]);
-        assert_eq!(matches.total, Some(1));
-        assert!(!matches.more);
-        assert_eq!(search_downloads(&downloads, "TRIP").rows, [group]);
-        assert!(search_downloads(&downloads, "not present").rows.is_empty());
-        assert!(search_downloads(&downloads, " ").rows.is_empty());
     }
 
     #[test]

@@ -350,12 +350,10 @@ def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
     def work_offline(window, remember):
         window.click("Settings")
         window.click("Work offline")
-        window.section(SAVED)
-        window.title("Offline mode")
+        window.section("Settings")
+        window.find("Go online", roles=("Button",))
         if remember:
             wait("committed explicit offline grant", lambda: active_mode("offline"))
-        window.click("Settings")
-        window.find("Go online", roles=("Button",))
 
     def offline_settings(window):
         window.click("Settings")
@@ -391,7 +389,7 @@ def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
             window.pixels("01-cold-offline-account")
         window.click(SAVED)
         window.section(SAVED)
-        window.title("Offline mode")
+        window.absent("Offline mode", roles=("Text",))
         if pixels:
             window.pixels("02-cold-saved-offline")
         offline_settings(window)
@@ -491,7 +489,7 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
             window.pixels("01-seeded-cold-offline-account")
         window.click(SAVED)
         window.section(SAVED)
-        window.title("Offline mode")
+        window.absent("Offline mode", roles=("Text",))
         if pixels:
             window.pixels("02-seeded-cold-saved-offline")
         quiet(receipt, 0, "seeded cold admission")

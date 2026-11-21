@@ -307,17 +307,45 @@ impl Action {
     }
 }
 
-/// Presentation metadata for an occurrence in the local-only queue. Engine
-/// accepts Command::PlayOffline { queue: Vec<Item>, index, input: PlaybackInput,
-/// store: OfflineStore }. The optional crossfade may also verify one successor.
-#[derive(Clone)]
+/// Presentation metadata per local occurrence. Context identifies only a browse
+/// destination; it grants no server selection or mutation authority.
+#[derive(Clone, Default)]
 pub struct LocalTrack {
     pub id: String,
     pub title: String,
     pub subtitle: String,
     pub album_name: String,
     pub duration: f64,
+    pub music: crate::pages::MusicMetadata,
+    pub context: Option<LocalContext>,
+    pub recording: Option<crate::offline::Recording>,
 }
+
+#[derive(Clone)]
+pub struct LocalContext {
+    pub kind: &'static str,
+    pub id: String,
+    pub name: String,
+}
+impl LocalContext {
+    pub fn for_page(route: &crate::pages::Route, page: &crate::pages::Page) -> Option<Self> {
+        use crate::pages::Route;
+        let (kind, id) = match route {
+            Route::Album(id) => ("album", id),
+            Route::Artist(id) => ("artist", id),
+            Route::Playlist(id) if page.kind == "playlist-rules" => ("derived", id),
+            Route::Playlist(id) => ("playlist", id),
+            Route::SavedCollection(id) => ("saved", id),
+            _ => return None,
+        };
+        Some(Self {
+            kind,
+            id: id.clone(),
+            name: page.title.clone(),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalEntry {
     pub key: u64,
@@ -348,33 +376,12 @@ impl LocalQueue {
         self.position.and_then(|p| self.entries.get(p))
     }
     pub fn replace(&mut self, tracks: Vec<LocalTrack>, selected: usize, shuffle: bool) -> Change {
-        if selected >= tracks.len()
-            || !self
-                .next_key
-                .checked_add(tracks.len() as u64)
-                .is_some_and(key)
-            || !tracks.iter().all(|t| {
-                id(&t.id, 512)
-                    && text(&t.title, 1024)
-                    && text(&t.subtitle, 4096)
-                    && text(&t.album_name, 1024)
-                    && seconds(t.duration)
-            })
-        {
+        if selected >= tracks.len() {
             return Change::Invalid;
         }
-        let mut entries = tracks
-            .into_iter()
-            .enumerate()
-            .map(|(order, track)| {
-                self.next_key += 1;
-                LocalEntry {
-                    key: self.next_key,
-                    track,
-                    order,
-                }
-            })
-            .collect::<Vec<_>>();
+        let Some(mut entries) = self.allocate(tracks, 0) else {
+            return Change::Invalid;
+        };
         if shuffle {
             shuffle_entries(&mut entries);
         } else {
@@ -387,6 +394,55 @@ impl LocalQueue {
         self.shuffle = shuffle;
         self.pinned = false;
         self.select(0)
+    }
+    /// Append only. In an idle queue there is no selected track, no audio
+    /// operation, and no implied playback owner until an explicit transport action.
+    pub fn append(&mut self, tracks: Vec<LocalTrack>) -> Change {
+        let base = self
+            .entries
+            .iter()
+            .map(|e| e.order)
+            .max()
+            .map_or(0, |n| n + 1);
+        let Some(entries) = self.allocate(tracks, base) else {
+            return Change::Invalid;
+        };
+        self.entries.extend(entries);
+        Change::Edit
+    }
+    fn allocate(&mut self, tracks: Vec<LocalTrack>, base: usize) -> Option<Vec<LocalEntry>> {
+        if tracks.is_empty()
+            || !self
+                .next_key
+                .checked_add(tracks.len() as u64)
+                .is_some_and(key)
+            || !tracks.iter().all(|t| {
+                id(&t.id, 512)
+                    && text(&t.title, 1024)
+                    && text(&t.subtitle, 4096)
+                    && text(&t.album_name, 1024)
+                    && seconds(t.duration)
+            })
+        {
+            return None;
+        }
+        Some(
+            tracks
+                .into_iter()
+                .enumerate()
+                .map(|(i, track)| {
+                    self.next_key += 1;
+                    LocalEntry {
+                        key: self.next_key,
+                        track,
+                        order: base + i,
+                    }
+                })
+                .collect(),
+        )
+    }
+    pub fn upcoming_start(&self) -> usize {
+        self.position.map_or(0, |p| p + 1)
     }
     fn select(&mut self, position: usize) -> Change {
         self.position = Some(position);
@@ -445,6 +501,11 @@ impl LocalQueue {
                     Change::Stop
                 }
             }
+            Action::Resume | Action::Next
+                if self.position.is_none() && !self.entries.is_empty() =>
+            {
+                self.select(0)
+            }
             Action::Next => self.advance(false),
             Action::Previous if self.position.is_some() => {
                 let p = self.position.unwrap();
@@ -474,15 +535,16 @@ impl LocalQueue {
                 let Some(from) = self.upcoming(key) else {
                     return Change::Invalid;
                 };
-                let anchor = match after {
-                    Some(a) if a != key => self.upcoming(a),
-                    None => self.position,
-                    _ => None,
+                let to = match after {
+                    Some(a) if a != key => {
+                        let Some(anchor) = self.upcoming(a) else {
+                            return Change::Invalid;
+                        };
+                        if from < anchor { anchor } else { anchor + 1 }
+                    }
+                    None => self.upcoming_start(),
+                    _ => return Change::Invalid,
                 };
-                let Some(anchor) = anchor else {
-                    return Change::Invalid;
-                };
-                let to = if from < anchor { anchor } else { anchor + 1 };
                 if from != to {
                     let entry = self.entries.remove(from);
                     self.entries.insert(to, entry);
@@ -528,11 +590,10 @@ impl LocalQueue {
         }
     }
     fn upcoming(&self, key: u64) -> Option<usize> {
-        let pos = self.position?;
         self.entries
             .iter()
             .position(|e| e.key == key)
-            .filter(|i| *i > pos)
+            .filter(|i| *i >= self.upcoming_start())
     }
 }
 fn shuffle_entries(entries: &mut [LocalEntry]) {
@@ -563,7 +624,40 @@ mod tests {
             subtitle: "Synthetic".into(),
             album_name: "".into(),
             duration: 60.0,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn append_duplicates_stays_idle_until_transport_and_keeps_occurrences() {
+        let mut q = LocalQueue::default();
+        assert_eq!(
+            q.append(vec![track("same"), track("other"), track("same")]),
+            Change::Edit
+        );
+        let keys: Vec<_> = q.entries.iter().map(|e| e.key).collect();
+        assert!(keys.windows(2).all(|ks| ks[0] < ks[1]));
+        assert_eq!(q.upcoming_start(), 0);
+        assert!(q.current().is_none());
+        assert!(!q.desired);
+        assert_eq!(
+            q.action(Action::Move {
+                key: keys[2],
+                after: None
+            }),
+            Change::Edit
+        );
+        assert!(!q.desired);
+        assert_eq!(q.action(Action::Resume), Change::Start);
+        assert_eq!(q.current().unwrap().key, keys[2]);
+        assert_eq!(q.action(Action::Next), Change::Start);
+        assert_eq!(q.current().unwrap().key, keys[0]);
+        assert_eq!(q.action(Action::Next), Change::Start);
+        assert_eq!(q.current().unwrap().track.id, "other");
+        let mut idle = LocalQueue::default();
+        assert_eq!(idle.append(vec![track("next")]), Change::Edit);
+        assert_eq!(idle.action(Action::Next), Change::Start);
+        assert_eq!(idle.current().unwrap().track.id, "next");
     }
     #[test]
     fn account_choices_are_canonical_and_move_uses_zero_anchor() {
