@@ -206,6 +206,8 @@ pub struct Page {
     pub total: Option<u64>,
     pub music: MusicMetadata,
     pub picker_track_id: Option<String>,
+    /// The durable source read with a Saved playlist detail, not its mutable status.
+    pub(crate) saved_pin: Option<crate::playlist_pin_store::Target>,
     #[doc(hidden)]
     pub state: PageState,
 }

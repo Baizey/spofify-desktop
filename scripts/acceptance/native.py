@@ -543,8 +543,8 @@ def selected_desktop(snapshot):
 def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None, *,
                   playlist_actions_only=False, playlist_offline_only=False):
     from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
-                                  compact_queue, empty_devices, keyboard_playlist_menu, manual_options, open_manual,
-                                  pane_layout, playlist_back, playlist_hit_checks, playlist_row_menu,
+                                  compact_queue, empty_devices, manual_actions, open_manual,
+                                  pane_layout, playlist_back, playlist_editor_actions, playlist_hit_checks, playlist_row_menu,
                                   playlists_root, queue_state, real_playlist_actions, real_playlist_offline_actions,
                                   root_navigation, rules_editor, synthetic_playlist_actions, track_face,
                                   track_play_and_highlight, typed_catalog, wide_queue_toggle)
@@ -588,7 +588,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 window.click("Playlists")
                 open_manual(window)
                 save_fixture_track(window)
-                real_playlist_offline_actions(window, ready)
+                real_playlist_offline_actions(window, ready, offline_mode=MINIMUM)
             else:
                 print("REAL GO PLAYLIST ACTIONS ONLY — checks queue publication, not audio output", flush=True)
                 with native_observer(api) as observe:
@@ -615,19 +615,28 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             root_navigation(window, wide=True)
             playlist_back(window, wide=True)
             playlist_hit_checks(window)
+            from wire_ui import NEGATIVE_PLAYLISTS
+            rule_title = NEGATIVE_PLAYLISTS[1][0]["name"]
+            playlist_editor_actions(window, rule_title)
+            window.resize(MINIMUM)
+            check(window.dimensions()[0] == MINIMUM[0], "expected 480 logical px for playlist actions")
+            playlist_hit_checks(window)
+            playlist_editor_actions(window, rule_title)
+            open_manual(window)
+            manual_actions(window, capture="03-playlist-actions-480")
+            window.click("Back")
+            window.resize(DESKTOP)
             rules_editor(window, "03-rules-editor")
             typed_catalog(window, DESKTOP[0], capture=True, via_shortcut=True)
             check_shortcut_back(window)
             open_manual(window)
-            manual_options(window, capture="04-playlist-menu-1910")
-            keyboard_playlist_menu(window)
+            manual_actions(window, capture="04-playlist-actions-1910")
             playlist_row_menu(window)
-            window.pixels("04-manual-playlist", DESKTOP[0])
             wide_queue_toggle(window, lambda: window.title(PLAYLIST), can_go_back=True)
             window.resize(COMPACT)
             pane_layout(window, wide=False, can_go_back=True)
             compact_queue(window, lambda: window.title(PLAYLIST), capture="05-queue-empty-compact")
-            manual_options(window, capture="05-playlist-menu-640")
+            manual_actions(window, capture="05-playlist-actions-640")
             window.click("Back")
             window.find(f"Open {PLAYLIST}", roles=("Button",))
             typed_catalog(window, COMPACT[0], capture=True, check_compact_targets=True)
@@ -635,10 +644,10 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             window.find("Work offline", roles=("Button",))
             window.find("Standard", roles=("Button",))
             window.pixels("06-settings-compact", COMPACT[0])
+            # Give the duplicate-row gestures room to use the actual hit targets,
+            # independent of how the direct actions wrap in the compact checks.
+            window.resize(DESKTOP)
             track_play_and_highlight(window, ready["play_requests"])
-            # The matrix has eight list rows, including the stock manual playlist.
-            if window.window_properties()["size"]["width"] != DESKTOP[0]:
-                window.resize(DESKTOP)
             synthetic_playlist_actions(window, ready["play_requests"])
             print("PASS workspace interaction against Go-shaped wire data (no playback execution)", flush=True)
             return
@@ -669,7 +678,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                     compact_queue(window, restore_playlists, capture="05-queue-empty-compact")
             window.resize(DESKTOP)
             open_manual(window)
-            manual_options(window)
+            manual_actions(window)
             window.pixels("03-manual-playlist", DESKTOP[0])
             manual = next(t for t in ready["targets"] if t["kind"] == "playlist" and t["name"] == PLAYLIST)
             with Peer(api, name="Acceptance occurrence readback") as reader:

@@ -1,7 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 import { Copy, EmptyState, Hero, MediaLine, PlaylistPager } from "catalog.slint";
-import { OverflowMenu } from "overflow-menu.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
 import { DockLayout, PlayerBar } from "playback.slint";
@@ -14,12 +13,23 @@ export { ArtistCredit, DeviceRow }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
-    credits: [ArtistCredit], album-id: string, album-name: string, track-id: string,
+    credits: [ArtistCredit], album-id: string, album-name: string, track-id: string, playlist-pinned: bool,
 }
 export struct QueueRow {
     key: string, track-id: string, title: string, subtitle: string, current: bool, upcoming: bool,
     credits: [ArtistCredit], album-id: string, album-name: string,
 }
+
+export struct PlaylistActions {
+    play: bool, queue: bool, offline-action: string, rename: bool, rules: bool, remove-action: string,
+}
+
+component PlaylistAction inherits Action {
+    in property <int> resume;
+    in property <bool> restore;
+    changed resume => { if self.restore { self.take-focus(); } }
+}
+
 export component AppWindow inherits Window {
     title: "Spofify Desktop";
     icon: @image-url("../assets/spofify-logo.svg");
@@ -86,7 +96,7 @@ export component AppWindow inherits Window {
     in property <bool> has-more;
     in property <bool> can-back;
     in property <[string]> page-actions;
-    in property <[string]> page-options;
+    in property <PlaylistActions> playlist-actions;
     in property <int> saved-pin-focus-serial;
     callback navigate(string);
     callback row-action(string, int);
@@ -96,9 +106,9 @@ export component AppWindow inherits Window {
     in-out property <string> form-name;
     in-out property <string> form-description;
     in-out property <string> form-value;
-    in property <string> form-error;
+    in-out property <string> form-error;
     in property <bool> form-busy;
-    in property <string> form-help;
+    in-out property <string> form-help;
 
     in property <string> now-track-id;
     in property <string> now-album-id;
@@ -175,7 +185,8 @@ export component AppWindow inherits Window {
     property <bool> queue-controls: local-mode ? local-playback && can-control : remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
-    property <string> form-return;
+    in-out property <string> form-return;
+    property <string> saved-removal-key;
     property <int> form-focus-serial;
     changed wide => { root.compact-queue-open = false; }
     changed signed-in => {
@@ -195,6 +206,23 @@ export component AppWindow inherits Window {
         root.form-mode = mode;
         if mode != "remove-saved" { root.page-action("prepare-" + mode, ""); }
     }
+    public function show-playlist-editor(key: string, mode: string, name: string, description: string, rules: string, help: string) {
+        if root.page-key == key && root.is-playlist && !root.editor-open && !root.compact-queue-open && !root.local-mode {
+            root.form-return = mode;
+            root.form-name = name;
+            root.form-description = description;
+            root.form-value = rules;
+            root.form-help = mode == "rules" ? help : "";
+            root.form-error = "";
+            root.form-mode = mode;
+        }
+    }
+    function confirm-saved-removal(action: string) {
+        root.edit-form("remove-saved");
+        root.form-return = action;
+        root.saved-removal-key = root.page-key;
+        root.form-error = "";
+    }
     function cancel-form() {
         if root.form-mode != "device-rename" && root.form-mode != "remove-saved" { root.page-action("cancel-form", root.form-mode); }
         root.form-mode = "";
@@ -204,12 +232,17 @@ export component AppWindow inherits Window {
     }
     function submit-form() {
         if root.form-mode == "device-rename" { root.device-action("rename", root.form-name); }
-        else if root.form-mode == "remove-saved" { root.form-mode = ""; root.page-action("remove", ""); }
+        else if root.form-mode == "remove-saved" {
+            if root.saved-removal-key == root.page-key
+                && (root.form-return == root.playlist-actions.remove-action || root.form-return == root.playlist-actions.offline-action) {
+                root.page-action(root.form-return, "");
+            } else { root.form-error = "This saved collection changed. Close the confirmation and open it again."; }
+        }
         else { root.page-action(root.form-mode, root.form-mode == "rules" || root.form-mode == "new-rules" ? root.form-value : root.form-mode == "delete" ? "" : root.form-name); }
     }
     function catalog-action(action: string) {
-        if action == "new-manual" || action == "new-rules" || action == "rename" || action == "rules" || action == "delete" { root.edit-form(action); }
-        else if action == "remove" { root.edit-form("remove-saved"); }
+        if action == "new-manual" || action == "new-rules" { root.edit-form(action); }
+        else if action == "remove" { root.confirm-saved-removal(action); }
         else { root.page-action(action, ""); }
     }
 
@@ -323,15 +356,15 @@ export component AppWindow inherits Window {
         changed editing => {
             if !self.editing {
                 // The browse view is still mounted. Focus the action that opened the editor if it survived.
-                if playlist-menu.actions.length > 0 { playlist-menu.take-focus(); }
-                else if back-row.visible { back-button.take-focus(); }
+                if back-row.visible { back-button.take-focus(); }
                 else { rail.restore-focus(); }
                 root.form-focus-serial += 1;
             }
         }
         property <int> saved-pin-focus: root.saved-pin-focus-serial;
         changed saved-pin-focus => {
-            if root.page-kind == "offline" && !root.editor-open && !root.compact-queue-open { rail.restore-focus(); }
+            if (root.page-kind == "offline" || (root.page-kind == "playlists" && root.local-mode))
+                && !root.editor-open && !root.compact-queue-open { rail.restore-focus(); }
         }
         function toggle-queue(by-pointer: bool) {
             if root.editor-open { return; }
@@ -550,30 +583,82 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            page-tools := HorizontalLayout {
-                                property <bool> has-primary: root.page-actions.length > 0 && (!root.local-mode || root.saved-view);
-                                property <bool> has-menu: playlist-menu.actions.length > 0;
-                                visible: self.has-primary || self.has-menu;
-                                spacing: self.has-menu ? 8px : 0px;
-                                FlexboxLayout {
-                                    flex-wrap: wrap; spacing: 6px; horizontal-stretch: 1;
-                                    for action in !root.local-mode || root.saved-view ? root.page-actions : []: Action {
-                                        text: Copy.action-label(action); icon: Copy.action-mark(action); primary: action == "play" || action == "new-manual";
-                                        enabled: action != "play" || !root.saved-view || root.can-play-local;
-                                        property <int> resume: root.form-focus-serial;
-                                        changed resume => { if root.form-return == action || (action == "remove" && root.form-return == "remove-saved") { self.take-focus(); } }
-                                        clicked => { root.catalog-action(action); }
+                            if root.page-actions.length > 0 && (!root.local-mode || root.saved-view): FlexboxLayout {
+                                flex-wrap: wrap; spacing: 6px;
+                                for action in root.page-actions: Action {
+                                    text: Copy.action-label(action); icon: Copy.action-mark(action); primary: action == "play" || action == "new-manual";
+                                    enabled: action != "play" || !root.saved-view || root.can-play-local;
+                                    property <int> resume: root.form-focus-serial;
+                                    changed resume => { if root.form-return == action { self.take-focus(); } }
+                                    clicked => { root.catalog-action(action); }
+                                }
+                            }
+                            if root.is-playlist || root.page-kind == "saved-collection": playlist-tools := FlexboxLayout {
+                                flex-wrap: wrap; spacing: 8px;
+                                property <bool> online: !root.local-mode;
+                                property <string> scope: root.page-key + "|" + root.browse-model-key;
+                                property <bool> play: root.playlist-actions.play && (self.online || root.page-kind == "saved-collection");
+                                property <bool> queue: root.playlist-actions.queue && self.online;
+                                property <bool> rename: root.playlist-actions.rename && self.online;
+                                property <bool> rules: root.playlist-actions.rules && self.online;
+                                property <string> offline-action: root.playlist-actions.offline-action == "unpin-playlist" || self.online ? root.playlist-actions.offline-action : "";
+                                property <string> remove-action: self.online || root.page-kind == "saved-collection" ? root.playlist-actions.remove-action : "";
+                                visible: self.play || self.queue || self.rename || self.rules || self.offline-action != "" || self.remove-action != "";
+                                if playlist-tools.play: Action {
+                                    text: "Play"; icon: "▶"; primary: true;
+                                    click-scope: playlist-tools.scope;
+                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
+                                    clicked => { root.page-action("play", ""); }
+                                }
+                                if playlist-tools.queue: Action {
+                                    text: "Add to queue";
+                                    click-scope: playlist-tools.scope;
+                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
+                                    clicked => { root.page-action("queue", ""); }
+                                }
+                                if playlist-tools.offline-action != "": PlaylistAction {
+                                    text: Copy.action-label(playlist-tools.offline-action);
+                                    accessible-checkable: true;
+                                    accessible-checked: playlist-tools.offline-action == "unpin-playlist";
+                                    click-scope: playlist-tools.scope + "|" + playlist-tools.offline-action;
+                                    resume: root.form-focus-serial;
+                                    restore: root.form-return == "unpin-playlist";
+                                    changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + self.y, self.height); } }
+                                    clicked => {
+                                        if playlist-tools.offline-action == "unpin-playlist" { root.confirm-saved-removal("unpin-playlist"); }
+                                        else { root.page-action("pin-playlist", ""); }
                                     }
                                 }
-                                playlist-menu := OverflowMenu {
-                                    actions: root.is-playlist && root.local-mode ? [] : root.page-options;
-                                    width: self.actions.length > 0 ? 37px : 0px;
-                                    height: self.actions.length > 0 ? 38px : 0px;
-                                    visible: self.actions.length > 0;
-                                    label: "Manage playlist"; open-label: "Hide playlist options";
-                                    context-key: root.page-key + "|" + root.catalog-title;
-                                    window-height: root.height;
-                                    action(op) => { root.catalog-action(op); }
+                                if playlist-tools.rename || playlist-tools.rules: management := HorizontalLayout {
+                                    spacing: 8px; alignment: start; horizontal-stretch: 0;
+                                    if playlist-tools.rename: PlaylistAction {
+                                        text: "Rename"; click-scope: playlist-tools.scope;
+                                        resume: root.form-focus-serial; restore: root.form-return == "rename";
+                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + management.y + self.y, self.height); } }
+                                        clicked => { root.page-action("edit-rename", ""); }
+                                    }
+                                    if playlist-tools.rules: PlaylistAction {
+                                        text: "Edit rules"; click-scope: playlist-tools.scope;
+                                        resume: root.form-focus-serial; restore: root.form-return == "rules";
+                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + management.y + self.y, self.height); } }
+                                        clicked => { root.page-action("edit-rules", ""); }
+                                    }
+                                }
+                                if playlist-tools.remove-action != "": destructive := HorizontalLayout {
+                                    spacing: 8px; horizontal-stretch: 0;
+                                    if playlist-tools.play || playlist-tools.queue || playlist-tools.offline-action != "" || playlist-tools.rename || playlist-tools.rules: Rectangle {
+                                        width: 1px; background: Theme.line; accessible-role: none;
+                                    }
+                                    PlaylistAction {
+                                        text: playlist-tools.remove-action == "remove" ? "Remove from Saved" : Copy.action-label(playlist-tools.remove-action);
+                                        quiet: true; click-scope: playlist-tools.scope + "|" + playlist-tools.remove-action;
+                                        resume: root.form-focus-serial; restore: root.form-return == playlist-tools.remove-action;
+                                        changed has-focus => { if self.has-focus { catalog-scroll.reveal(catalog.y + playlist-tools.y + destructive.y + self.y, self.height); } }
+                                        clicked => {
+                                            if playlist-tools.remove-action == "delete" { root.page-action("edit-delete", ""); }
+                                            else { root.confirm-saved-removal(playlist-tools.remove-action); }
+                                        }
+                                    }
                                 }
                             }
                             if root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
@@ -697,9 +782,15 @@ export component AppWindow inherits Window {
                                             compact: main.width < 435px;
                                             window-height: root.height;
                                             menu-key: root.page-key + "|" + root.browse-model-key + "|" + self.index;
-                                            actions: root.page-kind == "picker" ? [] : !root.local-mode || root.page-kind == "offline" ? self.entry.actions : [];
+                                            actions: root.page-kind == "picker" ? []
+                                                : !root.local-mode || root.page-kind == "offline" ? self.entry.actions
+                                                : root.page-kind == "playlists" && self.entry.playlist-pinned ? ["unpin-playlist"] : [];
                                             focused => { catalog-scroll.reveal(catalog.y + catalog-list.y + row-window.y + shelf-row.y + self.y, self.height); }
-                                            action(op) => { shell.browse(op, self.index); }
+                                            action(op) => {
+                                                if root.page-kind == "playlists" && (op == "rename" || op == "rules" || op == "delete") {
+                                                    shell.browse("edit-" + op, self.index);
+                                                } else { shell.browse(op, self.index); }
+                                            }
                                             page-action(op, id) => { shell.entity(op, id); }
                                         }
                                     }

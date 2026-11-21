@@ -91,27 +91,36 @@ pub(crate) async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> 
             expired: false,
         });
     }
-    if let Some(member) = record.committed {
+    let target = record.target;
+    let mut page = if let Some(member) = record.committed {
         let access = access.clone();
-        return disk(move || {
-            collections::saved_playlist_page(
-                &access,
-                member.title,
-                record.target.kind,
-                member.tracks,
-            )
-        })
-        .await;
+        let kind = target.kind;
+        disk(move || collections::saved_playlist_page(&access, member.title, kind, member.tracks))
+            .await?
+    } else {
+        match collections::detail(access, id).await {
+            Err(e) if e.status == 404 => Page {
+                title: target.title.clone(),
+                kind: "saved-collection".into(),
+                status: "Pending".into(),
+                ..Page::default()
+            },
+            other => other?,
+        }
+    };
+    page.saved_pin = Some(target);
+    Ok(page)
+}
+
+pub(crate) async fn remove_legacy(access: &Access, id: &str) -> Result<(), ApiError> {
+    if record(access, id).await?.is_some() {
+        return Err(ApiError {
+            message: "This saved collection changed. Close the confirmation and open it again.",
+            expired: false,
+            status: 409,
+        });
     }
-    match collections::detail(access, id).await {
-        Err(e) if e.status == 404 => Ok(Page {
-            title: record.target.title,
-            kind: "saved-collection".into(),
-            status: "Pending".into(),
-            ..Page::default()
-        }),
-        other => other,
-    }
+    collections::remove(access, id).await
 }
 
 pub(crate) async fn remove(

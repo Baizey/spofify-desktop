@@ -4,8 +4,8 @@ import re
 from time import monotonic, sleep
 
 from fixture import Failure, check
-from native import (ALT, CONTROL, DESKTOP, END, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
-                    RETURN, SAVED, TRACK, bounds, element_id, element_type, wait)
+from native import (ALT, CONTROL, DESKTOP, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
+                    RETURN, SAVED, TRACK, assert_disjoint, bounds, contains, element_id, element_type, wait)
 from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
                      LARGE_MANUAL, LARGE_PLAYLIST_COUNT, LARGE_RULE, NAME_ONLY,
                      NEGATIVE_PLAYLISTS, SINGLE_TRACK, SUMMARY)
@@ -37,63 +37,106 @@ def playlist_option(action, title):
     return re.escape(f"{action} · {title}")
 
 
-def offline_option(window, title=None, *, saved=False):
+def playlist_option_trigger(title):
+    return re.escape(f"Show actions for {title}")
+
+
+EDITORS = {"Rename": ("Rename playlist", "Playlist name"),
+           "Edit rules": ("Edit playlist rules", "Playlist rules definition"),
+           "Delete": ("Delete this playlist?", None)}
+DETAIL_ACTIONS = ("Play", "Add to queue", "Save offline", "Remove offline save",
+                  "Remove from Saved", *EDITORS)
+
+
+def row_offline_option(window, title, *, saved=False):
     action = "Remove offline save" if saved else "Save offline"
-    label = playlist_option(action, title) if title else action
+    label = playlist_option(action, title)
     item = window.find(label, roles=("Button",))
     check(item.get("accessibleCheckable") and item.get("accessibleChecked", False) == saved,
           f"wrong accessible offline state for {label}")
+    window.absent(playlist_option("Save offline" if saved else "Remove offline save", title), roles=("Button",))
     return label
 
 
-def manual_options(window, *, capture=None):
-    management = "Rename|Delete|Edit rules|Save offline"
-    window.absent(management, roles=("Button",))
-    window.click("Manage playlist")
-    trigger = window.find("Hide playlist options", timeout=3, roles=("Button",))
-    window.find("Delete", timeout=3, roles=("Button",))
-    offline_option(window)
-    window.absent("Edit rules", roles=("Button",))
+def detail_actions(window, expected, *, optional=()):
+    def read():
+        elements = window.elements()
+        toolbar = element_id(elements, "playlist-tools")
+        if toolbar is None:
+            return None
+        buttons = [e for e in window.subtree(toolbar) if e.get("accessibleRole") == "Button"]
+        labels = [e.get("accessibleLabel") for e in buttons]
+        return (elements, toolbar, buttons, labels) if all(label in labels for label in expected) else None
+
+    elements, toolbar, buttons, labels = wait(f"direct detail actions {expected}", read)
+    check(len(labels) == len(set(labels)) and set(labels) <= set(expected) | set(optional),
+          f"unexpected or duplicate detail actions: {labels}")
+    window.absent(r"Manage playlist|Hide playlist options", roles=("Button",))
+    generic_tools = element_id(elements, "page-tools")
+    if generic_tools:
+        check(not any(e.get("accessibleRole") == "Button" for e in window.subtree(generic_tools)),
+              "generic page tools duplicate the playlist detail actions")
+    viewport = element_id(elements, "catalog-scroll")
+    check(viewport, "missing playlist detail viewport")
+    for label, button in zip(labels, buttons):
+        x, y, right, bottom = bounds(button)
+        check(right - x >= 36 and bottom - y >= 36 and contains(toolbar, button) and contains(viewport, button),
+              f"detail action {label} is undersized or clipped: {bounds(button)}")
+        if label in expected:
+            check(button.get("accessibleEnabled", True), f"detail action {label} is disabled")
+        if label == "Save offline" or (label == "Remove offline save" and "Rename" in expected):
+            check(button.get("accessibleCheckable") and button.get("accessibleChecked", False) == (label != "Save offline"),
+                  f"wrong accessible offline state for direct action {label}")
+    assert_disjoint(list(zip(labels, buttons)))
+    if "Play" in expected:
+        x, y, _, _ = bounds(buttons[0])
+        check(labels[0] == "Play" and all(top >= y - 1 and (top > y + 1 or left >= x - 1)
+                                         for left, top, _, _ in map(bounds, buttons)),
+              "detail Play is not the leading action")
+    # The playback dock can have its own Play button. The other unsuffixed
+    # labels belong to the detail toolbar, not to track rows or other tools.
+    for label in DETAIL_ACTIONS[1:]:
+        count = sum(window.matches(e, re.escape(label)) and e.get("accessibleRole") == "Button" for e in elements)
+        check(count == labels.count(label), f"{label} is duplicated outside the detail actions")
+    return dict(zip(labels, buttons))
+
+
+def editor_actions(summary):
+    caps = summary["capabilities"]
+    return tuple(action for action, allowed in (("Rename", caps["editMetadata"]),
+                 ("Edit rules", summary["kind"] == "derived" and caps["editDefinition"]),
+                 ("Delete", caps["delete"])) if allowed)
+
+
+def cancel_and_reopen_editor(window, title, action, activate):
+    heading, field = EDITORS[action]
+
+    def opened():
+        window.title(heading)
+        if field:
+            item = window.find(field, roles=("TextInput",))
+            if action == "Rename":
+                check(item.get("accessibleValue") == title, "Rename opened for the wrong playlist")
+        window.find("Cancel", roles=("Button",))
+
+    activate()
+    opened()  # Row editors open asynchronously after routing to detail.
+    window.key(RETURN if action == "Delete" else ESCAPE)
+    window.title(title)
+    window.find(action, roles=("Button",))
+    window.absent("Cancel", roles=("Button",))
+    window.key(RETURN)  # Do not click or refocus the detail action.
+    opened()
+    window.key(ESCAPE)
+    window.title(title)
+    window.absent("Cancel", roles=("Button",))
+
+
+def manual_actions(window, *, capture=None):
+    detail_actions(window, ("Play", "Add to queue", "Save offline", "Rename", "Delete"))
     if capture:
         window.pixels(capture)
-    x, y = window.pointer_position_for_click("Rename")
-    _, top, right, bottom = bounds(trigger)
-    width, height = window.dimensions()
-    check(0 < x < width and 0 < y < height and 50 < right - x < 185
-          and (0 < y - bottom < 95 or 0 < top - y < 125),
-          f"rendered Rename target {x:g},{y:g} is not anchored to playlist menu {bounds(trigger)}")
-    window.title("Rename playlist")
-    window.find("Playlist name", roles=("TextInput",))
-    window.click("Cancel")
-    window.title(PLAYLIST)
-    window.absent(management, roles=("Button",))
-    window.click("Manage playlist")
-    window.find("Rename", timeout=3, roles=("Button",))
-    window.click("Hide playlist options")
-    window.title(PLAYLIST)
-    window.absent(management, roles=("Button",))
-    print("PASS manual playlist overflow offers Save offline, activates Rename and dismisses without navigating",
-          flush=True)
-
-
-def keyboard_playlist_menu(window):
-    # Clicking the trigger transfers focus to the popup; Escape must restore
-    # it to that trigger without spending a Back entry. No refocus/fallback.
-    management = "Rename|Delete|Save offline"
-    window.click("Manage playlist")
-    window.find("Save offline", timeout=3, roles=("Button",))
-    window.key(ESCAPE)
-    window.title(PLAYLIST)
-    window.absent(management, roles=("Button",))
-    window.key(RETURN)
-    window.find("Save offline", timeout=3, roles=("Button",))
-    window.key(END)
-    window.key(RETURN)
-    window.title("Delete this playlist?")
-    window.click("Cancel")
-    window.title(PLAYLIST)
-    window.absent(management, roles=("Button",))
-    print("PASS Escape restores detail trigger focus, Return reopens, End/Return opens Delete confirmation", flush=True)
+    print(f"PASS {window.dimensions()[0]:g}px manual playlist has single direct actions", flush=True)
 
 
 def playlist_case_actions(window, summary, activate=None, *, capture=None):
@@ -108,9 +151,17 @@ def playlist_case_actions(window, summary, activate=None, *, capture=None):
         window.find(row_play, roles=("Button",))
     else:
         window.absent(row_play, roles=("Button",))
-    window.click(f"Show actions for {label}")
-    offline_option(window, title)
-    window.click(f"Hide actions for {label}")
+    window.click(playlist_option_trigger(title))
+    row_offline_option(window, title)
+    row_actions = (*EDITORS, "Add to queue")
+    expected_row = set(editor_actions(summary)) | ({"Add to queue"} if playable else set())
+    for action in row_actions:
+        pattern = playlist_option(action, title)
+        if action in expected_row:
+            window.find(pattern, roles=("Button",))
+        else:
+            window.absent(pattern, roles=("Button",))
+    window.key(ESCAPE)
     if activate and playable:
         activate(lambda: window.click(row_play))
 
@@ -118,29 +169,13 @@ def playlist_case_actions(window, summary, activate=None, *, capture=None):
     window.title(title)
     if not count:
         window.title("No items here yet")
-    # Wait for committed detail capabilities rather than asserting against a
-    # placeholder with no buttons. Scope Play to the toolbar, not the dock.
-    window.find("Manage playlist", roles=("Button",))
-
-    def toolbar_play():
-        toolbar = element_id(window.elements(), "page-tools")
-        check(toolbar, "missing playlist detail toolbar")
-        return next((e for e in window.subtree(toolbar) if window.matches(e, "Play")
-                     and e.get("accessibleRole") == "Button"), None)
-
-    if playable:
-        check(wait(f"detail Play for {title}", toolbar_play).get("accessibleEnabled", True),
-              f"playlist detail Play disabled for {title}")
-    else:
-        check(toolbar_play() is None, f"unexpected playlist detail Play for {title}")
-    window.absent("Save offline|Remove offline save", roles=("Button",))
-    window.click("Manage playlist")
-    offline_option(window)
+    # The direct Save action is also a readiness fence for committed detail.
+    actions = detail_actions(window, (*(("Play", "Add to queue") if playable else ()),
+                                      "Save offline", *editor_actions(summary)))
     if capture and window.output:
         window.pixels(capture, DESKTOP[0])
-    window.click("Hide playlist options")
     if activate and playable:
-        activate(lambda: window.click_element(wait(f"detail Play for {title}", toolbar_play)))
+        activate(lambda: window.click_element(actions["Play"]))
     window.click("Back")
     playlists_root(window)
 
@@ -238,7 +273,18 @@ def real_playlist_actions(window, api, ready):
           flush=True)
 
 
-def real_playlist_offline_actions(window, ready):
+def cancel_remove_confirmation(window, title, action="Remove offline save"):
+    window.click(action)
+    window.title("Remove this saved collection?")
+    window.find("Remove from Saved", roles=("Button",))
+    window.find("Cancel", roles=("Button",))
+    window.key(RETURN)  # The default must cancel, never remove the pin.
+    window.title(title)
+    window.find(action, roles=("Button",))
+    window.absent("Cancel", roles=("Button",))
+
+
+def real_playlist_offline_actions(window, ready, *, offline_mode):
     # Use the smaller stock rule playlist for a bounded sync. Check durable
     # intent in both menus, not completion of the background media transfer.
     open_playlists(window)
@@ -247,8 +293,8 @@ def real_playlist_offline_actions(window, ready):
     label = re.escape(name)
     window.click(f"Open {label}")
     window.title(name)
-    window.click("Manage playlist")
-    window.click(offline_option(window))
+    detail_actions(window, ("Play", "Add to queue", "Save offline", "Rename", "Edit rules", "Delete"))
+    window.click("Save offline")
 
     def visit_saved():
         def open_section():
@@ -265,23 +311,19 @@ def real_playlist_offline_actions(window, ready):
         wait("Saved offline listing after durable playlist change", open_section)
 
     def row_toggle(saved):
-        window.click(f"Show actions for {label}")
-        offline_option(window, name, saved=saved)
-        opposite = "Save offline" if saved else "Remove offline save"
-        window.absent(playlist_option(opposite, name), roles=("Button",))
+        window.click(playlist_option_trigger(name))
+        row_offline_option(window, name, saved=saved)
         if saved and window.output:
-            window.pixels("playlist-actions-real-row-saved", DESKTOP[0])
+            window.pixels("playlist-actions-real-row-saved")
         window.key(ESCAPE)
 
     def detail_toggle(saved):
         window.click(f"Open {label}")
         window.title(name)
-        window.click("Manage playlist")
-        offline_option(window, saved=saved)
-        window.absent("Save offline" if saved else "Remove offline save", roles=("Button",))
+        detail_actions(window, ("Play", "Add to queue", "Remove offline save" if saved else "Save offline",
+                                "Rename", "Edit rules", "Delete"))
         if not saved and window.output:
-            window.pixels("playlist-actions-real-detail-unsaved", DESKTOP[0])
-        window.key(ESCAPE)
+            window.pixels("playlist-actions-real-detail-unsaved")
 
     visit_saved()
     window.find(f"Open {label}", roles=("Button",))
@@ -289,25 +331,31 @@ def real_playlist_offline_actions(window, ready):
     open_playlists(window)
     row_toggle(saved=True)
     detail_toggle(saved=True)
-    print("PASS online playlist row and detail menus mark Remove offline save as checked", flush=True)
+    cancel_remove_confirmation(window, name)
+    detail_actions(window, ("Play", "Add to queue", "Remove offline save", "Rename", "Edit rules", "Delete"))
+    print("PASS online row reflects durable pin; direct detail removal asks for confirmation with Cancel first", flush=True)
 
     window.click("Settings")
     window.title("Settings")
     window.click("Work offline")
     visit_saved()
+    window.resize(offline_mode)
+    check(window.dimensions()[0] == offline_mode[0], f"expected {offline_mode[0]} logical px for Saved detail")
     window.title("Offline mode")
     window.click(f"Show actions for {label}")
-    offline_option(window, name, saved=True)
+    row_offline_option(window, name, saved=True)
     window.key(ESCAPE)
     window.click(f"Open {label}")
     window.title(name)
     window.title("Offline mode")
-    window.click("Manage playlist")
-    remove = offline_option(window, saved=True)
-    print("PASS explicit Work offline keeps the checked action in Saved row and detail menus", flush=True)
+    detail_actions(window, ("Remove offline save",), optional=("Play",))
+    print("PASS explicit Work offline keeps the checked Saved row action and direct detail removal", flush=True)
     if window.output:
-        window.pixels("playlist-actions-real-offline-detail-saved", DESKTOP[0])
-    window.click(remove)
+        window.pixels("playlist-actions-real-offline-detail-saved")
+    cancel_remove_confirmation(window, name)
+    window.key(RETURN)  # Reopen from the restored direct removal action.
+    window.title("Remove this saved collection?")
+    window.click("Remove from Saved")
     window.title(SAVED)  # A successful removal returns to the listing itself.
     window.section(SAVED)
     window.absent("Back", roles=("Button",))
@@ -329,6 +377,34 @@ def real_playlist_offline_actions(window, ready):
     detail_toggle(saved=False)
     print("PASS real Go fixture: online row/detail reflect durable Save; offline detail removes only the playlist; "
           "both online toggles return to Save offline", flush=True)
+
+    # The Go fixture has no legacy saved playlist. Save its stock album through
+    # the UI to reach the same legacy Saved Collection detail/remove path.
+    album = next(t["name"] for t in ready["targets"] if t["kind"] == "album")
+    album_label = re.escape(album)
+    open_playlists(window)
+    open_manual(window)
+    window.click(f"Open album: {album_label}")
+    window.title(album)
+    window.click("Save offline")
+    window.find(r"Saved (?:all \d+ tracks on this device\.|\d+ of \d+ tracks\. Some audio is unavailable\.)",
+                roles=("Text",), timeout=60)
+    window.click("Settings")
+    window.click("Work offline")
+    visit_saved()
+    window.click(f"Open {album_label}")
+    window.title(album)
+    detail_actions(window, ("Remove from Saved",), optional=("Play",))
+    cancel_remove_confirmation(window, album, "Remove from Saved")
+    window.key(RETURN)
+    window.title("Remove this saved collection?")
+    window.click("Remove from Saved")
+    window.title(SAVED)
+    window.section(SAVED)
+    window.absent("Back", roles=("Button",))
+    window.find(f"Play track: {TRACK}", roles=("Button",))
+    window.absent(f"Open {album_label}", roles=("Button",))
+    print("PASS legacy Saved detail confirms removal and retains the independently saved track", flush=True)
 
 
 def playlist_row_menu(window):
@@ -386,7 +462,6 @@ def committed_playlist_edits(window, api):
             window.absent("Cancel|Working…", roles=("Button",))
 
             phase = "rename"
-            window.click("Manage playlist")
             window.click("Rename")
             window.title("Rename playlist")
             editor = wait("rename editor loaded current committed name", lambda: next((e for e in window.elements()
@@ -407,7 +482,6 @@ def committed_playlist_edits(window, api):
                       "fresh real socket did not read back the renamed playlist")
 
             phase = "delete"
-            window.click("Manage playlist")
             window.click("Delete")
             window.title("Delete this playlist?")
             window.click("Delete playlist")
@@ -783,14 +857,40 @@ def playlists_root(window):
 
 
 def playlist_hit_checks(window):
-    for region in ("icon", "subtitle", "whitespace"):
+    viewport = element_id(window.elements(), "catalog-scroll")
+    check(viewport, "missing playlist list viewport")
+    left, _, right, _ = bounds(viewport)
+    regions = ("subtitle", "whitespace") if right - left < 435 else ("icon", "subtitle", "whitespace")
+    for region in regions:
         playlist_open_by_pointer(window, region)
     playlist_overflow(window)
 
 
+def playlist_editor_actions(window, rule_title):
+    for title, actions in ((PLAYLIST, ("Rename", "Delete")), (rule_title, ("Edit rules",))):
+        for action in actions:
+            open_playlists(window)
+            window.click(playlist_option_trigger(title))
+            cancel_and_reopen_editor(window, title, action, lambda: window.click(playlist_option(action, title)))
+            window.click("Back")
+            playlists_root(window)
+        window.click(re.escape(f"Open {title}"))
+        window.title(title)
+        if title == PLAYLIST:
+            manual_actions(window)
+        else:
+            detail_actions(window, ("Save offline", "Rename", "Edit rules", "Delete"))
+        for action in actions:
+            cancel_and_reopen_editor(window, title, action, lambda: window.click(action))
+        window.click("Back")
+        playlists_root(window)
+    print(f"PASS {window.dimensions()[0]:g}px row and direct editors open, cancel and restore the detail action",
+          flush=True)
+
+
 def playlist_hit_targets(window):
     play = window.find(f"Play {PLAYLIST}", roles=("Button",))
-    overflow = window.find(f"Show actions for {PLAYLIST}", roles=("Button",))
+    overflow = window.find(playlist_option_trigger(PLAYLIST), roles=("Button",))
     px, py, pr, pb = bounds(play)
     ox, oy, oright, ob = bounds(overflow)
     check(px < pr <= ox < oright and py < pb and oy < ob, "playlist Play and overflow hit targets overlap")
@@ -831,15 +931,22 @@ def playlist_overflow(window):
     _, play, overflow = playlist_hit_targets(window)
     point = window.pointer_position_for_click("playlist overflow", element=overflow)
     check(inside(point, overflow) and not inside(point, play), "playlist overflow press hit the Play target")
-    window.find(playlist_option("Add to queue", PLAYLIST), roles=("Button",))
-    save = playlist_option("Save offline", PLAYLIST)
-    window.find(save, roles=("Button",))
+    save = row_offline_option(window, PLAYLIST)
+    width, height = window.dimensions()
+    for action in ("Add to queue", "Save offline", "Rename", "Delete"):
+        label = playlist_option(action, PLAYLIST)
+        button = window.find(label, roles=("Button",))
+        x, y, right, bottom = bounds(button)
+        check(0 <= x < right <= width + 1 and 0 <= y < bottom <= height + 1,
+              f"playlist row action {label} is clipped: {bounds(button)}")
+    window.absent(playlist_option("Edit rules", PLAYLIST), roles=("Button",))
     window.key(ESCAPE)
     playlists_root(window)
     window.absent(save, roles=("Button",))
     window.key(RETURN)
     window.find(save, roles=("Button",))
-    window.click(f"Hide actions for {PLAYLIST}")
+    window.key(ESCAPE)
+    window.find(playlist_option_trigger(PLAYLIST), roles=("Button",))
     window.absent(save, roles=("Button",))
     window.absent(r"Now playing: .+", roles=("Button",))
     print(f"PASS {window.dimensions()[0]:g}px playlist row overflow offers Save offline and restores focus on Escape",
