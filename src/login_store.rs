@@ -22,7 +22,7 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api::{Origin, RememberedCredential},
+    api::{Origin, RememberedCredential, RememberedLogin},
     storage::{DIR_FLAGS, private_dir},
 };
 
@@ -61,6 +61,7 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 type Result<T> = std::result::Result<T, StoreError>;
+type Permit<'a> = &'a (dyn Fn() -> bool + Sync);
 
 /// Prefill is usable without contacting either the server or the keyring.
 #[derive(Clone)]
@@ -71,9 +72,25 @@ pub(crate) struct LoginProfile {
     active_slot: Option<Slot>,
 }
 
+#[cfg(test)]
+impl LoginProfile {
+    pub(crate) fn test_remembered() -> Self {
+        Self {
+            origin: Origin::parse("http://127.0.0.1:1").unwrap(),
+            username: "synthetic".into(),
+            remembered: true,
+            active_slot: Some(Slot::new().unwrap()),
+        }
+    }
+}
+
 pub(crate) struct LoginStore {
     dir: OwnedFd,
 }
+
+/// The old active slot was durably disarmed before admitting online authority.
+#[derive(Clone)]
+pub(crate) struct StagedMode(LoginProfile);
 
 impl LoginStore {
     pub(crate) fn open_default() -> Result<Self> {
@@ -85,22 +102,21 @@ impl LoginStore {
         let base = absolute("XDG_CONFIG_HOME")
             .or_else(|| absolute("HOME").map(|home| home.join(".config")))
             .ok_or(StoreError::Config)?;
-        Ok(Self {
-            dir: config_dir(&base)?,
-        })
+        let dir = config_dir(&base)?;
+        // A single running Desktop owns remembered authority for this config
+        // root. Lock the directory inode (not a removable lock pathname) so
+        // another process cannot retire an active grant behind its owner.
+        lock_exclusive(&dir)?;
+        Ok(Self { dir })
     }
 
     pub(crate) fn profile(&self) -> Result<Option<LoginProfile>> {
         self.read()?.map(|meta| meta.profile()).transpose()
     }
 
-    /// Only call for an online sign-in attempt. This does not contact the server
-    /// or authorize offline access. The caller must validate the credential
-    /// against the expected origin/username and successfully resume online.
-    pub(crate) async fn restore(
-        &self,
-        expected: &LoginProfile,
-    ) -> Result<Option<RememberedCredential>> {
+    /// Read only the currently active item. Only the versioned LocalGrant variant
+    /// (never the disk prefill or a legacy bearer) can be admitted offline.
+    pub(crate) async fn restore(&self, expected: &LoginProfile) -> Result<Option<RememberedLogin>> {
         self.restore_with(&SecretService, expected)
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidCredential))
@@ -115,12 +131,102 @@ impl LoginStore {
         origin: &Origin,
         username: &str,
         credential: Option<&RememberedCredential>,
-    ) -> Result<()> {
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
         let blob = credential
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_| StoreError::InvalidInput)?;
-        self.record_with(&SecretService, origin, username, blob.as_deref())
+        self.record_with_permit(&SecretService, origin, username, blob.as_deref(), permitted)
+            .await
+    }
+
+    /// Re-check admission after the async keyring restore and UI acceptance.
+    pub(crate) fn is_active(&self, expected: &LoginProfile) -> Result<bool> {
+        let _lock = self.lock()?;
+        config(fs::fsync(&self.dir))?;
+        Ok(self
+            .read()?
+            .is_some_and(|meta| meta.active_matches(expected)))
+    }
+
+    pub(crate) fn stage_mode(&self, expected: &LoginProfile) -> Result<StagedMode> {
+        self.stage_active_mode(Some(expected))?
+            .ok_or(StoreError::InvalidCredential)
+    }
+
+    /// A missing active slot is not interchangeable with a mismatched slot.
+    /// The latter may still hold a cold grant after a failed publication sync.
+    pub(crate) fn stage_active_mode(
+        &self,
+        expected: Option<&LoginProfile>,
+    ) -> Result<Option<StagedMode>> {
+        let _lock = self.lock()?;
+        let Some(mut old) = self.read()?.filter(|meta| meta.active.is_some()) else {
+            config(fs::fsync(&self.dir))?;
+            return Ok(None);
+        };
+        let expected = expected
+            .filter(|expected| old.active_matches(expected))
+            .ok_or(StoreError::InvalidCredential)?;
+        old.cleanup = old.active.take();
+        self.commit(&old)?;
+        Ok(Some(StagedMode(expected.clone())))
+    }
+
+    pub(crate) fn retire(&self, expected: Option<&LoginProfile>) -> Result<()> {
+        let _lock = self.lock()?;
+        self.retire_active(expected).map(|_| ())
+    }
+
+    pub(crate) async fn change_mode(
+        &self,
+        expected: &LoginProfile,
+        login: &RememberedLogin,
+        staged: &StagedMode,
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
+        self.change_mode_with_permit(&SecretService, expected, login, staged, permitted)
+            .await
+    }
+
+    async fn change_mode_with_permit(
+        &self,
+        keyring: &impl Keyring,
+        expected: &LoginProfile,
+        login: &RememberedLogin,
+        StagedMode(staged): &StagedMode,
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
+        let blob = serde_json::to_vec(login).map_err(|_| StoreError::InvalidInput)?;
+        if !valid_secret(&blob) {
+            return Err(StoreError::InvalidInput);
+        }
+        let _lock = self.lock()?;
+        let mut old = self
+            .read()?
+            .filter(|meta| {
+                meta.active.is_none()
+                    && meta.cleanup.is_some()
+                    && meta.cleanup == staged.active_slot
+                    && staged.active_slot == expected.active_slot
+                    && meta.matches(staged)
+                    && meta.matches(expected)
+            })
+            .ok_or(StoreError::InvalidCredential)?;
+        let current = keyring
+            .lookup(old.cleanup.unwrap())
+            .await?
+            .filter(|b| valid_secret(b))
+            .ok_or(StoreError::InvalidCredential)?;
+        let current: RememberedLogin =
+            serde_json::from_slice(&current).map_err(|_| StoreError::InvalidCredential)?;
+        // A lost, replaced or differently bound item must not be re-created.
+        if current.credential() != login.credential() {
+            return Err(StoreError::InvalidCredential);
+        }
+        self.finish_cleanup(keyring, &mut old).await?;
+        self.publish_keyring(keyring, old, Some(&blob), permitted)
             .await
     }
 
@@ -148,12 +254,10 @@ impl LoginStore {
         let Some(meta) = self.read()? else {
             return Ok(None);
         };
-        let Some(slot) = meta.active.filter(|s| Some(*s) == expected.active_slot) else {
-            return Ok(None);
-        };
-        if !meta.matches(expected) {
+        if !meta.active_matches(expected) {
             return Ok(None);
         }
+        let slot = meta.active.unwrap();
         // Do not use state from a rename whose directory sync may have failed.
         config(fs::fsync(&self.dir))?;
         let found = keyring.lookup(slot).await?;
@@ -163,13 +267,14 @@ impl LoginStore {
         Ok(found)
     }
 
-    async fn record_with(
+    async fn record_with_permit(
         &self,
         keyring: &impl Keyring,
         origin: &Origin,
         username: &str,
         blob: Option<&[u8]>,
-    ) -> Result<()> {
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
         if !valid_username(username) || blob.is_some_and(|b| !valid_secret(b)) {
             return Err(StoreError::InvalidInput);
         }
@@ -186,6 +291,16 @@ impl LoginStore {
         // cleanup needs to wait for the keyring. Don't accumulate stale slots.
         self.commit(&meta)?;
         self.finish_cleanup(keyring, &mut meta).await?;
+        self.publish_keyring(keyring, meta, blob, permitted).await
+    }
+
+    async fn publish_keyring(
+        &self,
+        keyring: &impl Keyring,
+        mut meta: Metadata,
+        blob: Option<&[u8]>,
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
         if let Some(blob) = blob {
             let slot = Slot::new()?;
             meta.cleanup = Some(slot);
@@ -193,9 +308,17 @@ impl LoginStore {
             keyring.store(slot, blob).await?;
             meta.cleanup = None;
             meta.active = Some(slot);
-            self.commit(&meta)?;
+            if let Err(error) = self.commit_guarded(&meta, Some(permitted)) {
+                // If rename succeeded but the directory sync failed, explicitly
+                // disarm the potentially visible new slot before reporting failure.
+                if error != StoreError::InvalidCredential {
+                    meta.cleanup = meta.active.take();
+                    let _ = self.commit(&meta);
+                }
+                return Err(error);
+            }
         }
-        Ok(())
+        meta.profile()
     }
 
     async fn forget_with(
@@ -204,21 +327,28 @@ impl LoginStore {
         expected: Option<&LoginProfile>,
     ) -> Result<()> {
         let _lock = self.lock()?;
+        if let Some(mut meta) = self.retire_active(expected)? {
+            self.finish_cleanup(keyring, &mut meta).await?;
+        }
+        Ok(())
+    }
+
+    fn retire_active(&self, expected: Option<&LoginProfile>) -> Result<Option<Metadata>> {
         let Some(mut meta) = self.read()? else {
-            return Ok(());
+            return Ok(None);
         };
         if expected.is_some_and(|expected| {
             !expected.remembered
                 || !meta.matches(expected)
                 || meta.active.or(meta.cleanup) != expected.active_slot
         }) {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(slot) = meta.active.take() {
             meta.cleanup = Some(slot);
             self.commit(&meta)?;
         }
-        self.finish_cleanup(keyring, &mut meta).await
+        Ok(Some(meta))
     }
 
     async fn finish_cleanup(&self, keyring: &impl Keyring, meta: &mut Metadata) -> Result<()> {
@@ -243,13 +373,7 @@ impl LoginStore {
         if private_len(&config(fs::fstat(&fd))?, false)? != 0 {
             return Err(StoreError::Config);
         }
-        fs::flock(&fd, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == Errno::WOULDBLOCK {
-                StoreError::Busy
-            } else {
-                StoreError::Config
-            }
-        })?;
+        lock_exclusive(&fd)?;
         Ok(fd)
     }
 
@@ -286,6 +410,10 @@ impl LoginStore {
     /// it by following links. Sync data before publication and the directory
     /// after publication, before the operation can touch the keyring.
     fn commit(&self, meta: &Metadata) -> Result<()> {
+        self.commit_guarded(meta, None)
+    }
+
+    fn commit_guarded(&self, meta: &Metadata, permitted: Option<Permit<'_>>) -> Result<()> {
         let bytes = serde_json::to_vec(meta).map_err(|_| StoreError::Config)?;
         if bytes.len() > MAX_METADATA {
             return Err(StoreError::Config);
@@ -306,7 +434,16 @@ impl LoginStore {
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| StoreError::Config)?;
-        config(fs::renameat(&self.dir, STAGE, &self.dir, METADATA))?;
+        {
+            // Known revocation and active-slot publication share the rename
+            // fence; never hold it across a keyring operation or sync.
+            let _publication =
+                permitted.map(|_| crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap());
+            if permitted.is_some_and(|allowed| !allowed()) {
+                return Err(StoreError::InvalidCredential);
+            }
+            config(fs::renameat(&self.dir, STAGE, &self.dir, METADATA))?;
+        }
         drop(temp);
         config(fs::fsync(&self.dir))
     }
@@ -360,6 +497,10 @@ impl Metadata {
         })
     }
 
+    fn active_matches(&self, expected: &LoginProfile) -> bool {
+        self.active.is_some() && self.active == expected.active_slot && self.matches(expected)
+    }
+
     fn matches(&self, expected: &LoginProfile) -> bool {
         self.origin == expected.origin.as_str() && self.username == expected.username
     }
@@ -407,6 +548,16 @@ fn valid_username(value: &str) -> bool {
 
 fn valid_secret(bytes: &[u8]) -> bool {
     (1..=MAX_SECRET).contains(&bytes.len())
+}
+
+fn lock_exclusive(fd: &OwnedFd) -> Result<()> {
+    fs::flock(fd, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+        if e == Errno::WOULDBLOCK {
+            StoreError::Busy
+        } else {
+            StoreError::Config
+        }
+    })
 }
 
 fn config<T>(result: rustix::io::Result<T>) -> Result<T> {

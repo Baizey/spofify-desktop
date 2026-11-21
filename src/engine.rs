@@ -10,8 +10,9 @@ use crate::{
     AppWindow, ArtistCredit, DeviceRow, QueueRow,
     api::{Api, ApiError, Item, Session},
     audio::{Audio, MasterGain},
-    auth::{self, Kind, Success, Write, Writer},
+    auth::{self, Kind, Retention, Success, Write, Writer},
     desk::Access,
+    login_store::{LoginProfile, LoginStore, StagedMode, StoreError},
     mode::ModeControl,
     offline::{self, OfflineStore, PlaybackInput},
     output_identity::Installation,
@@ -99,6 +100,10 @@ struct Account {
     api: Arc<Api>,
     session: Session,
 }
+enum Rejoined {
+    Existing,
+    Cold(Account, LoginProfile),
+}
 struct Reconnect {
     serial: u64,
     task: JoinHandle<()>,
@@ -109,7 +114,7 @@ enum Reply {
     Reconnect {
         epoch: u64,
         serial: u64,
-        result: Result<(), ApiError>,
+        result: Result<Rejoined, ApiError>,
     },
     Media {
         epoch: u64,
@@ -134,7 +139,8 @@ struct Engine {
     auth_ready: Option<(u64, Success)>,
     auth_tx: Option<mpsc::UnboundedSender<AuthCommand>>,
     auth_writer: Option<Writer>,
-    retained: Option<(Arc<AtomicBool>, Option<crate::login_store::LoginProfile>)>,
+    login_store: Result<Arc<LoginStore>, StoreError>,
+    retained: Option<Retention>,
     reconnect: Option<Reconnect>,
     logouts: Vec<JoinHandle<()>>,
     account: Option<Account>,
@@ -325,6 +331,10 @@ impl Engine {
         }
     }
     fn revoke(&mut self, a: Account) {
+        if a.session.is_local_only() {
+            a.session.retire_local_grant();
+            return;
+        }
         self.logouts.push(tokio::spawn(async move {
             // Even offline, logout revokes every clone without creating a request.
             let _ = a.api.logout(&a.session).await;
@@ -334,7 +344,9 @@ impl Engine {
         self.cancel_reconnect();
         self.cancel_login();
         self.clear_output();
-        self.retained = None;
+        if let Some(retained) = self.retained.take() {
+            retained.retire();
+        }
         if let Some(a) = self.account.take() {
             self.revoke(a);
         }
@@ -345,6 +357,11 @@ impl Engine {
         self.publish_access();
     }
     async fn shutdown(&mut self) {
+        // A mode click just before the window closed may not have reached a
+        // playback tick yet. Consume it before sealing and flushing writes.
+        if self.current() {
+            self.apply_mode();
+        }
         let epoch = crate::advance_account_epoch(&self.shared_epoch);
         let account = self.account.take();
         let retained = self.retained.take();
@@ -356,12 +373,18 @@ impl Engine {
             writer.finish().await;
         }
         if let Some(a) = account {
-            if retained.is_some_and(|(keep, _)| keep.load(Ordering::Acquire)) {
-                // Api::logout will only revoke local clones under this fence;
-                // the keyring credential remains usable on the next launch.
+            if let Some(profile) = retained.and_then(|keep| keep.profile()) {
+                // Do not remotely log out a normally retained login. Check for
+                // a denial through the final local retirement, after writes drain.
                 a.session.set_offline(true);
+                if a.session.retire_local_grant()
+                    && let Ok(store) = &self.login_store
+                {
+                    let _ = store.forget_profile(&profile).await;
+                }
+            } else {
+                self.revoke(a);
             }
-            self.revoke(a);
         }
         for task in self.logouts.drain(..) {
             let _ = task.await;
@@ -418,10 +441,13 @@ impl Engine {
                 .account
                 .as_ref()
                 .is_some_and(|a| a.session.is_offline());
-            if (desired || fenced) && self.needs_mode_change(true) {
+            let entering = (desired || fenced) && self.needs_mode_change(true);
+            if entering {
                 self.stop();
                 retired = self.audio.take();
                 self.set_offline(true);
+                // A later Go online is not yet a successful online choice.
+                self.save_mode(true, None);
             }
             if !desired && self.offline {
                 self.start_reconnect(serial);
@@ -439,6 +465,7 @@ impl Engine {
                 .is_some_and(|a| a.session.is_offline())
         {
             self.set_offline(true);
+            self.save_mode(true, None);
         }
     }
     fn cancel_reconnect(&mut self) {
@@ -457,16 +484,96 @@ impl Engine {
             self.mode.clone(),
             self.results.clone(),
         );
+        let cold = session.is_local_only();
+        let retained = self.retained.clone();
+        let profile = retained.as_ref().and_then(Retention::profile);
+        let writer = self.auth_writer.as_ref().map(Writer::sender);
+        let prior_writes = self
+            .auth_writer
+            .as_ref()
+            .map(|writer| writer.barrier(epoch));
+        let store = self.login_store.clone();
         self.action_status = "";
         let task = tokio::spawn(async move {
-            let result = reconnect_attempts(
-                &mode,
-                serial,
-                || current.load(Ordering::SeqCst) == epoch,
-                || api.validate_reconnect(&session),
-            )
-            .await;
+            let result = if cold {
+                let (Some(profile), Ok(store)) = (profile, store) else {
+                    return;
+                };
+                let result = reconnect_attempts(
+                    &mode,
+                    serial,
+                    || current.load(Ordering::SeqCst) == epoch,
+                    Some(3),
+                    || {
+                        auth::reconnect_local(&store, &profile, &session, || {
+                            current.load(Ordering::SeqCst) == epoch && mode.can_probe(epoch, serial)
+                        })
+                    },
+                )
+                .await;
+                if result
+                    .as_ref()
+                    .is_some_and(|r| r.as_ref().is_err_and(|e| e.expired || e.status == 401))
+                {
+                    // A definite denial outlives a queued mode/epoch change. Only
+                    // retire the exact attempted slot, never its successor.
+                    session.retire_local_grant();
+                    let _ = store.retire(Some(&profile));
+                    if let Some(writer) = writer {
+                        let _ = writer.send((epoch, Write::Forget(Some(profile.clone()))));
+                    }
+                }
+                result.map(|r| {
+                    r.map(|(api, session)| Rejoined::Cold(Account { api, session }, profile))
+                })
+            } else {
+                let result = reconnect_attempts(
+                    &mode,
+                    serial,
+                    || current.load(Ordering::SeqCst) == epoch,
+                    None,
+                    || async {
+                        api.validate_reconnect(&session).await.map_err(|error| {
+                            if retained.is_some() && error.rejects_local_grant() {
+                                ApiError {
+                                    expired: true,
+                                    ..error
+                                }
+                            } else {
+                                error
+                            }
+                        })
+                    },
+                )
+                .await;
+                if result
+                    .as_ref()
+                    .is_some_and(|r| r.as_ref().is_err_and(|e| e.expired))
+                    && let Some(retained) = retained
+                {
+                    session.retire_local_grant();
+                    retained.retire();
+                    if let (Ok(store), Some(profile)) = (store, retained.profile()) {
+                        let _ = store.retire(Some(&profile));
+                    }
+                    if let Some(writer) = writer {
+                        let _ = writer.send((epoch, Write::ForgetRetained(retained)));
+                    }
+                }
+                result.map(|r| r.map(|()| Rejoined::Existing))
+            };
             if let Some(result) = result {
+                // A preceding Work offline write must not reactivate its slot
+                // after we open networking. Drain through that intent first.
+                if result.is_ok()
+                    && let Some(prior_writes) = prior_writes
+                {
+                    tokio::select! {
+                        biased;
+                        _ = mode.cancelled(serial) => return,
+                        done = prior_writes => if done.is_err() { return },
+                    }
+                }
                 let _ = replies
                     .send(Reply::Reconnect {
                         epoch,
@@ -478,7 +585,7 @@ impl Engine {
         });
         self.reconnect = Some(Reconnect { serial, task });
     }
-    fn finish_reconnect(&mut self, epoch: u64, serial: u64, result: Result<(), ApiError>) {
+    fn finish_reconnect(&mut self, epoch: u64, serial: u64, result: Result<Rejoined, ApiError>) {
         if epoch != self.epoch
             || !self.current()
             || !self.offline
@@ -491,15 +598,45 @@ impl Engine {
         }
         self.cancel_reconnect();
         match result {
-            Ok(()) => {
+            Ok(rejoined) => {
                 let mode = self.mode.clone();
                 let mut retired = None;
                 mode.if_current_online(epoch, serial, || {
                     if !self.current() {
                         return;
                     }
+                    let cold = matches!(&rejoined, Rejoined::Cold(..));
+                    let profile = match &rejoined {
+                        Rejoined::Cold(_, profile) => Some(profile.clone()),
+                        Rejoined::Existing => self.retained.as_ref().and_then(Retention::profile),
+                    };
+                    let mut staged = None;
+                    if self.retained.is_some() && (profile.is_some() || self.login_store.is_ok()) {
+                        match self
+                            .login_store
+                            .as_deref()
+                            .map_err(|e| *e)
+                            .and_then(|store| store.stage_active_mode(profile.as_ref()))
+                        {
+                            Ok(mode) if !cold || mode.is_some() => staged = mode,
+                            Ok(_) | Err(StoreError::InvalidCredential) if cold => {
+                                self.expire();
+                                return;
+                            }
+                            _ => {
+                                self.action_status = "Working offline";
+                                return;
+                            }
+                        }
+                    }
+                    if let Rejoined::Cold(account, _) = rejoined
+                        && let Some(local) = self.account.replace(account)
+                    {
+                        self.revoke(local);
+                    }
                     self.stop();
                     retired = self.audio.take();
+                    self.save_mode(false, staged);
                     self.set_offline(false);
                 });
                 drop(retired);
@@ -555,14 +692,61 @@ impl Engine {
         }
         self.publish_access();
     }
+    fn save_mode(&self, offline: bool, staged: Option<StagedMode>) {
+        let (Some(retained), Some(account)) = (&self.retained, &self.account) else {
+            return;
+        };
+        let grant = if offline {
+            account.api.offline_grant(&account.session)
+        } else {
+            account
+                .api
+                .remembered_credential(&account.session)
+                .map(crate::api::RememberedLogin::Online)
+        };
+        if let Ok(grant) = grant {
+            // Disarm the old mode before freeing its publication fence when
+            // possible; the ordered writer can stage a still-pending login slot.
+            let staged = staged.or_else(|| {
+                let profile = retained.profile()?;
+                self.login_store.as_ref().ok()?.stage_mode(&profile).ok()
+            });
+            self.write_auth(
+                self.epoch,
+                Write::Mode(retained.clone(), account.session.clone(), grant, staged),
+            );
+        } else if offline && !account.session.is_local_only() {
+            // A credential that expired or was denied just before Work offline
+            // cannot mint a new grant. Do not leave its previous online choice armed.
+            if let Some(profile) = retained.profile()
+                && let Ok(store) = &self.login_store
+            {
+                let _ = store.retire(Some(&profile));
+            }
+            self.write_auth(self.epoch, Write::ForgetRetained(retained.clone()));
+        }
+    }
     fn expire(&mut self) {
         let offline = self.offline;
-        if let Some((_, profile)) = self.retained.take() {
-            self.write_auth(self.epoch, Write::Forget(profile));
+        if let Some(retained) = self.retained.take() {
+            retained.retire();
+            if let Some(profile) = retained.profile()
+                && let Ok(store) = &self.login_store
+            {
+                let _ = store.retire(Some(&profile));
+            }
+            self.write_auth(self.epoch, Write::ForgetRetained(retained));
         }
         self.reset(self.epoch);
         self.offline = offline;
         self.login_view(false, true, "Session expired. Sign in again.");
+    }
+    fn slot_active(&self, profile: &LoginProfile) -> bool {
+        self.login_store
+            .as_deref()
+            .map_err(|e| *e)
+            .and_then(|store| store.is_active(profile))
+            .unwrap_or(false)
     }
     fn write_auth(&self, epoch: u64, write: Write) {
         if let Some(writer) = &self.auth_writer {
@@ -572,12 +756,14 @@ impl Engine {
     fn start_restore(&mut self) {
         let (epoch, current, results) =
             (self.epoch, self.shared_epoch.clone(), self.results.clone());
+        let store = self.login_store.clone();
         self.login = Some(tokio::spawn(async move {
             let prefill = results.clone();
-            let outcome = auth::restore(epoch, &current, move |origin, username| async move {
-                let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
-            })
-            .await;
+            let outcome =
+                auth::restore(store, epoch, &current, move |origin, username| async move {
+                    let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
+                })
+                .await;
             let _ = results.send(Reply::Login(epoch, outcome)).await;
         }));
     }
@@ -602,6 +788,12 @@ impl Engine {
                 // already queued. The persistence worker orders it with saves.
                 let offline = self.explicit_offline();
                 self.retire_pending(true);
+                if let Some(retained) = &self.retained {
+                    retained.retire();
+                }
+                if let Ok(store) = &self.login_store {
+                    let _ = store.retire(None);
+                }
                 self.write_auth(epoch, Write::Forget(None));
                 if epoch == self.shared_epoch.load(Ordering::SeqCst) {
                     self.reset(epoch);
@@ -1024,7 +1216,16 @@ impl Engine {
                 kind,
             },
         ) = self.auth_ready.take().unwrap();
-        // Both sign-in paths announce capability, not a selection or transport
+        let cold = session.is_local_only();
+        if cold && !matches!(&kind, Kind::Restored(profile) if self.slot_active(profile)) {
+            self.login_view(
+                false,
+                true,
+                "The saved session is no longer available. Sign in again.",
+            );
+            return;
+        }
+        // All sign-in paths announce capability, not a selection or transport
         // command. Only Go may elect a vacant output or rebind its same device.
         if self.installation.is_none() {
             self.installation = Installation::open().ok();
@@ -1038,9 +1239,19 @@ impl Engine {
             })
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.retained = match kind {
-            Kind::Restored(profile) => Some((Arc::new(AtomicBool::new(true)), Some(profile))),
+            Kind::Restored(profile) => Some(Retention::new(profile)),
             Kind::Password { remember } => {
-                let retained = Arc::new(AtomicBool::new(false));
+                // Account replacement cannot leave an old cold slot active
+                // while keyring deletion / publication is pending.
+                if let Ok(store) = &self.login_store
+                    && store.retire(None).is_err()
+                    && store.profile().ok().flatten().is_some_and(|p| p.remembered)
+                {
+                    self.revoke(Account { api, session });
+                    self.login_view(false, true, "Could not retire the previous saved sign-in.");
+                    return;
+                }
+                let retained = Retention::default();
                 let credential = remember
                     .then(|| api.remembered_credential(&session).ok())
                     .flatten();
@@ -1052,14 +1263,20 @@ impl Engine {
                         wanted: remember,
                         credential,
                         retained: retained.clone(),
+                        session: session.clone(),
                     },
                 );
-                remember.then_some((retained, None))
+                remember.then_some(retained)
             }
         };
         self.account = Some(Account { api, session });
-        self.publish_access();
-        self.connect();
+        if cold {
+            // No socket, output selection, or resumed playback on admission.
+            self.set_offline(true);
+        } else {
+            self.publish_access();
+            self.connect();
+        }
     }
     fn finish_login(&self, fallback: auth::Fallback) {
         if let Some(profile) = fallback.discard {
@@ -1591,19 +1808,21 @@ fn read_saved(
     }
 }
 
-async fn reconnect_attempts<F, Fut>(
+async fn reconnect_attempts<T, F, Fut>(
     mode: &ModeControl,
     serial: u64,
     current_epoch: impl Fn() -> bool,
+    attempt_limit: Option<u8>,
     mut probe: F,
-) -> Option<Result<(), ApiError>>
+) -> Option<Result<T, ApiError>>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), ApiError>>,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     let cancelled = mode.cancelled(serial);
     tokio::pin!(cancelled);
     let mut delay = PROBE_FIRST_DELAY;
+    let mut attempts = 0_u8;
     loop {
         if !current_epoch() {
             return None;
@@ -1612,13 +1831,19 @@ where
             biased;
             _ = &mut cancelled => return None,
             result = tokio::time::timeout(PROBE_TIMEOUT, async { probe().await }) => result.unwrap_or(Err(ApiError {
-                message: "Connection is unavailable.", status: 0, expired: false,
+                message: "Connection is unavailable.", status: 408, expired: false,
             })),
         };
-        let transient = result
-            .as_ref()
-            .is_err_and(|e| !e.expired && matches!(e.status, 0 | 408 | 429 | 500..=599));
-        if !transient {
+        attempts = attempts.saturating_add(1);
+        let transient = result.as_ref().is_err_and(|e| {
+            !e.expired
+                && if attempt_limit.is_some() {
+                    e.can_retry_restore()
+                } else {
+                    matches!(e.status, 0 | 408 | 429 | 500..=599)
+                }
+        });
+        if !transient || attempt_limit.is_some_and(|limit| attempts >= limit) {
             return Some(result);
         }
         tokio::select! {
@@ -1709,7 +1934,8 @@ pub fn start(
         runtime.block_on(async move {
             let (results, mut replies) = mpsc::channel(16);
             let (weak, shared) = (window.clone(), epoch.clone());
-            let writer = Writer::new(move |epoch, notice| {
+            let login_store = LoginStore::open_default().map(Arc::new);
+            let writer = Writer::new(login_store.clone(), move |epoch, notice| {
                 let (weak, shared) = (weak.clone(), shared.clone());
                 let _ = slint::invoke_from_event_loop(move || {
                     if shared.load(Ordering::SeqCst) == epoch
@@ -1731,6 +1957,7 @@ pub fn start(
                 auth_ready: None,
                 auth_tx: Some(auth_tx),
                 auth_writer: Some(writer),
+                login_store,
                 retained: None,
                 reconnect: None,
                 logouts: vec![],
@@ -1926,6 +2153,7 @@ mod tests {
             auth_ready: None,
             auth_tx: None,
             auth_writer: None,
+            login_store: Err(StoreError::Config),
             retained: None,
             reconnect: None,
             logouts: vec![],
@@ -2160,7 +2388,7 @@ mod tests {
             api,
             session: session.clone(),
         });
-        e.retained = Some((Arc::new(AtomicBool::new(true)), None));
+        e.retained = Some(Retention::new(LoginProfile::test_remembered()));
         e.publish_access();
         e.shutdown().await;
         assert!(e.access.borrow().is_none());
@@ -2288,7 +2516,7 @@ mod tests {
         e.reply(Reply::Reconnect {
             epoch: 7,
             serial,
-            result: Ok(()),
+            result: Ok(Rejoined::Existing),
         });
         assert!(e.offline && session.is_offline());
         assert!(e.reconnect.is_none() && e.socket.is_none());
@@ -2313,7 +2541,7 @@ mod tests {
         e.reply(Reply::Reconnect {
             epoch: 7,
             serial,
-            result: Ok(()),
+            result: Ok(Rejoined::Existing),
         });
         assert!(!e.offline && !session.is_offline());
         // This current-thread test never yields after socket spawn.
@@ -2365,7 +2593,7 @@ mod tests {
         e.reply(Reply::Reconnect {
             epoch: 7,
             serial,
-            result: Ok(()),
+            result: Ok(Rejoined::Existing),
         });
         assert!(e.local.current().is_none() && !session.is_offline());
         assert!(!e.access.borrow().as_ref().unwrap().offline);
@@ -2407,13 +2635,14 @@ mod tests {
             &mode,
             serial.unwrap(),
             || true,
+            None,
             || {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(());
                 } else {
                     panic!("cancelled probe retried");
                 }
-                std::future::ready(Err(ApiError {
+                std::future::ready(Err::<(), _>(ApiError {
                     message: "Temporary",
                     expired: false,
                     status: 503,

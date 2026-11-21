@@ -574,7 +574,7 @@ impl Api {
         self.with_authenticated_network(session, async {
             let request = self
                 .request(route.url(self, query)?)?
-                .header(header::COOKIE, session.secrets.cookie.clone());
+                .header(header::COOKIE, session.cookie()?.clone());
             let response = self.send(request, Some(session), false).await?;
             if response.status() != StatusCode::OK {
                 return Err(INVALID_RESPONSE);

@@ -100,11 +100,38 @@ impl Keyring for FakeKeyring {
     }
 }
 
+impl LoginStore {
+    async fn record_with(
+        &self,
+        keyring: &impl Keyring,
+        origin: &Origin,
+        username: &str,
+        blob: Option<&[u8]>,
+    ) -> Result<LoginProfile> {
+        self.record_with_permit(keyring, origin, username, blob, &|| true)
+            .await
+    }
+    async fn change_mode_with(
+        &self,
+        keyring: &impl Keyring,
+        profile: &LoginProfile,
+        login: &RememberedLogin,
+        staged: Option<&StagedMode>,
+    ) -> Result<LoginProfile> {
+        let staged = match staged {
+            Some(staged) => staged.clone(),
+            None => self.stage_mode(profile)?,
+        };
+        self.change_mode_with_permit(keyring, profile, login, &staged, &|| true)
+            .await
+    }
+}
+
 fn origin() -> Origin {
     Origin::parse("HTTPS://Music.Example:443/").unwrap()
 }
 
-async fn cancel_after_first_poll(future: impl Future<Output = Result<()>>) {
+async fn cancel_after_first_poll<T>(future: impl Future<Output = Result<T>>) {
     let mut future = std::pin::pin!(future);
     poll_fn(|cx| {
         assert!(future.as_mut().poll(cx).is_pending());
@@ -281,8 +308,8 @@ async fn new_successful_nonremembered_login_disarms_previous_even_when_keyring_i
         store
             .record_with(&keyring, &second, "new listener", None)
             .await
-            .unwrap_err(),
-        StoreError::KeyringUnavailable
+            .err(),
+        Some(StoreError::KeyringUnavailable)
     );
     let profile = store.profile().unwrap().unwrap();
     assert_eq!(profile.origin.as_str(), second.as_str());
@@ -302,8 +329,9 @@ async fn rejects_aliases_and_insecure_or_invalid_metadata_before_keyring_access(
     assert_eq!(
         store
             .record_with(&keyring, &origin(), "listener", Some(SYNTHETIC_SECRET))
-            .await,
-        Err(StoreError::Config)
+            .await
+            .err(),
+        Some(StoreError::Config)
     );
     assert_eq!(stdfs::read(&external).unwrap(), b"external");
     stdfs::remove_file(fixture.path(METADATA)).unwrap();
@@ -331,6 +359,212 @@ async fn rejects_aliases_and_insecure_or_invalid_metadata_before_keyring_access(
         config_child(&fixture.store.dir, OsStr::new("no-such-parent/entry")).err(),
         Some(StoreError::Config)
     );
+}
+
+const ONLINE_LOGIN: &[u8] = br#"{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}"#;
+const LOCAL_LOGIN: &[u8] = br#"{"format":"local-v1","username":"listener","role":"user","credential":{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}}"#;
+
+#[tokio::test]
+async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_authoritative() {
+    let fixture = Fixture::new();
+    let store = &fixture.store;
+    let keyring = FakeKeyring::default();
+    let online = store
+        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .await
+        .unwrap();
+    let offline: RememberedLogin = serde_json::from_slice(LOCAL_LOGIN).unwrap();
+    let local = store
+        .change_mode_with(&keyring, &online, &offline, None)
+        .await
+        .unwrap();
+    assert!(!store.is_active(&online).unwrap());
+    assert!(store.is_active(&local).unwrap());
+    assert_eq!(
+        store.stage_active_mode(Some(&online)).err(),
+        Some(StoreError::InvalidCredential)
+    );
+    assert_eq!(
+        store.stage_active_mode(None).err(),
+        Some(StoreError::InvalidCredential)
+    );
+    assert!(
+        store
+            .restore_with(&keyring, &online)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let blob = store.restore_with(&keyring, &local).await.unwrap().unwrap();
+    assert!(matches!(
+        serde_json::from_slice(&blob),
+        Ok(RememberedLogin::Offline(_))
+    ));
+    assert!(
+        store
+            .change_mode_with(&keyring, &online, &offline, None)
+            .await
+            .is_err()
+    );
+    let disk: serde_json::Value =
+        serde_json::from_slice(&stdfs::read(fixture.path(METADATA)).unwrap()).unwrap();
+    assert_eq!(
+        disk,
+        serde_json::json!({"version": 1, "origin": origin().as_str(), "username": "listener", "active": String::from(local.active_slot.unwrap())})
+    );
+    let staged = store.stage_mode(&local).unwrap();
+    assert!(!fixture.reopen().is_active(&local).unwrap());
+    assert!(store.stage_active_mode(Some(&local)).unwrap().is_none());
+    let online = store
+        .change_mode_with(
+            &keyring,
+            &local,
+            &serde_json::from_slice(ONLINE_LOGIN).unwrap(),
+            Some(&staged),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .restore_with(&keyring, &local)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let blob = store
+        .restore_with(&keyring, &online)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(serde_json::from_slice::<RememberedCredential>(&blob).is_ok());
+    assert_eq!(keyring.items.borrow().len(), 1);
+    store.forget_with(&keyring, Some(&online)).await.unwrap();
+    assert!(
+        store
+            .restore_with(&keyring, &online)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(keyring.items.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_or_missing_slot_cannot_fall_back_to_its_old_mode_or_create_a_grant() {
+    for behavior in [
+        Some(Behavior::Unavailable),
+        Some(Behavior::InterruptStore),
+        None,
+    ] {
+        let fixture = Fixture::new();
+        let store = &fixture.store;
+        let keyring = FakeKeyring::default();
+        let initial = store
+            .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+            .await
+            .unwrap();
+        let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
+        match behavior {
+            Some(Behavior::InterruptStore) => {
+                keyring.behavior.set(Behavior::InterruptStore);
+                cancel_after_first_poll(store.change_mode_with(&keyring, &initial, &offline, None))
+                    .await;
+            }
+            behavior => {
+                if let Some(behavior) = behavior {
+                    keyring.behavior.set(behavior);
+                } else {
+                    keyring.items.borrow_mut().clear();
+                }
+                assert!(
+                    store
+                        .change_mode_with(&keyring, &initial, &offline, None)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(keyring.calls.get().1, 1); // no new keyring payload
+            }
+        }
+        let reopened = fixture.reopen();
+        assert!(!reopened.profile().unwrap().unwrap().remembered);
+        assert!(reopened.read().unwrap().unwrap().cleanup.is_some());
+        assert!(
+            reopened
+                .restore_with(&keyring, &initial)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_same_admitted_owner_can_retry_its_stage_after_keyring_unlock() {
+    let fixture = Fixture::new();
+    let store = &fixture.store;
+    let keyring = FakeKeyring::default();
+    let online = store
+        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .await
+        .unwrap();
+    let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
+    let stage = store.stage_mode(&online).unwrap();
+    keyring.behavior.set(Behavior::Unavailable);
+    assert_eq!(
+        store
+            .change_mode_with(&keyring, &online, &offline, Some(&stage))
+            .await
+            .err(),
+        Some(StoreError::KeyringUnavailable)
+    );
+    assert!(!fixture.reopen().is_active(&online).unwrap());
+    keyring.behavior.set(Behavior::Available);
+    assert!(
+        store
+            .change_mode_with(&keyring, &online, &offline, None)
+            .await
+            .is_err()
+    );
+    let local = store
+        .change_mode_with(&keyring, &online, &offline, Some(&stage))
+        .await
+        .unwrap();
+    assert!(store.is_active(&local).unwrap());
+}
+
+#[tokio::test]
+async fn revoked_admission_can_never_publish_a_pending_keyring_write() {
+    let fixture = Fixture::new();
+    let store = &fixture.store;
+    let keyring = FakeKeyring::default();
+    let online = store
+        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .await
+        .unwrap();
+    let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
+    let staged = store.stage_mode(&online).unwrap();
+    assert_eq!(
+        store
+            .change_mode_with_permit(&keyring, &online, &offline, &staged, &|| false)
+            .await
+            .err(),
+        Some(StoreError::InvalidCredential)
+    );
+    let meta = fixture.reopen().read().unwrap().unwrap();
+    assert!(meta.active.is_none() && meta.cleanup.is_some());
+    assert_eq!(keyring.items.borrow().len(), 1); // Stored keyring item remains inaccessible.
+    assert!(!store.is_active(&online).unwrap());
+}
+
+#[test]
+fn installation_ownership_is_exclusive_for_the_config_directory() {
+    let fixture = Fixture::new();
+    let contender = config_dir(&fixture.base).unwrap();
+    let owner = config_dir(&fixture.base).unwrap();
+    lock_exclusive(&owner).unwrap();
+    assert_eq!(lock_exclusive(&contender), Err(StoreError::Busy));
+    drop(owner);
+    lock_exclusive(&contender).unwrap();
 }
 
 #[tokio::test]
