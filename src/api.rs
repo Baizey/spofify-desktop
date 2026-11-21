@@ -1539,11 +1539,14 @@ mod tests {
                             break;
                         }
                         drop(saved);
-                        if response == b"STALL" {
-                            thread::sleep(Duration::from_millis(100));
+                        let response = if response == b"STALL" {
+                            thread::sleep(Duration::from_secs(1));
+                            // Without the client deadline this request would succeed, not hit EOF.
+                            json(RESULTS)
                         } else {
-                            let _ = stream.write_all(&response);
-                        }
+                            response
+                        };
+                        let _ = stream.write_all(&response);
                     }
                 }
             });
@@ -2693,12 +2696,13 @@ mod tests {
             failure(api.search(&session, "track").await),
             INVALID_RESPONSE
         );
-        // The production bound is 15 seconds; exercise the same transport deadline cheaply.
+        // Shorten the production deadline for this test, but leave time for
+        // the request to reach the peer before its deliberately delayed reply.
         api.client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
-            .timeout(Duration::from_millis(20))
+            .timeout(Duration::from_millis(300))
             .build()
             .unwrap();
         assert_eq!(failure(api.search(&session, "track").await), NETWORK);
