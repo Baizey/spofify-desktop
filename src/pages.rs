@@ -745,20 +745,10 @@ pub fn personal_playlist(
     page.definition = definition.cloned();
     page.total = summary.track_count.or(Some(entries.len() as u64));
     let derived = metadata.kind == PlaylistKind::Derived;
-    let ready = !derived || summary.evaluation_state == Some(EvaluationState::Ready);
-    let allow_play = ready && metadata.capabilities.play;
-    let context = context_for(
-        if derived {
-            ContextKind::Derived
-        } else {
-            ContextKind::Playlist
-        },
-        &metadata.id,
-        &page.title,
-    );
-    if allow_play && metadata.available_count.unwrap_or(0) > 0 {
-        page.playback = Some(collection(&context));
-    }
+    let ready = playlist_ready(summary);
+    let allow_play = ready && summary.capabilities.play;
+    let context = playlist_context(summary, &page.title);
+    page.playback = playlist_selection(summary, &context);
     page.rows = entries
         .iter()
         .take(MAX_ROWS)
@@ -777,6 +767,10 @@ pub fn personal_playlist(
             _ => "This playlist is still updating.",
         }
         .into();
+    } else if summary.available_count.is_some_and(|count| count > 0) && !allow_play {
+        page.status = "Playback isn’t available for this playlist.".into();
+    } else if summary.available_count == Some(0) && summary.track_count.is_some_and(|n| n > 0) {
+        page.status = "No songs have available audio.".into();
     } else if truncated || entries.len() > MAX_ROWS {
         page.status = "Showing the first 500 songs.".into();
     }
@@ -1002,14 +996,33 @@ fn playlist_subtitle(summary: &PlaylistSummary) -> String {
     )
 }
 
+fn playlist_ready(summary: &PlaylistSummary) -> bool {
+    summary.kind == PlaylistKind::Manual || summary.evaluation_state == Some(EvaluationState::Ready)
+}
+
+fn playlist_context(summary: &PlaylistSummary, name: &str) -> Arc<PlaybackContext> {
+    let kind = match summary.kind {
+        PlaylistKind::Manual => ContextKind::Playlist,
+        PlaylistKind::Derived => ContextKind::Derived,
+    };
+    context_for(kind, &summary.id, name)
+}
+
+fn playlist_selection(
+    summary: &PlaylistSummary,
+    context: &Arc<PlaybackContext>,
+) -> Option<PlaybackSelection> {
+    // The current account protocol resolves the complete canonical playlist by
+    // kind and ID. Display rows/count limits are not selection credentials.
+    (playlist_ready(summary)
+        && summary.capabilities.play
+        && summary.available_count.is_some_and(|count| count > 0))
+    .then(|| collection(context))
+}
+
 fn playlist_row(summary: PlaylistSummary) -> Row {
     let name = title(&summary.name, "Untitled playlist");
-    // A derived card doesn't carry a fresh evaluation; allow opening it, not
-    // guessing a collection fence or starting an asynchronous Play lookup.
-    let playback = (summary.kind == PlaylistKind::Manual
-        && summary.capabilities.play
-        && summary.available_count.unwrap_or(0) > 0)
-        .then(|| collection(&context_for(ContextKind::Playlist, &summary.id, &name)));
+    let playback = playlist_selection(&summary, &playlist_context(&summary, &name));
     Row {
         kind: "playlist".into(),
         title: name,
@@ -1303,6 +1316,83 @@ mod tests {
         let row = playlist_row(summary);
         assert_eq!(row.title, page.title);
         assert_eq!(row.playlist.unwrap().name, name);
+    }
+
+    #[test]
+    fn playlist_collection_play_is_consistent_across_sizes_and_capabilities() {
+        let metadata = rule_metadata();
+        let mut summary = PlaylistSummary {
+            id: metadata.id,
+            name: "Mix".into(),
+            description: String::new(),
+            kind: metadata.kind,
+            count_state: library::CountState::Exact,
+            evaluation_state: Some(EvaluationState::Ready),
+            evaluation_error_code: None,
+            track_count: Some(1161),
+            available_count: Some(1161),
+            capabilities: metadata.capabilities,
+            revision: metadata.revision,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let entries = (0..1161)
+            .map(|i| library::ManualEntry {
+                id: format!("occurrence-{i}"),
+                position: i,
+                track: track(),
+            })
+            .collect::<Vec<_>>();
+        for (kind, wire_kind) in [
+            (PlaylistKind::Manual, "playlist"),
+            (PlaylistKind::Derived, "derived"),
+        ] {
+            summary.kind = kind;
+            summary.evaluation_state =
+                (kind == PlaylistKind::Derived).then_some(EvaluationState::Ready);
+            let list = personal_list(&Route::Playlists, &[summary.clone()]);
+            let detail = personal_playlist(&summary, None, &entries, false);
+            assert_eq!(detail.total, Some(1161));
+            assert!(list.rows[0].playable);
+            assert_eq!(list.rows[0].playback, detail.playback);
+            assert_eq!(
+                selection(&list.rows[0]),
+                json!({"kind":"collection", "context":{
+                    "kind": wire_kind, "id":"mix", "name":"Mix"
+                }})
+            );
+            for (total, available, permitted) in [
+                (0, Some(0), true),
+                (1161, Some(0), true),
+                (1161, None, true),
+                (1161, Some(1161), false),
+            ] {
+                let mut blocked = summary.clone();
+                blocked.track_count = Some(total);
+                blocked.available_count = available;
+                blocked.capabilities.play = permitted;
+                let row = playlist_row(blocked.clone());
+                assert!(!row.playable && row.playback.is_none());
+                assert!(
+                    personal_playlist(&blocked, None, &[], false)
+                        .playback
+                        .is_none()
+                );
+            }
+        }
+        for state in [
+            None,
+            Some(EvaluationState::Stale),
+            Some(EvaluationState::Error),
+        ] {
+            summary.evaluation_state = state;
+            assert!(!playlist_row(summary.clone()).playable);
+            assert!(
+                personal_playlist(&summary, None, &entries, false)
+                    .playback
+                    .is_none()
+            );
+        }
     }
 
     #[test]

@@ -1,13 +1,14 @@
 """Pointer and layout contracts for the listening workspace's native window."""
 import json
 import re
-from time import sleep
+from time import monotonic, sleep
 
 from fixture import Failure, check
-from native import (ALT, CONTROL, DESKTOP, DOWN, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
-                    RETURN, TRACK, bounds, element_id, element_type, wait)
+from native import (ALT, CONTROL, DESKTOP, END, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
+                    RETURN, SAVED, TRACK, bounds, element_id, element_type, wait)
 from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
-                     NAME_ONLY, SINGLE_TRACK, SUMMARY)
+                     LARGE_MANUAL, LARGE_PLAYLIST_COUNT, LARGE_RULE, NAME_ONLY,
+                     NEGATIVE_PLAYLISTS, SINGLE_TRACK, SUMMARY)
 
 
 QUEUE_TITLE = "Queue"
@@ -32,12 +33,26 @@ def manual_detail(window, timeout=10):
         for element in catalog_rows(window)) >= 2, timeout=timeout)
 
 
+def playlist_option(action, title):
+    return re.escape(f"{action} · {title}")
+
+
+def offline_option(window, title=None, *, saved=False):
+    action = "Remove offline save" if saved else "Save offline"
+    label = playlist_option(action, title) if title else action
+    item = window.find(label, roles=("Button",))
+    check(item.get("accessibleCheckable") and item.get("accessibleChecked", False) == saved,
+          f"wrong accessible offline state for {label}")
+    return label
+
+
 def manual_options(window, *, capture=None):
-    management = r"Rename|Delete|Edit rules"
+    management = "Rename|Delete|Edit rules|Save offline"
     window.absent(management, roles=("Button",))
     window.click("Manage playlist")
     trigger = window.find("Hide playlist options", timeout=3, roles=("Button",))
     window.find("Delete", timeout=3, roles=("Button",))
+    offline_option(window)
     window.absent("Edit rules", roles=("Button",))
     if capture:
         window.pixels(capture)
@@ -45,7 +60,7 @@ def manual_options(window, *, capture=None):
     _, top, right, bottom = bounds(trigger)
     width, height = window.dimensions()
     check(0 < x < width and 0 < y < height and 50 < right - x < 185
-          and (0 < y - bottom < 52 or 0 < top - y < 102),
+          and (0 < y - bottom < 95 or 0 < top - y < 125),
           f"rendered Rename target {x:g},{y:g} is not anchored to playlist menu {bounds(trigger)}")
     window.title("Rename playlist")
     window.find("Playlist name", roles=("TextInput",))
@@ -57,26 +72,263 @@ def manual_options(window, *, capture=None):
     window.click("Hide playlist options")
     window.title(PLAYLIST)
     window.absent(management, roles=("Button",))
-    print("PASS manual playlist overflow opens, activates Rename and dismisses without navigating", flush=True)
+    print("PASS manual playlist overflow offers Save offline, activates Rename and dismisses without navigating",
+          flush=True)
 
 
 def keyboard_playlist_menu(window):
     # Clicking the trigger transfers focus to the popup; Escape must restore
     # it to that trigger without spending a Back entry. No refocus/fallback.
+    management = "Rename|Delete|Save offline"
     window.click("Manage playlist")
-    window.find("Rename", timeout=3, roles=("Button",))
+    window.find("Save offline", timeout=3, roles=("Button",))
     window.key(ESCAPE)
     window.title(PLAYLIST)
-    window.absent("Rename|Delete", roles=("Button",))
+    window.absent(management, roles=("Button",))
     window.key(RETURN)
-    window.find("Rename", timeout=3, roles=("Button",))
-    window.key(DOWN)
+    window.find("Save offline", timeout=3, roles=("Button",))
+    window.key(END)
     window.key(RETURN)
     window.title("Delete this playlist?")
     window.click("Cancel")
     window.title(PLAYLIST)
-    window.absent("Rename|Delete", roles=("Button",))
-    print("PASS Escape restores trigger focus, Return reopens, Down/Return opens Delete confirmation", flush=True)
+    window.absent(management, roles=("Button",))
+    print("PASS Escape restores detail trigger focus, Return reopens, End/Return opens Delete confirmation", flush=True)
+
+
+def playlist_case_actions(window, summary, activate=None, *, capture=None):
+    title = summary["name"]
+    label = re.escape(title)
+    count = summary["trackCount"]
+    ready = summary["kind"] == "manual" or summary.get("evaluationState") == "ready"
+    playable = ready and summary["capabilities"]["play"] and summary["availableCount"] > 0
+    row_play = f"Play {label}"
+    window.find(f"Open {label}", roles=("Button",))
+    if playable:
+        window.find(row_play, roles=("Button",))
+    else:
+        window.absent(row_play, roles=("Button",))
+    window.click(f"Show actions for {label}")
+    offline_option(window, title)
+    window.click(f"Hide actions for {label}")
+    if activate and playable:
+        activate(lambda: window.click(row_play))
+
+    window.click(f"Open {label}")
+    window.title(title)
+    if not count:
+        window.title("No items here yet")
+    # Wait for committed detail capabilities rather than asserting against a
+    # placeholder with no buttons. Scope Play to the toolbar, not the dock.
+    window.find("Manage playlist", roles=("Button",))
+
+    def toolbar_play():
+        toolbar = element_id(window.elements(), "page-tools")
+        check(toolbar, "missing playlist detail toolbar")
+        return next((e for e in window.subtree(toolbar) if window.matches(e, "Play")
+                     and e.get("accessibleRole") == "Button"), None)
+
+    if playable:
+        check(wait(f"detail Play for {title}", toolbar_play).get("accessibleEnabled", True),
+              f"playlist detail Play disabled for {title}")
+    else:
+        check(toolbar_play() is None, f"unexpected playlist detail Play for {title}")
+    window.absent("Save offline|Remove offline save", roles=("Button",))
+    window.click("Manage playlist")
+    offline_option(window)
+    if capture and window.output:
+        window.pixels(capture, DESKTOP[0])
+    window.click("Hide playlist options")
+    if activate and playable:
+        activate(lambda: window.click_element(wait(f"detail Play for {title}", toolbar_play)))
+    window.click("Back")
+    playlists_root(window)
+
+
+def synthetic_playlist_actions(window, play_requests):
+    open_playlists(window)
+    expected = play_requests()
+    for summary, _, _ in (*NEGATIVE_PLAYLISTS, LARGE_MANUAL, LARGE_RULE):
+        kind = "derived" if summary["kind"] == "derived" else "playlist"
+        selection = dict(kind="collection", context=dict(kind=kind, id=summary["id"], name=summary["name"]))
+
+        def activate(click):
+            check(play_requests() == expected, "playlist browsing sent an unexpected Play")
+            click()
+            expected.append(selection)
+            observed = wait("synthetic collection Play", lambda: play_requests()
+                            if len(play_requests()) >= len(expected) else None)
+            check(observed == expected, "playlist Play used the wrong context, ID, or number of requests")
+
+        playlist_case_actions(window, summary, activate,
+                              capture="playlist-actions-wire-large-rules" if summary == LARGE_RULE[0] else None)
+    sleep(0.6)  # Drain accidental asynchronous Play from the final navigation.
+    check(play_requests() == expected, "playlist navigation sent an unexpected Play")
+    print("PASS synthetic row/detail Play and exact context for 1,161-song manual/rule playlists; "
+          "no Play for empty, no-audio, forbidden or stale cases; offline commands in ellipses", flush=True)
+
+
+def seed_playlist_actions(api, track_id):
+    """Seed only the runner-owned Go account through the supported write lane."""
+    from playback import Peer
+
+    with Peer(api, name="Disposable playlist action seeder") as writer:
+        def create(name, source=None):
+            fields = dict(name=f"Acceptance {name}")
+            if source is not None:
+                fields["definition"] = dict(version=1, sources=[dict(kind="playlist", playlistId=source["id"],
+                                                                     slotId="s_" + "1".zfill(32))],
+                                            duplicates="keep", sort="sourceOrder")
+            writer.personal("createPlaylist", **fields)
+            return writer.personal_change(lambda ch: ch.get("playlist", {}).get("name") == fields["name"])["playlist"]
+
+        def ready_rule(rule):
+            if rule.get("evaluationState") != "ready":
+                rule = writer.personal_change(lambda ch: ch.get("playlist", {}).get("id") == rule["id"]
+                                              and ch["playlist"].get("evaluationState") == "ready",
+                                              timeout=30)["playlist"]
+            return rule
+
+        empty = create("Empty Manual")
+        big = create("Large Manual")
+        pid = big["id"]
+        # One acknowledged change at a time avoids overrunning the Go account
+        # job queue. Duplicates are real canonical occurrences, not fake counts.
+        deadline = monotonic() + 120
+        for count in range(1, LARGE_PLAYLIST_COUNT + 1):
+            writer.personal("addEntry", playlistId=pid, trackId=track_id)
+            change = writer.personal_change(lambda ch: ch.get("playlist", {}).get("id") == pid,
+                                            timeout=max(0, min(8, deadline - monotonic())))
+            big = change["playlist"]
+            check(big["trackCount"] == count, "Go did not commit the next manual occurrence")
+        cases = (empty, ready_rule(create("Empty Rules", empty)), big, ready_rule(create("Large Rules", big)))
+        for summary, count in zip(cases, (0, 0, LARGE_PLAYLIST_COUNT, LARGE_PLAYLIST_COUNT)):
+            detail = writer.playlist(summary["id"], timeout=30)
+            check(detail["summary"] == summary and summary["trackCount"] == summary["availableCount"] == count
+                  and len(detail["rows"]) == count, "canonical Go playlist action fixture did not match its case")
+    return cases
+
+
+def real_playlist_actions(window, api, ready):
+    from playback import Peer
+
+    window.click("History")  # Don't re-render the playlist list for each seed commit.
+    window.section("History")
+    cases = seed_playlist_actions(api, ready["duplicateTrackId"])
+    open_playlists(window)
+    for summary in cases:
+        kind = "derived" if summary["kind"] == "derived" else "playlist"
+        identity = "occurrenceId" if kind == "derived" else "entryId"
+
+        def activate(click):
+            with Peer(api, name="Acceptance playlist Play observer") as observer:
+                click()
+                frame = observer.wait_frame(lambda f: f.get("player", {}).get("queue", {}).get("kind") == "replace",
+                                            timeout=20)
+                delta = frame["player"]
+                rows = delta["queue"]["rows"]
+                check(delta["cursor"].get("desired") and len(rows) == LARGE_PLAYLIST_COUNT
+                      and len({row.get(identity) for row in rows}) == LARGE_PLAYLIST_COUNT
+                      and all(row.get(identity) and row.get("playbackContext", {}).get("id") == summary["id"]
+                              and row["playbackContext"].get("kind") == kind for row in rows),
+                      "Go Play did not use the complete canonical collection and its correct context")
+
+        playlist_case_actions(window, summary, activate)
+    print("PASS real Go 0/1,161 manual and rule playlists; both Play surfaces queue all occurrences with canonical context",
+          flush=True)
+
+
+def real_playlist_offline_actions(window, ready):
+    # Use the smaller stock rule playlist for a bounded sync. Check durable
+    # intent in both menus, not completion of the background media transfer.
+    open_playlists(window)
+    target = next(t for t in ready["targets"] if t.get("playlistKind") == "derived")
+    name = target["name"]
+    label = re.escape(name)
+    window.click(f"Open {label}")
+    window.title(name)
+    window.click("Manage playlist")
+    window.click(offline_option(window))
+
+    def visit_saved():
+        def open_section():
+            elements = window.elements()
+            current = any(window.matches(e, SAVED) and (e.get("accessibleDescription") or "").startswith("Current section")
+                          for e in elements)
+            on_detail = any(window.matches(e, "Back") and e.get("accessibleRole") == "Button" for e in elements)
+            if current and not on_detail:
+                return True
+            # Navigation presses during the durable write are ignored.
+            window.click(SAVED)
+            return False
+
+        wait("Saved offline listing after durable playlist change", open_section)
+
+    def row_toggle(saved):
+        window.click(f"Show actions for {label}")
+        offline_option(window, name, saved=saved)
+        opposite = "Save offline" if saved else "Remove offline save"
+        window.absent(playlist_option(opposite, name), roles=("Button",))
+        if saved and window.output:
+            window.pixels("playlist-actions-real-row-saved", DESKTOP[0])
+        window.key(ESCAPE)
+
+    def detail_toggle(saved):
+        window.click(f"Open {label}")
+        window.title(name)
+        window.click("Manage playlist")
+        offline_option(window, saved=saved)
+        window.absent("Save offline" if saved else "Remove offline save", roles=("Button",))
+        if not saved and window.output:
+            window.pixels("playlist-actions-real-detail-unsaved", DESKTOP[0])
+        window.key(ESCAPE)
+
+    visit_saved()
+    window.find(f"Open {label}", roles=("Button",))
+    print("PASS playlist Save created durable intent visible in Saved offline", flush=True)
+    open_playlists(window)
+    row_toggle(saved=True)
+    detail_toggle(saved=True)
+    print("PASS online playlist row and detail menus mark Remove offline save as checked", flush=True)
+
+    window.click("Settings")
+    window.title("Settings")
+    window.click("Work offline")
+    visit_saved()
+    window.title("Offline mode")
+    window.click(f"Show actions for {label}")
+    offline_option(window, name, saved=True)
+    window.key(ESCAPE)
+    window.click(f"Open {label}")
+    window.title(name)
+    window.title("Offline mode")
+    window.click("Manage playlist")
+    remove = offline_option(window, saved=True)
+    print("PASS explicit Work offline keeps the checked action in Saved row and detail menus", flush=True)
+    if window.output:
+        window.pixels("playlist-actions-real-offline-detail-saved", DESKTOP[0])
+    window.click(remove)
+    window.title(SAVED)  # A successful removal returns to the listing itself.
+    window.section(SAVED)
+    window.absent("Back", roles=("Button",))
+
+    def only_independent_save_remains():
+        buttons = [e for e in window.elements() if e.get("accessibleRole") == "Button"]
+        return (any(window.matches(e, f"Play track: {TRACK}") for e in buttons)
+                and not any(window.matches(e, f"Open {label}") for e in buttons))
+
+    wait("offline listing drops playlist but keeps the independently saved track", only_independent_save_remains)
+    window.title("Offline mode")
+    print("PASS offline detail unpin removed the playlist and retained the independent track", flush=True)
+    window.click("Settings")
+    window.click("Go online")
+    window.find("Work offline", roles=("Button",))
+    window.absent("Offline mode", roles=("Text",))
+    open_playlists(window)
+    row_toggle(saved=False)
+    detail_toggle(saved=False)
+    print("PASS real Go fixture: online row/detail reflect durable Save; offline detail removes only the playlist; "
+          "both online toggles return to Save offline", flush=True)
 
 
 def playlist_row_menu(window):
@@ -579,12 +831,18 @@ def playlist_overflow(window):
     _, play, overflow = playlist_hit_targets(window)
     point = window.pointer_position_for_click("playlist overflow", element=overflow)
     check(inside(point, overflow) and not inside(point, play), "playlist overflow press hit the Play target")
-    window.find(f"Add to queue · {PLAYLIST}", roles=("Button",))
+    window.find(playlist_option("Add to queue", PLAYLIST), roles=("Button",))
+    save = playlist_option("Save offline", PLAYLIST)
+    window.find(save, roles=("Button",))
+    window.key(ESCAPE)
     playlists_root(window)
-    window.absent(r"Now playing: .+", roles=("Button",))
+    window.absent(save, roles=("Button",))
+    window.key(RETURN)
+    window.find(save, roles=("Button",))
     window.click(f"Hide actions for {PLAYLIST}")
-    window.absent(f"Add to queue · {PLAYLIST}", roles=("Button",))
-    print(f"PASS {window.dimensions()[0]:g}px playlist row overflow opens its menu without opening or playing the playlist",
+    window.absent(save, roles=("Button",))
+    window.absent(r"Now playing: .+", roles=("Button",))
+    print(f"PASS {window.dimensions()[0]:g}px playlist row overflow offers Save offline and restores focus on Escape",
           flush=True)
 
 

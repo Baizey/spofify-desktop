@@ -54,10 +54,46 @@ SUMMARY = {"id": "wire-playlist-01", "name": PLAYLIST, "description": "Two synth
                             "play": True, "copyToManual": False, "delete": True, "addTracks": True},
            "revision": 3, "createdAt": DATE, "updatedAt": DATE}
 ENTRIES = [{"id": f"wire-entry-{i}", "position": i, "addedAt": DATE, "track": TRACK} for i in range(2)]
+LARGE_PLAYLIST_COUNT = 1161
+
+
+def playlist_case(key, name, count, *, kind="derived", available=None, play=True, state="ready", source=None):
+    derived = kind == "derived"
+    available = count if available is None else available
+    summary = dict(SUMMARY, id=f"wire-{key}", name=name, description="", kind=kind,
+                   trackCount=count, availableCount=available,
+                   capabilities=dict(SUMMARY["capabilities"], play=play, editEntries=not derived,
+                                     editDefinition=derived, copyToManual=derived, addTracks=not derived))
+    definition = None
+    if derived:
+        summary.update(evaluationState=state, countState="stale" if state == "stale" else "exact")
+        definition = dict(version=1, sources=[dict(kind="playlist", playlistId=source or SUMMARY["id"],
+                                                   slotId="s_" + "1".zfill(32))],
+                          duplicates="keep", sort="sourceOrder")
+    prefix = "o1_" if derived else "entry-"
+    rows = [dict(id=f"{prefix}{key}-{i}", position=i, addedAt=DATE,
+                 track=TRACK if i < available else dict(TRACK, hasAudio=False,
+                                                        coverage=dict(TRACK["coverage"], inLibrary=0)))
+            for i in range(count)]
+    return summary, rows, definition
+
+
+LARGE_MANUAL = playlist_case("manual-large", "Wire Large Manual", LARGE_PLAYLIST_COUNT, kind="manual")
+LARGE_RULE = playlist_case("rules-large", "Wire Large Rules", LARGE_PLAYLIST_COUNT, source=LARGE_MANUAL[0]["id"])
+EMPTY_MANUAL = playlist_case("manual-empty", "Wire Empty Manual", 0, kind="manual")
+NEGATIVE_PLAYLISTS = (
+    EMPTY_MANUAL,
+    playlist_case("rules-empty", "Wire Empty Rules", 0, source=EMPTY_MANUAL[0]["id"]),
+    playlist_case("rules-silent", "Wire Rules Without Audio", 1, available=0),
+    playlist_case("rules-forbidden", "Wire Rules Without Play Permission", 1, play=False),
+    playlist_case("rules-stale", "Wire Stale Rules", 1, state="stale"),
+)
+PLAYLISTS = {summary["id"]: (summary, rows, definition) for summary, rows, definition in
+             ((SUMMARY, ENTRIES, None), LARGE_MANUAL, LARGE_RULE, *NEGATIVE_PLAYLISTS)}
+PLAYLIST_PART_ROWS = 64
 PROTOCOL = "spofify.account-state.v1"
 SOCKET_PATH = "/api/me/player/socket"
 TICKET_PATH = "/api/me/player/connect"
-PLAYLIST_TOKEN = "wire-rows-v1"
 
 
 def diagnostic_path(path):
@@ -118,15 +154,41 @@ class AccountWire:
 
     def initial(self):
         self.send(self.snapshot)
-        self.personal(snapshot=dict(playlists=[SUMMARY], recent=[]))
+        self.personal(snapshot=dict(playlists=[summary for summary, _, _ in PLAYLISTS.values()], recent=[]))
+
+    def playlist(self, command):
+        pid = command.get("playlistId")
+        check(pid in PLAYLISTS, "synthetic account asked for an unknown playlist")
+        summary, rows, definition = PLAYLISTS[pid]
+        token = f"{pid}-rows-v1"
+        offset, known = command.get("offset", 0), command.get("known")
+        check(type(offset) is int and (offset == 0 or
+              0 < offset < len(rows) and offset % PLAYLIST_PART_ROWS == 0 and known == token),
+              "synthetic account asked for an invalid playlist offset or token")
+        if offset or known != token:
+            end = offset + PLAYLIST_PART_ROWS
+            part = dict(summary=summary, token=token, offset=offset, rows=rows[offset:end], more=end < len(rows))
+            if definition is not None:
+                part["definition"] = definition
+            self.personal(part=part)
 
     def play(self, message):
         selection = message.get("selection")
         check(set(message) == {"type", "selection", "shuffle"} and message["shuffle"] is False
-              and isinstance(selection, dict) and selection.get("kind") == "track"
-              and isinstance(selection.get("track"), dict), "unexpected synthetic Play request")
-        track = next((t for t in (TRACK, SINGLE_TRACK) if t["id"] == selection["track"].get("id")), None)
-        check(track, "synthetic Play used an unknown track ID")
+              and isinstance(selection, dict), "unexpected synthetic Play request")
+        if selection.get("kind") == "collection":
+            # Only the ready, playable large controls should be activated here.
+            context = selection.get("context", {})
+            summary, rows, _ = PLAYLISTS[context.get("id")]
+            kind = "derived" if summary["kind"] == "derived" else "playlist"
+            check(selection == dict(kind="collection", context=dict(kind=kind, id=summary["id"], name=summary["name"]))
+                  and summary in (LARGE_MANUAL[0], LARGE_RULE[0]), "wrong synthetic collection Play context")
+            track = rows[0]["track"]
+        else:
+            check(selection.get("kind") == "track" and isinstance(selection.get("track"), dict),
+                  "unexpected synthetic track selection")
+            track = next((t for t in (TRACK, SINGLE_TRACK) if t["id"] == selection["track"].get("id")), None)
+            check(track, "synthetic Play used an unknown track ID")
         run = self.record_play(selection)
         # A paused cursor exercises the app's actual player projection without
         # starting a download, emitting an audio grant, or mutating a Go account.
@@ -165,10 +227,7 @@ class AccountWire:
                 if command.get("type") != "syncPlaylist":
                     self.writes.append("personal mutation")
                     return
-                check(command.get("playlistId") == SUMMARY["id"] and command.get("offset", 0) == 0,
-                      "synthetic account asked for an unknown playlist/offset")
-                if command.get("known") != PLAYLIST_TOKEN:
-                    self.personal(part=dict(summary=SUMMARY, token=PLAYLIST_TOKEN, offset=0, rows=ENTRIES, more=False))
+                self.playlist(command)
             elif kind == "play":
                 self.play(message)
             elif kind == "release":
@@ -191,7 +250,7 @@ def wire_fixture():
 
     def record_play(selection):
         with play_lock:
-            check(len(plays) < 8, "synthetic Play request cap exceeded")
+            check(len(plays) < 12, "synthetic Play request cap exceeded")
             plays.append(selection)
             return len(plays)
 

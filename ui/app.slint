@@ -90,6 +90,7 @@ export component AppWindow inherits Window {
     in property <bool> can-back;
     in property <[string]> page-actions;
     in property <[string]> page-options;
+    in property <int> saved-pin-focus-serial;
     callback navigate(string);
     callback row-action(string, int);
     callback page-action(string, string);
@@ -302,11 +303,15 @@ export component AppWindow inherits Window {
         changed editing => {
             if !self.editing {
                 // The browse view is still mounted. Focus the action that opened the editor if it survived.
-                if root.is-playlist && root.page-options.length > 0 && !root.local-mode { playlist-menu.take-focus(); }
+                if playlist-menu.actions.length > 0 { playlist-menu.take-focus(); }
                 else if back-row.visible { back-button.take-focus(); }
                 else { rail.restore-focus(); }
                 root.form-focus-serial += 1;
             }
+        }
+        property <int> saved-pin-focus: root.saved-pin-focus-serial;
+        changed saved-pin-focus => {
+            if root.page-kind == "offline" && !root.editor-open && !root.compact-queue-open { rail.restore-focus(); }
         }
         function toggle-queue(by-pointer: bool) {
             if root.editor-open { return; }
@@ -523,7 +528,7 @@ export component AppWindow inherits Window {
                             }
                             page-tools := HorizontalLayout {
                                 property <bool> has-primary: root.page-actions.length > 0 && (!root.local-mode || root.saved-view);
-                                property <bool> has-menu: !root.local-mode && root.is-playlist && root.page-options.length > 0;
+                                property <bool> has-menu: playlist-menu.actions.length > 0;
                                 visible: self.has-primary || self.has-menu;
                                 spacing: self.has-menu ? 8px : 0px;
                                 FlexboxLayout {
@@ -537,7 +542,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 playlist-menu := OverflowMenu {
-                                    actions: root.is-playlist && !root.local-mode ? root.page-options : [];
+                                    actions: root.is-playlist && root.local-mode ? [] : root.page-options;
                                     width: self.actions.length > 0 ? 37px : 0px;
                                     height: self.actions.length > 0 ? 38px : 0px;
                                     visible: self.actions.length > 0;
@@ -645,8 +650,7 @@ export component AppWindow inherits Window {
                                         compact: main.width < 435px;
                                         window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
-                                        actions: root.page-kind == "picker" ? [] : !root.local-mode ? row.actions
-                                            : root.page-kind == "offline" && row.actions.length > 0 ? ["remove"] : [];
+                                        actions: root.page-kind == "picker" ? [] : !root.local-mode || root.page-kind == "offline" ? row.actions : [];
                                         focused => { catalog-scroll.reveal(catalog.y + catalog-list.y + shelf-row.y + self.y, self.height); }
                                         action(op) => { shell.browse(op, i); }
                                         page-action(op, id) => { shell.entity(op, id); }

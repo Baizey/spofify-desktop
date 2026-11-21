@@ -32,6 +32,7 @@ OFFLINE_SWITCH = r"Work offline|Go online|Stay offline"
 OLD_NAV = r"Liked|Like|Unlike|Home|Search|Albums|Artists|Downloads"
 SAVED = "Saved offline"
 ESCAPE, CONTROL, ALT, LEFT, DOWN, RETURN = "\x1b", "\x11", "\x12", "\uf702", "\uf701", "\n"
+END = "\uf72b"
 
 
 def mcp_class():
@@ -514,11 +515,38 @@ def native_observer(api):
             reader.join()
 
 
-def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None):
+def save_fixture_track(window):
+    """Use the real track menu; no selection, playback or audio device required."""
+    row_menu = rf"(Add to queue|Add to playlist|Save offline) · {TRACK}"
+    window.absent(row_menu, roles=("Button",))
+    window.click(f"Show actions for {TRACK}")
+    for option in ("Add to queue", "Add to playlist", "Save offline"):
+        window.find(f"{option} · {TRACK}", roles=("Button",))
+    window.absent(r"(?:Like|Unlike)(?: · .*)?", roles=("Button",))
+    window.click(f"Save offline · {TRACK}")
+    window.title("Saved on this device.")
+    window.absent(row_menu, roles=("Button",))
+    window.click(SAVED)
+    window.section(SAVED)
+    window.absent("Back", roles=("Button",))
+    window.find(f"Play track: {TRACK}", roles=("Button",))
+    window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
+    print("PASS independently saved fixture track is in the Saved offline listing", flush=True)
+
+
+def selected_desktop(snapshot):
+    return any(device.get("name") == "Spofify Desktop" and device.get("canPlay")
+               and device.get("id") == snapshot.get("owner")
+               for device in snapshot.get("devices", []))
+
+
+def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None, *,
+                  playlist_actions_only=False, playlist_offline_only=False):
     from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
                                   compact_queue, empty_devices, keyboard_playlist_menu, manual_options, open_manual,
                                   pane_layout, playlist_back, playlist_hit_checks, playlist_row_menu,
-                                  playlists_root, queue_state, root_navigation, rules_editor, track_face,
+                                  playlists_root, queue_state, real_playlist_actions, real_playlist_offline_actions,
+                                  root_navigation, rules_editor, synthetic_playlist_actions, track_face,
                                   track_play_and_highlight, typed_catalog, wide_queue_toggle)
 
     synthetic = ready is not None and api is None
@@ -553,6 +581,20 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.click("Sign in")
         window.section("History")
         check_navigation(window)
+        if playlist_actions_only or playlist_offline_only:
+            check(api is not None and pcm is None, "playlist-only modes require the real Go fixture without PCM")
+            if playlist_offline_only:
+                print("REAL GO PLAYLIST OFFLINE ONLY — no large seeding or Play", flush=True)
+                window.click("Playlists")
+                open_manual(window)
+                save_fixture_track(window)
+                real_playlist_offline_actions(window, ready)
+            else:
+                print("REAL GO PLAYLIST ACTIONS ONLY — checks queue publication, not audio output", flush=True)
+                with native_observer(api) as observe:
+                    observe("desktop selected as the real Go output", selected_desktop, timeout=20)
+                real_playlist_actions(window, api, ready)
+            return
         pane_layout(window, wide=True)
         window.pixels("02-signed-in", DESKTOP[0])
 
@@ -594,16 +636,15 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             window.find("Standard", roles=("Button",))
             window.pixels("06-settings-compact", COMPACT[0])
             track_play_and_highlight(window, ready["play_requests"])
+            # The matrix has eight list rows, including the stock manual playlist.
+            if window.window_properties()["size"]["width"] != DESKTOP[0]:
+                window.resize(DESKTOP)
+            synthetic_playlist_actions(window, ready["play_requests"])
             print("PASS workspace interaction against Go-shaped wire data (no playback execution)", flush=True)
             return
         # Join only after the desktop: an observer must not become the initial
         # selected logical output or change how the desktop is admitted.
         with native_observer(api) as observe:
-            def selected_desktop(snapshot):
-                return any(device.get("name") == "Spofify Desktop" and device.get("canPlay")
-                           and device.get("id") == snapshot.get("owner")
-                           for device in snapshot.get("devices", []))
-
             # The initial output transfer can still be draining while the
             # catalog is already interactive. This case exercises Play on a
             # settled output, not rejection of actions during a handoff.
@@ -709,20 +750,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.pixels("09-album-detail", WIDE[0])
         print("PASS native album metadata link opens the real Go catalog detail", flush=True)
 
-        row_menu = rf"(Add to queue|Add to playlist|Save offline) · {TRACK}"
-        window.absent(row_menu, roles=("Button",))
-        window.click(f"Show actions for {TRACK}")
-        for option in ("Add to queue", "Add to playlist", "Save offline"):
-            window.find(f"{option} · {TRACK}", roles=("Button",))
-        window.absent(r"(?:Like|Unlike)(?: · .*)?", roles=("Button",))
-        window.click(f"Save offline · {TRACK}")
-        window.title("Saved on this device.")
-        window.absent(row_menu, roles=("Button",))
-        window.click(SAVED)
-        window.section(SAVED)
-        window.absent("Back", roles=("Button",))
-        window.find(f"Play track: {TRACK}", roles=("Button",))
-        window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
+        save_fixture_track(window)
         window.click("Settings")
         window.title("Settings")
         window.click("Work offline")

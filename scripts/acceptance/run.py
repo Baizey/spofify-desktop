@@ -13,7 +13,7 @@ import sys
 from tempfile import TemporaryDirectory
 
 sys.dont_write_bytecode = True
-from fixture import Failure, api_checks, build, check, fixture, private_env
+from fixture import Api, Failure, api_checks, build, check, fixture, private_env
 
 
 def interrupted(signum, _frame):
@@ -33,17 +33,22 @@ def main():
     mode.add_argument("--synthetic-wire-ui", action="store_true",
                       help="native navigation, fixed-theme Settings, density migration and track intent "
                            "against synthetic wire data; no Go or audio execution")
+    mode.add_argument("--playlist-actions-only", action="store_true",
+                      help="seed large playlists and verify native Play publishes the full Go queue; no audio output check")
+    mode.add_argument("--playlist-offline-only", action="store_true",
+                      help="only native playlist save and offline unpin against the disposable Go fixture; no large seeding or Play")
     parser.add_argument("--scratch-dir", type=Path,
                         help="existing base for disposable build/cache/DB/profile state (e.g. worker-private /dev/shm)")
     parser.add_argument("--capture-dir", type=Path,
-                        help="optionally retain synthetic PNGs in a new direct child of ~/repos/spofify-desktop-temporary")
+                        help="optionally retain disposable fixture PNGs in a new direct child of ~/repos/spofify-desktop-temporary")
     parser.add_argument("--pcm", action="store_true",
                         help="also verify online and offline Go fixture audio on a private PipeWire null sink")
     args = parser.parse_args()
-    if args.pcm and (not args.desktop or args.window_only or args.synthetic_wire_ui):
-        parser.error("--pcm requires --desktop with the real Go fixture")
-    if (args.window_only or args.synthetic_wire_ui or args.capture_dir) and not args.desktop:
-        parser.error("window-only, synthetic-wire and capture modes require --desktop")
+    playlist_only = args.playlist_actions_only or args.playlist_offline_only
+    if args.pcm and (not args.desktop or args.window_only or args.synthetic_wire_ui or playlist_only):
+        parser.error("--pcm requires the full real Go desktop run")
+    if (args.window_only or args.synthetic_wire_ui or playlist_only or args.capture_dir) and not args.desktop:
+        parser.error("window-only, synthetic-wire, playlist-only and capture modes require --desktop")
     artifact_root = (Path.home() / "repos" / "spofify-desktop-temporary").resolve()
     if not args.scratch_dir or args.capture_dir:
         artifact_root.mkdir(mode=0o700, exist_ok=True)
@@ -79,7 +84,7 @@ def main():
         failure = None
         with fixture(binary, root, env, revision) as ready:
             print(f"Go fixture source {ready['sourceRevision']}", flush=True)
-            api = api_checks(ready)
+            api = Api(ready, ready) if playlist_only else api_checks(ready)
             if args.desktop:
                 from native import native_checks
                 try:
@@ -88,8 +93,10 @@ def main():
                         with output(root, env) as pcm:
                             native_checks(desktop, root, env, ready, api, pixels=captures, pcm=pcm)
                     else:
-                        native_checks(desktop, root, env, ready, api, pixels=captures)
-                except Failure as error:
+                        native_checks(desktop, root, env, ready, api, pixels=captures,
+                                      playlist_actions_only=args.playlist_actions_only,
+                                      playlist_offline_only=args.playlist_offline_only)
+                except (Failure, TimeoutError) as error:
                     # Check the fixture's shutdown receipt even after a UI regression.
                     failure = error
             else:

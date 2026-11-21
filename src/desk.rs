@@ -165,6 +165,7 @@ struct Browser {
     pins: playlist_pins::Controller,
     pin_view: playlist_pins::View,
     saved_reload_due: bool,
+    unpinning: bool,
 }
 /// Opaque, account-session-local identity for the shell's scroll position.
 /// Hash the exact typed route, not its display title or refresh generation, and
@@ -310,18 +311,40 @@ fn strings(v: Vec<&str>) -> ModelRc<slint::SharedString> {
             .collect::<Vec<_>>(),
     ))
 }
-fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'static str> {
+fn playlist_pin_action(pinned: bool, can_pin: bool) -> Option<&'static str> {
+    if pinned {
+        Some("unpin-playlist")
+    } else if can_pin {
+        Some("pin-playlist")
+    } else {
+        None
+    }
+}
+fn row_actions(
+    p: &Page,
+    r: &pages::Row,
+    i: usize,
+    offline: bool,
+    personal_actions: bool,
+    pinned: bool,
+) -> Vec<&'static str> {
     let mut v = Vec::new();
-    if p.kind == "picker" {
+    if p.kind == "picker" || p.kind == "saved-collection" {
         return v;
     }
-    if matches!(p.kind.as_str(), "offline" | "saved-collection") {
-        if p.kind == "offline" {
-            v.push("remove");
+    if p.kind == "offline" {
+        v.push(if pinned { "unpin-playlist" } else { "remove" });
+        return v;
+    }
+    if p.kind == "playlists" && r.playlist.is_some() {
+        let can_use_account = !offline && personal_actions;
+        if can_use_account && r.playable {
+            v.push("queue");
         }
+        v.extend(playlist_pin_action(pinned, can_use_account));
         return v;
     }
-    if offline {
+    if offline || !personal_actions {
         return v;
     }
     if r.playback.is_some() && r.playable {
@@ -348,6 +371,47 @@ fn row_actions(p: &Page, r: &pages::Row, i: usize, offline: bool) -> Vec<&'stati
     }
     v
 }
+fn playlist_page_options(
+    route: &Route,
+    page: &Page,
+    pinned: bool,
+    can_use_account: bool,
+) -> Vec<&'static str> {
+    let mut options = Vec::new();
+    match route {
+        Route::Playlist(_) if let Some(m) = &page.playlist => {
+            options.extend(playlist_pin_action(pinned, can_use_account));
+            if can_use_account {
+                let c = &m.capabilities;
+                if c.edit_metadata {
+                    options.push("rename");
+                }
+                if c.edit_definition {
+                    options.push("rules");
+                }
+                if c.delete {
+                    options.push("delete");
+                }
+            }
+        }
+        Route::SavedCollection(_) if page.kind == "saved-collection" && pinned => {
+            options.push("unpin-playlist");
+        }
+        _ => {}
+    }
+    options
+}
+
+fn pin_subtitle(row: &pages::Row, status: Option<&playlist_pins::Status>) -> slint::SharedString {
+    match status {
+        Some(status) if !row.subtitle.is_empty() => {
+            format!("{} · {}", row.subtitle, status.label()).into()
+        }
+        Some(status) => status.label().into(),
+        None => row.subtitle.as_str().into(),
+    }
+}
+
 // Only the playlist list and Saved rows need the keyed pin state. Playlist
 // detail uses its own status line so the track model stays stable as it saves.
 struct PinDisplay<'a> {
@@ -423,6 +487,7 @@ impl Browser {
         self.busy = false;
         self.silent_read = false;
         self.writing = false;
+        self.unpinning = false;
     }
     fn scoped_ui(&self, f: impl FnOnce(AppWindow) + Send + 'static) {
         let ui = self.ui.clone();
@@ -526,26 +591,18 @@ impl Browser {
                             };
                             BrowseRow {
                                 section: Default::default(),
-                                actions: if personal_actions {
-                                    let mut acts = row_actions(&p, r, i, offline);
-                                    if !offline && kind == "playlists" && r.playlist.is_some() {
-                                        acts.push(if status.is_some() {
-                                            "unpin-playlist"
-                                        } else {
-                                            "save"
-                                        });
-                                    }
-                                    strings(acts)
-                                } else {
-                                    strings(Vec::new())
-                                },
+                                actions: strings(row_actions(
+                                    &p,
+                                    r,
+                                    i,
+                                    offline,
+                                    personal_actions,
+                                    status.is_some(),
+                                )),
                                 kind: r.kind.as_str().into(),
                                 track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
                                 title: r.title.as_str().into(),
-                                subtitle: status.map_or_else(
-                                    || r.subtitle.as_str().into(),
-                                    |r| r.label().into(),
-                                ),
+                                subtitle: pin_subtitle(r, status),
                                 detail: r.detail.as_str().into(),
                                 can_open: if matches!(route, Route::Picker(_)) {
                                     !offline && personal_actions
@@ -562,8 +619,9 @@ impl Browser {
                         })
                         .collect::<Vec<_>>(),
                 )));
+                let pinned = pin.page(&route).is_some();
                 let mut actions = Vec::new();
-                if kind == "saved-collection" {
+                if kind == "saved-collection" && !pinned {
                     actions.push("remove");
                 }
                 if matches!(kind.as_str(), "saved-collection" | "offline")
@@ -578,36 +636,19 @@ impl Browser {
                     if matches!(kind.as_str(), "album" | "artist") {
                         actions.push("save");
                     }
-                    if matches!(route, Route::Playlist(_)) && p.playlist.is_some() {
-                        actions.push(if pin.page(&route).is_some() {
-                            "unpin-playlist"
-                        } else {
-                            "save"
-                        });
-                    }
                     match kind.as_str() {
                         "playlists" => actions.extend(["new-manual", "new-rules"]),
                         "picker" => actions.push("new-manual"),
                         _ => {}
                     }
-                    if let Some(m) = &p.playlist {
-                        let c = &m.capabilities;
-                        if c.edit_metadata {
-                            actions.push("rename");
-                        }
-                        if c.edit_definition {
-                            actions.push("rules");
-                        }
-                        if c.delete {
-                            actions.push("delete");
-                        }
-                    }
                 }
-                let (options, primary) = actions
-                    .into_iter()
-                    .partition(|a| matches!(*a, "rename" | "rules" | "delete"));
-                ui.set_page_actions(strings(primary));
-                ui.set_page_options(strings(options));
+                ui.set_page_actions(strings(actions));
+                ui.set_page_options(strings(playlist_page_options(
+                    &route,
+                    &p,
+                    pinned,
+                    !offline && personal_actions,
+                )));
 
                 shown.store(token, Ordering::SeqCst);
                 ui.set_page_artwork(Default::default());
@@ -632,48 +673,67 @@ impl Browser {
                 }
                 return;
             }
-            if self.route.personal() {
-                self.render(true);
-            }
-        } else if matches!(&self.route, Route::Playlists | Route::Playlist(_))
-            || saved_route(&self.route)
+        }
+        if !matches!(self.route, Route::Playlists | Route::Playlist(_)) && !saved_route(&self.route)
         {
-            // Update only the visible labels. Replacing the entire model here
-            // would reset menus/focus and restart artwork for every progress tick.
-            let prev = PinDisplay::new(&old, self.access.as_ref());
-            let next = PinDisplay::new(&self.pin_view, self.access.as_ref());
-            let changes: Vec<_> = self
-                .page
+            return;
+        }
+        // Update the status and, only when intent changes, the menu actions in
+        // place. Do not remount the trigger or reload artwork on a pin update.
+        let prev = PinDisplay::new(&old, self.access.as_ref());
+        let next = PinDisplay::new(&self.pin_view, self.access.as_ref());
+        let offline = self.access.as_ref().is_some_and(|a| a.offline);
+        let personal_actions = !self.route.personal() || self.personal_ready;
+        let changes: Vec<_> = if matches!(self.route, Route::Playlists | Route::Offline) {
+            self.page
                 .rows
                 .iter()
                 .enumerate()
                 .filter_map(|(i, row)| {
-                    let old = prev.row(row).map(|r| r.label());
-                    let new = next.row(row).map(|r| r.label());
-                    (old != new).then(|| (i, new.unwrap_or_else(|| row.subtitle.clone())))
+                    let (old, new) = (prev.row(row), next.row(row));
+                    let actions = (old.is_some() != new.is_some()).then(|| {
+                        row_actions(&self.page, row, i, offline, personal_actions, new.is_some())
+                    });
+                    (actions.is_some() || old.map(|r| r.label()) != new.map(|r| r.label()))
+                        .then(|| (i, pin_subtitle(row, new), actions))
                 })
-                .collect();
-            if !changes.is_empty() {
-                let generation = self.generation;
-                let shown = self.shown.clone();
-                self.scoped_ui(move |ui| {
-                    if shown.load(Ordering::SeqCst) != generation {
-                        return;
-                    }
-                    let rows = ui.get_browse_rows();
-                    for (index, text) in changes {
-                        if let Some(mut row) = rows.row_data(index) {
-                            row.subtitle = text.into();
-                            rows.set_row_data(index, row);
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (old, new) = (prev.page(&self.route), next.page(&self.route));
+        let options = (old.is_some() != new.is_some()).then(|| {
+            playlist_page_options(
+                &self.route,
+                &self.page,
+                new.is_some(),
+                !offline && personal_actions,
+            )
+        });
+        if !changes.is_empty() || options.is_some() {
+            let generation = self.generation;
+            let shown = self.shown.clone();
+            self.scoped_ui(move |ui| {
+                if shown.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Some(options) = options {
+                    ui.set_page_options(strings(options));
+                }
+                let rows = ui.get_browse_rows();
+                for (index, text, actions) in changes {
+                    if let Some(mut row) = rows.row_data(index) {
+                        row.subtitle = text;
+                        if let Some(actions) = actions {
+                            row.actions = strings(actions);
                         }
+                        rows.set_row_data(index, row);
                     }
-                });
-            }
-            if prev.page(&self.route).map(|r| r.label())
-                != next.page(&self.route).map(|r| r.label())
-            {
-                self.render(false);
-            }
+                }
+            });
+        }
+        if old.map(|r| r.label()) != new.map(|r| r.label()) {
+            self.render(false);
         }
     }
     fn reset(&mut self, access: Option<Access>) {
@@ -716,6 +776,15 @@ impl Browser {
         let a = self.access.as_ref().unwrap();
         let offline = a.offline;
         if old.offline != offline {
+            if self.unpinning {
+                // Durable unpin needs the same local account grant, not the
+                // previous online connection. Finish before refreshing Saved.
+                self.personal_due = None;
+                self.personal_view = None;
+                self.personal_ready = false;
+                self.render(true);
+                return;
+            }
             let interrupted = self.pending.take().is_some();
             self.cancel();
             self.personal_due = None;
@@ -1231,9 +1300,24 @@ impl Browser {
         // Explicit Work offline closes the session gate immediately, before
         // the access watch necessarily reports the mode change to the browser.
         let offline = a.offline || a.session.is_offline();
+        let pin = if matches!(op.as_str(), "pin-playlist" | "unpin-playlist") {
+            let pins = PinDisplay::new(&self.pin_view, Some(&a));
+            match (&route, row.as_ref()) {
+                (Route::Playlists | Route::Offline, Some(row)) => pins.row(row),
+                (Route::Playlist(_) | Route::SavedCollection(_), None) => pins.page(&route),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let unpin = op == "unpin-playlist" && pin.is_some();
+        if op == "unpin-playlist" && !unpin {
+            return;
+        }
         if route.personal()
             && !self.personal_ready
-            && !(matches!(op.as_str(), "album" | "artist")
+            && !(unpin
+                || matches!(op.as_str(), "album" | "artist")
                 || op == "open" && !matches!(route, Route::Picker(_)))
         {
             self.message = "Wait for the current account library before making changes.".into();
@@ -1298,16 +1382,20 @@ impl Browser {
             }
             return;
         }
-        if matches!(op.as_str(), "save" | "unpin-playlist")
-            && let Some(target) = playlist_browser::target(&route, &page, row.as_ref())
-        {
-            let wanted = op == "save";
-            if wanted && offline {
-                return;
-            }
+        if op == "pin-playlist" || unpin {
+            let wanted = !unpin;
+            let target = if wanted && !offline && pin.is_none() {
+                playlist_browser::target(&route, &page, row.as_ref())
+            } else if unpin {
+                pin.map(|pin| pin.target.clone())
+            } else {
+                None
+            };
+            let Some(target) = target else { return };
             let pins = self.pins.clone();
             self.cancel();
             self.writing = true;
+            self.unpinning = unpin;
             self.error = false;
             self.message.clear();
             self.render(false);
@@ -1410,6 +1498,7 @@ impl Browser {
         }
         self.busy = false;
         self.writing = false;
+        let unpinning = std::mem::take(&mut self.unpinning);
         self.error = false;
         self.message.clear();
         match d.result {
@@ -1490,6 +1579,25 @@ impl Browser {
                 self.render(false);
             }
             Update::PinChanged(result) => {
+                let landed_offline = self.access.as_ref().is_some_and(|a| a.offline);
+                if unpinning && saved_route(&self.route) && result.is_ok() {
+                    self.cache.saved_changed();
+                    self.saved_reload_due = false;
+                    if matches!(self.route, Route::SavedCollection(_)) {
+                        self.trail.landed(&Route::Offline);
+                    }
+                    self.visit(Navigation::Untracked(Route::Offline), false);
+                    // The original popup trigger may no longer exist.
+                    self.scoped_ui(|ui| {
+                        ui.set_saved_pin_focus_serial(
+                            ui.get_saved_pin_focus_serial().wrapping_add(1),
+                        )
+                    });
+                    return;
+                }
+                if unpinning && landed_offline && !saved_route(&self.route) {
+                    self.visit(Navigation::Follow(Route::Offline), false);
+                }
                 if let Err(e) = result {
                     self.message = readable(&e);
                     self.error = true;
@@ -1856,7 +1964,74 @@ mod tests {
             playable: true,
             ..Default::default()
         };
-        assert!(row_actions(&p, &r, 0, true).is_empty());
+        assert!(row_actions(&p, &r, 0, true, true, false).is_empty());
+    }
+
+    #[test]
+    fn playlist_pin_menus_follow_intent_and_keep_offline_removal_available() {
+        let playlist = pages::PlaylistMetadata {
+            id: "mix".into(),
+            name: "Mix".into(),
+            kind: crate::api::library::PlaylistKind::Derived,
+            revision: 1,
+            track_count: None,
+            available_count: None,
+            capabilities: crate::api::library::PlaylistCapabilities {
+                edit_metadata: true,
+                edit_entries: false,
+                edit_definition: false,
+                play: true,
+                copy_to_manual: false,
+                delete: true,
+                add_tracks: false,
+            },
+        };
+        let row = pages::Row {
+            playlist: Some(playlist.clone()),
+            playable: true,
+            ..Default::default()
+        };
+        let list = Page {
+            kind: "playlists".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            row_actions(&list, &row, 0, false, true, false),
+            ["queue", "pin-playlist"]
+        );
+        assert_eq!(
+            row_actions(&list, &row, 0, false, true, true),
+            ["queue", "unpin-playlist"]
+        );
+        assert!(row_actions(&list, &row, 0, false, false, false).is_empty());
+        assert_eq!(
+            row_actions(&list, &row, 0, true, false, true),
+            ["unpin-playlist"]
+        );
+
+        let detail = Page {
+            playlist: Some(playlist),
+            ..Default::default()
+        };
+        let route = Route::Playlist("mix".into());
+        assert_eq!(
+            playlist_page_options(&route, &detail, false, true),
+            ["pin-playlist", "rename", "delete"]
+        );
+        assert_eq!(
+            playlist_page_options(&route, &detail, true, false),
+            ["unpin-playlist"]
+        );
+        let saved = Page {
+            kind: "saved-collection".into(),
+            ..Default::default()
+        };
+        let route = Route::SavedCollection("key".into());
+        assert_eq!(
+            playlist_page_options(&route, &saved, true, false),
+            ["unpin-playlist"]
+        );
+        assert!(playlist_page_options(&route, &saved, false, false).is_empty());
     }
 }
 fn draft_matches(b: &Option<(String, String, u64)>, p: &Page, mode: &str) -> bool {
@@ -1901,7 +2076,7 @@ pub fn start(
             .expect("browser runtime");
         runtime.block_on(async move {
             let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,pending:None,edit_basis:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);

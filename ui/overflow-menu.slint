@@ -3,15 +3,22 @@ import { Action, Theme } from "theme.slint";
 export global ActionCopy {
     public pure function label(action: string) -> string {
         return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
-            : action == "save" ? "Save offline" : action == "unpin-playlist" ? "Remove offline save"
+            : action == "save" || action == "pin-playlist" ? "Save offline" : action == "unpin-playlist" ? "Remove offline save"
             : action == "remove" ? "Remove" : action == "up" ? "Move up" : action == "down" ? "Move down"
             : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
             : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
             : action == "new-rules" ? "New rules playlist" : action;
     }
     public pure function mark(action: string) -> string {
-        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" ? "↓" : action == "remove" || action == "unpin-playlist" ? "−" : action == "up" ? "↑"
+        return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" || self.offline-toggle(action) ? "↓"
+            : action == "remove" || action == "delete" ? "−" : action == "up" ? "↑"
             : action == "down" ? "↓" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+    }
+    public pure function offline-toggle(action: string) -> bool {
+        return action == "pin-playlist" || action == "unpin-playlist";
+    }
+    public pure function separates(previous: string, action: string) -> bool {
+        return action == "delete" || self.offline-toggle(previous) || self.offline-toggle(action);
     }
 }
 
@@ -34,10 +41,7 @@ export component OverflowMenu inherits Rectangle {
     forward-focus: trigger;
     property <length> menu-width: 244px + max(0, Theme.density - 1) * 80px;
     property <length> item-height: max(37px, 34px * Theme.density);
-    property <length> menu-height: 12px + actions.length * item-height;
     property <length> anchor-y: self.absolute-position.y;
-    property <bool> open-above: window-height > 0px && anchor-y + self.height + 4px + menu-height > window-height
-        && anchor-y > window-height - anchor-y - self.height;
 
     changed actions => { if menu.is-open { menu.close(); } }
     changed context-key => { if menu.is-open { menu.close(); } }
@@ -65,9 +69,12 @@ export component OverflowMenu inherits Rectangle {
 
     menu := PopupWindow {
         x: root.width - root.menu-width;
-        y: root.open-above ? -root.menu-height - 4px : root.height + 4px;
+        y: self.open-above ? -self.height - 4px : root.height + 4px;
         width: root.menu-width;
-        height: root.menu-height;
+        height: items.preferred-height;
+        property <bool> open-above: root.window-height > 0px
+            && root.anchor-y + root.height + 4px + self.height > root.window-height
+            && root.anchor-y > root.window-height - root.anchor-y - root.height;
         close-policy: close-on-click-outside;
         forward-focus: keys;
         property <int> highlighted: 0;
@@ -81,48 +88,69 @@ export component OverflowMenu inherits Rectangle {
             width: 100%; height: 100%;
             background: Theme.panel;
             border-color: Theme.line; border-width: 1px; border-radius: Theme.container-radius;
-            VerticalLayout {
+            accessible-role: list;
+            accessible-label: root.label;
+            accessible-item-count: root.actions.length;
+            accessible-delegate-focus: menu.highlighted;
+            items := VerticalLayout {
                 padding: 6px;
-                for op[i] in root.actions: Action {
-                    height: root.item-height; min-width: 0px;
-                    text: ActionCopy.label(op); icon: ActionCopy.mark(op);
-                    leading: true; quiet: true;
-                    keyboard-focusable: false;
-                    selected: menu.highlighted == i;
-                    border-width: self.selected && keys.has-focus ? 2px : 0px;
-                    border-color: Theme.tertiary;
-                    accessible-label: self.text + (root.item-context == "" ? "" : " · " + root.item-context);
-                    changed has-hover => { if self.has-hover { menu.highlighted = i; } }
-                    clicked => { menu.choose(op); }
+                for op[i] in root.actions: Rectangle {
+                    property <bool> separated: i > 0 && ActionCopy.separates(root.actions[i - 1], op);
+                    height: root.item-height + (separated ? 7px : 0px);
+                    if separated: Rectangle {
+                        x: 5px; y: 3px; width: parent.width - 10px; height: 1px;
+                        background: Theme.line;
+                    }
+                    Action {
+                        y: parent.height - self.height; width: parent.width;
+                        height: root.item-height; min-width: 0px;
+                        text: ActionCopy.label(op); icon: ActionCopy.mark(op);
+                        leading: true; quiet: true;
+                        keyboard-focusable: false;
+                        selected: menu.highlighted == i;
+                        border-width: self.selected && keys.has-focus ? 2px : 0px;
+                        border-color: Theme.tertiary;
+                        accessible-label: self.text + (root.item-context == "" ? "" : " · " + root.item-context);
+                        accessible-checkable: ActionCopy.offline-toggle(op);
+                        accessible-checked: op == "unpin-playlist";
+                        changed has-hover => { if self.has-hover { menu.highlighted = i; } }
+                        clicked => { menu.choose(op); }
+                    }
+                    if op == "unpin-playlist": Text {
+                        x: parent.width - 27px; y: parent.height - root.item-height;
+                        width: 20px; height: root.item-height;
+                        text: "✓"; color: Theme.primary; vertical-alignment: center;
+                        accessible-role: none;
+                    }
                 }
             }
-        }
-        keys := FocusScope {
-            focus-on-click: false;
-            key-pressed(event) => {
-                if event.text == Key.Escape {
-                    menu.close();
-                    return accept;
-                }
-                if event.text == Key.Tab || event.text == Key.Backtab {
-                    // Let normal Tab traversal continue from the restored trigger.
-                    menu.close();
+            keys := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        menu.close();
+                        return accept;
+                    }
+                    if event.text == Key.Tab || event.text == Key.Backtab {
+                        // Let normal Tab traversal continue from the restored trigger.
+                        menu.close();
+                        return reject;
+                    }
+                    if root.actions.length == 0 { return reject; }
+                    if event.text == Key.UpArrow || event.text == Key.DownArrow {
+                        menu.highlighted = mod(menu.highlighted + root.actions.length + (event.text == Key.DownArrow ? 1 : -1), root.actions.length);
+                        return accept;
+                    }
+                    if event.text == Key.Home || event.text == Key.End {
+                        menu.highlighted = event.text == Key.Home ? 0 : root.actions.length - 1;
+                        return accept;
+                    }
+                    if event.text == Key.Return || event.text == Key.Space {
+                        if !event.repeat { menu.choose(root.actions[menu.highlighted]); }
+                        return accept;
+                    }
                     return reject;
                 }
-                if root.actions.length == 0 { return reject; }
-                if event.text == Key.UpArrow || event.text == Key.DownArrow {
-                    menu.highlighted = mod(menu.highlighted + root.actions.length + (event.text == Key.DownArrow ? 1 : -1), root.actions.length);
-                    return accept;
-                }
-                if event.text == Key.Home || event.text == Key.End {
-                    menu.highlighted = event.text == Key.Home ? 0 : root.actions.length - 1;
-                    return accept;
-                }
-                if event.text == Key.Return || event.text == Key.Space {
-                    if !event.repeat { menu.choose(root.actions[menu.highlighted]); }
-                    return accept;
-                }
-                return reject;
             }
         }
     }
