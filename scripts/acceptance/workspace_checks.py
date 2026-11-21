@@ -954,8 +954,10 @@ def playlist_overflow(window):
 
 
 def empty_devices(window, restore, *, wide, observer=False, capture=None):
+    # With no track the workspace toolbar opens Devices directly. The dock
+    # picker’s Manage devices route is exercised by its own native fixture.
+    window.absent(r"Now playing: .+", roles=("Button",))
     window.click("Playback devices")
-    window.click("Manage devices")
     window.title("Devices")
     if observer:
         window.absent("Deselect", roles=("Button",))
