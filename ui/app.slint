@@ -4,7 +4,7 @@ import { Copy, EmptyState, Hero, MediaLine, PlaylistPager } from "catalog.slint"
 import { OverflowMenu } from "overflow-menu.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
-import { PlayerBar } from "playback.slint";
+import { DockLayout, PlayerBar } from "playback.slint";
 import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings, SettingCard } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
@@ -160,9 +160,7 @@ export component AppWindow inherits Window {
     property <string> playback-status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
     property <bool> dock-visible: root.now-track-id != "" && !root.is-now && !root.editor-open;
     property <bool> toolbar-playback: !root.dock-visible && !root.editor-open;
-    property <length> player-height: !root.dock-visible ? 0px
-        : root.compact ? (root.playback-status == "" ? 58px : 72px) + (root.duration > 0 ? 69px : 48px)
-        : root.playback-status == "" ? 82px : 96px;
+    property <length> player-height: root.dock-visible ? DockLayout.height(root.compact) : 0px;
     property <bool> wide-queue-open: true;
     property <bool> compact-queue-open;
     property <bool> queue-shown: root.wide ? root.wide-queue-open : root.compact-queue-open;

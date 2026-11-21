@@ -298,7 +298,7 @@ def assert_dock_layout(window, title=DOCK_TITLE):
     left, top, right, bottom = bounds(dock)
     width, height = window.dimensions()
     check(abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
-    max_height = 145 if width < 820 else 100
+    max_height = 150 if width < 820 else 100
     check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= max_height,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
     dock_controls = window.subtree(dock, max_elements=1000)

@@ -190,7 +190,7 @@ def run(window):
     window.click("Previous track")
     window.absent("Playback position", roles=("Slider",))
     no_seek = element_type(window.elements(), "PlayerBar")
-    check(bounds(no_seek)[1] > bounds(dock)[1], "compact dock did not release the unused seek lane")
+    check(bounds(no_seek) == bounds(dock), "compact dock moved when the seek control was unavailable")
     window.click("Next track")
     title = "Now playing: Synthetic Tone 002"
     button(window, title)

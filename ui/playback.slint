@@ -160,6 +160,19 @@ component VolumeSlider inherits Rectangle {
     }
 }
 
+export global DockLayout {
+    // Fit the title, credits, and album targets above the status lane, even
+    // when the user's text scale increases their minimum heights.
+    out property <length> compact-metadata-height: 62px + 40px * max(0, Theme.density - 1);
+    out property <length> status-height: 18px;
+
+    // Reserve both lanes while a track is present: requests can change the
+    // message and available duration without moving the dock or workspace.
+    public pure function height(layered: bool) -> length {
+        return self.status-height + (layered ? self.compact-metadata-height + 69px : 82px);
+    }
+}
+
 export component PlayerBar inherits Rectangle {
     in property <string> track;
     in property <string> subtitle;
@@ -209,7 +222,7 @@ export component PlayerBar inherits Rectangle {
     property <length> track-and-transport: root.inner-width - output-tools.width - 2 * root.column-gap;
     property <length> transport-width: root.layered ? root.inner-width
         : clamp(root.track-and-transport * 2 / 3, 214px, root.track-and-transport - 188px);
-    property <length> top-height: root.layered ? (root.status == "" ? 58px : 72px) : root.height;
+    property <length> metadata-height: root.layered ? DockLayout.compact-metadata-height : root.height - DockLayout.status-height;
     property <bool> title-repaint-phase;
     changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
     vertical-stretch: 0; background: Theme.rail;
@@ -217,7 +230,7 @@ export component PlayerBar inherits Rectangle {
     track-info := Rectangle {
         x: root.edge; y: 0px;
         width: max(0px, root.layered ? output-tools.x - self.x - root.column-gap : root.track-and-transport - root.transport-width);
-        height: root.top-height;
+        height: root.metadata-height;
         // Damage the whole metadata area on title changes, rather than relying
         // on a partial software repaint of the old and new glyphs.
         // The transparent border affects neither layout nor progress-only damage.
@@ -246,15 +259,21 @@ export component PlayerBar inherits Rectangle {
                 text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
                 activated => { root.page-action("album", root.album-id); }
             }
-            if root.status != "": Caption { text: root.status; color: Theme.tertiary; }
         }
+    }
+    Caption {
+        x: root.edge; y: root.metadata-height; width: root.inner-width; height: DockLayout.status-height;
+        visible: root.status != "";
+        text: root.status; color: Theme.tertiary;
+        accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
     }
     Rectangle {
         width: root.transport-width; x: root.layered ? root.edge : track-info.x + track-info.width + root.column-gap;
-        y: root.layered ? root.top-height : 0px; height: root.height - self.y;
+        y: root.layered ? root.metadata-height + DockLayout.status-height : 0px;
+        height: root.layered ? root.height - self.y : root.metadata-height;
         Transport {
             x: (parent.width - self.width)/2;
-            y: root.duration <= 0 ? (parent.height - self.height)/2 : root.layered ? 0px : 7px;
+            y: root.layered ? 0px : 7px;
             playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip;
             shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.modes-enabled;
             previous => { root.previous(); } toggle => { root.toggle(); } next => { root.next(); }
@@ -267,7 +286,7 @@ export component PlayerBar inherits Rectangle {
         }
     }
     output-tools := HorizontalLayout {
-        x: root.width - self.width - root.edge; width: self.preferred-width; y: (root.top-height - self.height)/2; height: 38px; spacing: 3px;
+        x: root.width - self.width - root.edge; width: self.preferred-width; y: (root.metadata-height - self.height)/2; height: 38px; spacing: 3px;
         lyrics-trigger := PlaybackAction {
             width: 36px; icon: "lyrics"; quiet: true; accessible-label: "Lyrics";
             clicked => { root.navigate("lyrics"); }
