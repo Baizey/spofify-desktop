@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 from fixture import Api, Failure, check, fixture, private_env, stop
 from native import REMEMBER_LOGIN, bounds, desktop, element_id, login_options, verify, wait
 from remember_login import SERVER, assert_idle, disabled_login, interrupted, no_profile_secrets, store_metadata
-from remember_login_wire import recorded_origin
+from remember_login_wire import recorded_origin, vacant_output
 from workspace_checks import open_manual, open_playlists
 
 DBUS = "org.freedesktop.DBus"
@@ -155,11 +155,10 @@ def sign_out(window):
     window.find("Sign in", roles=("Button",))
 
 
-def play_pause(window, receipt, restore_mark, pcm):
+def play_pause(window, receipt, pcm):
     from audio_smoke import heard_tone
     open_playlists(window)
     open_manual(window)
-    check(("owner", True) not in receipt.events(restore_mark), "browsing acquired a Go output owner")
     mark = len(receipt.events())
     baseline = pcm.stat().st_size
     window.click("Play")
@@ -168,7 +167,7 @@ def play_pause(window, receipt, restore_mark, pcm):
     events = receipt.events(mark)
     check(events.count(("client", "play")) == 1 and ("playlist-play", True) in events,
           "one native Playlist Play did not send one correctly scoped command")
-    print("PASS explicit native Playlist Play acquired the Go output and selected the canonical queue", flush=True)
+    print("PASS explicit native Playlist Play selected the canonical queue on the elected Go output", flush=True)
 
     # Do not accept a second Play or a protocol-injected Pause: the native
     # transport must become active with real Go media and its private null sink.
@@ -206,23 +205,16 @@ def checks(binary, root, env, go, ready, receipt, wallet, *, playback, socket_re
     with desktop(binary, root, env) as window:
         window.section("History")
         wait("Go session validation on desktop restart", lambda: ("session", "GET", 200) in receipt.events(mark))
-        # Observe beyond the opening snapshot: Go can also assign ownership
-        # in response to a playback-capable client's first presence pulse.
-        wait("Go output state and two post-hello presence pulses",
-             lambda: ("owner", False) in receipt.events(mark)
-             and receipt.events(mark).count(("client", "presence")) >= 2)
-        events = receipt.events(mark)
-        check(("client", "hello") in events and not any(e[0] == "login" for e in events),
+        vacant_output(receipt, mark)
+        check(not any(e[0] == "login" for e in receipt.events(mark)),
               "desktop did not rejoin Go without password authentication")
-        check(not any(e in events for e in (("owner", True), ("client", "select"), ("client", "play"), ("media",))),
-              "desktop restart selected an audio output or started playback")
         check(wallet.items() == wallet.items(slot) == items and store_metadata(env).get("active") == slot,
               "desktop restart did not retain only the same credential")
         no_profile_secrets(env, ready, receipt)
-        print("PASS desktop restart recovered from KDE and validated with Go without password or automatic audio", flush=True)
+        print("PASS KDE restore validated without a password; Go elected the playable desktop without automatic media or commands", flush=True)
         if playback is not None:
             with verify(failures, "optional native Play/Pause"):
-                play_pause(window, receipt, mark, playback)
+                play_pause(window, receipt, playback)
         api = Api(go)
         api.cookie = receipt.rolling_cookie()
         check(api.cookie, "Go did not issue a rolling cookie")

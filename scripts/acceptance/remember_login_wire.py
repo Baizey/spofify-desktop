@@ -8,9 +8,11 @@ import json
 from select import select
 import socket
 from threading import Event, Lock, Thread
+from time import monotonic
 from urllib.parse import urlsplit
 
 from fixture import Failure, check
+from native import wait
 from playback import CONNECT, MAX_FRAME, SOCKET, apply_player
 
 
@@ -133,6 +135,8 @@ class Frames:
                 kind = message["type"]
                 if self.client:
                     self.receipt.record("client", kind)
+                    if kind == "hello":
+                        self.receipt.record("hello", message["deviceId"], message["canPlay"])
                     if kind == "play":
                         selection = message.get("selection", {})
                         context = selection.get("context", {})
@@ -148,14 +152,64 @@ class Frames:
             self.connection, self.player = message["connectionId"], message["player"]
         if kind in ("snapshot", "outputs"):
             self.owner = message["owner"]
-            self.receipt.record("owner", bool(self.owner))
+        if kind == "snapshot":
+            self.receipt.record("snapshot", self.connection, self.owner, self.player)
+        if kind == "grant":
+            self.receipt.record("grant", self.connection, message["handle"], monotonic(), message["ms"])
         if kind == "player":
             self.player = apply_player(self.player, message["player"])
+        if kind in ("snapshot", "outputs", "player") and self.player:
+            self.receipt.record("state", self.connection, self.owner, self.player)
         if kind in ("snapshot", "outputs", "player") and self.player and self.connection == self.owner:
             queue, cursor = self.player["queue"], self.player["cursor"]
             if (len(queue) == self.receipt.playlist_size and queue[0]["id"] == self.receipt.first_track
                     and queue[0]["key"] == cursor["key"] and cursor["desired"]):
                 self.receipt.record("owned-playlist-selection")
+
+
+def event(receipt, mark, kind, predicate=lambda _: True):
+    return next((row for row in receipt.events(mark) if row[0] == kind and predicate(row)), None)
+
+
+def state(receipt, mark, *, connection, owner, cursor=lambda _: True):
+    return event(receipt, mark, "state", lambda row: row[1] == connection and row[2] == owner
+                 and cursor(row[3]["cursor"]))
+
+
+def admitted(receipt, mark, device=None):
+    hello = wait("playback-capable desktop hello", lambda: event(receipt, mark, "hello"))
+    check(hello[1] and hello[2] is True and (device is None or hello[1] == device),
+          "desktop did not advertise the same playable installation identity")
+    _, connection, owner, player = wait("real Go admission snapshot", lambda: event(receipt, mark, "snapshot"))
+    return hello[1], connection, owner, player
+
+
+def no_writes(receipt, mark, *, playing=False):
+    permitted = {"hello", "presence", "sync"}
+    if playing:
+        permitted.add("fact")  # Observations, never a playback instruction.
+    events = receipt.events(mark)
+    rejected = {row[1] for row in events if row[0] == "client" and row[1] not in permitted}
+    check(not rejected and ("http-write",) not in events, f"unexpected desktop writes: {sorted(rejected)}")
+    if not playing:
+        check(("media",) not in events, "desktop requested media without local playback")
+
+
+def settle(receipt, mark):
+    wait("two desktop presence pulses", lambda: receipt.events(mark).count(("client", "presence")) >= 2)
+    check(receipt.events(mark).count(("client", "hello")) == 1, "unexpected extra desktop connection")
+
+
+def vacant_output(receipt, mark):
+    device, connection, _, _ = admitted(receipt, mark)
+    wait("Go elected the playable desktop on a vacant output", lambda: state(
+        receipt, mark, connection=connection, owner=connection))
+    settle(receipt, mark)
+    states = [row for row in receipt.events(mark) if row[0] == "state"]
+    check(all(not player["cursor"]["desired"] and not player["cursor"]["playing"]
+              for _, _, _, player in states), "vacant output election started canonical playback")
+    no_writes(receipt, mark)
+    return device, connection
 
 
 @contextmanager
@@ -203,6 +257,11 @@ def recorded_origin(go):
                 if self.path == SOCKET and self.headers.get("Upgrade", "").lower() == "websocket":
                     self.websocket(headers)
                     return
+                path = urlsplit(self.path).path
+                if path.endswith(("/audio", "/download")):
+                    receipt.record("media")
+                if self.command not in ("GET", "HEAD") and path not in {*AUTH, CONNECT}:
+                    receipt.record("http-write")
                 size = int(self.headers.get("Content-Length", 0))
                 check(0 <= size <= 16384, "recorder request exceeded bound")
                 body = self.rfile.read(size) if size else None
@@ -212,10 +271,7 @@ def recorded_origin(go):
                     response = conn.getresponse()
                     data = response.read(MAX_FRAME + 1)
                     check(len(data) <= MAX_FRAME, "recorder response exceeded bound")
-                    path = urlsplit(self.path).path
                     receipt.auth(self.command, path, response, data)
-                    if path.endswith(("/audio", "/download")):
-                        receipt.record("media")
                     self.send_response_only(response.status)
                     for name, value in response.getheaders():
                         if name.lower() not in HOP_HEADERS:
@@ -238,15 +294,19 @@ def recorded_origin(go):
                 request = f"GET {SOCKET} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
                 remote.sendall((request + "\r\n").encode("ascii"))
                 frames = {self.connection: Frames(receipt, client=True), remote: Frames(receipt, client=False)}
-                while not stopping.is_set():
-                    readable, _, _ = select(list(frames), [], [], 0.25)
-                    for source in readable:
-                        data = source.recv(65536)
-                        if not data:
-                            return
-                        frames[source].feed(data)
-                        target = remote if source is self.connection else self.connection
-                        target.sendall(data)
+                try:
+                    while not stopping.is_set():
+                        readable, _, _ = select(list(frames), [], [], 0.25)
+                        for source in readable:
+                            data = source.recv(65536)
+                            if not data:
+                                return
+                            frames[source].feed(data)
+                            target = remote if source is self.connection else self.connection
+                            target.sendall(data)
+                finally:
+                    if connection := frames[remote].connection:
+                        receipt.record("socket-end", connection)
 
     class Server(ThreadingHTTPServer):
         daemon_threads = False  # server_close joins its handlers.

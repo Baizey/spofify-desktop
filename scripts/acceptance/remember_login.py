@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Real Slint relaunches + prebuilt Go fixture + in-memory Secret Service double.
 
-Requires a debug desktop with SLINT_EMIT_DEBUG_INFO=1, cage, dbus-daemon, and
-Python with dbus-python and GLib (PyGObject) for the private service. No build,
-real keyring, host display/input, live origin, or retained captures.
+Requires a debug desktop built with SLINT_EMIT_DEBUG_INFO=1 and
+--features slint/mcp; cage, dbus-daemon, and Python dbus-python and GLib
+(PyGObject). --output-relaunch additionally uses the private ALSA/PipeWire
+null monitor and Cage's wlr-foreign-toplevel-management close protocol.
+No build, real keyring, host display/input, live origin, or retained captures.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import json
 import os
 from pathlib import Path
@@ -20,9 +22,9 @@ from time import monotonic, sleep
 from xml.sax.saxutils import escape
 
 sys.dont_write_bytecode = True
-from fixture import Api, Failure, check, fixture, private_env, stop
-from native import REMEMBER_LOGIN, bounds, desktop, login_options, verify, wait
-from remember_login_wire import recorded_origin
+from fixture import Api, check, fixture, private_env, stop
+from native import REMEMBER_LOGIN, bounds, desktop, login_options, wait
+from remember_login_wire import recorded_origin, vacant_output
 from workspace_checks import open_manual, open_playlists
 
 
@@ -128,8 +130,7 @@ def sign_out(window):
     window.find("Sign in", roles=("Button",))
 
 
-def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
-    failures = []
+def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after, pcm):
     for remember in (False, True):
         mark = len(receipt.events())
         with desktop(binary, root, env) as window:
@@ -174,50 +175,49 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
           flush=True)
 
     # During the password launches only ticket/upgrade routes were held back.
-    # Now let Go see its first account socket after its 15s startup drain, so a
-    # regression to advertising audio capability would visibly claim ownership.
+    # After Go's startup drain, the first playable hello gets the vacant output.
     sleep(max(0, first_socket_after - monotonic()))
     receipt.allow_socket.set()
     receipt.fail_next_sessions(503)
     expected_keyring.extend(["lookup", "lookup"])
     mark = len(receipt.events())
-    with desktop(binary, root, env) as window:
-        window.section("History")
+
+    def on_restore():
         wait("Go rolling session validation", lambda: ("session", "GET", 200) in receipt.events(mark))
-        wait("Go output state and a post-hello presence pulse",
-             lambda: any(e[0] == "owner" for e in receipt.events(mark))
-             and ("client", "presence") in receipt.events(mark))
-        sleep(0.4)  # Let Go's response to presence traverse the recorder.
-        events = receipt.events(mark)
-        check(("client", "hello") in events and not any(e[0] == "login" for e in events),
-              "remembered relaunch did not enter the socket without a password login")
-        check([event for event in events if event[0] == "session"]
+        check([event for event in receipt.events(mark) if event[0] == "session"]
               == [("session", "GET", 503), ("session", "GET", 200)],
               "remembered relaunch did not recover through one automatic read")
         check(keyring() == expected_keyring, "remembered relaunch did not revalidate the saved slot")
         print("PASS remembered relaunch recovered from 503 and entered History after real Go validation", flush=True)
-        with verify(failures, "remembered relaunch audio"):
-            check(("owner", True) not in events, "real Go assigned an output owner without user input")
-            check(not any(e in events for e in (("client", "select"), ("client", "play"), ("media",))),
-                  "desktop attempted an audio selection, playback command or media download without user input")
-            print("PASS remembered relaunch did not select audio", flush=True)
-        with verify(failures, "native playlist Play promotion"):
+
+    with ExitStack() as launches:
+        if pcm is None:
+            window = launches.enter_context(desktop(binary, root, env))
+            window.section("History")
+            on_restore()
+            vacant_output(receipt, mark)
+            print("PASS vacant Go output elected the playable desktop without automatic media or commands", flush=True)
             open_playlists(window)
             open_manual(window)
-            check(("owner", True) not in receipt.events(mark), "Go acquired an owner while merely browsing")
             play_mark = len(receipt.events())
             window.click("Play")
-            wait("actual Go ownership and canonical playlist selection", timeout=15,
-                 fn=lambda: ("owned-playlist-selection",) in receipt.events(play_mark))
-            # Watch one subsequent heartbeat as well; there must be no replay
-            # of the explicit command after the passive socket was replaced.
-            play_complete = len(receipt.events())
-            wait("post-play presence", lambda: ("client", "presence") in receipt.events(play_complete))
-            play_events = receipt.events(play_mark)
-            check(play_events.count(("client", "play")) == 1 and ("playlist-play", True) in play_events,
-                  "one native Playlist Play did not issue exactly one correctly scoped play command")
-            check(not any(event[0] == "login" for event in play_events), "output promotion sent a password login")
-            print("PASS one native playlist Play claimed the Go output and selected the expected canonical queue", flush=True)
+            wait("canonical playlist selection", lambda: ("owned-playlist-selection",) in receipt.events(play_mark))
+            wait("post-Play presence", lambda: ("client", "presence") in receipt.events(play_mark))
+            events = receipt.events(play_mark)
+            check(events.count(("client", "play")) == 1 and ("playlist-play", True) in events,
+                  "one native Playlist Play did not send exactly one correctly scoped command")
+            print("PASS one native Playlist Play selected the expected canonical queue", flush=True)
+        else:
+            from remember_login_output import output_relaunches
+            window = launches.enter_context(output_relaunches(
+                binary, root, env, receipt, pcm, mark, on_restore=on_restore, remote_api=Api(go, go)))
+            check([event for event in receipt.events(mark) if event[0] == "session"] ==
+                  [("session", "GET", 503)] + [("session", "GET", 200)] * 4,
+                  "remembered relaunches did not each validate a saved session")
+            expected_keyring.extend(["lookup"] * 3)
+            check(keyring() == expected_keyring, "output relaunches did not revalidate the same saved slot")
+        check(not any(event[0] == "login" for event in receipt.events(mark)),
+              "remembered relaunch sent a desktop password login")
         sign_out(window)
         wait("real Go logout", lambda: ("logout", "POST", 204) in receipt.events(mark))
         api = Api(go)
@@ -261,7 +261,6 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
               == [("session", "GET", 503), ("session", "GET", 401)],
               "401 did not stop automatic restore immediately")
     print("PASS restore-time 401 ends backoff, retires the credential and leaves manual Sign in", flush=True)
-    return failures
 
 
 def main():
@@ -269,6 +268,8 @@ def main():
     parser.add_argument("--desktop", type=Path, required=True, help="prebuilt debug Slint desktop")
     parser.add_argument("--fixture-binary", type=Path, required=True, help="prebuilt Go cmd/offline-fixture")
     parser.add_argument("--scratch-dir", type=Path, help="disposable existing scratch base (e.g. /dev/shm)")
+    parser.add_argument("--output-relaunch", action="store_true",
+                        help="also check graceful playing, paused and remote-owner relaunches with private PCM monitoring")
     parser.add_argument("--dbus-python", type=Path, default=Path("/usr/bin/python3"),
                         help="installed Python with dbus-python and PyGObject (default: /usr/bin/python3)")
     args = parser.parse_args()
@@ -280,9 +281,18 @@ def main():
         with secret_service(root, env, python) as (env, keyring), fixture(go_binary, root, env) as go:
             first_socket_after = monotonic() + 16
             print(f"EVIDENCE native Slint + real Go {go['sourceRevision']} + private in-memory Secret Service double", flush=True)
-            with recorded_origin(go) as (ready, receipt):
-                failures = checks(binary, root, env, go, ready, receipt, keyring, first_socket_after)
-    check(not failures, f"{len(failures)} native acceptance assertion(s) failed")
+            with ExitStack() as stack:
+                pcm = None
+                if args.output_relaunch:
+                    from audio_smoke import output
+                    from remember_login_output import prepare_tone
+                    prepare_tone(root, go)
+                    audio_env = dict(env)
+                    pcm = stack.enter_context(output(root, audio_env))
+                    # Keep Secret Service on its own bus, not the audio stack's absent bus.
+                    env.update({key: audio_env[key] for key in ("ALSA_CONFIG_PATH", "PIPEWIRE_RUNTIME_DIR", "PULSE_SERVER")})
+                ready, receipt = stack.enter_context(recorded_origin(go))
+                checks(binary, root, env, go, ready, receipt, keyring, first_socket_after, pcm)
 
 
 def interrupted(_signal, _frame):

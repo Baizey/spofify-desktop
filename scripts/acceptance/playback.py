@@ -18,9 +18,10 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class Peer:
-    """Does not claim audio. `wait` predicates receive the merged account view."""
+    """Read-only by default. `wait` predicates receive the merged account view."""
 
-    def __init__(self, api, timeout=8, *, name="Acceptance observer"):
+    def __init__(self, api, timeout=8, *, name="Acceptance observer", can_play=False):
+        self.can_play = can_play
         ticket = api.json(CONNECT, method="POST", body={})["ticket"]
         self.deadline = monotonic() + timeout
         self.device_id = "acceptance-" + uuid4().hex
@@ -45,12 +46,12 @@ class Peer:
             accept = b64encode(hashlib.sha1((key + WS_GUID).encode()).digest())
             check(headers.get(b"sec-websocket-accept") == accept and
                   headers.get(b"sec-websocket-protocol") == PROTOCOL.encode(), "account upgrade mismatch")
-            self.send(dict(type="hello", ticket=ticket, name=name, deviceId=self.device_id, canPlay=False))
+            self.send(dict(type="hello", ticket=ticket, name=name, deviceId=self.device_id, canPlay=can_play))
             first = self.message()
             self.apply(first)
             check(first["type"] == "snapshot" and first.get("connectionId") and any(
                 device["id"] == first["connectionId"] and device["deviceId"] == self.device_id
-                and device["name"] == name and device["canPlay"] is False for device in first["devices"]
+                and device["name"] == name and device["canPlay"] is can_play for device in first["devices"]
             ), "account observer admission")
             self.connection_id = first["connectionId"]
             try:
@@ -159,7 +160,7 @@ class Peer:
                 self.personal_snapshot = dict(playlists=list(playlists.values()), recent=recent)
             else:
                 check("part" in update, "unknown personal update")
-        else:
+        elif kind != "grant" or not self.can_play:
             raise Failure(f"unexpected observer frame type: {kind}")
 
     def wait_frame(self, predicate, timeout=12):
