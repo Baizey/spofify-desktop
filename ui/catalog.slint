@@ -151,6 +151,30 @@ export component MediaLine inherits Rectangle {
     in property <bool> compact;
     in property <bool> queue-row;
     property <bool> queue-cover: root.queue-row && root.artwork.width > 0;
+    property <bool> leading-cover: root.sequence == 0 && !root.compact && !root.queue-row;
+    property <bool> leading-marker: root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-row;
+    property <length> leading-slot: root.sequence > 0 ? (root.compact ? 26px : 33px)
+        : root.leading-cover ? 39px : root.leading-marker ? 16px : 0px;
+    property <length> word-gap: !root.queue-row && root.compact && root.kind == "track" ? 6px : 8px;
+    property <bool> row-reveals-play: row-face.has-hover || (row-keys.has-focus && !root.row-pointer-focus);
+    property <bool> row-pointer-focus;
+    property <bool> play-focused;
+    // The scroll owner supplies the row's viewport position and receives
+    // focus before a clipped Play action can handle another key.
+    in property <length> row-viewport-y;
+    in property <length> play-viewport-height;
+    callback play-focus-evicted();
+    property <bool> play-scrolled-out: root.play-focused && root.play-viewport-height > 0px
+        && (root.row-viewport-y + root.play-top + root.play-height <= 0px
+            || root.row-viewport-y + root.play-top >= root.play-viewport-height);
+    changed play-scrolled-out => { if root.play-scrolled-out { root.play-focus-evicted(); } }
+    changed playable => {
+        // A removed conditional control need not send a FocusOut event.
+        if !root.playable && root.play-focused {
+            root.play-focused = false;
+            root.keyboard-focus-changed(false, false);
+        }
+    }
     in property <bool> search-result;
     in property <bool> align-credit-fallback;
     in property <bool> selected;
@@ -179,11 +203,17 @@ export component MediaLine inherits Rectangle {
     property <bool> body-actionable: root.can-open || root.play-on-activate;
     property <bool> body-focusable: root.can-open || root.selectable;
     property <string> pressed-row-key;
+    property <bool> pressed-on-body;
+    property <string> previous-body-key;
+    property <bool> previous-body-release;
+    property <bool> accept-body-double;
+    property <length> play-height: root.leading-cover ? 39px : clamp(root.height - 4px, 0px, 46px);
+    property <length> play-top: (root.height - root.play-height) / 2;
     in property <string> occurrence-description;
     property <string> track-state-label: !root.current-track ? root.occurrence-description
         : (root.occurrence-description == "" ? "" : root.occurrence-description + ", ")
             + (root.playing-track ? "Playing" : "Current track");
-    public function take-row-focus() { row-keys.focus(); }
+    public function take-row-focus() { root.row-pointer-focus = false; row-keys.focus(); }
     property <string> resume-part;
     property <string> resume-credit;
     property <int> resume-serial;
@@ -191,18 +221,19 @@ export component MediaLine inherits Rectangle {
         if ((part == "artist" || part == "album") && !root.metadata-enabled)
             || (part == "album" && (root.album-id == "" || root.album-name == ""))
             || (part == "menu" && root.actions.length == 0) {
-            if root.body-focusable { row-keys.focus(); }
+            if root.body-focusable { root.take-row-focus(); }
         } else if part == "artist" || part == "album" || part == "menu" {
             root.resume-credit = credit;
             root.resume-part = part;
             root.resume-serial += 1;
-        } else if root.body-focusable { row-keys.focus(); }
+        } else if root.body-focusable { root.take-row-focus(); }
     }
     function activate-row() {
         if root.can-open { root.action("open"); }
         else if root.play-on-activate { root.action("play"); }
     }
     function click-row() {
+        root.row-pointer-focus = true;
         row-keys.focus();
         if root.can-open { root.activate-row(); }
     }
@@ -234,7 +265,7 @@ export component MediaLine inherits Rectangle {
             accessible-role: button;
             accessible-label: root.can-open ? root.open-label : "Play track: " + root.title;
             accessible-description: root.track-state-label;
-            accessible-action-default => { row-keys.focus(); root.activate-row(); }
+            accessible-action-default => { root.take-row-focus(); root.activate-row(); }
             forward-focus: row-keys;
         }
 
@@ -243,6 +274,7 @@ export component MediaLine inherits Rectangle {
             focus-on-click: false;
             focus-on-tab-navigation: root.body-actionable || root.playlist-track-row;
             focus-gained(reason) => {
+                if reason == FocusReason.tab-navigation { root.row-pointer-focus = false; }
                 if reason != FocusReason.window-activation { root.keyboard-focus-changed(true, true); }
                 root.focused();
             }
@@ -251,6 +283,7 @@ export component MediaLine inherits Rectangle {
             }
             key-pressed(event) => {
                 if root.body-actionable && (event.text == Key.Return || event.text == Key.Space) {
+                    root.row-pointer-focus = false;
                     if !event.repeat { root.activate-row(); }
                     return accept;
                 }
@@ -262,22 +295,33 @@ export component MediaLine inherits Rectangle {
     // Slint offers the press to descendants first, so links and controls
     // consume their own clicks. Only the plain track face starts this gesture.
     row-face := TouchArea {
-        width: parent.width; height: parent.height;
-        enabled: root.body-focusable;
+        x: root.playable ? -root.paint-left : 0px;
+        width: root.width - self.x; height: root.height;
+        enabled: root.body-focusable || root.playable;
         mouse-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
         pointer-event(event) => {
             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
                 root.pressed-row-key = root.menu-key;
+                root.pressed-on-body = self.mouse-x >= -self.x;
             }
         }
-        clicked => { if root.pressed-row-key == root.menu-key { root.click-row(); } }
-        double-clicked => { if root.pressed-row-key == root.menu-key { root.double-click-row(); } }
+        clicked => {
+            let matched = root.pressed-on-body && self.mouse-x >= -self.x && root.pressed-row-key == root.menu-key;
+            root.accept-body-double = matched && root.previous-body-release && root.previous-body-key == root.pressed-row-key;
+            root.previous-body-release = matched;
+            root.previous-body-key = root.pressed-row-key;
+            if matched { root.click-row(); }
+        }
+        double-clicked => { if root.accept-body-double { root.double-click-row(); } }
 
         HorizontalLayout {
+            x: -row-face.x;
+            width: max(0px, root.width - (root.actions.length > 0 ? 37px + root.word-gap : 0px));
+            height: parent.height;
             padding-top: 6px; padding-bottom: 6px;
-            spacing: !root.queue-row && root.compact && root.kind == "track" ? 6px : 8px;
+            spacing: root.word-gap;
             if root.sequence > 0: Rectangle {
-                width: root.compact ? 26px : 33px;
+                width: root.leading-slot;
                 Caption {
                     width: parent.width; height: parent.height; visible: !root.current-track;
                     text: root.sequence; horizontal-alignment: center; font-family: "JetBrains Mono";
@@ -287,7 +331,7 @@ export component MediaLine inherits Rectangle {
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }
             }
-            if root.sequence == 0 && !root.compact && !root.queue-row: Rectangle {
+            if root.leading-cover: Rectangle {
                 width: 39px;
                 TrackCover {
                     y: (parent.height - self.height) / 2;
@@ -295,7 +339,7 @@ export component MediaLine inherits Rectangle {
                     current-track: root.current-track; playing-track: root.playing-track;
                 }
             }
-            if root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-row: Rectangle {
+            if root.leading-marker: Rectangle {
                 width: 16px;
                 TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
             }
@@ -374,32 +418,52 @@ export component MediaLine inherits Rectangle {
                 width: root.playlist-track-row && !root.playable ? max(self.column-width, min(180px, self.preferred-width)) : self.column-width;
                 text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
             }
-            if root.playable: Rectangle {
-                width: 37px;
-                Action {
-                    y: (parent.height - self.height) / 2; width: parent.width;
-                    icon: "▶"; quiet: true; accessible-label: "Play " + root.title;
-                    accessible-description: root.track-state-label;
-                    single-pointer-activation: true; click-scope: root.menu-key;
-                    changed has-focus => { if self.has-focus { root.focused(); } }
-                    keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
-                    clicked => { root.action("play"); }
-                }
+        }
+        // Keep Play out of layout flow and after metadata links in Tab order.
+        // Hiding only the paint leaves a reachable, self-revealing keyboard action.
+        if root.playable: row-play := Action {
+            // For artless rows, use the pane inset, leaving the first pixel
+            // clear of the separator. Queue's links start 2px inside the row.
+            // The tiny compact track marker can borrow 5px on each side.
+            x: root.leading-slot == 0px ? 1px : -row-face.x - (root.leading-marker ? 5px : 0px);
+            y: root.play-top;
+            width: root.leading-slot == 0px ? max(0px, root.paint-left - 1px + (root.queue-row ? 2px : 0px))
+                : root.leading-slot + (root.leading-marker ? 10px : 0px);
+            height: root.play-height;
+            min-width: 0px;
+            icon: "▶"; quiet: true;
+            glyph-size: root.leading-cover ? 23px : 20px;
+            border-radius: root.leading-cover ? (root.kind == "artist" && root.artwork.width == 0
+                ? self.height / 2 : min(Theme.container-radius, self.height / 5)) : Theme.control-radius;
+            // Dim photos but replace the fallback glyph to avoid two icons
+            // fighting for the same center.
+            background: root.leading-cover && root.artwork.width > 0 ? Theme.bg.with-alpha(self.has-hover ? 0.83 : 0.73)
+                : self.has-hover || self.has-focus ? Theme.raised : Theme.panel;
+            property <bool> revealed: root.row-reveals-play || self.has-focus;
+            opacity: self.revealed ? 1 : 0;
+            pointer-enabled: self.revealed;
+            accessible-label: "Play " + root.title;
+            accessible-description: root.track-state-label;
+            single-pointer-activation: true; click-scope: root.menu-key;
+            keyboard-focus-changed(owns) => {
+                root.keyboard-focus-changed(owns, false);
+                // Tab can reach a mounted neighbor outside the viewport.
+                // Reveal it before arming the scroll-away handoff.
+                if owns { root.focused(); }
+                root.play-focused = owns;
             }
-            if root.actions.length > 0: Rectangle {
-                width: 37px;
-                OverflowMenu {
-                    y: (parent.height - self.height) / 2;
-                    actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
-                    item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
-                    restore-focus: root.restore-control == "menu";
-                    property <int> resume: root.resume-part == "menu" ? root.resume-serial : 0;
-                    changed resume => { if self.resume != 0 { self.take-focus(); } }
-                    trigger-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
-                    action(op) => { root.action(op); }
-                    focused => { root.focused(); }
-                }
-            }
+            clicked => { root.action("play"); }
+        }
+        if root.actions.length > 0: OverflowMenu {
+            x: parent.width - 37px; y: (parent.height - self.height) / 2;
+            actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
+            item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+            restore-focus: root.restore-control == "menu";
+            property <int> resume: root.resume-part == "menu" ? root.resume-serial : 0;
+            changed resume => { if self.resume != 0 { self.take-focus(); } }
+            trigger-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
+            action(op) => { root.action(op); }
+            focused => { root.focused(); }
         }
     }
     Divider { y: parent.height - 1px; x: 0px; width: parent.width; opacity: row-keys.has-focus ? 0 : 0.5; }

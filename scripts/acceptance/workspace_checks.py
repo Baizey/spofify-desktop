@@ -858,11 +858,7 @@ def playlists_root(window):
 
 
 def playlist_hit_checks(window):
-    viewport = element_id(window.elements(), "catalog-scroll")
-    check(viewport, "missing playlist list viewport")
-    left, _, right, _ = bounds(viewport)
-    regions = ("subtitle", "whitespace") if right - left < 435 else ("icon", "subtitle", "whitespace")
-    for region in regions:
+    for region in ("subtitle", "whitespace"):
         playlist_open_by_pointer(window, region)
     playlist_overflow(window)
 
@@ -900,11 +896,16 @@ def playlist_hit_targets(window):
                 and bounds(e)[1] <= min(py, oy) < max(pb, ob) <= bounds(e)[3]), None)
     check(row, f"could not find the visible playlist row for {PLAYLIST}")
     elements = window.subtree(row)
+    cover = element_type(elements, "Cover")
+    if cover:
+        # Play now owns the cover hit target; playlist_case_actions separately
+        # verifies that this pointer action sends the exact collection Play.
+        check(all(abs(a - b) <= 1 for a, b in zip(bounds(play), bounds(cover))),
+              "playlist Play is not centered on the cover")
     subtitle = next((e for e in elements if window.matches(e, r"Playlist · \d+ songs(?: · .+)?")), None)
-    # The noninteractive separator sits inside the blank bottom padding, away
+    # The noninteractive separator sits inside blank bottom padding, away
     # from the controls and the copy. It supplies an MCP pointer coordinate.
-    return {"icon": element_type(elements, "Cover"), "subtitle": subtitle,
-            "whitespace": element_type(elements, "Divider")}, play, overflow
+    return {"subtitle": subtitle, "whitespace": element_type(elements, "Divider")}, play, overflow
 
 
 def inside(point, element):

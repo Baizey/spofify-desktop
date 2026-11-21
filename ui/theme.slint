@@ -57,8 +57,13 @@ export component Action inherits Rectangle {
     in property <bool> single-pointer-activation;
     property <int> pending-clicks;
     property <string> pending-click-scope;
+    property <bool> previous-release-matched;
+    property <string> previous-release-scope;
+    property <bool> suppress-double-release;
     // Composite controls such as a popup menu can own keyboard focus themselves.
     in property <bool> keyboard-focusable: true;
+    // Hover-revealed actions can keep Tab access without a hidden pointer target.
+    in property <bool> pointer-enabled: true;
     // Let playback buttons keep Tab position without painting a pointer-only ring.
     in property <bool> pointer-focus-visible: true;
     out property <bool> has-focus: key.has-focus;
@@ -94,7 +99,7 @@ export component Action inherits Rectangle {
     }
     in property <color> secondary-ink: Theme.text;
     property <color> ink: primary && enabled ? Theme.on-primary : selected ? Theme.primary : secondary-ink;
-    property <length> glyph-size: root.icon == "" ? 0px : 18px;
+    in property <length> glyph-size: root.icon == "" ? 0px : 18px;
     property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
     // An empty Text still has a preferred width. An icon-only button has no label to reserve room for.
     property <length> inset: root.text == "" ? (root.width - root.glyph-size) / 2
@@ -106,7 +111,7 @@ export component Action inherits Rectangle {
         font-size: 14px * Theme.density; font-weight: 600; overflow: elide; vertical-alignment: center; accessible-role: none;
     }
     pointer := TouchArea {
-        enabled: root.enabled;
+        enabled: root.enabled && root.pointer-enabled;
         mouse-cursor: MouseCursor.pointer;
         pointer-event(event) => {
             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
@@ -114,7 +119,16 @@ export component Action inherits Rectangle {
             }
         }
         clicked => {
-            if root.pressed-scope == root.click-scope {
+            let matched = root.pressed-scope == root.click-scope;
+            if root.single-pointer-activation {
+                // A global double-click count can span two different targets
+                // at the same coordinates after a model refresh.
+                root.suppress-double-release = matched && root.previous-release-matched
+                    && root.previous-release-scope == root.pressed-scope;
+                root.previous-release-matched = matched;
+                root.previous-release-scope = root.pressed-scope;
+            }
+            if matched {
                 if root.keyboard-focusable { root.take-pointer-focus(); }
                 if root.single-pointer-activation {
                     if root.pending-click-scope != root.click-scope { root.pending-clicks = 0; }
@@ -124,9 +138,9 @@ export component Action inherits Rectangle {
             }
         }
         double-clicked => {
-            // Slint reports both clicked releases, then double-clicked for
-            // the second. Drop just that release, even if both are pending.
-            if root.single-pointer-activation && root.pressed-scope == root.click-scope {
+            // Slint reports the second clicked release before double-clicked.
+            // Drop it only if both releases belong to this occurrence.
+            if root.single-pointer-activation && root.suppress-double-release {
                 root.pending-clicks = max(0, root.pending-clicks - 1);
             }
         }

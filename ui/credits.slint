@@ -83,6 +83,9 @@ export component CreditLine inherits Rectangle {
     in property <string> background-click-scope;
     in property <MouseCursor> background-cursor: MouseCursor.pointer;
     property <string> background-pressed-scope;
+    property <string> background-previous-scope;
+    property <bool> background-previous-release;
+    property <bool> background-accept-double;
     callback background-clicked();
     callback background-double-clicked();
     callback activated(string /* id */);
@@ -124,11 +127,14 @@ export component CreditLine inherits Rectangle {
                 }
             }
             clicked => {
-                if root.background-pressed-scope == root.background-click-scope { root.background-clicked(); }
+                let matched = root.background-pressed-scope == root.background-click-scope;
+                root.background-accept-double = matched && root.background-previous-release
+                    && root.background-previous-scope == root.background-pressed-scope;
+                root.background-previous-release = matched;
+                root.background-previous-scope = root.background-pressed-scope;
+                if matched { root.background-clicked(); }
             }
-            double-clicked => {
-                if root.background-pressed-scope == root.background-click-scope { root.background-double-clicked(); }
-            }
+            double-clicked => { if root.background-accept-double { root.background-double-clicked(); } }
         }
 
         strip := HorizontalLayout {

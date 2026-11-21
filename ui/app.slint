@@ -932,6 +932,11 @@ export component AppWindow inherits Window {
                                         compact: main.width < 435px; window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
                                         playlist-track-row: true;
+                                        property <length> row-y: catalog-list.top + i * catalog-list.pitch;
+                                        row-viewport-y: self.row-y + catalog-scroll.content-y;
+                                        play-viewport-height: catalog-list.visible && history-pane.visible
+                                            && catalog-scroll.visible && catalog-list.focus-request < 0 ? catalog-scroll.visible-height : 0px;
+                                        play-focus-evicted => { catalog-list.focus(); catalog-list.focused-row = -1; }
                                         property <bool> focus-requested: catalog-list.focus-request == i;
                                         restore-control: self.focus-requested ? catalog-list.focus-control : "";
                                         function focus-if-requested() {
@@ -958,7 +963,7 @@ export component AppWindow inherits Window {
                                         focused => {
                                             catalog-list.focused-row = i;
                                             if self.focus-requested { catalog-list.focus-request = -1; }
-                                            else { catalog-scroll.reveal(catalog-list.top + i * catalog-list.pitch, self.height); }
+                                            else { catalog-scroll.reveal(self.row-y, self.height); }
                                         }
                                         action(op) => { shell.browse(op, i); }
                                         page-action(op, id) => { shell.entity(op, id, i); }
@@ -980,7 +985,12 @@ export component AppWindow inherits Window {
                                             playing-track: self.current-track && root.playing;
                                             compact: main.width < 435px; window-height: root.height;
                                             menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
-                                            focused => { catalog-scroll.reveal(catalog-list.top + other-rows.y + shelf-row.y + self.y, self.height); }
+                                            property <length> row-y: catalog-list.top + other-rows.y + shelf-row.y + self.y;
+                                            row-viewport-y: self.row-y + catalog-scroll.content-y;
+                                            play-viewport-height: catalog-list.visible && history-pane.visible && catalog-scroll.visible
+                                                ? catalog-scroll.visible-height : 0px;
+                                            play-focus-evicted => { catalog-list.focus(); }
+                                            focused => { catalog-scroll.reveal(self.row-y, self.height); }
                                             action(op) => {
                                                 if root.page-kind == "playlists" && (op == "rename" || op == "rules" || op == "delete") {
                                                     shell.browse("edit-" + op, i);
@@ -1044,6 +1054,12 @@ export component AppWindow inherits Window {
                                         window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + index;
                                         actions: !root.local-mode ? entry.actions : [];
+                                        // The Back anchor can keep this delegate mounted long after it
+                                        // leaves the viewport. Don't leave a clipped Play button active.
+                                        row-viewport-y: slot.visible-y;
+                                        play-viewport-height: history-pane.visible && catalog-scroll.visible && !catalog-scroll.restore-catalog
+                                            ? catalog-scroll.visible-height : 0px;
+                                        play-focus-evicted => { history-pane.focus(); root.catalog-focused-row = -1; }
                                         property <int> return-focus: catalog-scroll.return-focus-serial;
                                         changed return-focus => {
                                             if slot.restoring && slot.visible-y + slot.height > 0px && slot.visible-y < catalog-scroll.visible-height {
@@ -1200,8 +1216,10 @@ export component AppWindow inherits Window {
                             if self.scope-key != "" { root.queue-order-drop(self.scope-key, key, after); }
                         }
                     }
-                    queue-lane := Rectangle {
+                    queue-lane := FocusScope {
                         visible: !shell.queue-order-edit;
+                        focus-on-click: false;
+                        focus-on-tab-navigation: false;
                         max-height: self.visible ? 65535px : 0px;
                         min-width: queue-scroll.min-width;
                         min-height: 0px; vertical-stretch: self.visible ? 1 : 0;
@@ -1250,7 +1268,12 @@ export component AppWindow inherits Window {
                                             selectable: self.playable;
                                             actions: !root.queue-shown || !self.playable ? [] : ["remove"];
                                             window-height: root.height; menu-key: row.key;
-                                            focused => { queue-scroll.reveal(phase-list.y + queue-group.y + self.y, self.height); }
+                                            property <length> row-y: phase-list.y + queue-group.y + self.y;
+                                            row-viewport-y: self.row-y + queue-scroll.content-y;
+                                            play-viewport-height: root.queue-shown && queue-lane.visible && !root.editor-open
+                                                ? queue-scroll.visible-height : 0px;
+                                            play-focus-evicted => { queue-lane.focus(); }
+                                            focused => { queue-scroll.reveal(self.row-y, self.height); }
                                             action(op) => { if op != "open" { root.queue-action(op, row.key); } }
                                             page-action(op, id) => { shell.entity(op, id, -1); }
                                         }
@@ -1259,7 +1282,9 @@ export component AppWindow inherits Window {
                             }
                         }
                         queue-scroll := ScrollView {
-                            x: 0px; y: 0px; width: parent.width + queue-pane.inset-right; height: parent.height;
+                            // Wheel input covers the leading Play strip too.
+                            x: -queue-pane.inset-left; y: 0px;
+                            width: parent.width + queue-pane.inset-left + queue-pane.inset-right; height: parent.height;
                             content-height: queue-list.height;
                             horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
                             function reveal(y: length, h: length) {
