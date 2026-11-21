@@ -226,11 +226,27 @@ def run(win, ready, admitted, media, requests, pcm):
                 print(f"PASS {label} {direction} seek to {requested:.2f}s: native fact {report['elapsed']:.2f}s and {marker} Hz PCM",
                       flush=True)
     win.resize(WIDE)
+    streams = len(media)
     ended = peer.fact(active, lambda m: m["ended"], "bound native EOF fact", timeout=SECONDS + 2)
     check(not ended["playing"] and not ended["buffering"] and ended["landed"] == 0 and
           abs(ended["elapsed"] - SECONDS) < 0.05, "incorrect repeat-off EOF fact")
     silence(pcm, "after natural end")
-    print("PASS natural EOF (landed=0), stopped cursor and silent monitor", flush=True)
+    check(len(media) == streams, "terminal EOF requested another stream without a Play command")
+    baseline = pcm.stat().st_size
+    win.click("Play|Resume")
+    cmd = peer.command("resume")
+    started = monotonic()
+    replay = peer.control(cmd)
+    restarted = peer.fact(replay, audible, "playing fact after natural EOF")
+    check(0 <= restarted["elapsed"] < 2 and restarted["elapsed"] <= monotonic() - started + 0.25,
+          "replay after natural EOF did not start near zero")
+    wait("480 Hz opening PCM after natural EOF", lambda: heard_tone(pcm, start=baseline), 3)
+    print("PASS natural EOF (landed=0), silent monitor, and dock Resume from zero with 480 Hz PCM", flush=True)
+
+    # Stop the replay and drain PCM so it cannot satisfy the short-grant check.
+    win.click("Pause")
+    peer.control(peer.command("pause", before=lambda msg: peer.observe(replay, msg)))
+    silence(pcm, "after pausing the EOF replay")
 
     # Withhold renewals without sending a pause, a new cursor, or an owner change.
     peer.grant_ms = 3500

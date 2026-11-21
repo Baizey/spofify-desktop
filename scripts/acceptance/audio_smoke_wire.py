@@ -205,8 +205,13 @@ class Peer:
         check(not msg.get("error") and isfinite(msg["elapsed"]) and msg["elapsed"] >= 0 and
               all(type(msg[k]) is bool for k in ("playing", "buffering", "ended")) and
               msg["ended"] == ("landed" in msg), "invalid native account fact")
-        self.cursor(observed=True, elapsed=msg["elapsed"], playing=msg["playing"],
-                    **({"desired": False, "run": cursor["run"] + 1} if msg["ended"] else {}))
+        if msg["ended"]:
+            # Go's repeat-off terminal cursor keeps the row and visit but
+            # rewinds for Resume; the native fact still reports the real EOF.
+            self.cursor(observed=msg["landed"] == 0, elapsed=0, playing=False,
+                        desired=False, run=cursor["run"] + 1)
+        else:
+            self.cursor(observed=True, elapsed=msg["elapsed"], playing=msg["playing"])
         return True
 
     def fact(self, cursor, predicate, label, timeout=8):

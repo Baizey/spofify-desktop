@@ -142,7 +142,7 @@ pub(super) fn same_execution(a: &Cursor, b: &Cursor) -> bool {
 
 /// The exact Go natural traversal. The returned cursor is provisional until
 /// the server publishes it; positional edits may change where Go lands.
-pub(super) fn successor(state: &State, base: &Cursor, elapsed: f64) -> Option<Cursor> {
+pub(super) fn successor(state: &State, base: &Cursor) -> Option<Cursor> {
     let pos = state.queue.iter().position(|r| r.key == base.key)?;
     let to = match state.repeat {
         Repeat::One => Some(pos),
@@ -160,7 +160,7 @@ pub(super) fn successor(state: &State, base: &Cursor, elapsed: f64) -> Option<Cu
             playing: false,
         },
         None => Cursor {
-            elapsed,
+            elapsed: 0.0,
             desired: false,
             playing: false,
             run: base.run.checked_add(1)?,
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn go_eof_lands_by_occurrence_and_requires_landed_even_at_terminal() {
         let mut state = state();
-        let next = successor(&state, &state.cursor, 61.0).unwrap();
+        let next = successor(&state, &state.cursor).unwrap();
         assert_eq!(
             (next.key, next.visit, next.run, next.elapsed),
             (9, 3, 0, 0.0)
@@ -313,19 +313,20 @@ mod tests {
         assert_eq!(report.landed, Some(9));
         assert_eq!((report.key, report.visit, report.run), (8, 2, 1));
         state.cursor.key = 10;
-        let terminal = successor(&state, &state.cursor, 23.0).unwrap();
+        let terminal = successor(&state, &state.cursor).unwrap();
         assert!(!terminal.desired && !terminal.playing);
         assert_eq!(
             (terminal.key, terminal.visit, terminal.run, terminal.elapsed),
-            (10, 2, 2, 23.0)
+            (10, 2, 2, 0.0)
         );
         let end = fact(&state.cursor, 23.0, false, false, Some(0), None);
         assert!(end.ended);
+        assert_eq!(end.elapsed, 23.0);
         assert_eq!(serde_json::to_value(end).unwrap()["landed"], 0);
         state.repeat = Repeat::All;
-        assert_eq!(successor(&state, &state.cursor, 23.0).unwrap().key, 8);
+        assert_eq!(successor(&state, &state.cursor).unwrap().key, 8);
         state.repeat = Repeat::One;
-        let replay = successor(&state, &state.cursor, 23.0).unwrap();
+        let replay = successor(&state, &state.cursor).unwrap();
         assert_eq!((replay.key, replay.visit, replay.run), (10, 3, 0));
     }
 

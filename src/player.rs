@@ -417,6 +417,9 @@ impl LocalQueue {
             self.select(to)
         } else if self.position.is_some() {
             self.desired = false;
+            if natural {
+                self.elapsed = 0.0;
+            }
             Change::Stop
         } else {
             Change::Invalid
@@ -430,9 +433,6 @@ impl LocalQueue {
                 Change::Stop
             }
             Action::Resume if current.is_some() => {
-                if current.is_some_and(|d| d > 0.0 && self.elapsed >= d) {
-                    self.elapsed = 0.0;
-                }
                 self.desired = true;
                 Change::Start
             }
@@ -643,6 +643,42 @@ mod tests {
         assert_eq!(q.advance(true), Change::Start);
         assert_eq!(q.current().unwrap().track.id, "repeat");
         assert_ne!(q.entries[1].key, q.entries[2].key);
+    }
+    #[test]
+    fn saved_terminal_eof_stops_and_replays_the_same_occurrence_at_zero() {
+        for duration in [0.0, 6.0, 60.0] {
+            let mut q = LocalQueue::default();
+            let mut tail = track("same");
+            tail.duration = duration;
+            q.replace(vec![track("same"), tail], 0, false);
+            assert_eq!(q.advance(true), Change::Start);
+            let key = q.entries[1].key;
+            q.elapsed = 12.0;
+            assert_eq!(q.advance(true), Change::Stop);
+            assert!(!q.desired);
+            assert_eq!(q.elapsed, 0.0);
+            assert_eq!(q.current().unwrap().key, key);
+            assert_eq!(q.action(Action::Resume), Change::Start);
+            assert!(q.desired);
+            assert_eq!(q.elapsed, 0.0);
+            assert_eq!(q.current().unwrap().key, key);
+        }
+    }
+    #[test]
+    fn saved_pause_manual_next_and_seek_do_not_do_the_terminal_eof_reset() {
+        let mut q = LocalQueue::default();
+        q.replace(vec![track("tail")], 0, false);
+        q.elapsed = 61.0; // The label can underestimate actual audio.
+        assert_eq!(q.action(Action::Pause), Change::Stop);
+        assert!(!q.desired);
+        assert_eq!(q.elapsed, 61.0);
+        assert_eq!(q.action(Action::Resume), Change::Start);
+        assert_eq!(q.elapsed, 61.0);
+        assert_eq!(q.action(Action::Next), Change::Stop);
+        assert_eq!(q.elapsed, 61.0);
+        assert_eq!(q.action(Action::Seek(60.0)), Change::Stop);
+        assert_eq!(q.action(Action::Resume), Change::Start);
+        assert_eq!(q.elapsed, 60.0);
     }
     #[test]
     fn saved_crossfade_uses_natural_occurrences_but_not_self_repeat() {

@@ -730,7 +730,7 @@ impl Engine {
             {
                 return None;
             }
-            let to = output::successor(state, from, 0.0)?;
+            let to = output::successor(state, from)?;
             if !to.desired || to.key == from.key {
                 return None;
             }
@@ -891,7 +891,7 @@ impl Engine {
             return false;
         }
         let next = if allow_end && facts.ended && execution.status == Status::Ok {
-            output::successor(state, &execution.cursor, facts.elapsed)
+            output::successor(state, &execution.cursor)
         } else {
             None
         };
@@ -1138,6 +1138,42 @@ mod tests {
         assert!(state.advance.is_none());
         assert!(output::same_execution(&to, state.cursor().unwrap()));
         assert_eq!(state.cursor().unwrap().elapsed, 0.4);
+    }
+
+    #[test]
+    fn terminal_eof_projects_same_row_stopped_at_zero_before_go_confirms() {
+        let from = Cursor {
+            elapsed: 12.0,
+            playing: true,
+            ..cursor(5, 2, 1)
+        };
+        let state = State {
+            queue: serde_json::from_value(serde_json::json!([
+                {"key":5,"order":5,"id":"tail","intent":"low"}
+            ]))
+            .unwrap(),
+            cursor: from.clone(),
+            ..State::default()
+        };
+        let to = output::successor(&state, &from).unwrap();
+        let mut online = Online {
+            state: Some(state),
+            advance: Some(Advance {
+                from: from.clone(),
+                to: to.clone(),
+            }),
+            ..Online::default()
+        };
+        online.adopt_cursor(&from, true);
+        let projected = online.cursor().unwrap();
+        assert_eq!((projected.key, projected.visit, projected.run), (5, 2, 2));
+        assert!(!projected.desired && !projected.playing);
+        assert_eq!(projected.elapsed, 0.0);
+
+        online.state.as_mut().unwrap().cursor = to.clone();
+        online.adopt_cursor(&to, true);
+        assert!(online.advance.is_none());
+        assert_eq!(online.cursor().unwrap().elapsed, 0.0);
     }
 
     #[test]
