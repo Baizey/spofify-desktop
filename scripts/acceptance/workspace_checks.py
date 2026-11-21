@@ -666,7 +666,8 @@ def track_play_and_highlight(window, play_requests):
     window.title(PLAYLIST)
 
     # Keep both search rows visible above the dock when clicking the second.
-    window.resize(DESKTOP)
+    if window.window_properties()["size"]["width"] != DESKTOP[0]:
+        window.resize(DESKTOP)
     window.fill("Search tracks, albums or artists", "Synthetic")
     search_results(window)
     first = f"Play track: {TRACK}"

@@ -82,8 +82,16 @@ class Window:
         # was returned, so replace any partial dock with its complete subtree.
         if tree["truncated"]:
             player = element_id(elements, "player")
-            handles = [player["handle"]] if player else self.mcp.value("find_elements_by_id", {
-                "windowHandle": self.handle, "elementsId": "AppWindow::player"})["elementHandles"]
+            if player:
+                handles = [player["handle"]]
+            else:
+                lookup = self.mcp.value("find_elements_by_id", {
+                    "windowHandle": self.handle, "elementsId": "AppWindow::player"})
+                # Slint's protobuf JSON omits the repeated field when there are no matches.
+                check(isinstance(lookup, dict) and (not lookup or "elementHandles" in lookup),
+                      "invalid playback dock lookup response")
+                handles = lookup.get("elementHandles", [])
+                check(isinstance(handles, list), "invalid playback dock handles")
             check(len(handles) <= 1, "unexpected duplicate playback dock")
             for handle in handles:
                 dock = self.subtree({"handle": handle})
