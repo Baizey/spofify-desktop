@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 
 sys.dont_write_bytecode = True
 from fixture import check, private_env
-from native import CONTROL, ESCAPE, RETURN, bounds, contains, desktop, element_id, named, wait
+from native import CONTROL, ESCAPE, RETURN, assert_disjoint, bounds, contains, desktop, element_id, named, wait
 
 
 MINIMUM, WIDE = (480, 440), (1280, 790)  # Client pixels, excluding Cage decoration.
@@ -80,6 +80,66 @@ def selected_row(window, name):
     return selected
 
 
+def center_y(element):
+    _, top, _, bottom = bounds(element)
+    return (top + bottom) / 2
+
+
+def assert_popup_guides(window, panel, *, stacked_editor=False):
+    elements = window.subtree(panel)
+    title = named(window, elements, TRIGGER, "Text")
+    close = named(window, elements, CLOSE)
+    header = element_id(elements, "header")
+    guide = bounds(title)[0]
+    check(abs(guide - bounds(panel)[0] - 32) <= 1, f"popup text guide drifted: {guide:g}px")
+    check(abs(center_y(title) - center_y(header)) <= 1 and abs(center_y(close) - center_y(header)) <= 1,
+          "popup heading and Close are not centered in the header")
+
+    captions = [e for e in elements if any(t.get("typeName") == "Caption" for t in e.get("typeNamesAndIds", []))]
+    choices = [e for e in elements if (e.get("accessibleLabel") or "").startswith("Select output: ")]
+    labels = [(e.get("accessibleLabel"), e) for e in captions]
+    for choice in choices:
+        words = element_id(window.subtree(choice), "words")
+        check(words and contains(choice, words), f"device name escapes its list row: {choice['accessibleLabel']}")
+        labels.append((choice["accessibleLabel"], words))
+    selected = element_id(elements, "selected-name")
+    if selected:
+        labels.append((selected["accessibleLabel"], selected))
+    field = named(window, elements, "Device name", "TextInput")
+    if field:
+        labels.append(("rename input text", field))
+    for label, element in labels:
+        check(abs(bounds(element)[0] - guide) <= 1, f"{label!r} is not on the popup text guide: {bounds(element)}")
+
+    pencil = element_id(elements, "pencil")
+    mark = element_id(elements, "checkmark")
+    if pencil:
+        check(mark and selected and contains(panel, mark), "current output lacks a separate check gutter")
+        check(bounds(mark)[2] + 3 <= guide and abs(center_y(mark) - center_y(selected)) <= 1,
+              "checkmark is not in the selected-name gutter")
+        check(abs(center_y(pencil) - center_y(selected)) <= 1 and abs(bounds(pencil)[0] - bounds(close)[0]) <= 1
+              and abs(bounds(pencil)[2] - bounds(close)[2]) <= 1, "Rename is off the right action/selected row guides")
+        check(bounds(selected)[2] + 4 <= bounds(pencil)[0], "selected name touches or runs beneath Rename")
+    else:
+        check(not mark, "unexpected checkmark without a current row")
+    if field:
+        lane = element_id(elements, "selected-row")
+        field_box = element_id(elements, "name-field")
+        save, cancel = (named(window, elements, name) for name in ("Save device name", "Cancel device rename"))
+        controls = (("Rename field", field_box), ("Save", save), ("Cancel", cancel))
+        for label, control in controls:
+            check(control and contains(lane, control), f"{label} does not fit the pinned rename editor")
+        check(abs(center_y(save) - center_y(cancel)) <= 1, "rename actions do not share a centerline")
+        check(abs(bounds(cancel)[2] - bounds(close)[2]) <= 1, "rename editor misses the right action guide")
+        if stacked_editor:
+            check(bounds(field_box)[3] < bounds(save)[1], "enlarged rename controls are not below the field")
+            check(abs(bounds(field_box)[2] - bounds(cancel)[2]) <= 1, "enlarged rename field is not full width")
+        else:
+            check(all(abs(center_y(control) - center_y(lane)) <= 1 for _, control in controls),
+                  "rename editor controls are not on the selected row centerline")
+        assert_disjoint(controls)
+
+
 def assert_view(window, entry):
     window.absent("Devices", roles=TEXT)
     window.absent("Rename playback device", roles=TEXT)
@@ -135,6 +195,7 @@ def select_journey(window, width, entry, before, after, keyboard, expect):
     switch = trigger(window, entry, old_name)
     window.click_element(switch)
     panel = open_panel(window)
+    assert_popup_guides(window, panel)
     selected = selected_row(window, old_name)
     alternative = window.find(option(new_name), roles=BUTTON)
     check(alternative.get("accessibleEnabled") and bounds(selected)[1] < bounds(alternative)[1],
@@ -175,7 +236,7 @@ def select_journey(window, width, entry, before, after, keyboard, expect):
     check(queue_state(window) == queue, "device selection changed the queue state")
     expect(("device", "select", new_id))
     window.key(RETURN)
-    open_panel(window)
+    assert_popup_guides(window, open_panel(window))
     selected_row(window, new_name)
     window.key(ESCAPE)
     closed(window)
@@ -193,6 +254,7 @@ def rename_journey(window, width, entry, output, new_name, keyboard, expect):
     else:
         window.click(rename(old_name))
     field = window.find("Device name", roles=("TextInput",))
+    assert_popup_guides(window, open_panel(window))
     check(field.get("accessibleValue") == old_name, "Rename did not prefill the selected device")
     window.shortcut(CONTROL, "a")  # Must already be focused; no clicking into the field.
     window.key("Discard this")
@@ -308,6 +370,7 @@ def roster_states(window, update, expect):
         update(state)
         window.click(TRIGGER)
         panel = open_panel(window)
+        assert_popup_guides(window, panel)
         _, top, _, bottom = bounds(panel)
         check(50 <= bottom - top <= max_height, f"{state} popup isn't compact: {bottom - top:g}px")
         if state == "empty":
@@ -323,7 +386,7 @@ def roster_states(window, update, expect):
     for mode, message in (("offline", "Device control is unavailable offline"), ("reconnect", "Connecting…"), ("disconnect", None)):
         update(mode)
         window.click(TRIGGER)
-        open_panel(window)
+        assert_popup_guides(window, open_panel(window))
         if message:
             window.title(message)
             selected = window.title(DESKTOP_OUTPUT[1])  # stale roster is deliberately supplied by the fixture
@@ -341,6 +404,49 @@ def roster_states(window, update, expect):
         update("online")
     expect()
     print("PASS empty/one stay small; offline, reconnect and disconnect never show a false selection or write action", flush=True)
+
+
+def dense_guides(window, update, expect):
+    update("density-max")
+    for width, height in (MINIMUM, WIDE):
+        resize(window, (width, height))
+        update("long-names")
+        long_current = DESKTOP_OUTPUT[1] + " — " + "extended label " * 12
+        long_alternative = STUDIO_OUTPUT[1] + " — " + "extended label " * 12
+        window.click(TRIGGER)
+        assert_popup_guides(window, open_panel(window))
+        selected_row(window, long_current)
+        window.find(option(long_alternative), roles=BUTTON)
+        window.pixels(f"devices-long-names-density-125-{width}", width)
+        window.click(rename(long_current))
+        field = window.find("Device name", roles=("TextInput",))
+        check(field.get("accessibleValue") == long_current, "rename did not preserve the full long name")
+        assert_popup_guides(window, open_panel(window), stacked_editor=True)
+        window.shortcut(CONTROL, "a")
+        window.key(DESKTOP_OUTPUT[1])
+        window.pixels(f"devices-edit-density-125-{width}", width)
+        if width == MINIMUM[0]:
+            # The visual rows must not change keyboard order, or activate a write on Cancel.
+            window.key(TAB)
+            window.key(TAB)
+            window.key(RETURN)
+            selected_row(window, long_current)
+            expect()
+        else:
+            window.click("Save device name")
+            selected_row(window, DESKTOP_OUTPUT[1])
+            expect(("device", "rename", DESKTOP_OUTPUT[0], DESKTOP_OUTPUT[1]))
+        window.key(ESCAPE)
+        update("selected-unavailable")
+        window.click(TRIGGER)
+        panel = open_panel(window)
+        assert_popup_guides(window, panel)
+        window.absent(rename(DESKTOP_OUTPUT[1]), roles=BUTTON)
+        reason = element_id(window.subtree(panel), "reason-text")
+        check(reason and reason.get("accessibleLabel") == "Not available", "missing selected-row reason")
+        window.key(ESCAPE)
+    expect()
+    print("PASS popup guides at 125% text density: long names, editor and unavailable selected row", flush=True)
 
 
 def main():
@@ -391,6 +497,7 @@ def main():
             lifecycle(window, update, expect)
             resize(window, MINIMUM)
             roster_states(window, update, expect)
+            dense_guides(window, update, expect)
 
 
 if __name__ == "__main__":

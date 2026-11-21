@@ -49,6 +49,7 @@ export component Action inherits Rectangle {
     in property <bool> quiet;
     in property <bool> selected;
     in property <bool> leading;
+    in property <length> leading-inset: 10px;
     in property <bool> round;
     // An action whose target can change while the pointer is down can supply an identity.
     in property <string> click-scope;
@@ -94,7 +95,7 @@ export component Action inherits Rectangle {
     property <length> gap: root.icon != "" && root.text != "" ? 7px : 0px;
     // An empty Text still has a preferred width. An icon-only button has no label to reserve room for.
     property <length> inset: root.text == "" ? (root.width - root.glyph-size) / 2
-        : root.leading ? 10px : max(0px, (root.width - root.glyph-size - root.gap - words.preferred-width) / 2);
+        : root.leading ? root.leading-inset : max(0px, (root.width - root.glyph-size - root.gap - words.preferred-width) / 2);
     if root.icon != "": Glyph { x: root.inset; y: (root.height - self.height) / 2; width: root.glyph-size; height: self.width; name: root.icon; ink: root.ink; }
     words := Text {
         x: root.inset + root.glyph-size + root.gap; y: 0px; height: root.height;
@@ -285,6 +286,7 @@ export component Field inherits Rectangle {
     in property <string> prefix;
     in property <string> field-label;
     in property <bool> clearable;
+    out property <length> text-inset: prefix != "" ? 39px : 13px;
     callback cleared();
     callback edited();
     callback accepted();
@@ -309,7 +311,7 @@ export component Field inherits Rectangle {
         accessible-role: none;
     }
     input := TextInput {
-        x: root.prefix != "" ? 39px : 13px;
+        x: root.text-inset;
         y: root.multiline ? 9px : 0px;
         width: parent.width - self.x - (root.clearable ? 39px : 13px);
         height: parent.height - 2 * self.y;
