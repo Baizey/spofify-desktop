@@ -11,13 +11,11 @@ export component SignInView inherits Rectangle {
     in property <bool> restoring;
     in-out property <bool> keep-signed-in;
     in property <string> auth-notice;
-    in property <bool> can-retry-session;
     property <bool> reveal-password;
     property <bool> ready: !root.busy && root.origin != "" && root.username != "" && root.password != "";
     callback server-edited();
     callback username-edited();
     callback sign-in();
-    callback retry-session();
     callback cancel();
     background: Theme.bg;
     ScrollView {
@@ -53,7 +51,6 @@ export component SignInView inherits Rectangle {
                     }
                     if root.status != "": Notice { text: root.status; error: root.error; }
                     if root.auth-notice != "": Notice { text: root.auth-notice; }
-                    if root.can-retry-session && !root.busy: Action { text: "Retry saved session"; quiet: true; clicked => { root.retry-session(); } }
                 }
             }
         }

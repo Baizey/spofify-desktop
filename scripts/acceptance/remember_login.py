@@ -156,11 +156,30 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
             no_profile_secrets(env, ready, receipt)
     print("PASS explicit opt-in stores one cookie-only credential in the private Secret Service double", flush=True)
 
+    expected_keyring = ["store"]
+    for statuses in ((503, 503, 503), (404,)):
+        receipt.fail_next_sessions(*statuses)
+        mark = len(receipt.events())
+        expected_keyring.extend(["lookup"] * len(statuses))
+        with desktop(binary, root, env) as window:
+            window.find(r"Could not restore the saved session\. Sign in with your password\.")
+            disabled_login(window, ready["origin"], ready["username"])
+            window.absent(".*retry.*", roles=("Button",))
+            check([e for e in receipt.events(mark) if e[0] in AUTH]
+                  == [("session", "GET", status) for status in statuses],
+                  "saved-session restore did not finish after the expected read attempts")
+            check(keyring() == expected_keyring and store_metadata(env).get("active"),
+                  "non-auth restore failure unexpectedly changed the saved credential")
+    print("PASS transient restore stops after three reads; 404 stops after one; failures show Sign in without Retry",
+          flush=True)
+
     # During the password launches only ticket/upgrade routes were held back.
     # Now let Go see its first account socket after its 15s startup drain, so a
     # regression to advertising audio capability would visibly claim ownership.
     sleep(max(0, first_socket_after - monotonic()))
     receipt.allow_socket.set()
+    receipt.fail_next_sessions(503)
+    expected_keyring.extend(["lookup", "lookup"])
     mark = len(receipt.events())
     with desktop(binary, root, env) as window:
         window.section("History")
@@ -172,8 +191,11 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
         events = receipt.events(mark)
         check(("client", "hello") in events and not any(e[0] == "login" for e in events),
               "remembered relaunch did not enter the socket without a password login")
-        check(keyring() == ["store", "lookup"], "remembered relaunch did not read exactly the saved secret")
-        print("PASS remembered relaunch entered History after real Go session validation without password login", flush=True)
+        check([event for event in events if event[0] == "session"]
+              == [("session", "GET", 503), ("session", "GET", 200)],
+              "remembered relaunch did not recover through one automatic read")
+        check(keyring() == expected_keyring, "remembered relaunch did not revalidate the saved slot")
+        print("PASS remembered relaunch recovered from 503 and entered History after real Go validation", flush=True)
         with verify(failures, "remembered relaunch audio"):
             check(("owner", True) not in events, "real Go assigned an output owner without user input")
             check(not any(e in events for e in (("client", "select"), ("client", "play"), ("media",))),
@@ -202,7 +224,8 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
         api.cookie = receipt.rolling_cookie()
         check(api.cookie, "real Go rolling cookie was not observed")
         api.request("/api/auth/session", status=401)
-        wait("private credential removal", lambda: keyring() == ["store", "lookup", "clear"]
+        expected_keyring.append("clear")
+        wait("private credential removal", lambda: keyring() == expected_keyring
              and not {"active", "cleanup"} & store_metadata(env).keys())
         no_profile_secrets(env, ready, receipt)
     print("PASS native Sign out retired the saved keyring item and Go session", flush=True)
@@ -211,8 +234,33 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after):
     with desktop(binary, root, env) as window:
         disabled_login(window, ready["origin"], ready["username"])
         assert_idle(window, receipt, mark)
-    check(keyring() == ["store", "lookup", "clear"], "post-sign-out relaunch touched Secret Service")
+    check(keyring() == expected_keyring, "post-sign-out relaunch touched Secret Service")
     print("PASS second relaunch stays signed out with only server and username prefilled", flush=True)
+
+    # Re-enroll using only the normal password Sign in. A later definitive
+    # denial must stop a sequence that began with a recoverable failure.
+    with desktop(binary, root, env) as window:
+        disabled_login(window, ready["origin"], ready["username"])
+        window.click(REMEMBER_LOGIN)
+        window.fill("Password", ready["password"])
+        window.click("Sign in")
+        window.section("History")
+        expected_keyring.append("store")
+        wait("new remembered credential", lambda: keyring() == expected_keyring
+             and store_metadata(env).get("active"))
+    receipt.fail_next_sessions(503, 401)
+    mark = len(receipt.events())
+    with desktop(binary, root, env) as window:
+        window.find(r"The saved session is no longer valid\. Sign in again\.")
+        disabled_login(window, ready["origin"], ready["username"])
+        window.absent(".*retry.*", roles=("Button",))
+        expected_keyring.extend(["lookup", "lookup", "clear"])
+        wait("rejected credential retired", lambda: keyring() == expected_keyring
+             and not {"active", "cleanup"} & store_metadata(env).keys())
+        check([e for e in receipt.events(mark) if e[0] in AUTH]
+              == [("session", "GET", 503), ("session", "GET", 401)],
+              "401 did not stop automatic restore immediately")
+    print("PASS restore-time 401 ends backoff, retires the credential and leaves manual Sign in", flush=True)
     return failures
 
 

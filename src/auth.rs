@@ -7,9 +7,12 @@ use crate::{
     api::{Api, Origin, RememberedCredential, Session},
     login_store::{LoginProfile, LoginStore, StoreError},
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -21,8 +24,8 @@ const SAVE_KEYRING: &str =
 const FORGET_KEYRING: &str = "Automatic sign-in is off. The system keyring is unavailable or locked, so its old entry could not be removed.";
 const FORGET_FAILED: &str = "The desktop could not update its saved sign-in settings.";
 const STALE: &str = "The saved session is no longer valid. Sign in again.";
-const RESTORE_FAILED: &str =
-    "Could not restore the saved session. Retry or sign in with your password.";
+const RESTORE_FAILED: &str = "Could not restore the saved session. Sign in with your password.";
+const RESTORE_BACKOFF: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(1)];
 
 pub(crate) struct Success {
     pub api: Arc<Api>,
@@ -40,7 +43,6 @@ pub(crate) enum Kind {
 pub(crate) struct Fallback {
     pub status: &'static str,
     pub notice: &'static str,
-    pub retry: bool,
     pub discard: Option<LoginProfile>,
 }
 
@@ -73,7 +75,6 @@ pub(crate) async fn password(
 }
 
 pub(crate) async fn restore<F>(
-    scope: Option<(String, String)>,
     epoch: u64,
     current: &AtomicU64,
     prefill: impl FnOnce(String, String) -> F,
@@ -90,59 +91,102 @@ where
     let Some(profile) = profile else {
         return Err(Fallback::default());
     };
-    if let Some((origin, username)) = scope {
-        // A Retry is never allowed to use the credential for an edited form,
-        // or for a profile another process replaced with a different scope.
-        if origin != profile.origin.as_str() || username != profile.username {
-            return Err(Fallback::default());
-        }
-    } else {
-        prefill(profile.origin.as_str().into(), profile.username.clone()).await;
-    }
+    prefill(profile.origin.as_str().into(), profile.username.clone()).await;
     if !profile.remembered || current.load(Ordering::SeqCst) != epoch {
         return Err(Fallback::default());
     }
-    let credential = match store.restore(&profile).await {
+    let origin = profile.origin.clone();
+    let api = Arc::new(Api::new(origin.clone()).map_err(|_| restore_failed())?);
+    let session = with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
+        restore_once(&store, &profile, &api, epoch, current)
+    })
+    .await?;
+    Ok(Success {
+        api,
+        session,
+        origin,
+        kind: Kind::Restored(profile),
+    })
+}
+
+enum RestoreFailure {
+    Transient,
+    Final(Fallback),
+}
+
+async fn restore_once(
+    store: &LoginStore,
+    profile: &LoginProfile,
+    api: &Api,
+    epoch: u64,
+    current: &AtomicU64,
+) -> Result<Session, RestoreFailure> {
+    // Re-check the original login slot on each attempt. A changed profile
+    // can neither substitute its credential nor reuse the old one here.
+    let credential = match store.restore(profile).await {
         Ok(Some(credential)) => credential,
-        Ok(None) | Err(StoreError::InvalidCredential) => return Err(stale(profile)),
-        Err(e) => {
-            return Err(Fallback {
-                status: RESTORE_FAILED,
-                notice: if e == StoreError::KeyringUnavailable {
-                    KEYRING
-                } else {
-                    ""
-                },
-                retry: true,
-                ..Fallback::default()
-            });
+        Ok(None) | Err(StoreError::InvalidCredential) => {
+            return Err(RestoreFailure::Final(stale(profile.clone())));
         }
+        Err(StoreError::Busy) => return Err(RestoreFailure::Transient),
+        Err(StoreError::KeyringUnavailable) => {
+            return Err(RestoreFailure::Final(Fallback {
+                notice: KEYRING,
+                ..restore_failed()
+            }));
+        }
+        Err(_) => return Err(RestoreFailure::Final(restore_failed())),
     };
     // A cancelled keyring lookup must never open a network session later.
     if current.load(Ordering::SeqCst) != epoch {
-        return Err(Fallback::default());
+        return Err(RestoreFailure::Final(Fallback::default()));
     }
-    let origin = profile.origin.clone();
-    let api = Arc::new(Api::new(origin.clone()).map_err(|_| retry_restore())?);
     match api.resume(&credential).await {
-        Ok(session) if session.username == profile.username => Ok(Success {
-            api,
-            session,
-            origin,
-            kind: Kind::Restored(profile),
-        }),
-        // The server is authoritative; a renamed or mismatched account needs
-        // explicit sign-in before it can replace the last-good profile.
-        Ok(_) => Err(stale(profile)),
-        Err(e) if e.expired || e.status == 401 => Err(stale(profile)),
-        Err(_) => Err(retry_restore()),
+        Ok(session) if session.username == profile.username => Ok(session),
+        // A renamed or mismatched account still needs explicit sign-in.
+        Ok(_) => Err(RestoreFailure::Final(stale(profile.clone()))),
+        Err(e) if e.expired || e.status == 401 => {
+            Err(RestoreFailure::Final(stale(profile.clone())))
+        }
+        Err(e) if e.can_retry_restore() => Err(RestoreFailure::Transient),
+        Err(_) => Err(RestoreFailure::Final(restore_failed())),
     }
 }
 
-fn retry_restore() -> Fallback {
+async fn with_restore_backoff<T, F>(
+    epoch: u64,
+    current: &AtomicU64,
+    delays: &[Duration],
+    mut attempt: impl FnMut() -> F,
+) -> Result<T, Fallback>
+where
+    F: Future<Output = Result<T, RestoreFailure>>,
+{
+    // The engine aborts this task on Cancel, a newer sign-in, offline mode or
+    // shutdown. Recheck the epoch after sleeping as well as after the attempt.
+    let mut delays = delays.iter();
+    loop {
+        if current.load(Ordering::SeqCst) != epoch {
+            return Err(Fallback::default());
+        }
+        let outcome = attempt().await;
+        if current.load(Ordering::SeqCst) != epoch {
+            return Err(Fallback::default());
+        }
+        match outcome {
+            Ok(value) => return Ok(value),
+            Err(RestoreFailure::Final(fallback)) => return Err(fallback),
+            Err(RestoreFailure::Transient) => match delays.next() {
+                Some(delay) => tokio::time::sleep(*delay).await,
+                None => return Err(restore_failed()),
+            },
+        }
+    }
+}
+
+fn restore_failed() -> Fallback {
     Fallback {
         status: RESTORE_FAILED,
-        retry: true,
         ..Fallback::default()
     }
 }
@@ -152,6 +196,83 @@ fn stale(profile: LoginProfile) -> Fallback {
         status: STALE,
         discard: Some(profile),
         ..Fallback::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::ready;
+
+    #[tokio::test]
+    async fn restore_automatically_recovers_then_stops_at_the_attempt_limit() {
+        let current = AtomicU64::new(7);
+        let delays = RESTORE_BACKOFF.map(|_| Duration::ZERO);
+        let mut attempts = 0;
+        let recovered = with_restore_backoff(7, &current, &delays, || {
+            attempts += 1;
+            ready(if attempts == 1 {
+                Err(RestoreFailure::Transient)
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert!(recovered.is_ok());
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let failed = with_restore_backoff::<(), _>(7, &current, &delays, || {
+            attempts += 1;
+            ready(Err(RestoreFailure::Transient))
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(failed.status, RESTORE_FAILED);
+        assert!(failed.discard.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_failure_after_a_transient_one_finishes_immediately() {
+        let current = AtomicU64::new(7);
+        let mut attempts = 0;
+        let result = with_restore_backoff::<(), _>(7, &current, &[Duration::ZERO; 2], || {
+            attempts += 1;
+            ready(if attempts == 1 {
+                Err(RestoreFailure::Transient)
+            } else {
+                Err(RestoreFailure::Final(Fallback {
+                    status: STALE,
+                    ..Fallback::default()
+                }))
+            })
+        })
+        .await;
+        assert_eq!(result.err().unwrap().status, STALE);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn epoch_change_during_backoff_never_reissues_restore() {
+        let current = AtomicU64::new(7);
+        let attempted = tokio::sync::Notify::new();
+        let mut attempts = 0;
+        let delays = [Duration::from_millis(20)];
+        let (result, ()) = tokio::join!(
+            with_restore_backoff::<(), _>(7, &current, &delays, || {
+                attempts += 1;
+                attempted.notify_one();
+                ready(Err(RestoreFailure::Transient))
+            }),
+            async {
+                attempted.notified().await;
+                current.store(8, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(result.err().unwrap().status, "");
+        assert_eq!(attempts, 1);
     }
 }
 

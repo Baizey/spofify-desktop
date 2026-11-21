@@ -1250,8 +1250,16 @@ fn content_type(response: &Response) -> Result<String, ApiError> {
 }
 
 async fn decode<T: serde::de::DeserializeOwned>(
+    response: Response,
+    bound: usize,
+) -> Result<T, ApiError> {
+    decode_with(response, bound, |_| NETWORK).await
+}
+
+async fn decode_with<T: serde::de::DeserializeOwned>(
     mut response: Response,
     bound: usize,
+    read_error: fn(reqwest::Error) -> ApiError,
 ) -> Result<T, ApiError> {
     let media = content_type(&response)?;
     if media != "application/json"
@@ -1263,7 +1271,7 @@ async fn decode<T: serde::de::DeserializeOwned>(
         return Err(INVALID_RESPONSE);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| NETWORK)? {
+    while let Some(chunk) = response.chunk().await.map_err(read_error)? {
         if chunk.len() > bound - body.len() {
             return Err(INVALID_RESPONSE);
         }

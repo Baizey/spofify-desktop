@@ -42,11 +42,6 @@ pub enum AuthCommand {
         password: String,
         remember: bool,
     },
-    Retry {
-        epoch: u64,
-        origin: String,
-        username: String,
-    },
     Accept(u64),
     Cancel(u64),
     Logout(u64),
@@ -492,16 +487,15 @@ impl Engine {
             writer.send(epoch, write);
         }
     }
-    fn start_restore(&mut self, scope: Option<(String, String)>) {
+    fn start_restore(&mut self) {
         let (epoch, current, results) =
             (self.epoch, self.shared_epoch.clone(), self.results.clone());
         self.login = Some(tokio::spawn(async move {
             let prefill = results.clone();
-            let outcome =
-                auth::restore(scope, epoch, &current, move |origin, username| async move {
-                    let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
-                })
-                .await;
+            let outcome = auth::restore(epoch, &current, move |origin, username| async move {
+                let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
+            })
+            .await;
             let _ = results.send(Reply::Login(epoch, outcome)).await;
         }));
     }
@@ -539,15 +533,6 @@ impl Engine {
                 self.reset(epoch);
                 self.offline = offline;
                 self.login_view(false, false, "Sign-in canceled.");
-            }
-            AuthCommand::Retry {
-                epoch,
-                origin,
-                username,
-            } if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
-                self.retire_pending(false);
-                self.reset(epoch);
-                self.start_restore(Some((origin, username)));
             }
             AuthCommand::Login {
                 epoch,
@@ -910,7 +895,6 @@ impl Engine {
                 ui.set_username(username.into());
                 ui.set_password("".into());
                 ui.set_keep_signed_in(false);
-                ui.set_can_retry_session(false);
                 ui.set_busy(false);
                 ui.set_restoring_login(false);
                 ui.set_signed_in(true);
@@ -979,7 +963,6 @@ impl Engine {
                 ui.set_error(!fallback.status.is_empty());
                 ui.set_status(fallback.status.into());
                 ui.set_auth_notice(fallback.notice.into());
-                ui.set_can_retry_session(fallback.retry);
             }
         });
     }
@@ -1610,7 +1593,7 @@ pub fn start(
                 local_queue_instance: 0,
                 action_status: "",
             };
-            e.start_restore(None);
+            e.start_restore();
             let mut cadence = tokio::time::interval(TICK);
             cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut refresh = 0;

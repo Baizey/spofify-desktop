@@ -14,22 +14,37 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::{
-    Api, ApiError, CredentialDeadline, INVALID_INPUT, INVALID_RESPONSE, LOGIN_BODY, Origin,
-    Session, SessionLifetime, SessionSecrets, SessionSummary, content_type, decode, error,
-    parse_session_cookie, session_cookie, session_cookie_name, single_header, valid_id,
-    valid_session_cookie_value, valid_text,
+    Api, ApiError, CredentialDeadline, INVALID_INPUT, INVALID_RESPONSE, LOGIN_BODY, NETWORK,
+    Origin, Session, SessionLifetime, SessionSecrets, SessionSummary, content_type, decode,
+    decode_with, error, parse_session_cookie, session_cookie, session_cookie_name, single_header,
+    valid_id, valid_session_cookie_value, valid_text,
 };
 
 const MODE_HEADER: &str = "x-spofify-session-mode";
 const ROLLING_V1: &str = "rolling-v1";
 const ROLLING_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const NOT_REMEMBERED: ApiError = error("This sign-in did not enable Remember me.");
+const TRANSIENT_NETWORK: ApiError = error("The connection to the server was interrupted.");
 const WRONG_ORIGIN: ApiError = error("The remembered sign-in is for a different server address.");
 const WRONG_ACCOUNT: ApiError = ApiError {
     message: "The server returned a different account. Sign in again.",
     expired: true,
     status: 0,
 };
+
+impl ApiError {
+    pub(crate) fn can_retry_restore(self) -> bool {
+        self == TRANSIENT_NETWORK || crate::api_transport::is_transient_status(self.status)
+    }
+}
+
+fn restore_transport(error: reqwest::Error) -> ApiError {
+    if crate::api_transport::is_transient_error(&error) {
+        TRANSIENT_NETWORK
+    } else {
+        NETWORK
+    }
+}
 
 /// Secret-service payload only. No cached summary, CSRF token, password or expiry;
 /// the account is a binding to check against the server, not an authenticated identity.
@@ -159,12 +174,17 @@ impl Api {
             )?
             .header(header::CACHE_CONTROL, "no-cache, no-store")
             .header(header::COOKIE, saved_cookie.clone());
-        let response = self.send(request, None, false).await?;
+        // Use the same origin-bound client as other requests, but preserve
+        // transport classification for this bounded, replayable GET only.
+        let response = request.send().await.map_err(restore_transport)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(response.status().as_u16(), false));
+        }
         let (cookie, deadline) = rolling_cookie(&self.origin, &response)?;
         if cookie != saved_cookie {
             return Err(INVALID_RESPONSE); // rolling-v1 never replaces the bearer
         }
-        let summary: SessionSummary = decode(response, LOGIN_BODY).await?;
+        let summary: SessionSummary = decode_with(response, LOGIN_BODY, restore_transport).await?;
         // The GET has no sessionMode field in its body; its response header is authoritative.
         let session = self.session_from_summary(summary, cookie, deadline)?;
         if session.secrets.account_id != credential.account_id {

@@ -145,6 +145,19 @@ async fn resume_fences_origins_and_only_uses_valid_same_account_publication() {
     assert!(destination.recorded().is_empty());
 }
 
+#[test]
+fn resume_backoff_classifies_only_known_transient_failures() {
+    for status in [408, 500, 502, 503, 504] {
+        assert!(Api::response_error(status, false).can_retry_restore());
+    }
+    for status in [302, 400, 401, 403, 404, 429, 501, 505] {
+        assert!(!Api::response_error(status, false).can_retry_restore());
+    }
+    assert!(!INVALID_RESPONSE.can_retry_restore());
+    assert!(!INVALID_INPUT.can_retry_restore());
+    assert!(!NETWORK.can_retry_restore());
+}
+
 #[tokio::test]
 async fn opted_in_login_requires_both_mode_indicators_and_absolute_expiry() {
     let now = OffsetDateTime::now_utc();

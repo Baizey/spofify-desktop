@@ -42,7 +42,6 @@ export component AppWindow inherits Window {
     in property <bool> signed-in;
     in property <bool> busy;
     in property <bool> restoring-login;
-    in property <bool> can-retry-session;
     in property <string> auth-notice;
     in property <string> status;
     in property <bool> error;
@@ -63,7 +62,6 @@ export component AppWindow inherits Window {
     in property <string> time-label;
     callback sign-in();
     callback sign-out();
-    callback retry-session();
     callback cancel-sign-in();
     callback server-edited();
     callback username-edited();
@@ -223,10 +221,9 @@ export component AppWindow inherits Window {
         origin <=> root.origin; username <=> root.username; password <=> root.password;
         keep-signed-in <=> root.keep-signed-in;
         status: root.status; error: root.error; busy: root.busy;
-        restoring: root.restoring-login; auth-notice: root.auth-notice; can-retry-session: root.can-retry-session;
+        restoring: root.restoring-login; auth-notice: root.auth-notice;
         server-edited => { root.server-edited(); } username-edited => { root.username-edited(); }
         sign-in => { root.sign-in(); } cancel => { root.cancel-sign-in(); }
-        retry-session => { root.retry-session(); }
     }
     if root.signed-in: shell := FocusScope {
         x: 0px; y: 0px; width: parent.width; height: parent.height;

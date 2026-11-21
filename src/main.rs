@@ -277,35 +277,23 @@ fn advance_account_epoch(epoch: &AtomicU64) -> u64 {
 }
 
 fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Arc<AtomicU64>) {
-    for retry in [false, true] {
+    {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
-        let callback = move || {
+        ui.on_sign_in(move || {
             let Some(ui) = w.upgrade() else { return };
-            if ui.get_busy() || ui.get_signed_in() || (retry && !ui.get_can_retry_session()) {
+            if ui.get_busy() || ui.get_signed_in() {
                 return;
             }
-            let epoch = advance_account_epoch(&epoch);
-            let origin = ui.get_origin().into();
-            let username = ui.get_username().into();
-            let command = if retry {
-                AuthCommand::Retry {
-                    epoch,
-                    origin,
-                    username,
-                }
-            } else {
-                AuthCommand::Login {
-                    epoch,
-                    origin,
-                    username,
-                    password: ui.get_password().into(),
-                    remember: ui.get_keep_signed_in(),
-                }
+            let command = AuthCommand::Login {
+                epoch: advance_account_epoch(&epoch),
+                origin: ui.get_origin().into(),
+                username: ui.get_username().into(),
+                password: ui.get_password().into(),
+                remember: ui.get_keep_signed_in(),
             };
             ui.set_password("".into());
             ui.set_busy(true);
-            ui.set_restoring_login(retry);
-            ui.set_can_retry_session(false);
+            ui.set_restoring_login(false);
             ui.set_status("".into());
             ui.set_error(false);
             ui.set_auth_notice("".into());
@@ -315,12 +303,7 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
                 ui.set_error(true);
                 ui.set_status("Sign-in is unavailable. Reopen the desktop and try again.".into());
             }
-        };
-        if retry {
-            ui.on_retry_session(callback);
-        } else {
-            ui.on_sign_in(callback);
-        }
+        });
     }
     for kind in ["logout", "cancel", "server", "username"] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
@@ -335,7 +318,6 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
             }
             ui.set_password("".into());
             ui.set_keep_signed_in(false);
-            ui.set_can_retry_session(false);
             ui.set_auth_notice("".into());
             ui.set_status("".into());
             ui.set_error(false);

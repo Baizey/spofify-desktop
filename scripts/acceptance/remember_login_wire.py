@@ -1,4 +1,5 @@
 """Loopback-only recorder in front of the real Go fixture; never logs credentials."""
+from collections import deque
 from contextlib import contextmanager
 import http.client
 from http.cookies import SimpleCookie
@@ -27,6 +28,7 @@ class Receipt:
         self._events = []
         self._tokens = set()
         self._rolling_cookie = None
+        self._session_failures = deque()
         self.allow_socket = Event()
 
     def record(self, *event):
@@ -44,6 +46,21 @@ class Receipt:
     def rolling_cookie(self):
         with self._lock:
             return self._rolling_cookie
+
+    def fail_next_sessions(self, *statuses):
+        with self._lock:
+            check(not self._session_failures, "unused rolling session fixture responses")
+            self._session_failures.extend(statuses)
+
+    def session_failure(self, method, cookie):
+        with self._lock:
+            if not self._session_failures:
+                return None
+            check(method == "GET" and cookie == self._rolling_cookie and cookie is not None,
+                  "remembered session did not revalidate the expected fixture cookie")
+            status = self._session_failures.popleft()
+            self._events.append(("session", method, status))
+            return status
 
     def auth(self, method, path, response, body):
         action = AUTH.get(path)
@@ -169,6 +186,13 @@ def recorded_origin(go):
                 if name.lower() == "origin":
                     headers[name] = go["origin"]
             try:
+                if self.path == "/api/auth/session":
+                    status = receipt.session_failure(self.command, self.headers.get("Cookie"))
+                    if status is not None:
+                        self.send_response_only(status)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                 if self.path in (CONNECT, SOCKET) and not receipt.allow_socket.is_set():
                     # Keep Go's output room untouched until the remembered entry.
                     # All password and session routes still hit the real server.

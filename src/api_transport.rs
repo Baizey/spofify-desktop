@@ -2,6 +2,11 @@
 
 use std::{error::Error, io};
 
+pub(crate) fn is_transient_status(status: u16) -> bool {
+    // Rate limiting and permanent HTTP failures are not retried on this short budget.
+    matches!(status, 408 | 500 | 502..=504)
+}
+
 pub(crate) fn is_transient_error(error: &reqwest::Error) -> bool {
     if error.is_timeout() {
         return true;
