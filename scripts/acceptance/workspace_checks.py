@@ -4,7 +4,7 @@ import re
 from time import sleep
 
 from fixture import Failure, check
-from native import (ALT, CONTROL, DOWN, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
+from native import (ALT, CONTROL, DESKTOP, DOWN, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
                     RETURN, TRACK, bounds, element_id, element_type, wait)
 from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
                      NAME_ONLY, SINGLE_TRACK, SUMMARY)
@@ -302,6 +302,7 @@ def search_track_targets(window, width, capture, *, check_padding):
 def track_play_and_highlight(window, play_requests):
     # The synthetic peer observes commands and publishes a paused cursor from
     # those selections; it does not resolve media or execute playback.
+    open_playlists(window)
     open_manual(window)
     check(not play_requests(), "browsing, credits, or overflow sent an unexpected Play")
     track_face(window, occurrence=1)
@@ -338,6 +339,8 @@ def track_play_and_highlight(window, play_requests):
     expect(selected)
     window.title(PLAYLIST)
 
+    # Keep both search rows visible above the dock when clicking the second.
+    window.resize(DESKTOP)
     window.fill("Search tracks, albums or artists", "Synthetic")
     search_results(window)
     first = f"Play track: {TRACK}"
@@ -617,7 +620,7 @@ def queue_state(window, populated):
             control = window.find(label, roles=("Button",))
             check(control.get("accessibleEnabled"), f"populated queue has disabled {label}")
         window.title("Now playing")
-        window.title("Up next")
+        window.find("Up next|Played", roles=("Text",))
         window.find(r"Synthetic Tone \d{3}", roles=("Text",))
     else:
         window.find(r"The queue is empty\..*", roles=("Text",))
@@ -668,10 +671,10 @@ def compact_queue(window, restore, *, capture=None, populated=False):
         window.pixels(capture)
     window.click("Play queue")
     restore()
-    window.absent("Shuffle", roles=("Button",))
+    window.absent("Close play queue", roles=("Button",))
     window.click("Play queue")
     window.title(QUEUE_TITLE)
     window.click("Close play queue")
     restore()
-    window.absent("Shuffle", roles=("Button",))
+    window.absent("Close play queue", roles=("Button",))
     print("PASS compact queue opens and closes by pointer without losing the catalog route", flush=True)

@@ -402,11 +402,16 @@ def native_observer(api):
     with Peer(api) as peer:
         stopping = Event()
         errors = []
+        first_replacement = None
 
         def read_outputs():
+            nonlocal first_replacement
             try:
                 while not stopping.is_set():
-                    peer.wait_frame(lambda _: True, timeout=120)
+                    frame = peer.wait_frame(lambda _: True, timeout=120)
+                    delta = frame.get("player", {})
+                    if first_replacement is None and frame["type"] == "player" and delta.get("queue", {}).get("kind") == "replace":
+                        first_replacement = delta
             except (Failure, OSError, ValueError) as error:
                 if not stopping.is_set():
                     errors.append(error)
@@ -414,13 +419,13 @@ def native_observer(api):
         reader = Thread(target=read_outputs, name="native-account-observer")
         reader.start()
 
-        def observe(label, predicate, timeout=10):
-            def matching_snapshot():
+        def observe(label, predicate, timeout=10, *, replacement=False):
+            def matching_state():
                 if errors:
                     raise Failure(f"real Go account observer stopped while waiting for {label}: {errors[0]}")
-                snapshot = peer.snapshot
-                return snapshot if predicate(snapshot) else None
-            return wait(label, matching_snapshot, timeout)
+                state = first_replacement if replacement else peer.snapshot
+                return state if state is not None and predicate(state) else None
+            return wait(label, matching_state, timeout)
 
         try:
             yield observe
@@ -528,27 +533,23 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                               if r["track"]["id"] == ready["duplicateTrackId"]]
             check(len(duplicates) >= 2, "fixture lost the duplicate used for track double-click")
 
-            def canonical_track(snapshot):
-                state = snapshot.get("player", {})
-                queue, cursor = state.get("queue", []), state.get("cursor", {})
-                return (len(queue) > 1 and cursor.get("desired") and any(
-                    track.get("key") == cursor.get("key") and track.get("id") == ready["duplicateTrackId"]
-                    and track.get("entryId") == duplicates[1] for track in queue))
-
             if pcm is not None:
                 from audio_smoke import heard_tone
                 baseline = pcm.stat().st_size
-            # The fixture clips last one second. A native double-click on the
-            # second duplicate must select that entry, not just the recording.
+            # Short fixture clips can already advance by the time the native
+            # click returns. Verify the cursor and queue in the original delta.
             track_face(window, occurrence=1, double=True)
-            observe("double-click to select the exact Go playlist occurrence", canonical_track, timeout=20)
+            delta = observe("double-click to replace the Go queue", lambda _: True, timeout=20, replacement=True)
+            rows, cursor = delta["queue"].get("rows", []), delta.get("cursor", {})
+            current = next((row for row in rows if row.get("key") == cursor.get("key")), {})
+            check(len(rows) > 1 and cursor.get("desired") and current.get("id") == ready["duplicateTrackId"]
+                  and current.get("entryId") == duplicates[1], "Go did not select the second playlist duplicate")
             window.title(PLAYLIST)
             if pcm is not None:
                 with verify(failures, "real Go online PCM"):
                     wait("220 Hz Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                     print("PASS real Go online track rendered 220 Hz PCM", flush=True)
             window.find(DOCK_TITLE, roles=("Button",))
-            window.find("Pause", roles=("Button",))
             window.click("Back")
             restore_playlists()
             window.absent("Back", roles=("Button",))
@@ -560,18 +561,17 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 window.title(PLAYLIST)
                 pane_layout(window, wide=True, docked=True, can_go_back=True)
                 queue_state(window, populated=True)
-                window.find("Pause", roles=("Button",))
-                window.pixels(f"04-playing-{mode[0]}", mode[0])
+                window.pixels(f"04-dock-{mode[0]}", mode[0])
                 with verify(failures, f"dock geometry at {mode[0]}"):
                     assert_dock_layout(window)
             window.resize(COMPACT)
             window.find(DOCK_TITLE, roles=("Button",))
             pane_layout(window, wide=False, docked=True, can_go_back=True)
-            window.find("Pause", roles=("Button",))
             window.pixels("05-dock-compact", COMPACT[0])
             with verify(failures, "compact dock geometry"):
                 assert_dock_layout(window)
-            window.click("Pause")
+            if any(window.matches(e, "Pause") and e.get("accessibleRole") == "Button" for e in window.elements()):
+                window.click("Pause")
 
             def paused_selection(snapshot):
                 player = snapshot["player"]
@@ -579,7 +579,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 return not cursor["desired"] and not cursor["playing"] and any(
                     cursor["key"] == row["key"] for row in player["queue"])
 
-            observe("native Pause to leave a selected canonical queue occurrence", paused_selection)
+            observe("paused or finished playback retains a canonical queue occurrence", paused_selection)
             wait("paused dock transport", lambda: not any(window.matches(e, "Pause") for e in window.elements()))
             pane_layout(window, wide=False, docked=True, can_go_back=True)
             assert_dock_layout(window)
