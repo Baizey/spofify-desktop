@@ -36,28 +36,32 @@ fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
             true,
         )
     }));
-    ui.set_output_name(rows[0].name.clone());
-    ui.set_device_rows(ModelRc::new(VecModel::from(rows)));
+    load_roster(ui, &rows[..4]);
 
     let weak = ui.as_weak();
     let events = journal.clone();
-    ui.on_device_action(move |op, id| {
-        writeln!(&*events, "device\t{op}\t{id}").expect("record device action");
-        if op == "select" {
-            let ui = weak.unwrap();
-            let mut rows: Vec<_> = ui.get_device_rows().iter().collect();
-            if let Some(chosen) = rows
-                .iter()
-                .find(|device| device.id == id && device.available && device.can_play)
-            {
-                ui.set_output_name(chosen.name.clone());
-                for device in &mut rows {
-                    device.selected = device.id == id;
+    ui.on_device_action(move |op, id, name| {
+        let ui = weak.unwrap();
+        let mut rows: Vec<_> = ui.get_device_rows().iter().collect();
+        match op.as_str() {
+            "select" => {
+                writeln!(&*events, "device\t{op}\t{id}").expect("record selection");
+                for row in &mut rows {
+                    row.selected = row.id == id && row.available && row.can_play;
                 }
-                // Match the engine's snapshot replacement, without claiming a real output.
-                ui.set_device_rows(ModelRc::new(VecModel::from(rows)));
             }
+            "rename" => {
+                writeln!(&*events, "device\t{op}\t{id}\t{name}").expect("record rename");
+                if let Some(chosen) = rows
+                    .iter_mut()
+                    .find(|row| row.id == id && row.selected && row.available)
+                {
+                    chosen.name = name;
+                }
+            }
+            _ => panic!("unexpected disposable picker callback: {op}"),
         }
+        load_roster(&ui, &rows);
     });
 
     let control = journal_path.with_extension("control");
@@ -72,11 +76,49 @@ fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
             "change-page-key" => ui.set_page_key("fixture-new-history-context".into()),
             "drop-dock" => ui.set_now_track_id("".into()),
             "restore-dock" => ui.set_now_track_id("one".into()),
+            "now" => {
+                ui.set_page_kind("now".into());
+                ui.set_can_back(true);
+            }
+            "history" => {
+                ui.set_page_kind("history".into());
+                ui.set_can_back(false);
+            }
+            "empty" => load_roster(&ui, &[]),
+            "one" => load_roster(&ui, &rows[..1]),
+            "mixed" => load_roster(&ui, &rows[..4]),
+            "long" => load_roster(&ui, &rows),
+            "offline" => ui.set_manual_offline(true),
+            "reconnect" => ui.set_reconnecting(true),
+            "online" => {
+                ui.set_manual_offline(false);
+                ui.set_reconnecting(false);
+            }
+            "disconnect" => {
+                let rows = rows[..4]
+                    .iter()
+                    .cloned()
+                    .map(|mut row| {
+                        row.available = false;
+                        row.selected = false;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                load_roster(&ui, &rows);
+                ui.set_output_name("Output disconnected".into());
+            }
             _ => panic!("unknown disposable picker control: {command:?}"),
         }
         fs::remove_file(&control).expect("acknowledge disposable picker control");
     });
     Some((journal, timer))
+}
+
+fn load_roster(ui: &AppWindow, rows: &[DeviceRow]) {
+    let output = rows.iter().find(|row| row.selected);
+    ui.set_output_name(output.map_or_else(|| "No output selected".into(), |row| row.name.clone()));
+    // Match the engine's snapshot replacement without claiming a real output.
+    ui.set_device_rows(ModelRc::new(VecModel::from(rows.to_vec())));
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -131,9 +173,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui = weak.unwrap();
         if let Some(events) = &picker_journal {
             writeln!(&**events, "navigate\t{route}").expect("record navigation");
-            ui.set_page_title(if route == "devices" { "Devices" } else { "" }.into());
         }
-        ui.set_can_back(route == "now" || (picker_journal.is_some() && route == "devices"));
+        ui.set_can_back(route == "now");
         ui.set_page_kind(if route == "back" {
             "history".into()
         } else {

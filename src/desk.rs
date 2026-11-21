@@ -187,7 +187,6 @@ fn label(route: &Route) -> &'static str {
         Route::Appearance => "Settings",
         Route::Now => "Now playing",
         Route::Queue => "Queue",
-        Route::Devices => "Devices",
         Route::Album(_) => "Album",
         Route::Artist(_) => "Artist",
         Route::Playlist(_) => "Playlist",
@@ -211,7 +210,6 @@ impl Navigation {
             "search" => Self::Follow(Route::Search(String::new())),
             "now" => Self::Follow(Route::Now),
             "queue" => Self::Follow(Route::Queue),
-            "devices" => Self::Follow(Route::Devices),
             "back" => Self::Back,
             _ => return None,
         })
@@ -1220,7 +1218,7 @@ impl Browser {
             self.render(true);
             return;
         }
-        if matches!(next, Route::Now | Route::Queue | Route::Devices)
+        if matches!(next, Route::Now | Route::Queue)
             || matches!(&next, Route::Search(q) if q.is_empty())
         {
             self.render(true);

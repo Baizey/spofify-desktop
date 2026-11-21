@@ -9,7 +9,7 @@ export global Copy {
             : kind == "playlists" ? "Playlists" : kind == "offline" ? "Saved offline"
             : kind == "appearance" || kind == "settings" || kind == "account" ? "Settings"
             : kind == "albums" ? "Albums" : kind == "artists" ? "Artists" : kind == "picker" ? "Add to playlist"
-            : kind == "now" ? "Now playing" : kind == "queue" ? "Play queue" : kind == "devices" ? "Playback devices"
+            : kind == "now" ? "Now playing" : kind == "queue" ? "Play queue"
             : kind == "album" ? "Album" : kind == "artist" ? "Artist"
             : kind == "saved-collection" ? "Saved collection"
             : kind == "playlist" || kind == "playlist-manual" || kind == "playlist-rules" ? "Playlist" : "Search";
@@ -19,7 +19,7 @@ export global Copy {
             : kind == "offline" ? "↓" : kind == "albums" || kind == "album" ? "◎"
             : kind == "artist" || kind == "artists" ? "◉" : kind == "appearance" ? "◐" : kind == "settings" ? "⚙"
             : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" ? "playlists"
-            : kind == "queue" ? "≡" : kind == "devices" ? "◫" : kind == "saved-collection" ? "↓" : "♫";
+            : kind == "queue" ? "≡" : kind == "saved-collection" ? "↓" : "♫";
     }
     public pure function action-label(action: string) -> string {
         return ActionCopy.label(action);

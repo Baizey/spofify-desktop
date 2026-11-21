@@ -1,21 +1,5 @@
 import { Action, Caption, Divider, Theme } from "theme.slint";
 
-export component SettingCard inherits Rectangle {
-    in property <string> title;
-    in property <string> detail;
-    background: transparent;
-    min-height: layout.preferred-height;
-    vertical-stretch: 0;
-    Divider { y: parent.height - 1px; }
-    layout := VerticalLayout {
-        padding-top: 12px; padding-bottom: 12px;
-        spacing: 9px;
-        if root.title != "": Text { text: root.title; color: Theme.text; font-size: 15px * Theme.density; font-weight: 700; }
-        if root.detail != "": Caption { text: root.detail; wrap: word-wrap; }
-        @children
-    }
-}
-
 component SettingsLabel inherits Text {
     color: Theme.text;
     font-size: 14px * Theme.density;

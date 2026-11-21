@@ -955,34 +955,31 @@ def playlist_overflow(window):
 
 
 def empty_devices(window, restore, *, wide, observer=False, capture=None):
-    # With no track the workspace toolbar opens Devices directly. The dock
-    # picker’s Manage devices route is exercised by its own native fixture.
+    # The no-track toolbar uses the same popup as the playback dock.
     window.absent(r"Now playing: .+", roles=("Button",))
     window.click("Playback devices")
-    window.title("Devices")
+    window.title("Playback devices")
+    window.absent("Back|Manage devices|Deselect", roles=("Button",))
+    restore()
     if observer:
-        window.absent("Deselect", roles=("Button",))
-        selected = window.title("Selected output")
-        selected_card = containing_item(window.elements(), "SettingCard", selected)
-        check(selected_card and any(window.matches(e, "Rename device") and e.get("accessibleEnabled")
-                                    for e in window.subtree(selected_card)),
-              "the selected desktop output must still offer rename")
-        name = window.title("Acceptance observer")
-        card = containing_item(window.elements(), "SettingCard", name)
-        check(card, "missing Devices card for the real Go observer")
-        elements = window.subtree(card)
-        peer_button = next((e for e in elements if window.matches(e, "Select output")
-                            and e.get("accessibleRole") == "Button"), None)
-        check(peer_button and not peer_button.get("accessibleEnabled")
-              and any(window.matches(e, "Cannot play audio") for e in elements),
+        selected = next((e for e in window.elements() if e.get("accessibleDescription") == "Selected output"), None)
+        check(selected, "real Go output is not shown as selected")
+        rename = window.find("Rename device: " + re.escape(selected["accessibleLabel"]), roles=("Button",))
+        check(rename.get("accessibleEnabled"), "the selected desktop output must still offer rename")
+        peer = window.find("Select output: Acceptance observer", roles=("Button",))
+        check(not peer.get("accessibleEnabled") and peer.get("accessibleDescription") == "Cannot play audio",
               "real Go observer must be present and not selectable for audio")
-    pane_layout(window, wide=wide, can_go_back=True)
+    pane_layout(window, wide=wide)
     if capture:
         window.pixels(capture)
-    window.click("Back")
+    window.key(ESCAPE)
+    window.absent("Close playback devices", roles=("Button",))
+    window.key(RETURN)
+    window.title("Playback devices")
+    window.click("Close playback devices")
     restore()
     window.absent("Back", roles=("Button",))
-    print(f"PASS {window.dimensions()[0]:g}px device panel is reachable with no selected track", flush=True)
+    print(f"PASS {window.dimensions()[0]:g}px no-track toolbar device popup preserves page and focus", flush=True)
 
 
 def queue_state(window, populated):

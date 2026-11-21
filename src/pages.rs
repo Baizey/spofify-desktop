@@ -43,7 +43,6 @@ pub enum Route {
     Appearance,
     Now,
     Queue,
-    Devices,
 }
 
 impl Route {
@@ -68,7 +67,6 @@ impl Route {
             Self::Appearance => "appearance",
             Self::Now => "now",
             Self::Queue => "queue",
-            Self::Devices => "devices",
         }
     }
 }
@@ -409,7 +407,6 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
                 | Route::Appearance
                 | Route::Now
                 | Route::Queue
-                | Route::Devices
         )
     {
         return Err(OFFLINE);
@@ -527,7 +524,6 @@ pub async fn load(access: &Access, route: &Route, old: Option<&Page>) -> Result<
         Route::Appearance => page.title = "Appearance".into(),
         Route::Now => page.title = "Now playing".into(),
         Route::Queue => page.title = "Queue".into(),
-        Route::Devices => page.title = "Devices".into(),
     }
     if session.is_expired() {
         return Err(EXPIRED);

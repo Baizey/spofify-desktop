@@ -32,13 +32,9 @@ mod update;
 slint::include_modules!();
 use engine::{AuthCommand, Command};
 use slint::{ComponentHandle, Model};
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::{mpsc, watch};
 
@@ -223,31 +219,23 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
-        let renaming = Rc::new(RefCell::new(None::<(u64, String)>));
-        ui.on_device_action(move |op, value| {
+        ui.on_device_action(move |op, id, name| {
             let Some(ui) = w.upgrade() else { return };
-            if !ui.get_signed_in() {
+            if !ui.get_signed_in() || ui.get_manual_offline() || ui.get_reconnecting() {
                 return;
             }
-            let e = epoch.load(Ordering::SeqCst);
             use player::Action as A;
             let action = match op.as_str() {
-                "select" => A::SelectDevice(value.into()),
-                "prepare-rename" => {
-                    renaming.replace(Some((e, value.into())));
-                    return;
-                }
-                "rename" => {
-                    let Some((old, id)) = renaming.take() else {
-                        return;
-                    };
-                    if old != e {
-                        return;
-                    }
-                    ui.set_form_mode("".into());
+                "select" => A::SelectDevice(id.into()),
+                "rename"
+                    if ui
+                        .get_device_rows()
+                        .iter()
+                        .any(|row| row.id == id && row.selected && row.available) =>
+                {
                     A::RenameDevice {
-                        device_id: Some(id),
-                        name: value.into(),
+                        device_id: Some(id.into()),
+                        name: name.into(),
                     }
                 }
                 _ => return,

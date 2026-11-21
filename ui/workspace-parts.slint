@@ -1,4 +1,5 @@
 import { Action, Caption, Divider, Eyebrow, Notice, Theme } from "theme.slint";
+import { DeviceRow, OutputPicker } from "output-picker.slint";
 
 component PlaybackStatus inherits Action {
     in property <string> message;
@@ -35,15 +36,21 @@ component PlaybackStatus inherits Action {
     }
 }
 
-// Surface playback destinations here only when there is no playback dock.
+// Surface playback tools here only when there is no playback dock.
 export component PlaybackTools inherits Rectangle {
     in property <bool> labeled;
     in property <bool> enabled;
     in property <bool> queue-open;
-    in property <bool> devices-open;
     in property <string> status;
     in property <string> context-key;
+    in property <[DeviceRow]> devices;
+    in property <string> output;
+    in property <string> device-status;
+    in property <bool> offline;
+    in property <length> window-width;
+    in property <length> window-height;
     callback navigate(string);
+    callback device-action(string, string, string);
     public function focus-queue() { queue-trigger.take-focus(); }
     preferred-width: tools.preferred-width;
     horizontal-stretch: 0;
@@ -54,10 +61,12 @@ export component PlaybackTools inherits Rectangle {
             accessible-label: "Play queue"; accessible-expanded: root.queue-open;
             enabled: root.enabled; clicked => { root.navigate("queue"); }
         }
-        Action {
-            text: root.labeled ? "Devices" : ""; icon: "◫"; selected: root.devices-open;
-            accessible-label: "Playback devices";
-            enabled: root.enabled; clicked => { root.navigate("devices"); }
+        OutputPicker {
+            text: root.labeled ? "Devices" : ""; below: true;
+            window-width: root.window-width; window-height: root.window-height;
+            devices: root.devices; output: root.output; status: root.device-status;
+            enabled: root.enabled; context-key: root.context-key; offline: root.offline;
+            device-action(op, id, name) => { root.device-action(op, id, name); }
         }
         if root.status != "": PlaybackStatus {
             message: root.status; context-key: root.context-key;

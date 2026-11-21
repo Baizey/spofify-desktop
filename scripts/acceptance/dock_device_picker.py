@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the dock's native output picker without account, audio, or an installed app.
+"""Exercise the native playback devices popup without an installed app or account.
 
-Build in a private target directory with SLINT_EMIT_DEBUG_INFO=1 and
+Build privately with SLINT_EMIT_DEBUG_INFO=1 and
 `cargo build --locked --features slint/mcp --example playback_acceptance`.
-Run this script with that directory's debug/examples/playback_acceptance binary.
+Pass the resulting debug/examples/playback_acceptance binary.
 """
 import argparse
 from pathlib import Path
@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 
 sys.dont_write_bytecode = True
 from fixture import check, private_env
-from native import ESCAPE, RETURN, bounds, contains, desktop, element_id, named, wait
+from native import CONTROL, ESCAPE, RETURN, bounds, contains, desktop, element_id, named, wait
 
 
 MINIMUM, WIDE = (480, 440), (1280, 790)  # Client pixels, excluding Cage decoration.
@@ -22,7 +22,6 @@ BUTTON = ("Button",)
 TEXT = ("Text",)
 TRIGGER = "Playback devices"
 CLOSE = "Close playback devices"
-MANAGE = "Manage devices"
 DESKTOP_OUTPUT = ("desktop-1", "Desktop speakers")
 STUDIO_OUTPUT = ("remote-7", "Studio receiver")
 TAB = "\t"
@@ -30,6 +29,10 @@ TAB = "\t"
 
 def option(name):
     return "Select output: " + re.escape(name)
+
+
+def rename(name):
+    return "Rename device: " + re.escape(name)
 
 
 def resize(window, size):
@@ -46,26 +49,27 @@ def resize(window, size):
 def open_panel(window):
     window.find(TRIGGER, roles=TEXT)
     panel = element_id(window.elements(), "panel")
-    check(panel, "missing the open dock picker panel in Slint's native element tree")
+    check(panel, "missing the open picker panel in Slint's native element tree")
+    window.absent(r"Manage devices|Deselect(?: output)?|No playback device", roles=BUTTON)
     return panel
-
-
-def visible_button(window, region, label):
-    button = named(window, window.elements(), label)
-    return button if button and contains(region, button) else None
 
 
 def closed(window):
     window.absent(CLOSE, roles=BUTTON)
     window.absent(TRIGGER, roles=TEXT)
+    window.absent("Device name", roles=("TextInput",))
 
 
-def trigger(window, output):
+def trigger(window, entry, output=None):
     control = window.find(TRIGGER, roles=BUTTON)
     dock = element_id(window.elements(), "player")
-    check(dock and contains(dock, control), "Playback devices is not a dock control")
-    check(control.get("accessibleEnabled") and control.get("accessibleDescription") == output,
-          f"dock trigger did not expose current output {output!r}: {control.get('accessibleDescription')!r}")
+    region = dock if entry == "dock" else element_id(window.elements(), "toolbar")
+    check((entry == "dock") == bool(dock), f"incorrect dock presence in {entry}")
+    check(region and contains(region, control), f"Playback devices is not a {entry} control")
+    check(control.get("accessibleEnabled"), f"disabled {entry} trigger")
+    if output:
+        check(control.get("accessibleDescription") == output,
+              f"{entry} trigger did not announce {output!r}: {control.get('accessibleDescription')!r}")
     return control
 
 
@@ -76,122 +80,146 @@ def selected_row(window, name):
     return selected
 
 
-def no_deselect(window):
-    window.absent(r"Deselect(?: output)?|No playback device", roles=BUTTON)
-
-
-def history(window):
-    window.section("History")
-    window.absent("Back", roles=BUTTON)
+def assert_view(window, entry):
     window.absent("Devices", roles=TEXT)
-    window.find("Now playing: Synthetic Tone 001", roles=BUTTON)
+    window.absent("Rename playback device", roles=TEXT)
+    if entry == "now":
+        window.find("Back", roles=BUTTON)
+        window.title("Synthetic Tone 001")
+        window.find("Elapsed 0:46", roles=TEXT)
+        window.find("Duration 3:13", roles=TEXT)
+    else:
+        window.section("History")
+        window.absent("Back", roles=BUTTON)
+        if entry == "dock":
+            window.find("Now playing: Synthetic Tone 001", roles=BUTTON)
+        else:
+            window.absent(r"Now playing: .+", roles=BUTTON)
 
 
-def close_and_measure(window, panel, switch):
+def queue_state(window):
+    return (bool(element_id(window.elements(), "queue-pane")),
+            window.find("Play queue", roles=BUTTON).get("accessibleExpanded", False))
+
+
+def close_and_measure(window, panel, switch, entry):
     close = window.find(CLOSE, roles=BUTTON)
-    check(contains(panel, close) and contains(panel, window.find(MANAGE, roles=BUTTON)),
-          "popup clips its Close or Manage devices control")
+    check(contains(panel, close), "popup clips its Close control")
     left, top, right, bottom = bounds(panel)
     cx, cy, cright, cbottom = bounds(close)
-    # Slint's element coordinates are popup-local. The press recording at the
-    # center of Close supplies the actual translation into the client window.
+    # Slint's element coordinates are popup-local. Record where the native click landed.
     x, y = window.pointer_position_for_click(CLOSE, element=close)
     dx, dy = x - (cx + cright) / 2, y - (cy + cbottom) / 2
     left, top, right, bottom = left + dx, top + dy, right + dx, bottom + dy
-    sx, sy, sright, _ = bounds(switch)
-    width, _ = window.dimensions()
-    check(310 <= right - left <= 342 and 125 <= bottom - top <= 286.5,
+    sx, sy, sright, sbottom = bounds(switch)
+    width, height = window.dimensions()
+    check(310 <= right - left <= 342 and 50 <= bottom - top <= 286.5,
           f"unexpected popup size: {right - left:g} × {bottom - top:g}")
-    check(0 <= left <= sx < sright <= right <= width and 0 <= top < bottom <= sy <= bottom + 18,
-          f"picker {(left, top, right, bottom)} is not visibly anchored above trigger {bounds(switch)}")
+    check(0 <= left <= sx < sright <= right <= width and 0 <= top < bottom <= height,
+          f"picker {(left, top, right, bottom)} clips or misses trigger {bounds(switch)}")
+    if entry == "dock":
+        check(0 <= sy - bottom <= 18, f"popup is not above the dock trigger: {sy - bottom:g}px")
+    else:
+        check(0 <= top - sbottom <= 18, f"popup is not below the toolbar trigger: {top - sbottom:g}px")
+        check(abs(right - min(width - 8, max(sright, right - left + 8))) <= 1,
+              f"popup right edge {right:g}px is not aligned to toolbar trigger {sright:g}px")
     closed(window)
-    print(f"PASS {width:g}px popup geometry: {right - left:g} × {bottom - top:g}, anchored above dock trigger",
-          flush=True)
+    print(f"PASS {width:g}px {entry} popup geometry: {right - left:g} × {bottom - top:g}", flush=True)
 
 
-def check_size(window, mode, before, after, activate, expect):
+def select_journey(window, width, entry, before, after, keyboard, expect):
     _, old_name = before
     new_id, new_name = after
-    switch = trigger(window, old_name)
+    assert_view(window, entry)
+    queue = queue_state(window)
+    switch = trigger(window, entry, old_name)
     window.click_element(switch)
     panel = open_panel(window)
     selected = selected_row(window, old_name)
     alternative = window.find(option(new_name), roles=BUTTON)
-    check(alternative.get("accessibleEnabled"), f"eligible output {new_name!r} is disabled")
-    check(bounds(selected)[1] < bounds(alternative)[1], "current output is not shown before alternatives")
-    no_deselect(window)
-    window.absent("Rename device", roles=BUTTON)
+    check(alternative.get("accessibleEnabled") and bounds(selected)[1] < bounds(alternative)[1],
+          "selected output must be passive and above the next available output")
+    pencil = window.find(rename(old_name), roles=BUTTON)
+    check(abs(bounds(pencil)[1] - bounds(selected)[1]) < 10, "Rename must be next to the selected device")
     window.click_element(selected)
     for name, reason in (("Travel speaker", "Not available"), ("Library browser", "Cannot play audio")):
         disabled = window.find(option(name), roles=BUTTON)
         check(not disabled.get("accessibleEnabled") and disabled.get("accessibleDescription") == reason,
               f"{name!r} is actionable or missing its accessibility reason")
+        check(bounds(alternative)[1] < bounds(disabled)[1], "disabled output is above usable choices")
         window.click_element(disabled)
-    open_panel(window)  # Clicking passive or disabled rows must not dismiss or act.
+    open_panel(window)
     expect()
-    window.pixels(f"dock-device-picker-{mode[0]}", mode[0])
-    close_and_measure(window, panel, switch)
-    history(window)
+    window.pixels(f"devices-{entry}-{width}", width)
+    close_and_measure(window, panel, switch, entry)
 
-    # No deliberate refocus: every dismiss mechanism must return to the trigger.
+    # Enter reopens the action without manually moving focus after each dismiss.
     window.key(RETURN)
     open_panel(window)
     window.key(ESCAPE)
     closed(window)
     window.key(RETURN)
     open_panel(window)
-    # The top-left rail brand is inert and outside the dock popup; the broad
-    # catalog heading can have its center underneath the popup at 480px.
-    window.click_element(window.title("Spofify"))
+    window.click_element(window.title("Spofify"))  # Inert rail brand outside both anchors.
     closed(window)
-    history(window)
     window.key(RETURN)
     open_panel(window)
-    if activate == "keyboard":
-        window.key(TAB)
+    if keyboard:
+        window.key(TAB)  # First stop is the eligible alternative, not the pencil.
         window.key(RETURN)
     else:
         window.click(option(new_name))
     closed(window)
-    trigger(window, new_name)  # Wait for the synthetic model acknowledgement.
-    history(window)
+    trigger(window, entry, new_name)
+    assert_view(window, entry)
+    check(queue_state(window) == queue, "device selection changed the queue state")
     expect(("device", "select", new_id))
     window.key(RETURN)
     open_panel(window)
     selected_row(window, new_name)
-    check(window.find(option(old_name), roles=BUTTON).get("accessibleEnabled"),
-          "previous output did not become an enabled alternative")
-    window.click(MANAGE)
-    window.title("Devices")
+    window.key(ESCAPE)
     closed(window)
-    expect(("navigate", "devices"))
-    no_deselect(window)
-    catalog = element_id(window.elements(), "catalog-scroll")
-    check(catalog, "missing native Devices catalog viewport")
-    # MCP omits a fully clipped row, so seek the selected card by scrolling
-    # the viewport, not by looking up the offscreen control's position.
-    for _ in range(15):
-        if visible_button(window, catalog, "Rename device"):
-            break
-        window.mcp.call("scroll_element", {"elementHandle": catalog["handle"], "deltaY": -95})
-    rename = visible_button(window, catalog, "Rename device")
-    check(rename and rename.get("accessibleEnabled"), "enabled Rename device not revealed in Devices")
-    no_deselect(window)
-    window.click_element(rename)
-    window.title("Rename playback device")
+    print(f"PASS {width}px {entry}: {'keyboard' if keyboard else 'pointer'} selection, dismiss and focus return, no navigation", flush=True)
+
+
+def rename_journey(window, width, entry, output, new_name, keyboard, expect):
+    ident, old_name = output
+    window.click_element(trigger(window, entry, old_name))
+    open_panel(window)
+    if keyboard:
+        window.key(TAB)  # The sole eligible alternative precedes Rename.
+        window.key(TAB)
+        window.key(RETURN)
+    else:
+        window.click(rename(old_name))
     field = window.find("Device name", roles=("TextInput",))
-    check(field.get("accessibleValue") == new_name, "Manage devices opened Rename for the wrong output")
-    expect(("device", "prepare-rename", new_id))
-    window.click("Cancel")
-    window.absent("Rename playback device", roles=TEXT)
-    catalog = element_id(window.elements(), "catalog-scroll")
-    window.mcp.call("scroll_element", {"elementHandle": catalog["handle"], "deltaY": 2000})
-    window.title("Devices")
-    window.click("Back")
-    history(window)
-    expect(("navigate", "back"))
-    print(f"PASS {mode[0]}px dismiss/focus return, {activate} selection without navigation, and explicit management",
-          flush=True)
+    check(field.get("accessibleValue") == old_name, "Rename did not prefill the selected device")
+    window.shortcut(CONTROL, "a")  # Must already be focused; no clicking into the field.
+    window.key("Discard this")
+    check(window.find("Device name", roles=("TextInput",)).get("accessibleValue") == "Discard this", "rename input did not receive focus")
+    window.key(ESCAPE)
+    open_panel(window)
+    window.absent("Device name", roles=("TextInput",))
+    selected_row(window, old_name)
+    expect()
+    window.key(RETURN)  # Escape in the editor returns to the pencil, not the trigger.
+    check(window.find("Device name", roles=("TextInput",)).get("accessibleValue") == old_name,
+          "rename cancellation retained a stale draft or did not restore focus")
+    window.shortcut(CONTROL, "a")
+    window.key(new_name)
+    window.pixels(f"devices-rename-{entry}-{width}", width)
+    if keyboard:
+        window.key(RETURN)
+    else:
+        window.click("Save device name")
+    expect(("device", "rename", ident, new_name))
+    open_panel(window)
+    selected_row(window, new_name)
+    window.key(ESCAPE)
+    closed(window)
+    assert_view(window, entry)
+    trigger(window, entry, new_name)
+    print(f"PASS {width}px {entry}: inline rename, Escape reverts draft, exact device ID/name on save", flush=True)
 
 
 def roster_viewport(window):
@@ -201,90 +229,124 @@ def roster_viewport(window):
     return viewport
 
 
-def long_roster(window, expect):
+def visible_button(window, region, label):
+    button = named(window, window.elements(), label)
+    return button if button and contains(region, button) else None
+
+
+def long_roster(window, entry, expect):
     window.click(TRIGGER)
     viewport = roster_viewport(window)
     last_label = option("Room output 08")
     window.absent(last_label, roles=BUTTON)
-    pinned = {label: bounds(window.find(label, roles=BUTTON)) for label in (CLOSE, MANAGE)}
+    window.absent(option("Travel speaker"), roles=BUTTON)
+    window.find(option("Room output 02"), roles=BUTTON)
+    fixed = (bounds(window.find(CLOSE, roles=BUTTON)), bounds(selected_row(window, DESKTOP_OUTPUT[1])))
     window.mcp.call("scroll_element", {"elementHandle": viewport["handle"], "deltaY": -1000})
-    wait("last output revealed by wheel", lambda: visible_button(window, viewport, last_label))
-    check(all(bounds(window.find(label, roles=BUTTON)) == pos for label, pos in pinned.items()),
-          "wheel scrolled the picker header or management footer")
+    wait("last choice revealed by wheel", lambda: visible_button(window, viewport, last_label))
+    check(fixed == (bounds(window.find(CLOSE, roles=BUTTON)), bounds(selected_row(window, DESKTOP_OUTPUT[1]))),
+          "wheel scrolled the title or selected output out of place")
+    window.find(option("Travel speaker"), roles=BUTTON)
     window.key(ESCAPE)
     closed(window)
     window.key(RETURN)
     viewport = roster_viewport(window)
-    window.absent(last_label, roles=BUTTON)
-    # One first alternative, then eight room outputs. Neither of the two
-    # disabled alternatives nor the selected row may consume a Tab stop.
-    for _ in range(9):
+    for _ in range(9):  # One first alternative, then eight room outputs (before Rename).
         window.key(TAB)
-    wait("last output revealed by Tab", lambda: visible_button(window, viewport, last_label))
+    wait("last choice visible on Tab focus", lambda: visible_button(window, viewport, last_label))
     window.key(RETURN)
     closed(window)
-    history(window)
-    trigger(window, "Room output 08")
+    assert_view(window, entry)
+    trigger(window, entry, "Room output 08")
     expect(("device", "select", "extra-8"))
-    print("PASS long roster wheel and Tab reveal a clipped choice; header and management stay pinned", flush=True)
+    print(f"PASS {entry} long roster: usable choices first, wheel and Tab scroll, current output stays visible", flush=True)
 
 
-def live_resize(window, expect):
-    output = "Room output 08"
+def live_resize(window, entry, expect):
+    # Resize while open (including a layout breakpoint); do not reopen to inspect the new anchor.
     for size in (MINIMUM, WIDE):
-        window.click_element(trigger(window, output))
+        window.click_element(trigger(window, entry, "Room output 08"))
         open_panel(window)
         resize(window, size)
-        # No click to reopen: the existing popup must still be visible and must
-        # have recomputed its native pointer offset against the rebuilt dock.
         panel = open_panel(window)
-        selected_row(window, output)
-        close_and_measure(window, panel, trigger(window, output))
-        history(window)
+        selected_row(window, "Room output 08")
+        close_and_measure(window, panel, trigger(window, entry, "Room output 08"), entry)
+        assert_view(window, entry)
         expect()
-    print("PASS same open picker stays anchored while the native window resizes in both directions", flush=True)
+    print(f"PASS {entry} stays anchored while open through window resize", flush=True)
 
 
-def lifecycle(window, journal, expect):
-    output = "Room output 08"
-    control = journal.with_suffix(".control")
-    pending = control.with_suffix(".tmp")
-
-    def update(command):
-        # Post a complete command; the fixture removes it after applying state.
-        pending.write_text(command)
-        pending.replace(control)
-        wait(f"fixture state {command}", lambda: not control.exists())
-
-    window.click_element(trigger(window, output))
+def lifecycle(window, update, expect):
+    update("history")
+    update("restore-dock")
+    window.click_element(trigger(window, "dock"))
     open_panel(window)
     update("change-page-key")
     closed(window)
-    history(window)
-    trigger(window, output)
-    expect()
-
-    window.click(TRIGGER)
+    window.key(RETURN)
     open_panel(window)
     update("drop-dock")
     closed(window)
-    check(not element_id(window.elements(), "player"), "fixture did not remove the dock")
-    expect()
-    update("restore-dock")
-    history(window)
-    closed(window)
-    window.click_element(trigger(window, output))
+    window.click_element(trigger(window, "toolbar"))
     open_panel(window)
-    window.key(ESCAPE)
+    update("restore-dock")
     closed(window)
+    trigger(window, "dock")
+    update("now")
+    window.click_element(trigger(window, "now"))
+    open_panel(window)
+    update("history")
+    closed(window)
+    assert_view(window, "dock")
     expect()
-    print("PASS external route-context change and dock removal close the picker without callbacks", flush=True)
+    print("PASS external route changes and either trigger disappearing close the popup without callbacks", flush=True)
+
+
+def roster_states(window, update, expect):
+    update("drop-dock")
+    for state, max_height in (("empty", 86), ("one", 94)):
+        update(state)
+        window.click(TRIGGER)
+        panel = open_panel(window)
+        _, top, _, bottom = bounds(panel)
+        check(50 <= bottom - top <= max_height, f"{state} popup isn't compact: {bottom - top:g}px")
+        if state == "empty":
+            window.title("No outputs available")
+            window.absent(r"Rename device: .+|Select output: .+", roles=BUTTON)
+        else:
+            selected_row(window, DESKTOP_OUTPUT[1])
+            window.find(rename(DESKTOP_OUTPUT[1]), roles=BUTTON)
+            window.absent(r"Select output: .+", roles=BUTTON)
+        window.key(ESCAPE)
+        closed(window)
+    update("mixed")
+    for mode, message in (("offline", "Device control is unavailable offline"), ("reconnect", "Connecting…"), ("disconnect", None)):
+        update(mode)
+        window.click(TRIGGER)
+        open_panel(window)
+        if message:
+            window.title(message)
+            selected = window.title(DESKTOP_OUTPUT[1])  # stale roster is deliberately supplied by the fixture
+            check(not (selected.get("accessibleDescription") or "").startswith("Selected output"), "fake offline selection")
+        else:
+            trigger(window, "toolbar", "Output disconnected")
+            window.absent(re.escape(DESKTOP_OUTPUT[1]), roles=TEXT)
+        window.absent(r"Rename device: .+", roles=BUTTON)
+        alternate = window.find(option(STUDIO_OUTPUT[1]), roles=BUTTON)
+        check(not alternate.get("accessibleEnabled"), f"{mode} lets user select an output")
+        window.click_element(alternate)
+        open_panel(window)
+        window.key(ESCAPE)
+        closed(window)
+        update("online")
+    expect()
+    print("PASS empty/one stay small; offline, reconnect and disconnect never show a false selection or write action", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("example_binary", type=Path, help="prebuilt disposable playback_acceptance example")
-    parser.add_argument("--screenshots", type=Path, help="new private directory for the two native PNGs")
+    parser.add_argument("--screenshots", type=Path, help="new private directory for native PNGs")
     args = parser.parse_args()
     if args.screenshots:
         args.screenshots.mkdir(mode=0o700)
@@ -301,14 +363,34 @@ def main():
             actual = [tuple(line.split("\t")) for line in journal.read_text().splitlines()]
             check(actual == expected, f"unexpected fixture callbacks: {actual}; expected {expected}")
 
+        def update(command):
+            control = journal.with_suffix(".control")
+            pending = control.with_suffix(".tmp")
+            pending.write_text(command)
+            pending.replace(control)
+            wait(f"fixture state {command}", lambda: not control.exists())
+
         with desktop(binary, root, env, args.screenshots, multisize=True) as window:
-            for mode, before, after, activate in ((MINIMUM, DESKTOP_OUTPUT, STUDIO_OUTPUT, "keyboard"),
-                                                  (WIDE, STUDIO_OUTPUT, DESKTOP_OUTPUT, "pointer")):
-                resize(window, mode)
-                check_size(window, mode, before, after, activate, expect)
-            long_roster(window, expect)
-            live_resize(window, expect)
-            lifecycle(window, journal, expect)
+            for size, keyboard in ((MINIMUM, True), (WIDE, False)):
+                resize(window, size)
+                for entry in ("dock", "toolbar", "now"):
+                    update("history")
+                    update("drop-dock" if entry == "toolbar" else "restore-dock")
+                    if entry == "now":
+                        update("now")
+                    update("mixed")
+                    select_journey(window, size[0], entry, DESKTOP_OUTPUT, STUDIO_OUTPUT, keyboard, expect)
+                    if entry in ("dock", "toolbar"):
+                        rename_journey(window, size[0], entry, STUDIO_OUTPUT, f"Studio {entry} {size[0]}", keyboard, expect)
+            update("history")
+            for entry in ("dock", "toolbar"):
+                update("restore-dock" if entry == "dock" else "drop-dock")
+                update("long")
+                long_roster(window, entry, expect)
+                live_resize(window, entry, expect)
+            lifecycle(window, update, expect)
+            resize(window, MINIMUM)
+            roster_states(window, update, expect)
 
 
 if __name__ == "__main__":

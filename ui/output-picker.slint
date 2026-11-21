@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { Action, Caption, Divider, Theme } from "theme.slint";
+import { Action, Caption, Divider, Field, Theme } from "theme.slint";
 
 export struct DeviceRow { id: string, name: string, selected: bool, available: bool, can-play: bool }
 
@@ -9,29 +9,32 @@ export component OutputPicker inherits Action {
     in property <string> status;
     in property <string> context-key;
     in property <bool> offline;
-    in property <bool> show-management;
+    in property <bool> below;
     in property <length> window-width;
-    callback select-output(string);
-    callback manage-devices();
+    in property <length> window-height;
+    property <bool> open: picker.is-open;
+    callback device-action(string, string, string);
 
     icon: "◫";
-    quiet: true;
+    quiet: self.text == "";
     pointer-focus-visible: false;
     accessible-label: "Playback devices";
     accessible-description: root.offline ? root.message : root.output;
     accessible-expandable: true;
-    accessible-expanded: picker.is-open;
-    selected: picker.is-open;
+    accessible-expanded: root.open;
+    selected: root.open;
 
     property <length> anchor-x: self.absolute-position.x;
     property <length> anchor-y: self.absolute-position.y;
     property <string> message: root.status != "" ? root.status : root.offline ? "Device control is unavailable offline"
         : root.devices.length == 0 ? "No outputs available" : "";
-    changed context-key => { if picker.is-open { picker.close(); } }
+    changed context-key => { root.dismiss(); }
+    changed enabled => { if !self.enabled { root.dismiss(); } }
+    function dismiss() { if root.open { picker.close(); } }
     clicked => {
-        if picker.is-open { picker.close(); }
+        if root.open { picker.close(); }
         else {
-            // Save the trigger as Slint's focus-return target, also for assistive activation.
+            // Slint saves the focused trigger before showing the popup.
             if self.pointer-focused { self.take-pointer-focus(); }
             else { self.take-focus(); }
             picker.show();
@@ -40,16 +43,12 @@ export component OutputPicker inherits Action {
 
     picker := PopupWindow {
         width: min(326px, root.window-width - 16px);
-        height: min(286px, root.anchor-y - 14px, header.height + rows.preferred-height + footer.height + 2px);
-        x: clamp((root.width - self.width) / 2, 8px - root.anchor-x,
+        height: min(286px, max(42px, root.below ? root.window-height - root.anchor-y - root.height - 14px : root.anchor-y - 14px),
+            header.height + selected-row.preferred-height + rows.preferred-height + 2px);
+        x: clamp(root.below ? root.width - self.width : (root.width - self.width) / 2, 8px - root.anchor-x,
             root.window-width - root.anchor-x - self.width - 8px);
-        y: -self.height - 6px;
+        y: root.below ? root.height + 6px : -self.height - 6px;
         close-policy: close-on-click-outside;
-        function choose(id: string) {
-            // Call through the popup's parent before close disconnects its Slint item tree.
-            root.select-output(id);
-            self.close();
-        }
         init => {
             if root.pointer-focused { close-button.take-pointer-focus(); }
             else { close-button.take-focus(); }
@@ -75,8 +74,8 @@ export component OutputPicker inherits Action {
                 Divider { y: parent.height - 1px; }
             }
             scroll := ScrollView {
-                x: 1px; y: header.y + header.height; width: parent.width - 2px;
-                height: parent.height - self.y - footer.height - 1px;
+                x: 1px; y: selected-row.y + selected-row.height; width: parent.width - 2px;
+                height: max(0px, parent.height - self.y - 1px);
                 content-width: self.visible-width;
                 horizontal-scrollbar-policy: always-off;
                 function reveal(y: length, h: length) {
@@ -86,64 +85,126 @@ export component OutputPicker inherits Action {
                     }
                 }
                 rows := VerticalLayout {
-                    width: scroll.visible-width; padding: 5px; padding-right: 15px; spacing: 2px;
+                    width: scroll.visible-width; padding-left: 5px; padding-right: 15px;
+                    padding-bottom: root.message != "" || choices.preferred-height > 0px ? 7px : 0px;
                     if root.message != "": Caption {
-                        text: root.message; wrap: word-wrap;
-                        height: self.preferred-height + 8px;
+                        text: root.message; wrap: word-wrap; min-width: 0px;
+                        height: self.preferred-height + 12px;
                     }
-                    // Surface the actual output above alternatives, without making it an action.
-                    for selected in [true, false]: VerticalLayout {
-                        spacing: 0px;
-                        for device in root.devices: VerticalLayout {
-                            spacing: 0px;
-                            if selected == device.selected: row := VerticalLayout {
-                                spacing: 0px;
-                                // The roster can still carry the last owner when its socket is unavailable.
-                                property <bool> current: device.selected && device.available && !root.offline;
-                                property <string> reason: root.offline ? "" : !device.available ? "Not available"
-                                    : !device.can-play ? "Cannot play audio" : "";
-                                if device.selected: Text {
-                                    x: 10px; width: parent.width - 20px; height: 34px;
-                                    text: (row.current ? "✓ " : "") + device.name;
-                                    color: row.current ? Theme.primary : Theme.muted;
-                                    font-size: 14px * Theme.density; font-weight: 600;
-                                    vertical-alignment: center; overflow: elide;
-                                    accessible-label: device.name;
-                                    accessible-item-selectable: row.current;
-                                    accessible-item-selected: row.current;
-                                    accessible-description: !row.current ? row.reason
-                                        : row.reason == "" ? "Selected output" : "Selected output · " + row.reason;
-                                }
-                                if !device.selected: Action {
-                                    height: 34px; min-width: 0px;
-                                    text: device.name; leading: true; quiet: true;
-                                    enabled: !root.offline && device.available && device.can-play;
-                                    accessible-label: "Select output: " + device.name;
-                                    accessible-description: row.reason;
-                                    click-scope: device.id;
-                                    changed has-focus => {
-                                        if self.has-focus { scroll.reveal(self.absolute-position.y - rows.absolute-position.y, row.height); }
+                    choices := VerticalLayout {
+                        for eligible in [true, false]: VerticalLayout {
+                            for device in root.devices: VerticalLayout {
+                                if !device.selected && eligible == (!root.offline && device.available && device.can-play): choice := VerticalLayout {
+                                    property <string> reason: root.offline ? "" : !device.available ? "Not available"
+                                        : !device.can-play ? "Cannot play audio" : "";
+                                    Action {
+                                        height: 34px; min-width: 0px;
+                                        text: device.name; leading: true; quiet: true;
+                                        enabled: eligible;
+                                        accessible-label: "Select output: " + device.name;
+                                        accessible-description: choice.reason;
+                                        click-scope: device.id;
+                                        changed has-focus => {
+                                            if self.has-focus { scroll.reveal(self.absolute-position.y - rows.absolute-position.y, self.height); }
+                                        }
+                                        clicked => {
+                                            root.device-action("select", device.id, "");
+                                            picker.close();
+                                        }
                                     }
-                                    clicked => { picker.choose(device.id); }
-                                }
-                                if row.reason != "": Caption {
-                                    x: 10px; width: parent.width - 20px;
-                                    text: row.reason; height: self.preferred-height + 3px;
-                                    accessible-role: none;
+                                    if choice.reason != "": Caption {
+                                        x: 10px; width: parent.width - 20px;
+                                        text: choice.reason; height: self.preferred-height + 3px;
+                                        accessible-role: none;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            footer := Rectangle {
-                x: 1px; y: parent.height - self.height - 1px; width: parent.width - 2px;
-                height: root.show-management ? 43px : 0px;
-                if root.show-management: Divider { y: 0px; }
-                if root.show-management: Action {
-                    x: 5px; y: 4px; width: parent.width - 10px; height: 34px;
-                    text: "Manage devices"; leading: true; quiet: true;
-                    clicked => { root.manage-devices(); picker.close(); }
+            // Positioned at the top, but after the roster in Tab order: selection
+            // is the primary action. Leave the current name visible while scrolling.
+            selected-row := VerticalLayout {
+                x: 1px; y: header.y + header.height; width: parent.width - 2px;
+                height: self.preferred-height;
+                for device in root.devices: VerticalLayout {
+                    if device.selected: row := FocusScope {
+                        height: 42px + (self.reason != "" && !self.editing ? 17px : 0px);
+                        focus-on-click: false; focus-on-tab-navigation: false;
+                        property <bool> current: device.available && !root.offline;
+                        property <string> reason: root.offline ? "" : !device.available ? "Not available"
+                            : !device.can-play ? "Cannot play audio" : "";
+                        property <string> device-id: device.id;
+                        property <string> editing-id;
+                        property <bool> editing: self.current && self.editing-id == self.device-id;
+                        property <string> draft;
+                        changed device-id => { self.editing-id = ""; }
+                        changed current => {
+                            if !self.current && self.editing-id != "" {
+                                self.editing-id = "";
+                                close-button.take-focus();
+                            }
+                        }
+                        function finish(save: bool) {
+                            if !self.editing || (save && self.draft == "") { return; }
+                            self.editing-id = "";
+                            pencil.take-focus();
+                            if save && self.draft != device.name { root.device-action("rename", device.id, self.draft); }
+                        }
+                        capture-key-pressed(event) => {
+                            if self.editing && event.text == Key.Escape {
+                                if !event.repeat { self.finish(false); }
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        HorizontalLayout {
+                            height: 42px;
+                            padding-left: 11px; padding-right: 4px; spacing: 3px;
+                            Text {
+                                visible: !row.editing;
+                                min-width: 0px; horizontal-stretch: 1;
+                                max-width: self.visible ? 65535px : 0px;
+                                text: (row.current ? "✓ " : "") + device.name;
+                                color: row.current ? Theme.primary : Theme.muted;
+                                font-size: 14px * Theme.density; font-weight: 600;
+                                vertical-alignment: center; overflow: elide;
+                                accessible-label: device.name;
+                                accessible-item-selectable: row.current;
+                                accessible-item-selected: row.current;
+                                accessible-description: !row.current ? row.reason
+                                    : row.reason == "" ? "Selected output" : "Selected output · " + row.reason;
+                            }
+                            pencil := Action {
+                                visible: row.current && !row.editing; enabled: self.visible;
+                                width: self.visible ? 34px : 0px;
+                                height: 34px; icon: "rename"; quiet: true;
+                                accessible-label: "Rename device: " + device.name;
+                                click-scope: device.id;
+                                clicked => { row.draft = device.name; row.editing-id = device.id; }
+                            }
+                            if row.editing: Field {
+                                height: 36px; text <=> row.draft; field-label: "Device name";
+                                init => { self.take-focus(); }
+                                accepted => { row.finish(true); }
+                            }
+                            if row.editing: Action {
+                                text: "Save"; height: 34px; primary: true; enabled: row.draft != "";
+                                accessible-label: "Save device name";
+                                clicked => { row.finish(true); }
+                            }
+                            if row.editing: Action {
+                                text: "Cancel"; height: 34px; quiet: true;
+                                accessible-label: "Cancel device rename";
+                                clicked => { row.finish(false); }
+                            }
+                        }
+                        if row.reason != "" && !row.editing: Caption {
+                            x: 11px; y: 39px; height: 17px;
+                            text: row.reason; accessible-role: none;
+                        }
+                    }
                 }
             }
         }

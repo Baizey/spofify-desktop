@@ -6,7 +6,7 @@ import { Editor, SignInView } from "forms.slint";
 import { DockLayout, PlayerBar } from "playback.slint";
 import { DeviceRow } from "output-picker.slint";
 import { NowPlaying, TimedLyricLine } from "now-playing.slint";
-import { Settings, SettingCard } from "settings.slint";
+import { Settings } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
 export { ArtistCredit, DeviceRow }
@@ -154,7 +154,7 @@ export component AppWindow inherits Window {
     in property <bool> local-muted;
     callback local-volume-change(float);
     callback local-mute-toggle();
-    callback device-action(string, string);
+    callback device-action(string, string, string);
 
     default-font-size: 13px * Theme.density;
     background: Theme.bg;
@@ -169,6 +169,8 @@ export component AppWindow inherits Window {
     property <string> playback-status: root.player-status != "" ? root.player-status : root.reconnecting ? "Connecting…" : "";
     property <bool> dock-visible: root.now-track-id != "" && !root.is-now && !root.editor-open;
     property <bool> toolbar-playback: !root.dock-visible && !root.editor-open;
+    property <string> device-picker-context: root.page-kind + "|" + root.page-key + "|" + root.account-label;
+    property <string> device-picker-status: root.reconnecting ? "Connecting…" : root.device-status;
     property <length> player-height: root.dock-visible ? DockLayout.height(root.compact) : 0px;
     property <bool> wide-queue-open: true;
     property <bool> compact-queue-open;
@@ -224,15 +226,14 @@ export component AppWindow inherits Window {
         root.form-error = "";
     }
     function cancel-form() {
-        if root.form-mode != "device-rename" && root.form-mode != "remove-saved" { root.page-action("cancel-form", root.form-mode); }
+        if root.form-mode != "remove-saved" { root.page-action("cancel-form", root.form-mode); }
         root.form-mode = "";
         root.form-name = "";
         root.form-description = "";
         root.form-value = "";
     }
     function submit-form() {
-        if root.form-mode == "device-rename" { root.device-action("rename", root.form-name); }
-        else if root.form-mode == "remove-saved" {
+        if root.form-mode == "remove-saved" {
             if root.saved-removal-key == root.page-key
                 && (root.form-return == root.playlist-actions.remove-action || root.form-return == root.playlist-actions.offline-action) {
                 root.page-action(root.form-return, "");
@@ -491,8 +492,12 @@ export component AppWindow inherits Window {
                             playback-tools := PlaybackTools {
                                 x: 0px; y: (parent.height - self.height) / 2; width: parent.width; height: 38px;
                                 labeled: !main.narrow; enabled: root.toolbar-playback;
-                                queue-open: root.queue-shown; devices-open: root.page-kind == "devices";
-                                status: root.playback-status; context-key: root.page-kind + "|" + root.page-key;
+                                queue-open: root.queue-shown; status: root.playback-status;
+                                context-key: root.device-picker-context;
+                                window-width: root.width; window-height: root.height;
+                                devices: root.device-rows; output: root.output-name;
+                                device-status: root.device-picker-status; offline: root.local-mode;
+                                device-action(op, id, name) => { root.device-action(op, id, name); }
                                 navigate(target) => { shell.route(target); }
                             }
                         }
@@ -674,33 +679,6 @@ export component AppWindow inherits Window {
                                 density-changed(scale) => { root.density-changed(scale); }
                                 focused(y, h) => { catalog-scroll.reveal(catalog.y + self.y + y, h); }
                             }
-                            if root.page-kind == "devices" && root.device-rows.length > 0 && root.device-status != "": Notice { text: root.device-status; }
-                            if root.page-kind == "devices" && root.device-rows.length == 0: EmptyState {
-                                title: "No playback devices yet";
-                                subtitle: root.device-status != "" ? root.device-status : "Available outputs will appear here.";
-                                glyph: "◫";
-                            }
-                            if root.page-kind == "devices": VerticalLayout {
-                                spacing: 6px;
-                                for device in root.device-rows: SettingCard {
-                                    title: device.name;
-                                    detail: !device.available ? "Not available" : device.selected ? "Selected output"
-                                        : device.can-play ? "Available for playback" : "Cannot play audio";
-                                    FlexboxLayout {
-                                        flex-wrap: wrap; spacing: 6px;
-                                        if !device.selected: Action {
-                                            text: "Select output"; enabled: !root.local-mode && device.available && device.can-play;
-                                            primary: true; clicked => { root.device-action("select", device.id); }
-                                        }
-                                        if device.selected: Action {
-                                            text: "Rename device"; enabled: !root.local-mode && device.available;
-                                            property <int> resume: root.form-focus-serial;
-                                            changed resume => { if root.form-return == "device-rename" { self.take-focus(); } }
-                                            clicked => { root.form-return = "device-rename"; root.form-name = device.name; root.form-mode = "device-rename"; root.device-action("prepare-rename", device.id); }
-                                        }
-                                    }
-                                }
-                            }
                             if root.is-history && root.browse-rows.length == 0 && !root.page-busy && !root.page-error: VerticalLayout {
                                 spacing: 12px;
                                 Caption { text: root.local-mode ? "Listening history isn’t available offline." : "Tracks you play will appear here."; font-size: 14px * Theme.density; wrap: word-wrap; }
@@ -712,7 +690,7 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            if !root.is-history && !root.is-settings && root.page-kind != "devices" && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
+                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
                                     title: root.is-search && root.query == "" ? (root.local-mode ? "Search your downloads" : "What would you like to hear?")
@@ -928,10 +906,10 @@ export component AppWindow inherits Window {
             x: 0px; y: parent.height - root.player-height; width: parent.width; height: root.player-height;
             track: root.now-title; subtitle: root.now-detail; output: root.output-name;
             devices: root.device-rows;
-            device-status: root.reconnecting ? "Connecting…" : root.device-status;
-            device-picker-context: root.page-kind + "|" + root.page-key + "|" + root.account-label
+            device-status: root.device-picker-status;
+            device-picker-context: root.device-picker-context
                 + (root.dock-visible && root.signed-in ? "|shown" : "|hidden");
-            select-output(id) => { root.device-action("select", id); }
+            device-action(op, id, name) => { root.device-action(op, id, name); }
             credits: root.now-credits; metadata-enabled: !root.local-mode;
             album-id: root.now-album-id; album-name: root.now-album-name;
             status: root.playback-status;

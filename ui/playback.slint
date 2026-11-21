@@ -212,7 +212,7 @@ export component PlayerBar inherits Rectangle {
     callback queue-action(string, string);
     callback volume-change(float);
     callback mute-toggle();
-    callback select-output(string);
+    callback device-action(string, string, string);
     public function focus-queue(by-pointer: bool) {
         if by-pointer { queue-trigger.take-pointer-focus(); }
         else { queue-trigger.take-focus(); }
@@ -305,9 +305,7 @@ export component PlayerBar inherits Rectangle {
             width: 36px; window-width: root.width;
             devices: root.devices; output: root.output; status: root.device-status;
             context-key: root.device-picker-context; offline: root.offline;
-            show-management: !root.offline && root.page != "devices";
-            select-output(id) => { root.select-output(id); }
-            manage-devices => { root.navigate("devices"); }
+            device-action(op, id, name) => { root.device-action(op, id, name); }
         }
         PlaybackAction {
             width: 36px; icon: root.muted || root.volume == 0 ? "volume-muted" : "volume";
