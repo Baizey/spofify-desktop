@@ -150,17 +150,17 @@ export component MediaLine inherits Rectangle {
     in property <int> sequence;
     in property <bool> compact;
     in property <bool> queue-row;
-    property <bool> queue-cover: root.queue-row && root.artwork.width > 0;
-    property <bool> leading-cover: root.sequence == 0 && !root.compact && !root.queue-row;
+    property <bool> leading-cover: root.sequence == 0 && (root.queue-row ? root.artwork.width > 0 : !root.compact);
+    property <bool> leading-state: root.queue-row && root.current-track && !root.leading-cover;
     property <bool> leading-marker: root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-row;
     property <length> leading-slot: root.sequence > 0 ? (root.compact ? 26px : 33px)
-        : root.leading-cover ? 39px : root.leading-marker ? 16px : 0px;
+        : root.leading-cover || root.leading-state ? 39px : root.leading-marker ? 16px : 0px;
     property <length> word-gap: !root.queue-row && root.compact && root.kind == "track" ? 6px : 8px;
     property <bool> row-reveals-play: row-face.has-hover || (row-keys.has-focus && !root.row-pointer-focus);
     property <bool> row-pointer-focus;
     property <bool> play-focused;
     // The scroll owner supplies the row's viewport position and receives
-    // focus before a clipped Play action can handle another key.
+    // focus before a clipped Play action (or Queue face) can handle another key.
     in property <length> row-viewport-y;
     in property <length> play-viewport-height;
     callback play-focus-evicted();
@@ -168,6 +168,15 @@ export component MediaLine inherits Rectangle {
         && (root.row-viewport-y + root.play-top + root.play-height <= 0px
             || root.row-viewport-y + root.play-top >= root.play-viewport-height);
     changed play-scrolled-out => { if root.play-scrolled-out { root.play-focus-evicted(); } }
+    property <string> focused-occurrence;
+    property <bool> queue-body-clipped: root.queue-row && row-keys.has-focus && root.play-viewport-height > 0px
+        && (root.row-viewport-y + root.height <= 0px || root.row-viewport-y >= root.play-viewport-height
+            || (root.play-viewport-height >= root.height && (root.row-viewport-y < 0px || root.row-viewport-y + root.height > root.play-viewport-height)));
+    changed queue-body-clipped => { if root.queue-body-clipped { root.play-focus-evicted(); } }
+    changed menu-key => {
+        // Repeated rows can be reused for a different occurrence in a new Queue snapshot.
+        if root.queue-row && row-keys.has-focus && root.focused-occurrence != root.menu-key { root.play-focus-evicted(); }
+    }
     changed playable => {
         // A removed conditional control need not send a FocusOut event.
         if !root.playable && root.play-focused {
@@ -230,7 +239,8 @@ export component MediaLine inherits Rectangle {
     }
     function activate-row() {
         if root.can-open { root.action("open"); }
-        else if root.play-on-activate { root.action("play"); }
+        else if root.play-on-activate && (!root.queue-row ||
+            (!root.queue-body-clipped && root.focused-occurrence == root.menu-key)) { root.action("play"); }
     }
     function click-row() {
         root.row-pointer-focus = true;
@@ -252,10 +262,14 @@ export component MediaLine inherits Rectangle {
 
         Rectangle {
             width: parent.width; height: parent.height;
-            border-width: row-keys.has-focus ? 2px : 0px;
+            border-width: row-keys.has-focus && !root.queue-row ? 2px : 0px;
             border-color: Theme.tertiary;
             background: !parent.engaged ? transparent : row-face.pressed ? Theme.line.with-alpha(0.7)
                 : Theme.raised.with-alpha(0.55);
+        }
+        if root.queue-row && row-keys.has-focus && !root.row-pointer-focus: Rectangle {
+            x: 8px; y: 1px; width: max(0px, parent.width - 16px); height: parent.height - 2px;
+            border-radius: Theme.control-radius; border-width: 2px; border-color: Theme.tertiary;
         }
     }
     Rectangle {
@@ -275,7 +289,10 @@ export component MediaLine inherits Rectangle {
             focus-on-tab-navigation: root.body-actionable || root.playlist-track-row;
             focus-gained(reason) => {
                 if reason == FocusReason.tab-navigation { root.row-pointer-focus = false; }
-                if reason != FocusReason.window-activation { root.keyboard-focus-changed(true, true); }
+                if reason != FocusReason.window-activation {
+                    if root.queue-row { root.focused-occurrence = root.menu-key; }
+                    root.keyboard-focus-changed(true, true);
+                }
                 root.focused();
             }
             focus-lost(reason) => {
@@ -295,7 +312,7 @@ export component MediaLine inherits Rectangle {
     // Slint offers the press to descendants first, so links and controls
     // consume their own clicks. Only the plain track face starts this gesture.
     row-face := TouchArea {
-        x: root.playable ? -root.paint-left : 0px;
+        x: root.playable && !root.queue-row ? -root.paint-left : 0px;
         width: root.width - self.x; height: root.height;
         enabled: root.body-focusable || root.playable;
         mouse-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
@@ -337,6 +354,13 @@ export component MediaLine inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
                     current-track: root.current-track; playing-track: root.playing-track;
+                }
+            }
+            if root.leading-state: Rectangle {
+                width: 39px;
+                TrackState {
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    playing: root.playing-track;
                 }
             }
             if root.leading-marker: Rectangle {
@@ -400,19 +424,6 @@ export component MediaLine inherits Rectangle {
                     keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                 }
             }
-            // Queue text stays on the same edge even as the current cover loads.
-            // Other occurrences do not reserve either the cover or state slot.
-            if root.queue-row && root.current-track: Rectangle {
-                width: root.queue-cover ? 39px : 37px;
-                if root.queue-cover: TrackCover {
-                    y: (parent.height - self.height) / 2;
-                    artwork: root.artwork; current-track: true; playing-track: root.playing-track;
-                }
-                if !root.queue-cover: TrackState {
-                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                    playing: root.playing-track;
-                }
-            }
             if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
                 property <length> column-width: root.sequence > 0 ? (root.compact ? 42px : 64px) : 126px;
                 width: root.playlist-track-row && !root.playable ? max(self.column-width, min(180px, self.preferred-width)) : self.column-width;
@@ -421,13 +432,12 @@ export component MediaLine inherits Rectangle {
         }
         // Keep Play out of layout flow and after metadata links in Tab order.
         // Hiding only the paint leaves a reachable, self-revealing keyboard action.
-        if root.playable: row-play := Action {
-            // For artless rows, use the pane inset, leaving the first pixel
-            // clear of the separator. Queue's links start 2px inside the row.
-            // The tiny compact track marker can borrow 5px on each side.
+        if root.playable && !root.queue-row: row-play := Action {
+            // Artless catalog rows can use the pane inset; the compact
+            // track marker can borrow 5px on each side.
             x: root.leading-slot == 0px ? 1px : -row-face.x - (root.leading-marker ? 5px : 0px);
             y: root.play-top;
-            width: root.leading-slot == 0px ? max(0px, root.paint-left - 1px + (root.queue-row ? 2px : 0px))
+            width: root.leading-slot == 0px ? max(0px, root.paint-left - 1px)
                 : root.leading-slot + (root.leading-marker ? 10px : 0px);
             height: root.play-height;
             min-width: 0px;

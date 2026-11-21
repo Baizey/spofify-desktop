@@ -45,7 +45,8 @@ const SEARCH_PLAY: Point = (244., 269.);
 const SEARCH_FALLBACK: Point = (244., 437.);
 const SEARCH_MENU: Point = (928., 269.);
 const UPCOMING_HOVER: Point = (1065., 322.);
-const UPCOMING_PLAY: Point = (986., 322.);
+const QUEUE_BODY: Point = (1120., 303.);
+const QUEUE_MENU: Point = (1245., 322.);
 const RULES_BODY: Point = (400., 400.);
 const RULES_PLAY: Point = (240., 419.);
 const ALBUM_PLAY: Point = (240., 460.);
@@ -261,10 +262,30 @@ fn queue() -> ModelRc<QueueRow> {
     ])
 }
 
+fn long_queue() -> ModelRc<QueueRow> {
+    let rows = queue();
+    let mut upcoming = rows.row_data(2).unwrap();
+    upcoming.title = "Night Ferry Across the Open Sea (Extended Mix)".into();
+    upcoming.credits = model(vec![
+        ArtistCredit {
+            id: "vera".into(),
+            name: "Vera North".into(),
+        },
+        ArtistCredit {
+            id: "marin".into(),
+            name: "Marin James and the Harbourside Ensemble".into(),
+        },
+    ]);
+    upcoming.album_name = "Glass Coast: Expanded Anniversary Edition".into();
+    rows.set_row_data(2, upcoming);
+    rows
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Receipt {
     Row(String, i32, String),
     Queue(String, String),
+    QueueOrder(String, String, String),
     Entity(String, String),
     Navigate(String),
 }
@@ -402,6 +423,14 @@ impl Fixture {
         let f = self.clone();
         ui.on_queue_action(move |op, key| {
             f.record(Receipt::Queue(op.to_string(), key.to_string()))
+        });
+        let f = self.clone();
+        ui.on_queue_order_drop(move |basis, key, after| {
+            f.record(Receipt::QueueOrder(
+                basis.to_string(),
+                key.to_string(),
+                after.to_string(),
+            ))
         });
         let f = self.clone();
         ui.on_page_action(move |op, id| f.record(Receipt::Entity(op.to_string(), id.to_string())));
@@ -567,18 +596,44 @@ fn captures(script: &mut Script) {
     script.hover(OUTSIDE);
     script.shot("05-queue-current-art-and-played");
     script.hover(UPCOMING_HOVER);
-    script.shot("06-queue-artless-gutter");
+    script.shot("06-queue-upcoming-hover");
     script.hover(OUTSIDE);
-    script.shot("07-queue-artless-hover-left");
+    script.step("show current without an active output", |_, ui| {
+        ui.set_playing(false);
+        Ok(())
+    });
+    script.shot("07a-queue-current-not-playing");
+    script.step("restore active current", |_, ui| {
+        ui.set_playing(true);
+        Ok(())
+    });
     script.step("show current marker", |_, ui| {
         ui.set_cover_art(Image::default());
         Ok(())
     });
     script.shot("08-queue-current-marker");
-    script.step("restore current artwork", |f, ui| {
+    script.step("show long upcoming metadata", |f, ui| {
         ui.set_cover_art(f.art.clone());
+        ui.set_queue_rows(long_queue());
         Ok(())
     });
+    script.shot("08a-queue-long-metadata-rest");
+    script.hover(UPCOMING_HOVER);
+    script.shot("08b-queue-long-metadata-hover");
+    script.step("restore regular metadata", |_, ui| {
+        ui.set_queue_rows(queue());
+        Ok(())
+    });
+    script.click(QUEUE_MENU);
+    script.shot("07-queue-upcoming-menu");
+    script.key(Key::Escape);
+    script.hover(OUTSIDE);
+    script.shot("07b-queue-menu-escape");
+    // The whole face comes before artist and album links, then overflow.
+    for _ in 0..3 {
+        script.key(Key::Backtab);
+    }
+    script.shot("07c-queue-keyboard");
     script.click(SEARCH_MENU);
     script.shot("04-search-menu");
     script.key(Key::Escape);
@@ -616,17 +671,12 @@ fn queue_receipt(op: &str, key: &str) -> Receipt {
     Receipt::Queue(op.into(), key.into())
 }
 
-/// A Play ring has gold pixels inside this leading slot at its vertical center.
-/// The body outline is pane-wide and never intersects this inner check region.
+/// A small control's ring has gold pixels across its vertical center.
+/// The row outline never intersects this inner check region.
 fn play_ring(frame: &Frame, (x, y): Point) -> bool {
     let stride = frame.width() as usize * 4;
     let (x, y) = (x as usize, y as usize);
-    // In Queue the artist link is only two pixels beyond the Play slot.
-    let (left, right) = if x == UPCOMING_PLAY.0 as usize {
-        (977, 995)
-    } else {
-        (x - 21, x + 21)
-    };
+    let (left, right) = (x - 21, x + 21);
     (y - 12..=y + 12)
         .flat_map(|y| {
             frame.as_bytes()[y * stride + left * 4..y * stride + right * 4].chunks_exact(4)
@@ -654,6 +704,17 @@ impl Script {
     fn expect(&mut self, label: &'static str, receipts: Vec<Receipt>) {
         self.step(label, move |f, _| f.expect(label, &receipts));
     }
+}
+
+fn queue_body_ring(frame: &Frame) -> bool {
+    let stride = frame.width() as usize * 4;
+    (285..290)
+        .flat_map(|y| {
+            frame.as_bytes()[y * stride + 1000 * 4..y * stride + 1240 * 4].chunks_exact(4)
+        })
+        .filter(|pixel| pixel[..3] == [0xdf, 0xbd, 0x78])
+        .count()
+        > 200
 }
 
 fn queue_upcoming_ink(frame: &Frame) -> Vec<(usize, usize)> {
@@ -798,73 +859,216 @@ fn assertions(s: &mut Script) {
         "current and Played queue occurrences have no Play slot",
         vec![],
     );
-    s.hover(OUTSIDE);
     s.click((977.5, 302.));
-    s.expect(
-        "direct entry at the Queue Play left/top edge activates the first occurrence",
-        vec![queue_receipt("play", "q-next-1")],
-    );
+    s.expect("pane inset has no Queue Play strip", vec![]);
+    s.click(QUEUE_MENU);
+    s.key(Key::Escape);
     s.hover(OUTSIDE);
-    s.step("clicked Queue Play retains visible ownership", |f, ui| {
+    s.step("Escape restores Queue overflow keyboard focus", |f, ui| {
         check(
-            play_ring(&f.snapshot(ui)?, UPCOMING_PLAY),
-            "Play focus vanished after the pointer left",
+            play_ring(&f.snapshot(ui)?, QUEUE_MENU),
+            "queue menu trigger did not regain focus",
         )
     });
-    s.shot("16a-queue-pointer-play-focused");
-    s.hover((1065., 396.));
-    s.click((994.5, 416.));
-    s.expect(
-        "Queue Play right/bottom edge activates the second duplicate",
-        vec![queue_receipt("play", "q-next-2")],
-    );
-    s.click((1246., 396.));
+    s.key(Key::Return);
     s.key(Key::Return);
     s.expect(
-        "queue overflow retains the correct occurrence",
+        "menu Play names the first duplicate",
+        vec![queue_receipt("play", "q-next-1")],
+    );
+    s.click((QUEUE_MENU.0, 396.));
+    s.key(Key::End);
+    s.key(Key::Return);
+    s.expect(
+        "menu Remove names the second duplicate",
         vec![queue_receipt("remove", "q-next-2")],
     );
-    s.click((1120., 303.));
-    s.expect("queue body selects without playing", vec![]);
-    s.step("focus artwork-free Queue Play by Tab", |f, ui| {
-        tab_to_play(f, ui, UPCOMING_PLAY)
-    });
+    s.click(QUEUE_MENU);
+    s.key(Key::Escape);
+    for _ in 0..4 {
+        s.key(Key::Backtab);
+    }
+    s.key(Key::Tab);
+    s.step(
+        "a single Tab from the preceding link focuses the entire upcoming row",
+        |f, ui| {
+            check(
+                queue_body_ring(&f.snapshot(ui)?),
+                "unclipped Queue row focus outline missing",
+            )
+        },
+    );
     s.shot("16b-queue-keyboard-play");
     s.key(Key::Space);
-    s.expect(
-        "keyboard activates artwork-free Queue Play",
-        vec![queue_receipt("play", "q-next-1")],
-    );
-    s.key(Key::Tab);
-    s.step("Tab advances past Queue Play", |f, ui| {
-        check(
-            !play_ring(&f.snapshot(ui)?, UPCOMING_PLAY),
-            "Queue Play still focused after Tab",
-        )
-    });
-    s.key(Key::Backtab);
-    s.step("Shift-Tab returns to Queue Play", |f, ui| {
-        check(
-            play_ring(&f.snapshot(ui)?, UPCOMING_PLAY),
-            "Queue Play ring missing after Shift-Tab",
-        )
-    });
     s.key(Key::Return);
     s.expect(
-        "Shift-Tabbed Queue Play accepts Enter",
-        vec![queue_receipt("play", "q-next-1")],
+        "Space and Enter play the focused occurrence",
+        vec![queue_receipt("play", "q-next-1"); 2],
     );
-    s.step("drag from Queue Play to another row", |_, ui| {
-        move_to(ui, UPCOMING_PLAY);
-        button(ui, UPCOMING_PLAY, true);
-        move_to(ui, (1100., 376.));
-        button(ui, (1100., 376.), false);
+    s.key(Key::Tab);
+    s.key(Key::Return);
+    s.expect(
+        "Tab moves to artist link, not a duplicate Play stop",
+        vec![Receipt::Entity("artist".into(), "vera".into())],
+    );
+    s.key(Key::Tab);
+    s.key(Key::Return);
+    s.expect(
+        "album link retains its own keyboard action",
+        vec![Receipt::Entity("album".into(), "glass-coast".into())],
+    );
+    s.click((1012., 323.));
+    s.expect(
+        "pointer opens artist link without Play",
+        vec![Receipt::Entity("artist".into(), "vera".into())],
+    );
+    s.click((1012., 343.));
+    s.expect(
+        "pointer opens album link without Play",
+        vec![Receipt::Entity("album".into(), "glass-coast".into())],
+    );
+    s.step("show overflowing credit list", |_, ui| {
+        ui.set_queue_rows(long_queue());
+        Ok(())
+    });
+    s.click(QUEUE_MENU);
+    s.key(Key::Escape);
+    s.hover(OUTSIDE);
+    s.key(Key::Backtab);
+    s.key(Key::Backtab);
+    s.shot("16f-queue-overflowed-credit-focus");
+    s.key(Key::Return);
+    s.expect(
+        "keyboard reveals and activates the second artist credit",
+        vec![Receipt::Entity("artist".into(), "marin".into())],
+    );
+    s.step("restore short credits", |_, ui| {
+        ui.set_queue_rows(queue());
+        Ok(())
+    });
+    s.click(QUEUE_BODY);
+    s.expect("single body click does not play", vec![]);
+    s.step("double-click duplicate row body", |_, ui| {
+        let second = (QUEUE_BODY.0, 377.);
+        click(ui, second);
+        click(ui, second);
         Ok(())
     });
     s.expect(
-        "dragging off Queue Play before release does not play",
+        "double-click plays the second duplicate exactly once",
+        vec![queue_receipt("play", "q-next-2")],
+    );
+    s.step("replace focused Queue key in place", |_, ui| {
+        let rows = ui.get_queue_rows();
+        let mut next = rows.row_data(3).ok_or("missing focused upcoming row")?;
+        next.key = "q-next-replacement".into();
+        rows.set_row_data(3, next);
+        Ok(())
+    });
+    s.key(Key::Space);
+    s.key(Key::Return);
+    s.expect(
+        "stale body focus cannot play the replacement occurrence",
         vec![],
     );
+    s.click(QUEUE_MENU);
+    s.step("remove the occurrence with an open menu", |_, ui| {
+        ui.set_queue_rows(model(
+            queue().iter().filter(|row| row.key != "q-next-1").collect(),
+        ));
+        Ok(())
+    });
+    s.key(Key::Return);
+    s.expect(
+        "stale popup cannot act after its occurrence was removed",
+        vec![],
+    );
+    s.key(Key::Escape);
+    s.click(QUEUE_MENU);
+    s.key(Key::Return);
+    s.expect(
+        "fresh popup targets the remaining duplicate",
+        vec![queue_receipt("play", "q-next-2")],
+    );
+    s.step("restore rows before a playback transition", |_, ui| {
+        ui.set_queue_rows(queue());
+        Ok(())
+    });
+    s.click(QUEUE_BODY);
+    s.key(Key::Return);
+    s.expect(
+        "focused occurrence starts playing",
+        vec![queue_receipt("play", "q-next-1")],
+    );
+    s.step(
+        "publish that occurrence as current, retaining its duplicate",
+        |_, ui| {
+            let rows = queue();
+            let mut previous = rows.row_data(1).unwrap();
+            previous.current = false;
+            rows.set_row_data(1, previous);
+            let mut current = rows.row_data(2).unwrap();
+            current.current = true;
+            current.upcoming = false;
+            rows.set_row_data(2, current);
+            ui.set_now_track_id("night-ferry".into());
+            ui.set_cover_art(Image::default());
+            ui.set_queue_rows(rows);
+            Ok(())
+        },
+    );
+    s.shot("16h-queue-play-transition");
+    s.key(Key::Return);
+    s.key(Key::Space);
+    s.expect(
+        "former upcoming focus does not play the new current or remaining duplicate",
+        vec![],
+    );
+    s.step("disable playback in offline view", |f, ui| {
+        ui.set_now_track_id("amber-lines".into());
+        ui.set_cover_art(f.art.clone());
+        ui.set_queue_rows(queue());
+        ui.set_manual_offline(true);
+        Ok(())
+    });
+    s.click(QUEUE_BODY);
+    s.click(QUEUE_BODY);
+    s.key(Key::Space);
+    s.click(QUEUE_MENU);
+    s.expect(
+        "offline without a local queue cannot play or remove",
+        vec![],
+    );
+    s.step("enable idle local Queue while still offline", |_, ui| {
+        ui.set_local_playback(true);
+        ui.set_playing(false);
+        ui.set_now_track_id("".into());
+        ui.set_queue_rows(model(queue().iter().filter(|row| row.upcoming).collect()));
+        Ok(())
+    });
+    s.shot("16g-queue-idle-local");
+    let idle_menu = (QUEUE_MENU.0, 218.);
+    s.click(idle_menu);
+    s.key(Key::Return);
+    s.expect(
+        "idle local Queue retains Play",
+        vec![queue_receipt("play", "q-next-1")],
+    );
+    s.click(idle_menu);
+    s.key(Key::End);
+    s.key(Key::Return);
+    s.expect(
+        "idle local Queue retains Remove",
+        vec![queue_receipt("remove", "q-next-1")],
+    );
+    s.step("restore online Queue", |_, ui| {
+        ui.set_local_playback(false);
+        ui.set_manual_offline(false);
+        ui.set_playing(true);
+        ui.set_now_track_id("amber-lines".into());
+        ui.set_queue_rows(queue());
+        Ok(())
+    });
     s.step("populate a scrollable Queue", |_, ui| {
         let mut rows: Vec<_> = queue().iter().collect();
         rows.extend((0..30).map(|i| QueueRow {
@@ -877,40 +1081,101 @@ fn assertions(s: &mut Script) {
         ui.set_queue_rows(model(rows));
         Ok(())
     });
-    s.click(UPCOMING_PLAY);
+    s.click(QUEUE_BODY);
+    s.key(Key::Return);
     s.expect(
-        "Play is pointer-owned in the long Queue before scrolling",
+        "long Queue body owns focus before wheel",
         vec![queue_receipt("play", "q-next-1")],
     );
-    s.step(
-        "wheel from the left edge of the Queue Play strip",
-        |f, ui| {
-            let wheel_at = (978., UPCOMING_PLAY.1);
-            move_to(ui, wheel_at);
-            let before = f.snapshot(ui)?;
-            check(
-                play_ring(&before, UPCOMING_PLAY),
-                "first Upcoming Play did not own focus before scrolling",
-            )?;
-            wheel(ui, wheel_at, -40_000.);
-            let after = f.snapshot(ui)?;
-            let offset = (219 * WIDTH as usize + 1240) * 4;
-            check(
-                before.as_bytes()[offset..offset + 4] != after.as_bytes()[offset..offset + 4],
-                "Queue did not scroll the current artwork offscreen",
-            )
-        },
-    );
+    s.step("wheel from the leading Queue inset", |f, ui| {
+        let before = f.snapshot(ui)?;
+        check(
+            queue_body_ring(&before),
+            "row does not own focus before wheel",
+        )?;
+        wheel(ui, (978., QUEUE_BODY.1), -40_000.);
+        let after = f.snapshot(ui)?;
+        check(
+            !queue_body_ring(&after) && queue_upcoming_ink(&before) != queue_upcoming_ink(&after),
+            "Queue did not release focus and scroll through the leading inset",
+        )
+    });
     s.key(Key::Return);
     s.key(Key::Space);
     s.expect(
         "wheel and keys do not activate clipped Play in the unchanged Queue",
         vec![],
     );
-    s.shot("16c-queue-scrolled-from-play-gutter");
+    s.shot("16c-queue-scrolled-from-pane-inset");
+    s.step("restore Queue top", |_, ui| {
+        wheel(ui, UPCOMING_HOVER, 40_000.);
+        Ok(())
+    });
+    s.click(QUEUE_BODY);
+    s.key(Key::Return);
+    s.expect(
+        "first upcoming occurrence plays before partial scroll",
+        vec![queue_receipt("play", "q-next-1")],
+    );
+    s.step("partially clip the focused Queue row", |_, ui| {
+        wheel(ui, UPCOMING_HOVER, -156.);
+        Ok(())
+    });
+    s.shot("16e-queue-partly-clipped");
+    s.key(Key::Return);
+    s.key(Key::Space);
+    s.expect(
+        "partly clipped Queue face does not handle old focus",
+        vec![],
+    );
     s.step("restore original Queue", |_, ui| {
         wheel(ui, (1065., 322.), 40_000.);
         ui.set_queue_rows(queue());
+        Ok(())
+    });
+
+    s.step("prepare reorder view", |_, ui| {
+        ui.set_queue_order_token("queue-order-1".into());
+        ui.set_queue_order_writable(true);
+        ui.set_queue_order_rows(model(vec![
+            ReorderRow {
+                key: "q-current".into(),
+                title: "Amber Lines".into(),
+                section: "Now playing".into(),
+                ..Default::default()
+            },
+            ReorderRow {
+                key: "q-next-1".into(),
+                title: "Night Ferry".into(),
+                reorderable: true,
+                ..Default::default()
+            },
+            ReorderRow {
+                key: "q-next-2".into(),
+                title: "Night Ferry".into(),
+                reorderable: true,
+                ..Default::default()
+            },
+        ]));
+        Ok(())
+    });
+    s.click((1180., 30.));
+    s.key(Key::Space);
+    s.key(Key::DownArrow);
+    s.key(Key::Space);
+    s.expect(
+        "reorder sends only the moved occurrence and predecessor",
+        vec![Receipt::QueueOrder(
+            "queue-order-1".into(),
+            "q-next-1".into(),
+            "q-next-2".into(),
+        )],
+    );
+    s.shot("16d-queue-reorder");
+    s.click((1180., 30.));
+    s.step("leave reorder fixture", |_, ui| {
+        ui.set_queue_order_token("".into());
+        ui.set_queue_order_rows(ModelRc::default());
         Ok(())
     });
 
@@ -1033,7 +1298,7 @@ fn assertions(s: &mut Script) {
         vec![row("play", Page::Saved, 0)],
     );
     s.click((244., 490.));
-    s.click(UPCOMING_PLAY);
+    s.click(QUEUE_BODY);
     s.expect("unsaved track and offline queue are gated", vec![]);
 
     s.show(Page::Search);

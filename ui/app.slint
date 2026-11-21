@@ -1286,17 +1286,19 @@ export component AppWindow inherits Window {
                                             title: row.title; subtitle: row.subtitle; kind: "track";
                                             // Queue rows name occurrences. Only the cursor row is current,
                                             // even if the recording also occurs in Played or Up Next.
-                                            current-track: row.current && row.track-id != "" && row.track-id == root.now-track-id;
-                                            playing-track: self.current-track && root.playing;
+                                            property <bool> matches-current-art: row.current && row.track-id != "" && row.track-id == root.now-track-id;
+                                            current-track: row.current;
+                                            playing-track: self.matches-current-art && root.playing;
                                             credits: row.credits; metadata-enabled: !root.editor-open;
                                             album-id: row.album-id; album-name: row.album-name;
-                                            artwork: self.current-track ? root.cover-art : root.no-artwork;
+                                            artwork: self.matches-current-art ? root.cover-art : root.no-artwork;
                                             can-open: false; compact: true; queue-row: true;
+                                            occurrence-description: row.current ? "" : row.upcoming ? "Up next" : "Played";
                                             paint-left: queue-pane.inset-left; paint-right: queue-pane.inset-right;
                                             paint-surface: Theme.rail;
-                                            playable: row.upcoming && root.queue-controls && !root.editor-open;
+                                            playable: !row.current && row.upcoming && root.queue-shown && queue-lane.visible && root.queue-controls && !root.editor-open;
                                             selectable: self.playable;
-                                            actions: !root.queue-shown || !self.playable ? [] : ["remove"];
+                                            actions: self.playable ? ["play", "remove"] : [];
                                             window-height: root.height; menu-key: row.key;
                                             property <length> row-y: phase-list.y + queue-group.y + self.y;
                                             row-viewport-y: self.row-y + queue-scroll.content-y;
@@ -1312,7 +1314,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         queue-scroll := ScrollView {
-                            // Wheel input covers the leading Play strip too.
+                            // The scrollbar and wheel also cover the pane insets.
                             x: -queue-pane.inset-left; y: 0px;
                             width: parent.width + queue-pane.inset-left + queue-pane.inset-right; height: parent.height;
                             content-height: queue-list.height;
