@@ -119,6 +119,7 @@ export component MediaLine inherits Rectangle {
     in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
     in property <bool> compact;
+    in property <bool> queue-columns;
     in property <bool> search-result;
     in property <bool> selected;
     in property <bool> current-track;
@@ -206,7 +207,7 @@ export component MediaLine inherits Rectangle {
 
         HorizontalLayout {
             padding-top: 6px; padding-bottom: 6px;
-            spacing: root.compact && root.kind == "track" ? 6px : 8px;
+            spacing: !root.queue-columns && root.compact && root.kind == "track" ? 6px : 8px;
             if root.sequence > 0: Rectangle {
                 width: root.compact ? 26px : 33px;
                 Caption {
@@ -218,9 +219,10 @@ export component MediaLine inherits Rectangle {
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }
             }
-            if root.sequence == 0 && !root.compact: Rectangle {
+            // Queue rows share the current row's cover column even when there is no art.
+            if root.sequence == 0 && (!root.compact || root.queue-columns): Rectangle {
                 width: 39px;
-                Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
+                if !root.compact: Cover { y: (parent.height - self.height) / 2; width: 39px; height: 39px;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
                     Rectangle {
                         visible: root.current-track;
@@ -230,7 +232,7 @@ export component MediaLine inherits Rectangle {
                     }
                 }
             }
-            if root.sequence == 0 && root.compact && root.kind == "track": Rectangle {
+            if root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-columns: Rectangle {
                 width: 16px;
                 TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
             }
@@ -260,16 +262,22 @@ export component MediaLine inherits Rectangle {
                         text: root.result-type + (root.detail == "" ? "" : " · " + root.detail);
                     }
                 }
-                if root.credits.length > 0 || root.subtitle != "": CreditLine {
-                    credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
-                    height: max(20px, self.font-size + 6px);
-                    background-clickable: root.body-focusable;
-                    background-click-scope: root.menu-key;
-                    background-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
-                    background-clicked => { root.click-row(); }
-                    background-double-clicked => { root.double-click-row(); }
-                    activated(id) => { root.page-action("artist", id); }
-                    focused => { root.focused(); }
+                if root.credits.length > 0 || root.subtitle != "": Rectangle {
+                    min-width: 0px; horizontal-stretch: 1;
+                    height: artist-line.preferred-height;
+                    artist-line := CreditLine {
+                        // Credit names already have a 2px text inset; the fallback has none.
+                        x: !root.queue-columns ? 0px : root.credits.length > 0 ? 2px : 4px;
+                        width: max(0px, parent.width - 2 * self.x); height: parent.height;
+                        credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                        background-clickable: root.body-focusable;
+                        background-click-scope: root.menu-key;
+                        background-cursor: root.can-open ? MouseCursor.pointer : MouseCursor.default;
+                        background-clicked => { root.click-row(); }
+                        background-double-clicked => { root.double-click-row(); }
+                        activated(id) => { root.page-action("artist", id); }
+                        focused => { root.focused(); }
+                    }
                 }
                 if root.album-name != "": AlbumLine {
                     text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;

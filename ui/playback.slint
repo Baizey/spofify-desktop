@@ -58,6 +58,12 @@ export component SeekBar inherits Rectangle {
     }
 }
 
+// Pointer activation keeps the real focus position for subsequent Tab or
+// Space, but does not leave a keyboard ring in the playback controls.
+component PlaybackAction inherits Action {
+    pointer-focus-visible: false;
+}
+
 export component Transport inherits Rectangle {
     in property <bool> playing;
     in property <bool> available;
@@ -74,33 +80,35 @@ export component Transport inherits Rectangle {
     height: 44px;
     horizontal-stretch: 0;
     HorizontalLayout {
+        y: (parent.height - self.height) / 2;
+        height: 42px;
         alignment: center;
         spacing: 5px;
-        Action {
-            width: 36px; height: 36px; icon: "shuffle"; quiet: true; selected: root.shuffle;
+        PlaybackAction {
+            width: 36px; height: 42px; icon: "shuffle"; quiet: true; selected: root.shuffle;
             enabled: root.modes-enabled;
             accessible-label: "Shuffle"; accessible-description: root.shuffle ? "On" : "Off";
             changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.queue-action("shuffle", ""); }
         }
-        Action {
+        PlaybackAction {
             width: 39px; height: 42px; icon: "|◀"; quiet: true; accessible-label: "Previous track"; enabled: root.skip-enabled;
             changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.previous(); }
         }
-        Action {
+        PlaybackAction {
             width: 42px; height: 42px; primary: true; round: true; icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available;
             accessible-label: root.playing ? "Pause" : "Play";
             changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.toggle(); }
         }
-        Action {
+        PlaybackAction {
             width: 39px; height: 42px; icon: "▶|"; quiet: true; accessible-label: "Next track"; enabled: root.skip-enabled;
             changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.next(); }
         }
-        Action {
-            width: 36px; height: 36px; icon: root.repeat-mode == "one" ? "repeat-one" : "repeat";
+        PlaybackAction {
+            width: 36px; height: 42px; icon: root.repeat-mode == "one" ? "repeat-one" : "repeat";
             quiet: true; selected: root.repeat-mode == "one" || root.repeat-mode == "all";
             enabled: root.modes-enabled;
             accessible-label: "Repeat";
@@ -185,21 +193,32 @@ export component PlayerBar inherits Rectangle {
     callback toggle();
     callback seek(float);
     callback navigate(string);
+    callback toggle-queue(bool);
     callback queue-action(string, string);
     callback volume-change(float);
     callback mute-toggle();
-    public function focus-queue() { queue-trigger.take-focus(); }
+    public function focus-queue(by-pointer: bool) {
+        if by-pointer { queue-trigger.take-pointer-focus(); }
+        else { queue-trigger.take-focus(); }
+    }
     public function focus-lyrics() { lyrics-trigger.take-focus(); }
-    property <length> pad: max(clamp(root.width * 0.03, 14px, 34px), (root.width - 1220px) / 2);
-    property <length> center-width: root.layered ? min(root.width - 2 * root.pad, 480px) : clamp(root.width * 0.36, 214px, 480px);
+    property <length> edge: clamp(root.width * 0.018, 12px, 24px);
+    property <length> column-gap: root.layered ? 10px : 16px;
+    property <length> inner-width: root.width - 2 * root.edge;
+    // After reserving the right-hand controls, give the seek lane two shares
+    // and metadata one, with room for cover and title at the inline breakpoint.
+    // The compact seek lane spans the full bar below the track and tools.
+    property <length> track-and-transport: root.inner-width - output-tools.width - 2 * root.column-gap;
+    property <length> transport-width: root.layered ? root.inner-width
+        : clamp(root.track-and-transport * 2 / 3, 214px, root.track-and-transport - 188px);
     property <length> top-height: root.layered ? (root.status == "" ? 58px : 72px) : root.height;
     property <bool> title-repaint-phase;
     changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
     vertical-stretch: 0; background: Theme.rail;
     Divider { y: 0px; }
     track-info := Rectangle {
-        x: root.pad; y: 0px;
-        width: max(0px, (root.layered ? output-tools.x : (root.width - root.center-width) / 2) - root.pad - 10px);
+        x: root.edge; y: 0px;
+        width: max(0px, root.layered ? output-tools.x - self.x - root.column-gap : root.track-and-transport - root.transport-width);
         height: root.top-height;
         // Damage the whole metadata area on title changes, rather than relying
         // on a partial software repaint of the old and new glyphs.
@@ -233,7 +252,7 @@ export component PlayerBar inherits Rectangle {
         }
     }
     Rectangle {
-        width: root.center-width; x: (root.width - self.width)/2;
+        width: root.transport-width; x: root.layered ? root.edge : track-info.x + track-info.width + root.column-gap;
         y: root.layered ? root.top-height : 0px; height: root.height - self.y;
         Transport {
             x: (parent.width - self.width)/2;
@@ -250,30 +269,30 @@ export component PlayerBar inherits Rectangle {
         }
     }
     output-tools := HorizontalLayout {
-        x: root.width - self.width - root.pad; width: self.preferred-width; y: (root.top-height - self.height)/2; height: 38px; spacing: 2px;
-        lyrics-trigger := Action {
+        x: root.width - self.width - root.edge; width: self.preferred-width; y: (root.top-height - self.height)/2; height: 38px; spacing: 3px;
+        lyrics-trigger := PlaybackAction {
             width: 36px; icon: "lyrics"; quiet: true; accessible-label: "Lyrics";
             clicked => { root.navigate("lyrics"); }
         }
-        queue-trigger := Action {
+        queue-trigger := PlaybackAction {
             width: 36px; icon: "≡"; quiet: true; selected: root.queue-open || root.page == "queue";
             accessible-label: "Play queue"; accessible-expanded: root.queue-open;
-            clicked => { root.navigate("queue"); }
+            clicked => { root.toggle-queue(self.pointer-focused); }
         }
-        Action {
+        PlaybackAction {
             width: 36px; icon: "◫"; quiet: true; selected: root.page == "devices";
             accessible-label: "Playback devices";
             accessible-description: root.offline ? "This computer" : root.output != "" ? root.output : "No output selected";
             clicked => { root.navigate("devices"); }
         }
-        Action {
+        PlaybackAction {
             width: 36px; icon: root.muted || root.volume == 0 ? "volume-muted" : "volume";
             quiet: true; selected: root.muted;
             accessible-label: root.muted ? "Unmute desktop playback" : "Mute desktop playback";
             clicked => { root.mute-toggle(); }
         }
         VolumeSlider {
-            width: root.layered ? 55px : clamp((root.width - 820px) / 3 + 62px, 62px, 90px);
+            width: clamp(root.width * 0.085, 64px, 116px);
             level: root.volume * 100; muted: root.muted;
             adjusted(value) => { root.volume-change(value / 100); }
         }

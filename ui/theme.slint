@@ -58,28 +58,33 @@ export component Action inherits Rectangle {
     property <string> pending-click-scope;
     // Composite controls such as a popup menu can own keyboard focus themselves.
     in property <bool> keyboard-focusable: true;
+    // Let playback buttons keep Tab position without painting a pointer-only ring.
+    in property <bool> pointer-focus-visible: true;
     out property <bool> has-focus: key.has-focus;
     out property <bool> has-hover: pointer.has-hover;
+    out property <bool> pointer-focused;
+    out property <bool> focus-visible: root.enabled && key.has-focus && (root.pointer-focus-visible || !root.pointer-focused);
     callback clicked();
-    public function take-focus() { key.focus(); }
+    public function take-focus() { root.pointer-focused = false; key.focus(); }
+    public function take-pointer-focus() { root.pointer-focused = true; key.focus(); }
     forward-focus: key;
     accessible-role: button;
     accessible-label: text;
     accessible-enabled: enabled;
-    accessible-action-default => { if root.enabled { root.clicked(); } }
+    accessible-action-default => { if root.enabled { root.pointer-focused = false; root.clicked(); } }
     height: 38px;
     min-width: text == "" ? 36px : max(40px, words.preferred-width + (icon == "" ? 23px : 43px));
     horizontal-stretch: 0;
     vertical-stretch: 0;
     border-radius: round ? self.height / 2 : Theme.control-radius;
-    border-width: key.has-focus && enabled ? 2px : (quiet ? 0px : 1px);
-    border-color: key.has-focus && enabled ? Theme.tertiary : primary ? Theme.primary : selected ? Theme.primary.with-alpha(0.48) : Theme.line;
+    border-width: focus-visible ? 2px : (quiet ? 0px : 1px);
+    border-color: focus-visible ? Theme.tertiary : primary ? Theme.primary : selected ? Theme.primary.with-alpha(0.48) : Theme.line;
     background: !enabled ? (quiet ? transparent : Theme.panel)
         : primary ? (pointer.pressed ? Theme.primary.darker(0.18) : pointer.has-hover ? Theme.primary.brighter(0.14) : Theme.primary)
-        : pointer.pressed ? Theme.raised : selected ? Theme.primary.with-alpha(0.15) : pointer.has-hover || key.has-focus ? Theme.raised : quiet ? transparent : Theme.panel;
+        : pointer.pressed ? Theme.raised : selected ? Theme.primary.with-alpha(0.15) : pointer.has-hover || focus-visible ? Theme.raised : quiet ? transparent : Theme.panel;
     opacity: enabled ? 1 : 0.48;
     // Keep gold focus distinct from the similarly bright mint fill.
-    if root.primary && root.has-focus && root.enabled: Rectangle {
+    if root.primary && root.focus-visible: Rectangle {
         x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px;
         border-width: 2px; border-color: Theme.bg; border-radius: max(0px, parent.border-radius - 2px);
         accessible-role: none;
@@ -106,7 +111,7 @@ export component Action inherits Rectangle {
         }
         clicked => {
             if root.pressed-scope == root.click-scope {
-                if root.keyboard-focusable { key.focus(); }
+                if root.keyboard-focusable { root.take-pointer-focus(); }
                 if root.single-pointer-activation {
                     if root.pending-click-scope != root.click-scope { root.pending-clicks = 0; }
                     root.pending-click-scope = root.click-scope;
@@ -134,8 +139,12 @@ export component Action inherits Rectangle {
     key := FocusScope {
         enabled: root.enabled && root.keyboard-focusable;
         focus-on-click: false;
+        focus-gained(reason) => {
+            if reason == FocusReason.tab-navigation { root.pointer-focused = false; }
+        }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
+                root.pointer-focused = false;
                 if !event.repeat { root.clicked(); }
                 return accept;
             }

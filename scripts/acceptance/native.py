@@ -23,6 +23,8 @@ from playback import Peer
 DESKTOP = (1910, 1537)  # Cage's 35px client decoration leaves 1910×1502 content.
 WIDE = (1280, 720)
 COMPACT = (640, 640)
+MINIMUM = (480, 640)
+ULTRAWIDE = (2560, 720)
 DOCK_TITLE = r"Now playing: Synthetic Tone \d{3}"
 TRACK = "Synthetic Tone 001"
 PLAYLIST = "Synthetic Manual Duplicates"
@@ -91,8 +93,8 @@ class Window:
                 elements = [e for e in elements if handle_key(e) not in dock_keys] + dock
         return elements
 
-    def subtree(self, element):
-        tree = self.mcp.value("get_element_tree", {"elementHandle": element["handle"], "maxElements": 256})
+    def subtree(self, element, *, max_elements=256):
+        tree = self.mcp.value("get_element_tree", {"elementHandle": element["handle"], "maxElements": max_elements})
         check(not tree["truncated"], "truncated native subtree inspection")
         return tree["elements"]
 
@@ -237,6 +239,56 @@ def verify(failures, label):
         print(f"FAIL {failures[-1]}", flush=True)
 
 
+def contains(parent, child, slack=1):
+    x, y, right, bottom = bounds(child)
+    px, py, pright, pbottom = bounds(parent)
+    return px - slack <= x < right <= pright + slack and py - slack <= y < bottom <= pbottom + slack
+
+
+def assert_disjoint(controls):
+    for i, (label, control) in enumerate(controls):
+        x, y, right, bottom = bounds(control)
+        for other_label, other in controls[:i]:
+            ox, oy, oright, obottom = bounds(other)
+            check(right <= ox or oright <= x or bottom <= oy or obottom <= y,
+                  f"{label} {bounds(control)} and {other_label} {bounds(other)} overlap")
+
+
+def assert_transport(window, transport, surface):
+    check(transport, f"missing {surface} transport")
+    children = window.subtree(transport)
+    glyphs = [e for e in children if element_type([e], "Glyph")]
+    left, top, _, bottom = bounds(transport)
+    previous_right = left - 1
+    center = None
+    for label in ("Shuffle", "Previous track", "Play|Pause", "Next track", "Repeat"):
+        control = next((e for e in children if window.matches(e, label) and e.get("accessibleRole") == "Button"), None)
+        check(control and contains(transport, control), f"{surface} transport is missing or clipping {label}")
+        x, y, right, end = bounds(control)
+        check(abs(end - y - 42) <= 1 and abs(y + end - top - bottom) <= 2,
+              f"{surface} {label} is not a vertically centered 42px target: {bounds(control)} in {bounds(transport)}")
+        check(center is None or abs(y + end - center) <= 2,
+              f"{surface} {label} does not share the other buttons' vertical center")
+        if center is None:
+            center = y + end
+        glyph = next((e for e in glyphs if contains(control, e)), None)
+        check(glyph and abs(sum(bounds(glyph)[1::2]) - y - end) <= 2,
+              f"{surface} {label} glyph is missing or vertically off-center")
+        check(previous_right <= x, f"{surface} transport buttons overlap or are out of order at {label}")
+        previous_right = right
+
+
+def assert_usable(control, label, min_width, min_height):
+    check(control, f"missing {label}")
+    x, y, right, bottom = bounds(control)
+    check(right - x >= min_width and bottom - y >= min_height,
+          f"{label} has no usable pointer target: {bounds(control)}")
+
+
+def named(window, elements, pattern, role="Button"):
+    return next((e for e in elements if window.matches(e, pattern) and e.get("accessibleRole") == role), None)
+
+
 def assert_dock_layout(window, title=DOCK_TITLE):
     elements = window.elements()
     dock = element_type(elements, "PlayerBar")
@@ -248,40 +300,54 @@ def assert_dock_layout(window, title=DOCK_TITLE):
     max_height = 145 if width < 820 else 100
     check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= max_height,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
-    dock_controls = window.subtree(dock)
-
-    def named(pattern, role="Button"):
-        return next((e for e in dock_controls if window.matches(e, pattern) and e.get("accessibleRole") == role), None)
-
+    dock_controls = window.subtree(dock, max_elements=1000)
     transport = element_type(dock_controls, "Transport")
-    check(transport, "missing dock transport")
-    transport_controls = window.subtree(transport)
-    for label in ("Shuffle", "Previous track", "Play|Pause", "Next track", "Repeat"):
-        check(any(window.matches(e, label) and e.get("accessibleRole") == "Button" for e in transport_controls),
-              f"missing dock transport control {label}")
-    midpoint = sum(bounds(transport)[::2]) / 2
-    check(abs(midpoint - width / 2) <= 1, "dock transport is not centered")
-    rail = element_type(elements, "SeekBar")
-    check(rail, "populated dock must render a seek rail at both widths")
-    x, y, x2, y2 = bounds(rail)
-    check(left <= x < x2 <= right and bounds(transport)[3] <= y < y2 <= bottom,
-          "dock seek rail overlaps transport or leaves the dock")
+    assert_transport(window, transport, "dock")
+    rail = element_type(dock_controls, "SeekBar")
+    seek = named(window, dock_controls, "Playback position", "Slider")
     track_info = element_id(dock_controls, "track-info")
-    check(named(title), f"missing dock control {title}")
-    controls = (("Transport", transport), ("Playback position", rail), ("Track information", track_info),
-                ("Lyrics", named("Lyrics")), ("Play queue", named("Play queue")),
-                ("Playback devices", named("Playback devices")), ("Mute", named("(Unmute|Mute) desktop playback")),
-                ("Desktop volume", named("Desktop volume", "Slider")))
-    for i, (label, control) in enumerate(controls):
+    title_target = named(window, dock_controls, title)
+    volume = named(window, dock_controls, "Desktop volume", "Slider")
+    assert_usable(title_target, title, 96, 20)
+    assert_usable(volume, "desktop volume", 48, 22)
+    assert_usable(seek, "dock seek slider", 80, 20)
+    check(track_info and contains(track_info, title_target), "dock title escapes the track information area")
+    check(rail and contains(rail, seek) and bounds(transport)[3] <= bounds(rail)[1],
+          "dock seek slider leaves its rail or is not below transport")
+    right_controls = [(label, named(window, dock_controls, label)) for label in
+                      ("Lyrics", "Play queue", "Playback devices", "(Unmute|Mute) desktop playback")]
+    right_controls.append(("Desktop volume", volume))
+    controls = [("Transport", transport), ("Seek rail", rail), ("Track information", track_info), *right_controls]
+    for label, control in controls:
         check(control, f"missing dock control {label}")
-        x, y, x2, y2 = bounds(control)
-        check(left <= x < x2 <= right and top <= y < y2 <= bottom,
-              f"dock control {label} is clipped: {bounds(control)}")
-        for other_label, other in controls[:i]:
-            ox, oy, ox2, oy2 = bounds(other)
-            check(x2 <= ox or ox2 <= x or y2 <= oy or oy2 <= y,
-                  f"dock controls {label} and {other_label} overlap")
+        check(contains(dock, control), f"dock control {label} is clipped: {bounds(control)}")
+    assert_disjoint(controls)
+    # Measure the occupied edges, not the window midpoint: the middle lane
+    # may shift to leave enough room for both metadata and output controls.
+    check(bounds(track_info)[0] - left <= 36 and right - max(bounds(e)[2] for _, e in right_controls) <= 36,
+          f"dock content is inset instead of using both window edges at {width:g}px")
     print(f"PASS dock geometry: {width:g}×{height:g} logical, height {bottom - top:g}, controls disjoint", flush=True)
+
+
+def assert_queue_columns(window):
+    pane = element_id(window.elements(), "queue-pane")
+    check(pane, "missing populated queue pane")
+    # Stay in the queue subtree: the same track titles and the same row
+    # components can also be present in the adjacent playlist.
+    elements = window.subtree(pane, max_elements=1000)
+    scroll = element_id(elements, "queue-scroll")
+    check(scroll, "missing queue viewport")
+    columns = []
+    for row in elements:
+        if not element_type([row], "MediaLine") or not contains(scroll, row):
+            continue
+        words = element_id(window.subtree(row), "words")
+        check(words and contains(row, words) and bounds(words)[2] - bounds(words)[0] >= 72,
+              f"visible queue row has no usable metadata column: {bounds(row)}")
+        columns.append(bounds(words)[0])
+    check(len(columns) >= 2, "fixture did not show at least two queue rows")
+    check(max(columns) - min(columns) <= 1, f"queue metadata columns don't align: {columns}")
+    print(f"PASS queue columns: {len(columns)} visible rows share a metadata start", flush=True)
 
 
 def full_player(window, title, name, width, failures):
@@ -296,10 +362,17 @@ def full_player(window, title, name, width, failures):
     window.find("Playback devices", roles=("Button",))
     window.find(r"Synthetic Tone \d{3}", roles=("Text",))
     window.pixels(name, width)
-    with verify(failures, name + " slider hit target"):
-        slider = window.find("Playback position", roles=("Slider",))
-        x, y, right, bottom = bounds(slider)
-        check(right - x >= 32 and bottom > y, f"full-player slider has no usable pointer target: {bounds(slider)}")
+    with verify(failures, name + " playback geometry"):
+        page = element_type(window.elements(), "NowPlaying")
+        check(page, "missing full-player page")
+        elements = window.subtree(page, max_elements=1000)
+        slider = named(window, elements, "Playback position", "Slider")
+        rail = element_type(elements, "SeekBar")
+        transport = element_type(elements, "Transport")
+        assert_usable(slider, "full-player seek slider", 32, 20)
+        check(rail and contains(rail, slider), "full-player seek slider escapes its rail")
+        assert_transport(window, transport, "full player")
+        assert_disjoint((("full-player seek rail", rail), ("full-player transport", transport)))
     if not any(window.matches(e, "Lyrics") for e in window.elements()):
         window.scroll_catalog(-360)
         window.find("Lyrics", roles=("Text",), timeout=3)
@@ -591,6 +664,14 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 window.title(PLAYLIST)
                 pane_layout(window, wide=True, docked=True, can_go_back=True)
                 queue_state(window, populated=True)
+                window.pixels(f"04-dock-{mode[0]}", mode[0])
+                with verify(failures, f"dock geometry at {mode[0]}"):
+                    assert_dock_layout(window)
+                with verify(failures, f"queue columns at {mode[0]}"):
+                    assert_queue_columns(window)
+            for mode in (ULTRAWIDE, MINIMUM):
+                window.resize(mode)
+                window.find(DOCK_TITLE, roles=("Button",))
                 window.pixels(f"04-dock-{mode[0]}", mode[0])
                 with verify(failures, f"dock geometry at {mode[0]}"):
                     assert_dock_layout(window)
