@@ -67,7 +67,7 @@ component RulesField inherits Rectangle {
     forward-focus: input;
     height: 178px;
     background: Theme.bg;
-    border-radius: 8px;
+    border-radius: Theme.control-radius;
     border-width: input.has-focus ? 2px : 1px;
     border-color: Theme.field-border(input.has-focus);
     opacity: enabled ? 1 : 0.55;
@@ -140,7 +140,7 @@ export component Editor inherits Rectangle {
                     max-width: 660px;
                     min-height: editor-form.preferred-height;
                     vertical-stretch: 0;
-                    background: Theme.panel; border-radius: 10px; border-width: 1px; border-color: Theme.line;
+                    background: Theme.panel; border-radius: Theme.container-radius; border-width: 1px; border-color: Theme.line;
                     editor-form := VerticalLayout {
                         padding: 15px; spacing: 10px;
                         Eyebrow { text: root.mode == "device-rename" ? "PLAYBACK DEVICES" : root.mode == "remove-saved" ? "SAVED OFFLINE" : "PLAYLIST MANAGEMENT"; }

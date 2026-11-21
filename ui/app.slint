@@ -486,8 +486,10 @@ export component AppWindow inherits Window {
                             spacing: 8px; alignment: start;
                             detail-hero := Rectangle {
                                 property <bool> with-art: root.is-playlist || root.page-kind == "album" || root.page-kind == "artist";
-                                border-radius: 12px;
+                                border-radius: Theme.container-radius;
                                 background: self.with-art ? Theme.panel : transparent;
+                                border-width: self.with-art ? 1px : 0px;
+                                border-color: Theme.line;
                                 min-height: hero-layout.preferred-height; vertical-stretch: 0;
                                 hero-layout := VerticalLayout {
                                     padding: detail-hero.with-art ? (main.narrow ? 12px : 20px) : 0px;

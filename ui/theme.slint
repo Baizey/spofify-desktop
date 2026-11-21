@@ -1,6 +1,8 @@
 import { Glyph } from "icon.slint";
 export global Theme {
     in-out property <float> density: 1.0;
+    out property <length> control-radius: 8px;
+    out property <length> container-radius: 12px;
     out property <color> bg: #131617;
     out property <color> rail: #191d1e;
     out property <color> panel: #1e2324;
@@ -69,7 +71,7 @@ export component Action inherits Rectangle {
     min-width: text == "" ? 36px : max(40px, words.preferred-width + (icon == "" ? 23px : 43px));
     horizontal-stretch: 0;
     vertical-stretch: 0;
-    border-radius: round ? self.height / 2 : 8px;
+    border-radius: round ? self.height / 2 : Theme.control-radius;
     border-width: key.has-focus && enabled ? 2px : (quiet ? 0px : 1px);
     border-color: key.has-focus && enabled ? Theme.tertiary : primary ? Theme.primary : selected ? Theme.primary.with-alpha(0.48) : Theme.line;
     background: !enabled ? (quiet ? transparent : Theme.panel)
@@ -284,7 +286,7 @@ export component Field inherits Rectangle {
     horizontal-stretch: 1;
     vertical-stretch: 0;
     background: Theme.bg;
-    border-radius: pill ? 23px : 8px;
+    border-radius: Theme.control-radius;
     property <bool> show-focus: root.enabled && input.has-focus;
     border-width: show-focus ? 2px : 1px;
     border-color: Theme.field-border(show-focus);
@@ -322,7 +324,7 @@ export component Cover inherits Rectangle {
     in property <image> artwork;
     in property <string> mark: "♫";
     in property <bool> circular;
-    border-radius: circular && artwork.width == 0 ? self.height / 2 : min(12px, self.height / 5);
+    border-radius: circular && artwork.width == 0 ? self.height / 2 : min(Theme.container-radius, self.height / 5);
     background: Theme.raised;
     border-width: 1px;
     border-color: Theme.line;
@@ -341,7 +343,7 @@ export component Notice inherits Rectangle {
     min-width: 0px;
     min-height: message.preferred-height + 20px;
     vertical-stretch: 0;
-    border-radius: 10px;
+    border-radius: Theme.container-radius;
     border-width: 1px;
     border-color: error ? Theme.error.with-alpha(0.40) : Theme.line;
     background: error ? Theme.error.with-alpha(0.09) : Theme.panel;

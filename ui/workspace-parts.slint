@@ -107,7 +107,7 @@ export component WorkspaceRail inherits Rectangle {
             enabled: !root.locked; clicked => { root.navigate("history"); }
         }
         playlists := Action {
-            text: "Playlists"; icon: "≡"; leading: true; quiet: true; min-width: 0px;
+            text: "Playlists"; icon: "playlists"; leading: true; quiet: true; min-width: 0px;
             selected: root.kind == "playlists" || root.kind == "playlist" || root.kind == "playlist-manual" || root.kind == "playlist-rules" || root.kind == "picker";
             accessible-description: self.selected ? "Current section" : "Your playlists";
             enabled: !root.locked; clicked => { root.navigate("playlists"); }

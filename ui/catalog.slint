@@ -18,8 +18,8 @@ export global Copy {
         return kind == "search" ? "⌕" : kind == "history" || kind == "recent" ? "◷"
             : kind == "offline" ? "↓" : kind == "albums" || kind == "album" ? "◎"
             : kind == "artist" || kind == "artists" ? "◉" : kind == "appearance" ? "◐" : kind == "settings" ? "⚙"
-            : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" || kind == "queue" ? "≡"
-            : kind == "devices" ? "◫" : kind == "saved-collection" ? "↓" : "♫";
+            : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" ? "playlists"
+            : kind == "queue" ? "≡" : kind == "devices" ? "◫" : kind == "saved-collection" ? "↓" : "♫";
     }
     public pure function action-label(action: string) -> string {
         return ActionCopy.label(action);
@@ -138,7 +138,7 @@ export component MediaLine inherits Rectangle {
     min-width: 0px;
     min-height: max(max(48px, 56px * Theme.density), words.min-height + 12px);
     vertical-stretch: 0;
-    border-radius: 10px;
+    border-radius: Theme.container-radius;
     background: selected || (selectable && row-keys.has-focus) ? Theme.panel : transparent;
     property <bool> play-on-activate: root.selectable && root.playable && !root.can-open;
     property <bool> body-actionable: root.can-open || root.play-on-activate;

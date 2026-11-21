@@ -80,7 +80,7 @@ export component OverflowMenu inherits Rectangle {
         Rectangle {
             width: 100%; height: 100%;
             background: Theme.panel;
-            border-color: Theme.line; border-width: 1px; border-radius: 10px;
+            border-color: Theme.line; border-width: 1px; border-radius: Theme.container-radius;
             VerticalLayout {
                 padding: 6px;
                 for op[i] in root.actions: Action {
