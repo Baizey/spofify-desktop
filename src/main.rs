@@ -134,7 +134,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let _covers = artwork::install(&ui, access.clone(), pages);
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx.clone(), art);
     desk.bind(&ui, mode, access.clone());
-    let _media = presentation::install(&ui, access.clone());
+    let _media = presentation::install(&ui, access.clone(), epoch.clone());
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     update::start(&ui, access);
     bind_auth(&ui, &auth_tx, &epoch);

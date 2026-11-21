@@ -13,7 +13,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -143,15 +143,16 @@ pub(crate) const TIMEOUT: ApiError = ApiError {
     status: 0,
 };
 
-pub(crate) async fn read_with_backoff<T>(
+async fn read_with_backoff<T>(
     mut read: impl AsyncFnMut() -> Result<T, ApiError>,
+    should_retry: impl Fn(ApiError) -> bool,
 ) -> Result<T, ApiError> {
     for delay in [250, 750] {
         match tokio::time::timeout(Duration::from_secs(5), read())
             .await
             .unwrap_or(Err(TIMEOUT))
         {
-            Err(e) if !e.expired && (matches!(e.status, 0 | 408 | 429) || e.status >= 500) => {
+            Err(e) if !e.expired && should_retry(e) => {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             outcome => return outcome,
@@ -160,6 +161,18 @@ pub(crate) async fn read_with_backoff<T>(
     tokio::time::timeout(Duration::from_secs(5), read())
         .await
         .unwrap_or(Err(TIMEOUT))
+}
+
+fn retry_artwork_or_waveform(error: ApiError) -> bool {
+    matches!(error.status, 0 | 408 | 429) || error.status >= 500
+}
+
+fn retry_lyrics_read(error: ApiError) -> bool {
+    // Status zero also covers permanent local failures and invalid responses.
+    // Don't guess at a server's rate-limit cooldown (429).
+    error == TIMEOUT
+        || error.is_retryable_lyric_transport_failure()
+        || matches!(error.status, 408 | 500 | 502..=504)
 }
 
 pub(crate) struct Presentation {
@@ -178,18 +191,18 @@ struct Demand {
 struct LyricDemand {
     view: Demand,
     occurrence: String,
-    // Increments when the reader opens or Retry lyrics is activated.
-    generation: i32,
+    open_generation: i32,
     available: bool,
 }
 
 impl LyricDemand {
     fn from_ui(ui: &AppWindow, view: Demand) -> Self {
-        let available = ui.get_lyrics_available() && ui.get_lyrics_track_id() == view.track;
+        let available = ui.get_lyrics_track_id() == view.track
+            && (!ui.get_lyrics_text().is_empty() || ui.get_lyrics_lines().row_count() != 0);
         Self {
             view,
             occurrence: ui.get_media_track_token().to_string(),
-            generation: ui.get_lyrics_request_generation(),
+            open_generation: ui.get_lyrics_open_generation(),
             available,
         }
     }
@@ -199,8 +212,10 @@ impl LyricDemand {
     }
 
     fn matches(&self, ui: &AppWindow) -> bool {
-        ui.get_media_track_token() == self.occurrence
-            && ui.get_lyrics_request_generation() == self.generation
+        ui.get_page_kind() == "now"
+            && ui.get_now_track_id() == self.view.track
+            && ui.get_media_track_token() == self.occurrence
+            && ui.get_lyrics_open_generation() == self.open_generation
     }
 }
 
@@ -229,8 +244,6 @@ pub(crate) fn clear(ui: &AppWindow) {
     ui.set_lyrics_lines(Default::default());
     ui.set_lyrics_attribution(Default::default());
     ui.set_lyrics_status(Default::default());
-    ui.set_lyrics_available(false);
-    ui.set_lyrics_retryable(false);
     ui.set_waveform(Default::default());
     ui.set_media_status(Default::default());
 }
@@ -238,7 +251,7 @@ pub(crate) fn clear(ui: &AppWindow) {
 /// UI-thread install. The timer observes local Slint state only; it does not
 /// poll the server. A result also checks live Slint state at delivery, so the
 /// observation interval can never let data from a different track publish.
-pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
+pub(crate) fn install(ui: &AppWindow, access: AccessRx, epoch: Arc<AtomicU64>) -> Presentation {
     clear(ui);
     ui.on_resolve_active_lyric(displayed_lyric_line);
     let initial = demand(ui, 0);
@@ -261,7 +274,6 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
             let lyrics = LyricDemand::from_ui(&ui, next.clone());
             let reading = lyrics.needs_read();
             if update_demand(&lyrics_tx, lyrics) && reading {
-                ui.set_lyrics_retryable(false);
                 ui.set_lyrics_status(Default::default());
             }
             update_demand(&tx, next);
@@ -271,7 +283,7 @@ pub(crate) fn install(ui: &AppWindow, access: AccessRx) -> Presentation {
     let worker = Worker::start("desktop-presentation", move || async move {
         tokio::join!(
             run_media(weak.clone(), access.clone(), rx, shown.clone()),
-            run_lyrics(weak, access, lyrics_rx, shown),
+            run_lyrics(weak, access, lyrics_rx, shown, epoch),
         );
     });
     Presentation {
@@ -341,9 +353,11 @@ struct Projection {
 
 async fn load_media(account: &Account, id: &str, expanded: bool) -> Projection {
     if !expanded {
-        let art =
-            read_with_backoff(async || media::artwork(&account.api, &account.session, id).await)
-                .await;
+        let art = read_with_backoff(
+            async || media::artwork(&account.api, &account.session, id).await,
+            retry_artwork_or_waveform,
+        )
+        .await;
         return Projection {
             settled: art.is_ok(),
             art: art.ok().flatten(),
@@ -352,8 +366,14 @@ async fn load_media(account: &Account, id: &str, expanded: bool) -> Projection {
         };
     }
     let (art, waveform) = tokio::join!(
-        read_with_backoff(async || media::artwork(&account.api, &account.session, id).await),
-        read_with_backoff(async || media::waveform(&account.api, &account.session, id).await),
+        read_with_backoff(
+            async || media::artwork(&account.api, &account.session, id).await,
+            retry_artwork_or_waveform,
+        ),
+        read_with_backoff(
+            async || media::waveform(&account.api, &account.session, id).await,
+            retry_artwork_or_waveform,
+        ),
     );
     let settled = art.is_ok()
         && waveform.as_ref().is_ok_and(|v| {
@@ -448,6 +468,7 @@ async fn run_lyrics(
     mut access: AccessRx,
     mut wanted: watch::Receiver<LyricDemand>,
     shown: DisplayBinding,
+    epoch: Arc<AtomicU64>,
 ) {
     loop {
         access.mark_unchanged();
@@ -456,24 +477,46 @@ async fn run_lyrics(
         if let Some(account) = account.as_ref().filter(|a| {
             !a.offline && request.needs_read() && demand_is_bound(&shown, &request.view, a)
         }) {
+            let authority = access.clone();
             let result = tokio::select! {
                 biased;
                 change = scope_changed(&mut access, Some(account)) => { if !change { break } continue; }
                 change = wanted.changed() => { if change.is_err() { break } continue; }
-                result = tokio::time::timeout(
-                    Duration::from_secs(5), media::lyrics(&account.api, &account.session, &request.view.track),
-                ) => result.unwrap_or(Err(TIMEOUT)),
+                result = read_with_backoff(
+                    async || {
+                        // The observer may not yet have seen a route or occurrence
+                        // change right before this backoff elapsed. Check live UI
+                        // state before issuing each GET, not just when publishing.
+                        let (tx, live) = oneshot::channel();
+                        let demand = request.clone();
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
+                            let _ = tx.send(demand.matches(&ui));
+                        });
+                        if live.await != Ok(true)
+                            || epoch.load(Ordering::SeqCst) != account.epoch
+                            || !account.matches(&authority)
+                        {
+                            return Ok(None);
+                        }
+                        media::lyrics(&account.api, &account.session, &request.view.track)
+                            .await
+                            .map(Some)
+                    },
+                    retry_lyrics_read,
+                ) => result,
             };
-            Delivery {
-                ui: ui.clone(),
-                access: access.clone(),
-                account: account.clone(),
-                shown: shown.clone(),
+            if let Some(result) = result.transpose() {
+                Delivery {
+                    ui: ui.clone(),
+                    access: access.clone(),
+                    account: account.clone(),
+                    shown: shown.clone(),
+                }
+                .lyrics(request, project_lyrics(result), epoch.clone());
             }
-            .lyrics(request, project_lyrics(result));
         }
-        // One GET per demand. Only a new occurrence, reopening, or explicit
-        // retry can revalidate a negative result while playback stays online.
+        // A bounded read per demand, not polling. Valid DTOs (including pending
+        // and error) are snapshots, not progress signals for a client-owned job.
         tokio::select! {
             change = scope_changed(&mut access, account.as_ref()) => { if !change { break } }
             change = wanted.changed() => { if change.is_err() { break } }
@@ -576,20 +619,16 @@ impl Delivery {
         });
     }
 
-    fn lyrics(self, request: LyricDemand, lyrics: LyricProjection) {
-        // A result queued just before closing may still publish, but it cannot
-        // cross a repeat, reopen or explicit retry of that reader.
+    fn lyrics(self, request: LyricDemand, lyrics: LyricProjection, epoch: Arc<AtomicU64>) {
+        let account_epoch = self.account.epoch;
         self.update(
             request.view.clone(),
-            move |ui| request.matches(ui),
+            move |ui| epoch.load(Ordering::SeqCst) == account_epoch && request.matches(ui),
             move |ui, track| {
-                let available = lyrics.text.is_some() || !lyrics.lines.is_empty();
                 ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
                 ui.set_lyrics_lines(lyric_model(lyrics.lines));
                 ui.set_lyrics_attribution(lyrics.attribution.into());
                 ui.set_lyrics_status(lyrics.status.into());
-                ui.set_lyrics_available(available);
-                ui.set_lyrics_retryable(!available);
                 ui.set_lyrics_track_id(track.into());
             },
         );
@@ -673,13 +712,13 @@ mod tests {
                 display_revision: 1,
             },
             occurrence: "online:1:chain:1".into(),
-            generation: 1,
+            open_generation: 1,
             available: false,
         };
         let (tx, mut rx) = watch::channel(negative.clone());
         assert!(negative.needs_read());
         assert!(!update_demand(&tx, negative.clone())); // clock/observer tick
-        negative.generation += 1; // reopen or retry
+        negative.open_generation += 1; // reopen
         assert!(update_demand(&tx, negative.clone()));
         assert!(rx.borrow_and_update().needs_read());
         negative.occurrence = "online:1:chain:2".into();
@@ -688,8 +727,46 @@ mod tests {
         let mut accepted = negative;
         accepted.available = true;
         accepted.occurrence = "online:1:chain:3".into();
-        accepted.generation += 1;
+        accepted.open_generation += 1;
         assert!(!accepted.needs_read());
+    }
+
+    #[tokio::test]
+    async fn lyric_reads_retry_only_transient_failures_with_a_fixed_budget() {
+        let mut calls = 0;
+        let unavailable = ApiError {
+            status: 503,
+            ..TIMEOUT
+        };
+        let result = read_with_backoff(
+            async || {
+                calls += 1;
+                Err::<(), _>(unavailable)
+            },
+            retry_lyrics_read,
+        )
+        .await;
+        assert_eq!(result, Err(unavailable));
+        assert_eq!(calls, 3);
+
+        for status in [0, 400, 401, 403, 404, 429, 501, 505, 511] {
+            let failure = ApiError {
+                message: "Permanent test failure",
+                status,
+                expired: status == 401,
+            };
+            let mut calls = 0;
+            let result = read_with_backoff(
+                async || {
+                    calls += 1;
+                    Err::<(), _>(failure)
+                },
+                retry_lyrics_read,
+            )
+            .await;
+            assert_eq!(result, Err(failure));
+            assert_eq!(calls, 1, "status {status}");
+        }
     }
 
     #[test]

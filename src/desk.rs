@@ -565,9 +565,7 @@ impl Browser {
             ui.set_manual_offline(offline);
             if kind == "now" && ui.get_page_kind() != "now" {
                 // Record reopening with the route, before the media observer runs.
-                ui.set_lyrics_request_generation(
-                    ui.get_lyrics_request_generation().wrapping_add(1),
-                );
+                ui.set_lyrics_open_generation(ui.get_lyrics_open_generation().wrapping_add(1));
             }
             ui.set_page_kind(kind.clone().into());
             ui.set_page_key(key.into());

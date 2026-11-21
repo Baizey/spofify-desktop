@@ -25,8 +25,6 @@ component LyricsReader inherits Rectangle {
     in property <bool> split;
     in property <length> reading-height;
     in property <bool> active;
-    in property <bool> retryable;
-    callback retry();
     callback move-page(string);
     callback reveal();
     out property <bool> has-reading-focus: reading-focus.has-focus;
@@ -37,7 +35,7 @@ component LyricsReader inherits Rectangle {
     property <bool> overflow: reader.content-height > reader.visible-height;
     property <bool> has-lyrics: root.lyrics != "" || root.lines.length > 0;
     property <length> verse-size: (root.split ? 19px : 17px) * Theme.density;
-    preferred-height: root.heading-height + (!root.has-lyrics ? 77px
+    preferred-height: root.heading-height + (!root.has-lyrics ? 42px
         : root.split ? root.reading-height : verses.height + 10px);
     changed track-id => { reader.content-y = 0px; }
     changed split => { reader.content-y = 0px; }
@@ -138,14 +136,6 @@ component LyricsReader inherits Rectangle {
             border-width: 2px; border-color: Theme.tertiary; border-radius: 5px;
         }
     }
-    if root.retryable && !root.has-lyrics: Action {
-        x: root.inset; y: root.heading-height + 32px;
-        width: self.min-width; height: 34px;
-        text: "Retry lyrics";
-        enabled: root.active;
-        click-scope: root.track-id;
-        clicked => { root.take-focus(); root.retry(); }
-    }
 }
 
 export component NowPlaying inherits Rectangle {
@@ -165,7 +155,6 @@ export component NowPlaying inherits Rectangle {
     in property <string> lyrics-attribution;
     in property <int> active-lyric-line: -1;
     in property <string> lyrics-status;
-    in property <bool> lyrics-retryable;
     in property <bool> offline;
     in property <[float]> waveform;
     in property <float> elapsed;
@@ -180,7 +169,6 @@ export component NowPlaying inherits Rectangle {
     in property <string> next-title;
     in property <string> next-subtitle;
 
-    callback retry-lyrics();
     callback previous();
     callback toggle();
     callback next();
@@ -373,8 +361,6 @@ export component NowPlaying inherits Rectangle {
                 attribution: root.offline ? "" : root.lyrics-attribution;
                 active-line: root.active-lyric-line;
                 status: root.offline ? "Lyrics unavailable offline." : root.lyrics-status != "" ? root.lyrics-status : "Loading lyrics…";
-                retryable: !root.offline && root.lyrics-retryable;
-                retry => { root.retry-lyrics(); }
                 reveal => { root.reveal(stage.y + self.y, root.split ? min(self.height, scroll.visible-height - 30px) : 92px); }
                 move-page(key) => {
                     let page = max(32px, scroll.visible-height - 32px);

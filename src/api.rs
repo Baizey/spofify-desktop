@@ -69,12 +69,19 @@ impl fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+impl ApiError {
+    pub(crate) fn is_retryable_lyric_transport_failure(self) -> bool {
+        self == LYRIC_TRANSPORT_INTERRUPTED
+    }
+}
+
 const INVALID_ORIGIN: ApiError =
     error("Enter an HTTP or HTTPS server address without a path, credentials, query, or fragment.");
 const INVALID_RESPONSE: ApiError = error("The server returned an incompatible API response.");
 const INVALID_INPUT: ApiError = error("The request contains invalid or oversized input.");
 const NETWORK: ApiError =
     error("Unable to reach the server. Check your connection and server address.");
+const LYRIC_TRANSPORT_INTERRUPTED: ApiError = error("The lyrics connection was interrupted.");
 const OFFLINE: ApiError = error("This session is offline.");
 const EXPIRED: ApiError = ApiError {
     message: "Your session has expired. Sign in again.",
@@ -94,6 +101,18 @@ const fn error(message: &'static str) -> ApiError {
         message,
         expired: false,
         status: 0,
+    }
+}
+
+fn network_error(_: reqwest::Error) -> ApiError {
+    NETWORK
+}
+
+fn lyric_network_error(error: reqwest::Error) -> ApiError {
+    if crate::api_transport::is_transient_error(&error) {
+        LYRIC_TRANSPORT_INTERRUPTED
+    } else {
+        NETWORK
     }
 }
 
@@ -555,7 +574,9 @@ impl Api {
                 .header(header::SEC_WEBSOCKET_VERSION, "13")
                 .header(header::SEC_WEBSOCKET_KEY, key)
                 .header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
-            let response = self.send_inner(request, Some(session), false, true).await?;
+            let response = self
+                .send_inner(request, Some(session), false, true, network_error)
+                .await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 return Err(INVALID_RESPONSE);
             }
@@ -592,6 +613,7 @@ impl Api {
                     response,
                     MAX_MEDIA,
                     error("This track exceeds the 32 MiB in-memory playback limit."),
+                    network_error,
                 )
                 .await?;
             if bytes.is_empty() {
@@ -666,7 +688,14 @@ impl Api {
         request: RequestBuilder,
         resource: crate::media::TrackResource,
     ) -> Result<(String, Vec<u8>), ApiError> {
-        let response = self.send(request, Some(session), false).await?;
+        let transport_error = if resource == crate::media::TrackResource::Lyrics {
+            lyric_network_error
+        } else {
+            network_error
+        };
+        let response = self
+            .send_inner(request, Some(session), false, false, transport_error)
+            .await?;
         if response.status() != 200 {
             return Err(INVALID_RESPONSE);
         }
@@ -675,7 +704,13 @@ impl Api {
             return Err(INVALID_RESPONSE);
         }
         let bytes = self
-            .resource_bytes(session, response, resource.max_bytes(), INVALID_RESPONSE)
+            .resource_bytes(
+                session,
+                response,
+                resource.max_bytes(),
+                INVALID_RESPONSE,
+                transport_error,
+            )
             .await?;
         if bytes.is_empty() {
             return Err(INVALID_RESPONSE);
@@ -775,7 +810,13 @@ impl Api {
                 return Err(INVALID_RESPONSE);
             }
             let bytes = self
-                .resource_bytes(session, response, byte_length, INVALID_RESPONSE)
+                .resource_bytes(
+                    session,
+                    response,
+                    byte_length,
+                    INVALID_RESPONSE,
+                    network_error,
+                )
                 .await?;
             if bytes.len() != byte_length {
                 return Err(INVALID_RESPONSE);
@@ -807,7 +848,7 @@ impl Api {
             return Err(INVALID_RESPONSE);
         }
         let bytes = self
-            .resource_bytes(session, response, bound, INVALID_RESPONSE)
+            .resource_bytes(session, response, bound, INVALID_RESPONSE, network_error)
             .await?;
         if bytes.is_empty() {
             return Err(INVALID_RESPONSE);
@@ -840,6 +881,7 @@ impl Api {
         mut response: Response,
         bound: usize,
         oversized: ApiError,
+        transport_error: fn(reqwest::Error) -> ApiError,
     ) -> Result<Vec<u8>, ApiError> {
         self.check_session(session)?;
         if response.content_length().is_some_and(|n| n > bound as u64) {
@@ -848,7 +890,7 @@ impl Api {
         let mut bytes = Vec::new();
         loop {
             self.check_session(session)?;
-            let Some(chunk) = response.chunk().await.map_err(|_| NETWORK)? else {
+            let Some(chunk) = response.chunk().await.map_err(transport_error)? else {
                 break;
             };
             if chunk.len() > bound - bytes.len() {
@@ -969,7 +1011,8 @@ impl Api {
         session: Option<&Session>,
         login: bool,
     ) -> Result<Response, ApiError> {
-        self.send_inner(request, session, login, false).await
+        self.send_inner(request, session, login, false, network_error)
+            .await
     }
 
     async fn send_inner(
@@ -978,6 +1021,7 @@ impl Api {
         session: Option<&Session>,
         login: bool,
         upgrading: bool,
+        transport_error: fn(reqwest::Error) -> ApiError,
     ) -> Result<Response, ApiError> {
         let request_scope = if let Some(session) = session {
             self.check_session_owner(session)?;
@@ -991,7 +1035,7 @@ impl Api {
         } else {
             None
         };
-        let response = request.send().await.map_err(|_| NETWORK)?;
+        let response = request.send().await.map_err(transport_error)?;
         let status = response.status();
         if let Some((session, generation, used)) = request_scope {
             let _publication = (status == 401)
@@ -1815,6 +1859,24 @@ mod tests {
                 .unwrap(),
             "new response"
         );
+    }
+
+    #[tokio::test]
+    async fn track_lyrics_classify_interrupted_transport_without_retrying_malformed_http() {
+        use crate::media::TrackResource::Lyrics;
+
+        let wire = Wire::new(vec![
+            Vec::new(), // Disconnect before sending headers.
+            b"not an HTTP status\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{".to_vec(),
+        ]);
+        let api = wire.api();
+        let session = api.test_session();
+        for retryable in [true, false, true] {
+            let error = failure(api.track_resource(&session, "track", Lyrics).await);
+            assert_eq!(error.is_retryable_lyric_transport_failure(), retryable);
+        }
+        assert_eq!(wire.recorded().len(), 3); // The API itself never replays.
     }
 
     #[tokio::test]
