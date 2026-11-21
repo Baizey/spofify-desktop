@@ -8,7 +8,7 @@ mod output;
 
 use crate::{
     AppWindow, ArtistCredit, DeviceRow, QueueRow,
-    api::{Api, ApiError, Item, Session},
+    api::{Api, ApiError, Session},
     audio::{Audio, MasterGain},
     auth::{self, Kind, Success, Write, Writer},
     desk::Access,
@@ -76,9 +76,14 @@ pub enum Command {
     Offline(bool),
     PlaySaved {
         mode_stamp: u64,
-        queue: Vec<Item>,
+        queue: Vec<LocalTrack>,
         index: usize,
         input: PlaybackInput,
+        store: OfflineStore,
+    },
+    QueueSaved {
+        mode_stamp: u64,
+        queue: Vec<LocalTrack>,
         store: OfflineStore,
     },
 }
@@ -182,15 +187,21 @@ impl Engine {
             .as_ref()
             .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
     }
+    fn can_queue_saved(&self) -> bool {
+        self.current()
+            && self.account.as_ref().is_some_and(|a| {
+                a.session.can_access_local() && a.session.is_offline() == self.offline
+            })
+            // While online, append only to a queue that is already local.
+            // Even an apparently empty account queue may have a write in flight.
+            && (self.offline || self.local_store.is_some())
+    }
     fn queue_order_token(&self) -> Option<String> {
-        if self.reconnect.is_some() {
-            return None;
-        }
         let has_targets = if self.offline || self.local_store.is_some() {
             self.local
                 .entries
                 .len()
-                .saturating_sub(self.local.position? + 1)
+                .saturating_sub(self.local.upcoming_start())
                 > 1
         } else {
             // The output engine may be auditioning a provisional successor.
@@ -222,13 +233,15 @@ impl Engine {
             return;
         }
         let valid = if local {
-            self.local.position.is_some_and(|pos| {
-                queue_destination(
-                    self.local.entries.iter().skip(pos + 1).map(|r| r.key),
-                    key,
-                    after,
-                )
-            })
+            queue_destination(
+                self.local
+                    .entries
+                    .iter()
+                    .skip(self.local.upcoming_start())
+                    .map(|r| r.key),
+                key,
+                after,
+            )
         } else {
             self.online.state.as_ref().is_some_and(|s| {
                 s.queue
@@ -287,14 +300,16 @@ impl Engine {
                 .is_some_and(|a| !a.session.is_offline() && !a.session.is_expired())
     }
     fn publish_access(&self) {
-        self.access
-            .send_replace(self.account.as_ref().map(|a| Access {
-                epoch: self.epoch,
-                api: a.api.clone(),
-                session: a.session.clone(),
-                offline: self.offline,
-                personal: self.personal.access(),
-            }));
+        let access = self.account.as_ref().map(|a| Access {
+            epoch: self.epoch,
+            api: a.api.clone(),
+            session: a.session.clone(),
+            offline: self.offline,
+            personal: self.personal.access(),
+        });
+        self.personal
+            .bind_observations(access.as_ref(), &self.shared_epoch);
+        self.access.send_replace(access);
     }
     fn login_view(&self, busy: bool, error: bool, status: &'static str) {
         let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
@@ -345,6 +360,12 @@ impl Engine {
         self.publish_access();
     }
     async fn shutdown(&mut self) {
+        // Best-effort local read cache only; do not delay logout/account switches.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            self.personal.flush_observations(),
+        )
+        .await;
         let epoch = crate::advance_account_epoch(&self.shared_epoch);
         let account = self.account.take();
         let retained = self.retained.take();
@@ -692,30 +713,17 @@ impl Engine {
                         && a.session.can_access_local()
                 }) =>
             {
-                if !queue
-                    .get(index)
-                    .is_some_and(|item| item.id == input.item.id)
+                if !queue.get(index).is_some_and(|item| {
+                    item.id == input.item.id && item.recording == Some(input.recording)
+                }) || queue.iter().any(|item| item.recording.is_none())
                     || input.source.len() == 0
-                    || queue
-                        .iter()
-                        .any(|item| item.kind != "track" || !item.has_audio)
                 {
                     return;
                 }
-                let tracks = queue
-                    .into_iter()
-                    .map(|item| LocalTrack {
-                        id: item.id,
-                        title: item.name,
-                        subtitle: item.artists,
-                        album_name: item.album_name,
-                        duration: item.duration_ms as f64 / 1000.0,
-                    })
-                    .collect();
                 if !self.offline && !self.pause_room_for_saved() {
                     return;
                 }
-                if self.local.replace(tracks, index, false) == Change::Start {
+                if self.local.replace(queue, index, false) == Change::Start {
                     // A newer explicit Saved Play supersedes a catalog Play
                     // still waiting for the first account snapshot.
                     self.pending_initial_play = None;
@@ -725,6 +733,23 @@ impl Engine {
                     self.local_queue_instance = self.local_queue_instance.wrapping_add(1);
                     self.local_revision = self.local_revision.wrapping_add(1);
                     self.start_saved(Some(input));
+                }
+            }
+            Command::QueueSaved {
+                mode_stamp,
+                queue,
+                store,
+            } if self.can_queue_saved()
+                && self
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| *a.session.network_changes().borrow() == mode_stamp) =>
+            {
+                if queue.iter().all(|item| item.recording.is_some())
+                    && self.local.append(queue) == Change::Edit
+                {
+                    self.local_store = Some(store);
+                    self.local_change(Change::Edit);
                 }
             }
             #[cfg(target_os = "linux")]
@@ -898,7 +923,13 @@ impl Engine {
             return;
         };
         self.local_status = Status::Ok;
-        let load = read_saved(account, store, self.local_read_slot.clone(), id);
+        let load = read_saved(
+            account,
+            store,
+            self.local_read_slot.clone(),
+            id,
+            entry.track.recording,
+        );
         let results = self.results.clone();
         let (epoch, operation) = (self.epoch, self.operation);
         self.media = Some(tokio::spawn(async move {
@@ -944,7 +975,13 @@ impl Engine {
             let id = to.track.id.clone();
             // A retired speculative read can still be inside blocking I/O;
             // it must not occupy the slot needed to play, seek, or resume.
-            let load = read_saved(account, store, self.local_preview_slot.clone(), id.clone());
+            let load = read_saved(
+                account,
+                store,
+                self.local_preview_slot.clone(),
+                id.clone(),
+                to.track.recording,
+            );
             self.local_lookahead =
                 Some(crossfade::Lookahead::new((from.key, to.key), async move {
                     let input = load.await?;
@@ -1220,6 +1257,7 @@ impl Engine {
             offline: self.offline,
             local_playback: self.offline || self.local_store.is_some(),
             reconnecting: self.reconnect.is_some(),
+            saved_queue_enabled: self.can_queue_saved(),
             status: self.action_status,
             room_token: self.room_token().unwrap_or_default(),
             queue_order_token: self.queue_order_token().unwrap_or_default(),
@@ -1238,17 +1276,14 @@ impl Engine {
         }
         if p.local_playback {
             p.media_track_token.clear();
-            p.output = if self.offline {
-                "This desktop · Offline"
-            } else {
-                "This desktop · Saved"
-            }
-            .into();
+            p.output = "This desktop".into();
             p.status = self.action_status;
             p.playing = false;
             p.album.clear();
             p.credits.clear();
             p.context_id.clear();
+            p.context_kind = "";
+            p.context_name.clear();
             p.shuffle = self.local.shuffle;
             p.repeat = self.local.repeat.wire();
             p.elapsed = self.local.elapsed;
@@ -1261,8 +1296,13 @@ impl Engine {
                 p.detail = entry.track.subtitle.clone();
                 p.track = entry.track.id.clone();
                 p.album_name = entry.track.album_name.clone();
-                p.context_kind = "offline";
-                p.context_name = "Saved music".into();
+                p.album = local_album(&entry.track);
+                p.credits = local_credits(&entry.track);
+                if let Some(context) = &entry.track.context {
+                    p.context_kind = context.kind;
+                    p.context_id.clone_from(&context.id);
+                    p.context_name.clone_from(&context.name);
+                }
                 p.duration = entry.track.duration;
                 p.control = true;
                 p.transport = true;
@@ -1281,9 +1321,6 @@ impl Engine {
                 Status::Blocked => "Audio output is unavailable on this desktop.",
                 _ => p.status,
             };
-            if p.reconnecting {
-                p.status = "Connecting… · Working offline";
-            }
             p.queue = self
                 .local
                 .entries
@@ -1295,9 +1332,10 @@ impl Engine {
                     title: e.track.title.clone(),
                     subtitle: e.track.subtitle.clone(),
                     album_name: e.track.album_name.clone(),
+                    album_id: local_album(&e.track),
+                    credits: local_credits(&e.track),
                     current: self.local.position == Some(i),
-                    upcoming: self.local.position.is_some_and(|pos| i > pos),
-                    ..QueueEntryView::default()
+                    upcoming: i >= self.local.upcoming_start(),
                 })
                 .collect();
         }
@@ -1361,6 +1399,27 @@ fn queue_order_rows(queue: &[QueueEntryView]) -> Vec<crate::ReorderRow> {
 struct CreditView {
     id: String,
     name: String,
+}
+
+fn local_album(track: &LocalTrack) -> String {
+    match track.music.album.as_ref().and_then(|c| c.target.as_ref()) {
+        Some(crate::pages::Route::Album(id)) => id.clone(),
+        _ => String::new(),
+    }
+}
+fn local_credits(track: &LocalTrack) -> Vec<CreditView> {
+    track
+        .music
+        .credits
+        .iter()
+        .map(|c| CreditView {
+            id: match &c.target {
+                Some(crate::pages::Route::Artist(id)) => id.clone(),
+                _ => String::new(),
+            },
+            name: c.name.clone(),
+        })
+        .collect()
 }
 
 fn credits_match(credits: &[CreditView], model: &ModelRc<ArtistCredit>) -> bool {
@@ -1434,6 +1493,7 @@ struct PlayerView {
     offline: bool,
     local_playback: bool,
     reconnecting: bool,
+    saved_queue_enabled: bool,
     shuffle: bool,
     repeat: &'static str,
     status: &'static str,
@@ -1471,6 +1531,7 @@ impl PlayerView {
             };
             ui.set_local_playback(self.local_playback);
             ui.set_reconnecting(self.reconnecting);
+            ui.set_saved_queue_enabled(self.saved_queue_enabled);
             ui.set_room_token(self.room_token.into());
             ui.set_media_track_token(self.media_track_token.into());
             ui.set_shuffle(self.shuffle);
@@ -1581,12 +1642,14 @@ fn read_saved(
     store: OfflineStore,
     slot: Arc<Semaphore>,
     id: String,
+    recording: Option<offline::Recording>,
 ) -> impl std::future::Future<Output = Option<PlaybackInput>> + use<> {
     let (api, session) = (account.api.clone(), account.session.clone());
     async move {
-        let (_, input) = offline::read_verified(api, session, slot, id, move || Ok(store))
-            .await
-            .ok()?;
+        let (_, input) =
+            offline::read_verified_recording(api, session, slot, id, recording?, move || Ok(store))
+                .await
+                .ok()?;
         Some(input)
     }
 }
@@ -1869,6 +1932,7 @@ mod tests {
             subtitle: String::new(),
             album_name: String::new(),
             duration: 25.0,
+            ..Default::default()
         };
         assert_eq!(e.local.replace(vec![track; 4], 0, false), Change::Start);
         let keys = |e: &Engine| {
@@ -1983,6 +2047,7 @@ mod tests {
             subtitle: String::new(),
             album_name: String::new(),
             duration: 25.0,
+            ..Default::default()
         };
         assert_eq!(
             e.local.replace(vec![track.clone(), track], 0, false),
@@ -2039,7 +2104,7 @@ mod tests {
             api,
             session: session.clone(),
         });
-        let item = Item {
+        let item = crate::api::Item {
             id: "saved".into(),
             name: "Saved fixture".into(),
             kind: "track".into(),
@@ -2053,11 +2118,18 @@ mod tests {
         let command = |mode_stamp| {
             Command::PlaySaved {
                 mode_stamp,
-                queue: vec![item.clone()],
+                queue: vec![LocalTrack {
+                    id: item.id.clone(),
+                    title: item.name.clone(),
+                    duration: 10.0,
+                    recording: Some(offline::Recording::fixture()),
+                    ..Default::default()
+                }],
                 index: 0,
                 // Invalid audio still admits the selected queue, then fails decoding.
                 input: PlaybackInput {
                     item: item.clone(),
+                    recording: offline::Recording::fixture(),
                     source: crate::audio_input::AudioInput::from(Arc::from([1])),
                 },
                 store: store.clone(),
@@ -2083,6 +2155,53 @@ mod tests {
         e.action(Action::Close);
         assert!(e.local_store.is_none());
         assert!(e.network_allowed());
+    }
+    #[tokio::test]
+    async fn queue_saved_is_fenced_and_idle_without_native_work() {
+        use std::{fs, os::unix::fs::DirBuilderExt};
+        let dir = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("spofify-queue-test-{}", uuid::Uuid::new_v4()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let store = OfflineStore::open(&dir).unwrap();
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
+        });
+        assert!(!e.can_queue_saved());
+        e.local_store = Some(store.clone());
+        assert!(e.can_queue_saved());
+        e.command(Command::Offline(true).scoped(7));
+        let stamp = *session.network_changes().borrow();
+        let add = |stamp| {
+            Command::QueueSaved {
+                mode_stamp: stamp,
+                queue: vec![
+                    LocalTrack {
+                        id: "one".into(),
+                        title: "One".into(),
+                        duration: 2.0,
+                        recording: Some(offline::Recording::fixture()),
+                        ..Default::default()
+                    };
+                    2
+                ],
+                store: store.clone(),
+            }
+            .scoped(7)
+        };
+        e.command(add(stamp.wrapping_add(2)));
+        assert!(e.local.entries.is_empty());
+        e.command(add(stamp));
+        assert_eq!(e.local.entries.len(), 2);
+        assert_ne!(e.local.entries[0].key, e.local.entries[1].key);
+        assert!(!e.local.desired && e.local.current().is_none() && e.media.is_none());
+        assert!(e.socket.is_none() && e.queue_order_token().is_some());
+        drop(e);
+        fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn manual_saved_next_does_not_wait_for_a_retired_preview_read() {
@@ -2113,6 +2232,7 @@ mod tests {
                 subtitle: String::new(),
                 album_name: String::new(),
                 duration: 25.0,
+                ..Default::default()
             })
             .collect();
         assert_eq!(e.local.replace(tracks, 0, false), Change::Start);
@@ -2336,6 +2456,7 @@ mod tests {
                 subtitle: String::new(),
                 album_name: String::new(),
                 duration: 20.0,
+                ..Default::default()
             }],
             0,
             false,

@@ -33,7 +33,7 @@ sys.dont_write_bytecode = True
 from audio_smoke import admission
 from audio_smoke_wire import Peer
 from fixture import Failure, check, private_env
-from native import DESKTOP, SAVED, bounds, desktop, element_id, element_type, wait
+from native import DESKTOP, bounds, desktop, element_id, element_type, wait
 from playback import CONNECT, PROTOCOL, SOCKET, WS_GUID
 
 
@@ -573,13 +573,13 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
         save(capture(win, image_module), "08-recovered-track")
     print("PASS automatic recovery on the same track after exactly three GETs, with no retry control", flush=True)
 
-    # Settings closes the reader and Work offline switches to Saved, so this
-    # verifies the visible transition, not cancellation of an in-flight retry.
+    # Settings closes the reader before the mode change, so this verifies the
+    # visible transition, not cancellation of an in-flight retry.
     win.click("Settings")
-    win.title("Settings")
+    win.section("Settings")
     win.click("Work offline")
-    win.section(SAVED)
-    win.title("Offline mode")
+    win.find("Go online", roles=("Button",))
+    win.section("Settings")
     wait("Work offline retires the account socket", peer.closed.is_set, 5)
     win.absent(containing((RECOVERED_TEXT, RECOVERED_SOURCE)), roles=("Text",))
     exact_gets()

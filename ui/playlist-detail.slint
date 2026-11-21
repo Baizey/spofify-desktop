@@ -48,6 +48,7 @@ export component PlaylistDetailHeader inherits Rectangle {
     in property <image> artwork;
     in property <bool> play;
     in property <bool> queue;
+    in property <bool> queue-enabled: true;
     in property <bool> rename;
     in property <bool> rules;
     in property <bool> edit-order;
@@ -140,6 +141,7 @@ export component PlaylistDetailHeader inherits Rectangle {
                         clicked => { root.command("play"); }
                     }
                     if root.queue: DetailCommand {
+                        enabled: root.queue-enabled;
                         text: "Add to queue"; icon: root.tight ? "" : "queue-add"; quiet: true; height: 42px;
                         label-min-inset: root.tight ? 17px : 23px;
                         click-scope: root.click-scope;

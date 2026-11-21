@@ -1,14 +1,18 @@
 //! Track-level adapter for the Saved screen; disk operations run off the desk actor.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::Semaphore;
 
 use crate::{
-    api::ApiError,
+    api::{ApiError, Item},
     desk::Access,
     engine::Command,
-    offline::{self, OfflineStore},
-    pages::{Page, Row, RowKey},
+    offline::{self, Download, OfflineStore},
+    pages::{Page, Route, Row, RowKey},
+    player::{LocalContext, LocalTrack},
 };
 
 const STORAGE: ApiError = ApiError {
@@ -51,6 +55,9 @@ fn error(err: offline::Error) -> ApiError {
             Busy => "The download store is busy. Try again shortly.",
             Storage => STORAGE.message,
             Damaged => "The downloaded file or store layout is invalid.",
+            RecordingChanged => {
+                "This download changed. Open the song list again to play the current version."
+            }
             UnsupportedAudio => "This audio cannot be played on this device.",
             InvalidMedia => "Unable to verify this track’s download.",
             Offline => "Downloads are unavailable while offline.",
@@ -59,6 +66,14 @@ fn error(err: offline::Error) -> ApiError {
         expired: false,
         status: 0,
     }
+}
+
+pub(crate) async fn inventory(access: &Access) -> Result<HashMap<String, Download>, ApiError> {
+    offline::VerifiedDownloads::new(access.api.clone(), access.session.clone())
+        .map_err(error)?
+        .verified_records(None)
+        .await
+        .map_err(error)
 }
 
 pub async fn storage_summary(access: &Access) -> Result<String, ApiError> {
@@ -96,12 +111,22 @@ fn storage_label(count: usize, bytes: u64) -> String {
 pub async fn page(access: &Access) -> Result<Page, ApiError> {
     let api = access.api.clone();
     let session = access.session.clone();
-    let saved =
+    let items = if access.offline || access.session.is_offline() {
+        let mut items: Vec<_> = inventory(access).await?.into_values().collect();
+        items.sort_unstable_by(|a, b| {
+            a.item
+                .name
+                .cmp(&b.item.name)
+                .then_with(|| a.item.id.cmp(&b.item.id))
+        });
+        items
+    } else {
         tokio::task::spawn_blocking(move || OfflineStore::open_default()?.list(&api, &session))
             .await
             .map_err(|_| STORAGE)?
-            .map_err(error)?;
-    let rows = saved
+            .map_err(error)?
+    };
+    let rows = items
         .into_iter()
         .map(|download| {
             let item = download.item;
@@ -114,6 +139,7 @@ pub async fn page(access: &Access) -> Result<Page, ApiError> {
                 id: item.id.clone(),
                 key: RowKey::Track(item.id.clone()),
                 item: Some(item),
+                local_recording: Some(download.recording),
                 ..Row::default()
             }
         })
@@ -167,19 +193,33 @@ pub async fn remove(access: &Access, row: &Row) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command, ApiError> {
+pub async fn play(
+    access: &Access,
+    route: &Route,
+    page: &Page,
+    index: Option<usize>,
+    enqueue: bool,
+) -> Result<Command, ApiError> {
     access.api.authenticated_account(&access.session)?;
     let mut network = access.session.network_changes();
     let mode_stamp = *network.borrow_and_update();
-    let (mut queue, index) = queue_selection(page, index)?;
-    let track_id = queue[index].id.clone();
+    let occurrence = index
+        .or_else(|| {
+            page.rows
+                .iter()
+                .position(|r| r.kind == "track" && r.playable)
+        })
+        .ok_or(INVALID_TRACK)?;
+    let (mut queue, selected) = selection(page, occurrence)?;
+    let track_id = queue[selected].id.clone();
+    let recording = page.rows[occurrence].local_recording.ok_or(INVALID_TRACK)?;
     let slot = SELECTED_READ_SLOT
         .get_or_init(|| Arc::new(Semaphore::new(1)))
         .clone();
     let (store, input) = tokio::select! {
         biased;
         _ = network.changed() => return Err(MODE_CHANGED),
-        result = offline::read_verified(access.api.clone(), access.session.clone(), slot, track_id, OfflineStore::open_default) => result.map_err(error)?,
+        result = offline::read_verified_recording(access.api.clone(), access.session.clone(), slot, track_id, recording, OfflineStore::open_default) => result.map_err(error)?,
     };
     access.api.authenticated_account(&access.session)?;
     if *network.borrow() != mode_stamp || access.offline != access.session.is_offline() {
@@ -187,26 +227,59 @@ pub async fn play(access: &Access, page: &Page, index: usize) -> Result<Command,
     }
     // Prefer the presentation metadata paired with the verified local bytes.
     // Other occurrences carry only identities/labels and load lazily in the engine.
-    queue[index] = input.item.clone();
-    Ok(Command::PlaySaved {
-        mode_stamp,
-        queue,
-        index,
-        input,
-        store,
-    })
+    let context = LocalContext::for_page(route, page);
+    queue[selected] = input.item.clone();
+    let rows = page.rows.iter().filter(|r| local_item(r).is_some());
+    let mut queue: Vec<_> = queue
+        .into_iter()
+        .zip(rows)
+        .map(|(item, row)| LocalTrack {
+            id: item.id,
+            title: item.name,
+            subtitle: item.artists,
+            album_name: item.album_name,
+            duration: item.duration_ms as f64 / 1000.0,
+            music: row.music.clone(),
+            context: context.clone(),
+            recording: row.local_recording,
+        })
+        .collect();
+    let single = index.is_some() && (enqueue || matches!(route, Route::Search(_) | Route::History));
+    let selected = if single {
+        queue = vec![queue.swap_remove(selected)];
+        0
+    } else {
+        selected
+    };
+    if enqueue {
+        Ok(Command::QueueSaved {
+            mode_stamp,
+            queue,
+            store,
+        })
+    } else {
+        Ok(Command::PlaySaved {
+            mode_stamp,
+            queue,
+            index: selected,
+            input,
+            store,
+        })
+    }
 }
 
-fn queue_selection(
-    page: &Page,
-    visible_index: usize,
-) -> Result<(Vec<crate::api::Item>, usize), ApiError> {
+fn local_item(row: &Row) -> Option<&Item> {
+    row.local_recording?;
+    row.item
+        .as_ref()
+        .filter(|item| row.playable && row.id == item.id && item.kind == "track" && item.has_audio)
+}
+
+fn selection(page: &Page, visible_index: usize) -> Result<(Vec<Item>, usize), ApiError> {
     let mut queue = Vec::new();
     let mut selected = None;
     for (visible, row) in page.rows.iter().enumerate() {
-        let Some(item) = row.item.as_ref().filter(|item| {
-            row.playable && row.id == item.id && item.kind == "track" && item.has_audio
-        }) else {
+        let Some(item) = local_item(row) else {
             continue;
         };
         if visible == visible_index {
@@ -226,6 +299,7 @@ mod tests {
         Row {
             id: id.into(),
             playable,
+            local_recording: Some(offline::Recording::fixture()),
             item: Some(Item {
                 id: id.into(),
                 name: id.into(),
@@ -259,7 +333,7 @@ mod tests {
             rows,
             ..Page::default()
         };
-        let (queue, selected) = queue_selection(&page, 1161).unwrap();
+        let (queue, selected) = selection(&page, 1161).unwrap();
         assert_eq!(queue.len(), 1160);
         assert_eq!(selected, 1159);
         assert_eq!(queue[selected].id, "repeat");
@@ -280,15 +354,15 @@ mod tests {
             ..Page::default()
         };
         // Pure projection of the saved snapshot, with no API or network access.
-        let (queue, selected) = queue_selection(&page, 5).unwrap();
+        let (queue, selected) = selection(&page, 5).unwrap();
         assert_eq!(selected, 3);
         assert_eq!(queue[selected].id, "duplicate");
         assert_eq!(
             queue.into_iter().map(|item| item.id).collect::<Vec<_>>(),
             ["before", "duplicate", "between", "duplicate", "after"]
         );
-        assert_eq!(queue_selection(&page, 2).unwrap().1, 1);
-        assert!(queue_selection(&page, 0).is_err());
-        assert!(queue_selection(&page, 3).is_err());
+        assert_eq!(selection(&page, 2).unwrap().1, 1);
+        assert!(selection(&page, 0).is_err());
+        assert!(selection(&page, 3).is_err());
     }
 }

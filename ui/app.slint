@@ -22,6 +22,7 @@ export struct QueueRow {
     credits: [ArtistCredit], album-id: string, album-name: string,
 }
 
+export struct PlaylistSourceRestore { y: float, before: int, after: int, serial: int }
 export struct PlaylistActions {
     play: bool, queue: bool, offline-action: string, rename: bool, rules: bool, remove-action: string,
 }
@@ -35,22 +36,18 @@ component BrowseLine inherits MediaLine {
     in property <int> index;
     in property <string> page-kind;
     in property <bool> is-playlist;
-    in property <bool> local-mode;
-    in property <bool> can-play-local;
     title: entry.title; subtitle: entry.subtitle; detail: entry.detail; kind: entry.kind;
     search-result: page-kind == "search";
     sequence: page-kind == "album" || is-playlist ? index + 1 : 0;
     occurrence-description: is-playlist || page-kind == "saved-collection" ? "Song " + (index + 1) : "";
-    credits: entry.credits; metadata-enabled: !local-mode && page-kind != "picker";
+    credits: entry.credits; metadata-enabled: page-kind != "picker";
     album-id: entry.album-id;
     album-name: page-kind == "album" || page-kind == "picker" || entry.kind != "track" ? "" : entry.album-name;
-    playable: entry.playable && (!local-mode || can-play-local) && page-kind != "picker";
-    can-open: entry.can-open && (!local-mode || entry.kind == "saved-collection");
+    playable: entry.playable && page-kind != "picker";
+    can-open: entry.can-open;
     open-label: page-kind == "picker" ? "Add to " + entry.title : "Open " + entry.title;
     selectable: entry.kind == "track";
-    actions: page-kind == "picker" ? []
-        : !local-mode || page-kind == "offline" ? entry.actions
-        : page-kind == "playlists" && entry.playlist-pinned ? ["unpin-playlist"] : [];
+    actions: page-kind == "picker" ? [] : entry.actions;
 }
 
 export component AppWindow inherits Window {
@@ -133,6 +130,9 @@ export component AppWindow inherits Window {
     in property <string> catalog-return-credit;
     in property <int> catalog-return-serial;
     in-out property <float> catalog-scroll-y;
+    in-out property <bool> browse-local-audio;
+    in-out property <int> playlist-focus-index: -1;
+    in property <PlaylistSourceRestore> playlist-source-restore;
     in-out property <int> catalog-anchor-row: -1;
     in-out property <float> catalog-anchor-y;
     in-out property <int> catalog-focused-row: -1;
@@ -187,6 +187,8 @@ export component AppWindow inherits Window {
     in property <string> account-label;
     in property <bool> manual-offline;
     in property <bool> reconnecting;
+    in property <bool> account-actions-available: true;
+    in property <bool> saved-queue-enabled: true;
     in property <bool> local-playback;
     in property <string> music-storage;
     in property <bool> crossfade-enabled;
@@ -243,8 +245,7 @@ export component AppWindow inherits Window {
     property <bool> is-now: page-kind == "now";
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
     property <bool> local-mode: manual-offline || reconnecting;
-    property <bool> can-play-local: root.saved-view || (root.manual-offline && root.is-search);
-    property <bool> queue-controls: local-playback ? can-control : !local-mode && remote-controls;
+    property <bool> queue-controls: local-playback ? queue-rows.length > 0 : !local-mode && remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
     in-out property <string> form-return;
@@ -405,7 +406,35 @@ export component AppWindow inherits Window {
                 self.restoring-key = "";
             }
         }
+        property <int> source-restore-serial: root.playlist-source-restore.serial;
+        changed source-restore-serial => {
+            self.restore-playlist-source(root.playlist-source-restore.y * 1px,
+                root.playlist-source-restore.before, root.playlist-source-restore.after);
+        }
+        property <string> source-restore-key;
+        property <length> source-restore-y;
+        property <int> source-restore-focus: -1;
+        function restore-playlist-source(y: length, before: int, after: int) {
+            if !root.playlist-detail { return; }
+            self.source-restore-key = catalog-scroll.scroll-key;
+            self.source-restore-y = after >= 0 ? y - (after - before) * catalog-list.pitch : y;
+            self.source-restore-focus = after;
+            if before >= 0 && after < 0 { catalog-list.focus(); }
+        }
+        Timer {
+            interval: 1ms; running: shell.source-restore-key != "";
+            triggered => {
+                if shell.source-restore-key == catalog-scroll.scroll-key && root.playlist-detail {
+                    catalog-scroll.set-scroll(shell.source-restore-y);
+                    if shell.source-restore-focus >= 0 {
+                        catalog-list.focus-row(shell.source-restore-focus, false, "");
+                    }
+                }
+                shell.source-restore-key = "";
+            }
+        }
         function destination-scrolled() {
+            root.playlist-focus-index = -1;
             self.restoring-key = "";
             self.restoring-row = -1;
             catalog-list.focused-row = -1;
@@ -484,7 +513,7 @@ export component AppWindow inherits Window {
             }
         }
         function entity(kind: string, id: string, row: int) {
-            if !root.local-mode && !root.editor-open && id != "" {
+            if !root.editor-open && id != "" {
                 self.leave-orders();
                 self.remember-scroll(row, kind + ":" + id);
                 if root.compact-queue-open { root.compact-queue-open = false; self.focus(); }
@@ -546,7 +575,7 @@ export component AppWindow inherits Window {
             rail := WorkspaceRail {
                 x: 0px; y: 0px; width: root.rail-width; height: parent.height;
                 kind: root.page-kind; account: root.account-label; compact: root.compact;
-                offline: root.manual-offline; reconnecting: root.reconnecting; locked: root.editor-open;
+                locked: root.editor-open;
                 navigate(target) => { shell.route(target); }
             }
             main := Rectangle {
@@ -565,8 +594,8 @@ export component AppWindow inherits Window {
                             search := Field {
                                 y: (parent.height - self.height) / 2; width: parent.width; height: 39px;
                                 text <=> root.query; prefix: "⌕"; clearable: true; enabled: !root.editor-open;
-                                field-label: root.local-mode ? "Search downloads" : "Search tracks, albums or artists";
-                                placeholder-text: root.local-mode ? "Search downloads" : main.width < 420px ? "Search music" : "Search tracks, albums or artists";
+                                field-label: "Search tracks, albums or artists";
+                                placeholder-text: main.width < 420px ? "Search music" : "Search tracks, albums or artists";
                                 cleared => { shell.edited-search(); }
                                 edited => { shell.edited-search(); }
                                 accepted => { shell.edited-search(); }
@@ -642,11 +671,11 @@ export component AppWindow inherits Window {
                             triggered => { self.running = false; now.focus-lyrics(); }
                         }
                         track-id: root.now-track-id; track: root.now-title; subtitle: root.now-detail;
-                        credits: root.now-credits; metadata-interactive: !root.local-mode;
+                        credits: root.now-credits; metadata-interactive: true;
                         album-name: root.now-album-name; album-id: root.now-album-id;
                         next-title: root.next-title; next-subtitle: root.next-subtitle;
-                        context-kind: root.now-context-kind; context-id: root.local-mode ? "" : root.now-context-id;
-                        context-name: root.local-mode ? "" : root.now-context-name;
+                        context-kind: root.now-context-kind; context-id: root.now-context-id;
+                        context-name: root.now-context-name;
                         artwork: root.cover-art;
                         property <bool> lyrics-current: root.lyrics-track-id == root.now-track-id;
                         lyrics-text: self.lyrics-current ? root.lyrics-text : "";
@@ -749,7 +778,7 @@ export component AppWindow inherits Window {
                                             section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : "";
                                             glyph: Copy.mark(root.page-kind);
                                             artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
-                                            credits: root.page-credits; metadata-enabled: !root.local-mode;
+                                            credits: root.page-credits; metadata-enabled: true;
                                             focused(y, h) => { catalog-scroll.reveal(catalog.y + header-slot.y + self.y + y, h); }
                                             page-action(op, id) => { shell.entity(op, id, -1); }
                                         }
@@ -761,13 +790,14 @@ export component AppWindow inherits Window {
                                     compact: main.narrow;
                                     title: root.catalog-title; metadata: root.playlist-metadata; description: root.playlist-description;
                                     artwork: root.page-artwork;
-                                    play: self.visible && root.playlist-actions.play && (!root.local-mode || root.page-kind == "saved-collection");
-                                    queue: self.visible && root.playlist-actions.queue && !root.local-mode;
-                                    rename: self.visible && root.playlist-actions.rename && !root.local-mode;
-                                    rules: self.visible && root.playlist-actions.rules && !root.local-mode;
+                                    play: self.visible && root.playlist-actions.play;
+                                    queue: self.visible && root.playlist-actions.queue;
+                                    queue-enabled: !root.saved-view || root.saved-queue-enabled;
+                                    rename: self.visible && root.playlist-actions.rename;
+                                    rules: self.visible && root.playlist-actions.rules;
                                     edit-order: main.can-edit-order; sticky-order: main.sticky-order;
-                                    offline-action: self.visible && (root.playlist-actions.offline-action == "unpin-playlist" || !root.local-mode) ? root.playlist-actions.offline-action : "";
-                                    remove-action: self.visible && (!root.local-mode || root.page-kind == "saved-collection") ? root.playlist-actions.remove-action : "";
+                                    offline-action: self.visible ? root.playlist-actions.offline-action : "";
+                                    remove-action: self.visible ? root.playlist-actions.remove-action : "";
                                     saved: root.playlist-offline-state.saved; offline-feedback: root.playlist-offline-state.feedback;
                                     status: root.page-status; error: root.page-error; loading: root.page-busy;
                                     click-scope: root.page-key + "|" + root.browse-model-key;
@@ -781,11 +811,12 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.page-actions.length > 0 && (!root.local-mode || root.saved-view): FlexboxLayout {
+                            if root.page-actions.length > 0: FlexboxLayout {
                                 flex-wrap: wrap; spacing: 6px;
                                 for action in root.page-actions: Action {
                                     text: Copy.action-label(action); icon: Copy.action-mark(action); primary: action == "play" || action == "new-manual";
-                                    enabled: action != "play" || !root.saved-view || root.can-play-local;
+                                    enabled: ((action != "new-manual" && action != "new-rules") || root.account-actions-available)
+                                        && (action != "queue" || !root.saved-view || root.saved-queue-enabled);
                                     property <int> resume: root.form-focus-serial;
                                     changed resume => { if root.form-return == action { self.take-focus(); } }
                                     clicked => { root.catalog-action(action); }
@@ -806,30 +837,28 @@ export component AppWindow inherits Window {
                             }
                             if root.is-history && root.browse-rows.length == 0 && !root.page-busy && !root.page-error: VerticalLayout {
                                 spacing: 12px;
-                                Caption { text: root.local-mode ? "Listening history isn’t available offline." : "Tracks you play will appear here."; font-size: 14px * Theme.density; wrap: word-wrap; }
+                                Caption { text: "No recent plays"; font-size: 14px * Theme.density; wrap: word-wrap; }
                                 HorizontalLayout {
                                     Action {
-                                        text: root.local-mode ? "Open saved offline" : "Search music"; icon: root.local-mode ? "↓" : "⌕";
-                                        clicked => { if root.local-mode { shell.route("offline"); } else { search.take-focus(); } }
+                                        text: "Search music"; icon: "⌕";
+                                        clicked => { search.take-focus(); }
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error
-                                && !(root.page-kind == "saved-collection" && !root.playlist-offline-state.saved && root.playlist-offline-state.feedback != ""):
+                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
-                                    title: root.is-search && root.query == "" ? (root.local-mode ? "Search your downloads" : "What would you like to hear?")
+                                    title: root.is-search && root.query == "" ? "What would you like to hear?"
                                         : root.is-search ? "No matching results" : root.page-kind == "picker" ? "No manual playlists"
                                         : root.page-kind == "offline" ? "Nothing saved yet" : root.page-kind == "playlists" ? "No playlists yet"
                                         : root.page-kind == "artist" ? "No releases found" : root.page-kind == "album" ? "No tracks found" : "No items here yet";
-                                    subtitle: root.is-search && root.query == "" ? (root.local-mode ? "Find music saved on this device." : "Search by track, album or artist.")
+                                    subtitle: root.is-search && root.query == "" ? "Search by track, album or artist."
                                         : root.is-search ? "Try a different title, artist or album." : root.page-kind == "picker" ? "Create a manual playlist before adding tracks."
                                         : root.page-kind == "offline" ? "Choose Save offline on music you want to keep on this device."
-                                        : root.page-kind == "playlists" && !root.local-mode ? "Create a playlist to keep tracks together."
-                                        : root.page-kind == "artist" ? "There are no releases listed here. Tracks and appearances may still be indexed in search." : "";
+                                        : root.page-kind == "artist" ? "Tracks and appearances may still be listed in Search." : "";
                                 }
-                            if root.page-kind == "artist" && root.browse-rows.length == 0 && !root.page-busy && !root.page-error && !root.local-mode: HorizontalLayout {
+                            if root.page-kind == "artist" && root.browse-rows.length == 0 && !root.page-busy && !root.page-error: HorizontalLayout {
                                 alignment: center;
                                 Action {
                                     text: "Search for this artist"; icon: "⌕";
@@ -924,7 +953,6 @@ export component AppWindow inherits Window {
                                         x: 0px; y: 0px; width: parent.width; height: parent.height - 2px;
                                         entry: root.browse-rows[i]; index: i;
                                         page-kind: root.page-kind; is-playlist: root.is-playlist;
-                                        local-mode: root.local-mode; can-play-local: root.can-play-local;
                                         paint-left: main.inset; paint-right: main.inset;
                                         artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
                                         current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
@@ -949,11 +977,15 @@ export component AppWindow inherits Window {
                                         }
                                         keyboard-focus-changed(owns, body) => {
                                             if owns {
+                                                root.playlist-focus-index = body ? i : -1;
                                                 catalog-list.focus-owner = i;
                                                 catalog-list.focus-owner-on-body = body;
                                                 catalog-list.focus-owner-page = catalog-scroll.scroll-key;
                                                 catalog-list.focus-owner-context = catalog-list.focus-context;
-                                            } else if catalog-list.focus-owner == i { catalog-list.focus-owner = -1; }
+                                            } else if catalog-list.focus-owner == i {
+                                                root.playlist-focus-index = -1;
+                                                catalog-list.focus-owner = -1;
+                                            }
                                         }
                                         focused => {
                                             catalog-list.focused-row = i;
@@ -973,7 +1005,6 @@ export component AppWindow inherits Window {
                                         BrowseLine {
                                             entry: shelf-row.entry; index: i;
                                             page-kind: root.page-kind; is-playlist: false;
-                                            local-mode: root.local-mode; can-play-local: root.can-play-local;
                                             paint-left: main.inset; paint-right: main.inset;
                                             artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
                                             current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
@@ -1033,17 +1064,17 @@ export component AppWindow inherits Window {
                                         paint-left: main.inset; paint-right: main.inset;
                                         sequence: root.page-kind == "album" ? index + 1 : 0;
                                         artwork: index < root.browse-artwork.length ? root.browse-artwork[index] : root.no-artwork;
-                                        credits: entry.credits; metadata-enabled: !root.local-mode;
+                                        credits: entry.credits; metadata-enabled: true;
                                         album-id: entry.album-id; album-name: slot.album;
-                                        playable: entry.playable && (!root.local-mode || root.can-play-local);
-                                        can-open: entry.can-open && (!root.local-mode || entry.kind == "saved-collection");
+                                        playable: entry.playable;
+                                        can-open: entry.can-open;
                                         selectable: entry.kind == "track";
                                         current-track: entry.track-id != "" && entry.track-id == root.now-track-id;
                                         playing-track: self.current-track && root.playing;
                                         compact: main.width < 435px;
                                         window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + index;
-                                        actions: !root.local-mode ? entry.actions : [];
+                                        actions: entry.actions;
                                         property <int> return-focus: catalog-scroll.return-focus-serial;
                                         changed return-focus => {
                                             if slot.restoring && slot.visible-y + slot.height > 0px && slot.visible-y < catalog-scroll.visible-height {
@@ -1240,7 +1271,7 @@ export component AppWindow inherits Window {
                                             // even if the recording also occurs in Played or Up Next.
                                             current-track: row.current && row.track-id != "" && row.track-id == root.now-track-id;
                                             playing-track: self.current-track && root.playing;
-                                            credits: row.credits; metadata-enabled: !root.local-mode && !root.editor-open;
+                                            credits: row.credits; metadata-enabled: !root.editor-open;
                                             album-id: row.album-id; album-name: row.album-name;
                                             artwork: self.current-track ? root.cover-art : root.no-artwork;
                                             can-open: false; compact: true; queue-row: true;
@@ -1286,7 +1317,7 @@ export component AppWindow inherits Window {
             device-picker-context: root.device-picker-context
                 + (root.dock-visible && root.signed-in ? "|shown" : "|hidden");
             device-action(op, id, name) => { root.device-action(op, id, name); }
-            credits: root.now-credits; metadata-enabled: !root.local-mode;
+            credits: root.now-credits; metadata-enabled: true;
             album-id: root.now-album-id; album-name: root.now-album-name;
             status: root.playback-status;
             artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;

@@ -6,13 +6,14 @@
 //! are persisted. A download grants no player/coordinator authority.
 
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::File,
     future::{Future, pending},
     io::{Read, Write},
     mem::MaybeUninit,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -41,6 +42,12 @@ const DOWNLOAD_DISK_STALL: Duration = Duration::from_secs(10);
 // an admission worker stuck before it acquires the file lock keeps this slot.
 static DOWNLOAD_SLOT: Semaphore = Semaphore::const_new(1);
 static DOWNLOAD_OPEN_SLOTS: Semaphore = Semaphore::const_new(2);
+const PROJECTION_DISK_STALL: Duration = Duration::from_secs(10);
+static PROJECTION_SLOTS: Semaphore = Semaphore::const_new(2);
+// A failed payload never modifies downloads. Suppress only the exact scoped
+// file identity, until the recording is replaced or this process ends.
+static DAMAGED_RECORDS: Mutex<VecDeque<(String, Stat)>> = Mutex::new(VecDeque::new());
+const MAX_DAMAGED_RECORDS: usize = 64;
 const MAX_HEADER: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"SPOFDL01";
 const PREFIX_BYTES: usize = 12;
@@ -66,6 +73,7 @@ pub enum Error {
     Busy,
     Storage,
     Damaged,
+    RecordingChanged,
     UnsupportedAudio,
     InvalidMedia,
     Offline,
@@ -83,6 +91,9 @@ impl fmt::Display for Error {
             Self::Busy => "The download store is busy. Try again shortly.",
             Self::Storage => "Unable to access private download storage.",
             Self::Damaged => "The downloaded file or store layout is invalid.",
+            Self::RecordingChanged => {
+                "This download changed. Select it again to play the current version."
+            }
             Self::UnsupportedAudio => "This audio cannot be played on this device.",
             Self::InvalidMedia => "Unable to verify this track’s download.",
             Self::Offline => "Downloads are unavailable while offline.",
@@ -97,10 +108,38 @@ impl From<ApiError> for Error {
     }
 }
 
+/// The v1 payload's expected digest, not a local grant or proof of playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recording([u8; 32]);
+
+impl Recording {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self([0; 32])
+    }
+
+    // Both v1 record opening and manifest parsing validate the digest syntax.
+    fn from_validated_hex(value: &str) -> Self {
+        debug_assert!(hex_digest(value));
+        fn nibble(b: u8) -> u8 {
+            match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                _ => unreachable!("validated lowercase hexadecimal"),
+            }
+        }
+        Self(std::array::from_fn(|i| {
+            let bytes = value.as_bytes();
+            nibble(bytes[2 * i]) << 4 | nibble(bytes[2 * i + 1])
+        }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Download {
     pub item: Item,
     pub bytes: u64,
+    pub recording: Recording,
 }
 
 /// A verified, original-format payload from the same descriptor that was hashed.
@@ -109,6 +148,7 @@ pub struct Download {
 pub struct PlaybackInput {
     pub item: Item,
     pub source: AudioInput,
+    pub(crate) recording: Recording,
 }
 
 pub(crate) struct OnlineMedia {
@@ -155,13 +195,36 @@ async fn online_media_with_store(
     .await
 }
 
-/// Incremental verification renews a disk stall timer, not a track deadline.
-/// A retired kernel read still owns its slot until it actually returns.
 pub(crate) async fn read_verified(
     api: Arc<Api>,
     session: Session,
     slot: Arc<Semaphore>,
     id: String,
+    open: impl FnOnce() -> Result<OfflineStore, Error> + Send + 'static,
+) -> Result<(OfflineStore, PlaybackInput), Error> {
+    read_verified_inner(api, session, slot, id, None, open).await
+}
+
+/// Verify that the selected recording is on the descriptor used for playback.
+pub(crate) async fn read_verified_recording(
+    api: Arc<Api>,
+    session: Session,
+    slot: Arc<Semaphore>,
+    id: String,
+    recording: Recording,
+    open: impl FnOnce() -> Result<OfflineStore, Error> + Send + 'static,
+) -> Result<(OfflineStore, PlaybackInput), Error> {
+    read_verified_inner(api, session, slot, id, Some(recording), open).await
+}
+
+/// Incremental verification renews a disk stall timer, not a track deadline.
+/// A retired kernel read still owns its slot until it actually returns.
+async fn read_verified_inner(
+    api: Arc<Api>,
+    session: Session,
+    slot: Arc<Semaphore>,
+    id: String,
+    recording: Option<Recording>,
     open: impl FnOnce() -> Result<OfflineStore, Error> + Send + 'static,
 ) -> Result<(OfflineStore, PlaybackInput), Error> {
     use std::time::Duration;
@@ -189,7 +252,7 @@ pub(crate) async fn read_verified(
         };
         live()?;
         let store = open()?;
-        let input = store.read_live(&api, &session, &id, live)?;
+        let input = store.read_live_recording(&api, &session, &id, recording, live)?;
         Ok((store, input))
     });
     loop {
@@ -203,6 +266,99 @@ pub(crate) async fn read_verified(
                 Ok(Ok(())) => (),
             }
         }
+    }
+}
+
+/// Structurally verified download metadata in a single explicit-offline
+/// interval. Keep one handle per interval and fence late results in the caller.
+/// Browsing does not read audio bytes; playback verifies the digest separately.
+#[derive(Clone)]
+pub(crate) struct VerifiedDownloads {
+    api: Arc<Api>,
+    session: Session,
+    mode: watch::Receiver<u64>,
+    generation: u64,
+}
+
+impl VerifiedDownloads {
+    pub(crate) fn new(api: Arc<Api>, session: Session) -> Result<Self, Error> {
+        let mut mode = session.network_changes();
+        let generation = *mode.borrow_and_update();
+        if generation & 1 == 0 {
+            return Err(Error::Offline);
+        }
+        api.authenticated_account(&session)?;
+        Ok(Self {
+            api,
+            session,
+            mode,
+            generation,
+        })
+    }
+
+    fn check_live(&self) -> Result<(), Error> {
+        if *self.mode.borrow() != self.generation {
+            return Err(Error::Cancelled);
+        }
+        self.api.authenticated_account(&self.session)?;
+        Ok(())
+    }
+
+    /// `None` scans the active scope (Search); `Some` opens only the requested
+    /// track keys. Missing, unreadable and structurally invalid entries are
+    /// omitted independently. This is a snapshot, not a playback guarantee.
+    pub(crate) async fn verified_records(
+        &self,
+        ids: Option<Vec<String>>,
+    ) -> Result<HashMap<String, Download>, Error> {
+        self.verified_records_with(ids, OfflineStore::open_existing)
+            .await
+    }
+
+    async fn verified_records_with(
+        &self,
+        ids: Option<Vec<String>>,
+        open: impl FnOnce() -> Result<Option<OfflineStore>, Error> + Send + 'static,
+    ) -> Result<HashMap<String, Download>, Error> {
+        self.check_live()?;
+        let mut mode = self.mode.clone();
+        let work = async {
+            if ids.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(HashMap::new());
+            }
+            // A retired blocking worker still holds its slot until disk I/O
+            // returns and the worker observes cancellation.
+            let permit = tokio::time::timeout(PROJECTION_DISK_STALL, PROJECTION_SLOTS.acquire())
+                .await
+                .map_err(|_| Error::Busy)?
+                .map_err(|_| Error::Cancelled)?;
+            let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+            let cancelled = cancellation.0.clone();
+            let (progress, mut advances) = watch::channel(());
+            let grant = self.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let live = || download_checkpoint(&cancelled, &progress, || grant.check_live());
+                live()?;
+                let scope = Scope::new(&grant.api, &grant.session)?;
+                let store = open()?;
+                live()?;
+                match store {
+                    Some(store) => store.project_records(&scope, ids, live),
+                    None => Ok(HashMap::new()),
+                }
+            });
+            await_download_disk(&mut advances, PROJECTION_DISK_STALL, worker)
+                .await?
+                .map_err(|_| Error::Storage)?
+        };
+        let result = tokio::select! {
+            biased;
+            _ = mode.changed() => return Err(Error::Cancelled),
+            result = work => result,
+        };
+        self.check_live()?;
+        result
     }
 }
 
@@ -451,13 +607,25 @@ impl OfflineStore {
         self.read_live(api, session, track_id, || Ok(()))
     }
 
-    /// As in `read`, with an additional caller-owned cancellation or mode fence
-    /// checked between bounded disk reads, including before returning the source.
-    pub fn read_live(
+    #[cfg(test)]
+    fn read_live(
         &self,
         api: &Api,
         session: &Session,
         track_id: &str,
+        live: impl Fn() -> Result<(), Error>,
+    ) -> Result<PlaybackInput, Error> {
+        self.read_live_recording(api, session, track_id, None, live)
+    }
+
+    /// The caller's liveness fence is checked between bounded reads, including
+    /// before returning the same descriptor that passed digest verification.
+    fn read_live_recording(
+        &self,
+        api: &Api,
+        session: &Session,
+        track_id: &str,
+        recording: Option<Recording>,
         live: impl Fn() -> Result<(), Error>,
     ) -> Result<PlaybackInput, Error> {
         let check = || {
@@ -467,12 +635,17 @@ impl OfflineStore {
         };
         check()?;
         let scope = Scope::new(api, session)?;
-        let (mut file, header, offset) = {
+        let name = scope.name(track_id)?;
+        let (mut file, header, offset, stat) = {
             let dir = self.lock_dir(false)?;
-            open_entry(&dir, &scope.name(track_id)?, &scope)?
+            open_entry_stamped(&dir, &name, &scope)?
         }; // Only pin the name during open; the descriptor survives unlink.
         if header.track.id != track_id {
             return Err(Error::Damaged);
+        }
+        let actual_recording = header.recording();
+        if recording.is_some_and(|expected| expected != actual_recording) {
+            return Err(Error::RecordingChanged);
         }
         let mut hash = Context::new(&SHA256);
         let mut remaining = header.bytes;
@@ -488,13 +661,91 @@ impl OfflineStore {
         if file.read(&mut [0]).map_err(|_| Error::Damaged)? != 0
             || header.audio_hash != hex(hash.finish().as_ref())
         {
+            let mut failed = DAMAGED_RECORDS.lock().expect("failed recording inventory");
+            failed.retain(|(key, _)| key != &name);
+            failed.push_back((name, stat));
+            if failed.len() > MAX_DAMAGED_RECORDS {
+                failed.pop_front();
+            }
             return Err(Error::Damaged);
         }
         check()?;
         Ok(PlaybackInput {
             item: header.track.item(),
             source: AudioInput::file(file, offset, header.bytes),
+            recording: actual_recording,
         })
+    }
+
+    fn project_records(
+        &self,
+        scope: &Scope,
+        ids: Option<Vec<String>>,
+        live: impl Fn() -> Result<(), Error>,
+    ) -> Result<HashMap<String, Download>, Error> {
+        // Do not hold the publication lock during a scan. Published records
+        // are opened by descriptor and rechecked by name after the scan.
+        // Use a fresh directory description so RawDir starts at offset zero.
+        let dir = storage(fs::openat(
+            self.root.as_ref(),
+            ".",
+            DIR_FLAGS,
+            Mode::empty(),
+        ))?;
+        live()?;
+        storage(local_storage::private_dir(&dir))?;
+        let mut opened = Vec::new();
+        let mut visit = |name: &str| -> Result<(), Error> {
+            live()?;
+            // A per-file error is not a failure of the scope or directory.
+            if let Ok((_, header, _, stat)) = open_entry_stamped(&dir, name, scope) {
+                opened.push((name.to_owned(), header.download(), stat));
+            }
+            Ok(())
+        };
+        if let Some(ids) = ids {
+            let mut seen = HashSet::new();
+            for id in ids {
+                live()?;
+                if seen.contains(&id) {
+                    continue;
+                }
+                if let Ok(name) = scope.name(&id) {
+                    visit(&name)?;
+                }
+                seen.insert(id);
+            }
+        } else {
+            let mut buffer = [MaybeUninit::uninit(); 4096];
+            let mut entries = RawDir::new(&dir, &mut buffer);
+            loop {
+                live()?;
+                let Some(entry) = entries.next() else { break };
+                let entry = storage(entry)?;
+                if let Ok(name) = entry.file_name().to_str()
+                    && scope.contains(name)
+                    && valid_key(name)
+                {
+                    visit(name)?;
+                }
+            }
+        }
+        let mut records = HashMap::new();
+        for (name, download, before) in opened {
+            live()?;
+            if fs::statat(&dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|after| unchanged_entry(&before, &after))
+                && !DAMAGED_RECORDS
+                    .lock()
+                    .expect("failed recording inventory")
+                    .iter()
+                    .any(|(key, stat)| key == &name && unchanged_entry(stat, &before))
+            {
+                records.insert(download.item.id.clone(), download);
+            }
+        }
+        live()?;
+        Ok(records)
     }
 
     /// Hold the shared directory lock across playlist publication. Each
@@ -939,10 +1190,16 @@ struct Header {
     audio_hash: String,
 }
 impl Header {
+    fn recording(&self) -> Recording {
+        Recording::from_validated_hex(&self.audio_hash)
+    }
+
     fn download(self) -> Download {
+        let recording = self.recording();
         Download {
             item: self.track.item(),
             bytes: self.bytes,
+            recording,
         }
     }
 }
@@ -1019,6 +1276,15 @@ impl Track {
 }
 
 fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header, u64), Error> {
+    let (file, header, offset, _) = open_entry_stamped(dir, name, scope)?;
+    Ok((file, header, offset))
+}
+
+fn open_entry_stamped(
+    dir: &OwnedFd,
+    name: &str,
+    scope: &Scope,
+) -> Result<(File, Header, u64, Stat), Error> {
     let fd = fs::openat(dir, name, FILE_FLAGS | OFlags::RDONLY, Mode::empty()).map_err(|e| {
         if e == Errno::NOENT {
             Error::NotDownloaded
@@ -1026,7 +1292,8 @@ fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header,
             Error::Damaged
         }
     })?;
-    let actual = file_size(&storage(fs::fstat(&fd))?)?;
+    let stat = storage(fs::fstat(&fd))?;
+    let actual = file_size(&stat)?;
     let mut file = File::from(fd);
     let mut prefix = [0; PREFIX_BYTES];
     file.read_exact(&mut prefix).map_err(|_| Error::Damaged)?;
@@ -1046,7 +1313,20 @@ fn open_entry(dir: &OwnedFd, name: &str, scope: &Scope) -> Result<(File, Header,
     {
         return Err(Error::Damaged);
     }
-    Ok((file, header, offset))
+    Ok((file, header, offset, stat))
+}
+
+// Verify the name still refers to the same unchanged file, even if it was
+// opened early in the scan. Do not compare access times (header reads).
+fn unchanged_entry(before: &Stat, after: &Stat) -> bool {
+    file_size(after).is_ok()
+        && before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_size == after.st_size
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec
 }
 
 // Admission only needs the candidate key. Real filesystem writes enforce
@@ -1496,6 +1776,268 @@ mod tests {
         file.write_all(&json).unwrap();
         file.set_len((PREFIX_BYTES + json.len()) as u64 + bytes)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn projection_does_not_read_sparse_library_payloads_or_replace_playback_verification() {
+        let fixture = Fixture::new();
+        let api = Arc::new(api("https://one.invalid"));
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+
+        // Structurally valid but far too large for browsing to read. A wrong
+        // digest additionally makes any accidental eager verification fail
+        // the result assertion independently of machine performance.
+        write_sparse_entry(
+            &fixture.root(),
+            &scope,
+            "huge",
+            16 * 1024_u64.pow(3),
+            &"0".repeat(64),
+        );
+        install(&store, &scope, "changed", b"audio bytes").unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(fixture.root().join(scope.name("changed").unwrap()))
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"!").unwrap();
+        drop(file);
+
+        session.set_offline(true);
+        let downloads = VerifiedDownloads::new(api.clone(), session.clone()).unwrap();
+        let projected = tokio::time::timeout(Duration::from_secs(5), {
+            let store = store.clone();
+            downloads.verified_records_with(None, move || Ok(Some(store)))
+        })
+        .await
+        .expect("browsing must not read large payloads")
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected["huge"].bytes, 16 * 1024_u64.pow(3));
+        assert_eq!(projected["huge"].recording, Recording::fixture());
+        let selected_store = store.clone();
+        let result = read_verified_recording(
+            api,
+            session,
+            Arc::new(Semaphore::new(1)),
+            "changed".into(),
+            projected["changed"].recording,
+            move || Ok(selected_store),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Damaged)));
+        let after_failure = downloads
+            .verified_records_with(None, {
+                let store = store.clone();
+                move || Ok(Some(store))
+            })
+            .await
+            .unwrap();
+        assert!(!after_failure.contains_key("changed"));
+        assert!(after_failure.contains_key("huge"));
+        stdfs::remove_file(fixture.root().join(scope.name("changed").unwrap())).unwrap();
+        install(&store, &scope, "changed", b"replacement").unwrap();
+        let replacement = downloads
+            .verified_records_with(None, move || Ok(Some(store)))
+            .await
+            .unwrap();
+        assert!(replacement.contains_key("changed"));
+    }
+
+    #[tokio::test]
+    async fn projection_skips_invalid_and_vanished_entries_without_losing_valid_tracks() {
+        let fixture = Fixture::new();
+        let api = Arc::new(api("https://one.invalid"));
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+        let good = install(&store, &scope, "good", b"audio bytes").unwrap();
+        let removed = install(&store, &scope, "remove", b"audio bytes").unwrap();
+        for id in ["truncated", "unreadable"] {
+            install(&store, &scope, id, b"audio bytes").unwrap();
+        }
+        OpenOptions::new()
+            .write(true)
+            .open(fixture.root().join(scope.name("truncated").unwrap()))
+            .unwrap()
+            .set_len(PREFIX_BYTES as u64)
+            .unwrap();
+        stdfs::set_permissions(
+            fixture.root().join(scope.name("unreadable").unwrap()),
+            stdfs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        symlink(
+            "missing",
+            fixture.root().join(scope.name("symlink").unwrap()),
+        )
+        .unwrap();
+        for (origin, account, id) in [
+            ("https://one.invalid", "other-account", "foreign-account"),
+            ("https://two.invalid", &session.account_id, "foreign-origin"),
+        ] {
+            install(
+                &store,
+                &Scope::from_parts(origin, account),
+                id,
+                b"other scope",
+            )
+            .unwrap();
+        }
+
+        session.set_offline(true);
+        let downloads = VerifiedDownloads::new(api.clone(), session.clone()).unwrap();
+        let project = |ids| {
+            let store = store.clone();
+            downloads.verified_records_with(ids, move || Ok(Some(store)))
+        };
+        assert_eq!(
+            project(None).await.unwrap(),
+            HashMap::from([("good".into(), good.clone()), ("remove".into(), removed)])
+        );
+        assert!(store.remove(&api, &session, "remove").unwrap());
+        assert_eq!(
+            project(Some(
+                [
+                    "good",
+                    "good",
+                    "remove",
+                    "truncated",
+                    "unreadable",
+                    "symlink",
+                    "foreign-account",
+                    "foreign-origin",
+                    "..",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            ))
+            .await
+            .unwrap(),
+            HashMap::from([("good".into(), good)])
+        );
+        assert!(project(Some(Vec::new())).await.unwrap().is_empty());
+        assert!(
+            downloads
+                .verified_records_with(None, || Ok(None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_cancels_on_mode_change_and_rejects_stale_grants() {
+        let api = Arc::new(api("https://one.invalid"));
+        let session = api.test_session();
+        assert!(matches!(
+            VerifiedDownloads::new(api.clone(), session.clone()),
+            Err(Error::Offline)
+        ));
+        session.set_offline(true);
+        let downloads = VerifiedDownloads::new(api.clone(), session.clone()).unwrap();
+        let foreign_api = Arc::new(self::api("https://two.invalid"));
+        assert!(matches!(
+            VerifiedDownloads::new(foreign_api, session.clone()),
+            Err(Error::Api(_))
+        ));
+
+        let (started, opening) = oneshot::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let stale = downloads.clone();
+        let request = tokio::spawn(async move {
+            stale
+                .verified_records_with(None, move || {
+                    started.send(()).unwrap();
+                    finished.recv().unwrap();
+                    Ok(None)
+                })
+                .await
+        });
+        opening.await.unwrap();
+        session.set_offline(false);
+        session.set_offline(true);
+        let result = tokio::time::timeout(Duration::from_secs(2), request).await;
+        finish.send(()).unwrap();
+        assert_eq!(result.unwrap().unwrap(), Err(Error::Cancelled));
+        assert_eq!(
+            downloads
+                .verified_records_with(None, || unreachable!())
+                .await,
+            Err(Error::Cancelled)
+        );
+
+        let renewed = VerifiedDownloads::new(api.clone(), session.clone()).unwrap();
+        assert!(api.logout(&session).await.is_err()); // local revocation only
+        assert!(
+            matches!(renewed.verified_records_with(None, || unreachable!()).await, Err(Error::Api(err)) if err.expired)
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_recording_cannot_play_a_same_id_valid_replacement() {
+        let fixture = Fixture::new();
+        let api = Arc::new(api("https://one.invalid"));
+        let session = api.test_session();
+        let scope = Scope::new(&api, &session).unwrap();
+        let store = fixture.store();
+        let id = "same-id";
+        let mut original = wav_header(2).to_vec();
+        original.extend_from_slice(&[0, 0]);
+        let installed = install(&store, &scope, id, &original).unwrap();
+        assert_eq!(store.list(&api, &session).unwrap(), [installed.clone()]);
+
+        session.set_offline(true);
+        let downloads = VerifiedDownloads::new(api.clone(), session.clone()).unwrap();
+        let browse = || {
+            let store = store.clone();
+            downloads.verified_records_with(Some(vec![id.into()]), move || Ok(Some(store)))
+        };
+        let selected = browse().await.unwrap()[id].clone();
+        assert_eq!(selected, installed);
+        let open = || {
+            let store = store.clone();
+            move || Ok(store)
+        };
+        let play = |recording| {
+            read_verified_recording(
+                api.clone(),
+                session.clone(),
+                Arc::new(Semaphore::new(1)),
+                id.into(),
+                recording,
+                open(),
+            )
+        };
+        let (_, initial_input) = play(selected.recording).await.unwrap();
+        assert_eq!(initial_input.recording, selected.recording);
+        assert_eq!(fixture_payload(initial_input), original);
+
+        assert!(store.remove(&api, &session, id).unwrap());
+        let mut replacement = wav_header(2).to_vec();
+        replacement.extend_from_slice(&[1, 0]);
+        let mut header = fixture_header(&scope, id, &replacement);
+        header.track.name = "Replacement recording".into();
+        {
+            let _guard = store.admit(&scope.name(id).unwrap()).unwrap();
+            let mut stage = store.stage(header).unwrap();
+            stage.write(&replacement, || Ok(())).unwrap();
+            let (partial, header) = stage.verify_and_sync(|| Ok(())).unwrap();
+            store.publish(partial, header, || Ok(()), || ()).unwrap();
+        }
+
+        assert!(matches!(
+            play(selected.recording).await,
+            Err(Error::RecordingChanged)
+        ));
+        let current = browse().await.unwrap()[id].clone();
+        assert_ne!(selected.recording, current.recording);
+        let (_, input) = play(current.recording).await.unwrap();
+        assert_eq!(input.recording, current.recording);
+        assert_eq!(input.item.name, "Replacement recording");
+        assert_eq!(fixture_payload(input), replacement);
     }
 
     #[test]

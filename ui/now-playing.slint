@@ -194,7 +194,7 @@ export component NowPlaying inherits Rectangle {
     property <length> record-width: min(root.deck-lane, max(root.split ? 334px : 370px, root.art-size));
     property <length> deck-top: root.short ? 47px : root.split ? 65px : 55px;
     property <bool> has-context: root.context-id != "" && root.context-name != "" &&
-        (root.context-kind == "album" || root.context-kind == "artist" || root.context-kind == "playlist" || root.context-kind == "derived");
+        (root.context-kind == "album" || root.context-kind == "artist" || root.context-kind == "playlist" || root.context-kind == "derived" || root.context-kind == "saved");
     property <bool> context-is-album: root.has-context && root.context-kind == "album" && root.context-id == root.album-id;
     property <bool> link-album: root.metadata-interactive && root.album-id != "";
     property <bool> show-album: root.link-album || root.album-label != "";

@@ -5,6 +5,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     mem::size_of,
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -173,7 +174,7 @@ pub struct Playlist {
     pub definition: Option<RuleDefinition>,
     /// The token of a complete server part set; a delta clears it.
     pub token: String,
-    pub rows: Vec<ManualEntry>,
+    pub rows: Arc<Vec<ManualEntry>>,
     /// Rows are last-good rather than reconciled with the account summary.
     pub stale: bool,
 }
@@ -235,6 +236,17 @@ pub enum Update {
 
 pub use Command as PersonalCommand;
 pub use Update as PersonalUpdate;
+
+/// Exact successful reducer commits; never an input frame or staged rows.
+pub(crate) enum AcceptedPlaylist<'a> {
+    Summaries(&'a [PlaylistSummary]),
+    Summary {
+        summary: &'a PlaylistSummary,
+        invalidates_membership: bool,
+    },
+    Complete(&'a Playlist),
+    Deleted(&'a str),
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -499,11 +511,30 @@ impl Replica {
         *self = Self::default();
     }
 
+    #[cfg(test)]
     pub fn receive(&mut self, update: Update) -> Result<Option<Command>, PersonalError> {
+        self.receive_observed(update, |_| {})
+    }
+
+    pub(crate) fn receive_observed(
+        &mut self,
+        update: Update,
+        mut accept: impl FnMut(AcceptedPlaylist<'_>),
+    ) -> Result<Option<Command>, PersonalError> {
         match update {
-            Update::Snapshot(s) => self.install_snapshot(s),
-            Update::Part(p) if self.ready => self.receive_part(p),
-            Update::Change(d) if self.ready => self.receive_change(d),
+            Update::Snapshot(s) => {
+                let command = self.install_snapshot(s)?;
+                accept(AcceptedPlaylist::Summaries(
+                    &self
+                        .snapshot
+                        .as_ref()
+                        .expect("installed snapshot")
+                        .playlists,
+                ));
+                Ok(command)
+            }
+            Update::Part(p) if self.ready => self.receive_part(p, &mut accept),
+            Update::Change(d) if self.ready => self.receive_change(d, &mut accept),
             _ => Ok(None),
         }
     }
@@ -626,7 +657,11 @@ impl Replica {
         Ok(self.start_watch())
     }
 
-    fn receive_part(&mut self, p: Part) -> Result<Option<Command>, PersonalError> {
+    fn receive_part(
+        &mut self,
+        p: Part,
+        accept: &mut impl FnMut(AcceptedPlaylist<'_>),
+    ) -> Result<Option<Command>, PersonalError> {
         let id = p.summary.id.clone();
         if self.desired.as_deref() != Some(&id) || self.pull == Pull::Idle {
             return Ok(None);
@@ -671,7 +706,7 @@ impl Replica {
                     summary: p.summary,
                     definition: p.definition,
                     token: p.token,
-                    rows: Vec::new(),
+                    rows: Arc::default(),
                     stale: false,
                 },
             }
@@ -716,7 +751,7 @@ impl Replica {
             .iter()
             .map(row_bytes)
             .fold(stage.bytes, usize::saturating_add);
-        stage.playlist.rows.extend(p.rows);
+        Arc::make_mut(&mut stage.playlist.rows).extend(p.rows);
         if p.more {
             let next_offset = stage.playlist.rows.len();
             let token = stage.playlist.token.clone();
@@ -739,6 +774,9 @@ impl Replica {
             self.details.remove(i);
         }
         self.details.push_back(stage);
+        accept(AcceptedPlaylist::Complete(
+            &self.details.back().expect("installed detail").playlist,
+        ));
         self.evict_details();
         Ok(None)
     }
@@ -760,7 +798,11 @@ impl Replica {
         Ok(Some(self.sync(id, None, 0)))
     }
 
-    fn receive_change(&mut self, d: Change) -> Result<Option<Command>, PersonalError> {
+    fn receive_change(
+        &mut self,
+        d: Change,
+        accept: &mut impl FnMut(AcceptedPlaylist<'_>),
+    ) -> Result<Option<Command>, PersonalError> {
         let snapshot = self.snapshot.as_ref().expect("ready snapshot");
         if d.deleted.as_deref().is_some_and(|id| !id_ok(id))
             || d.playlist.is_none() && (d.entries.is_some() || d.rows_invalid)
@@ -792,6 +834,7 @@ impl Replica {
                 self.unconfirmed_direct = false;
                 self.unavailable = true;
             }
+            accept(AcceptedPlaylist::Deleted(&id));
         }
         let Some(p) = d.playlist else {
             return Ok(None);
@@ -806,6 +849,7 @@ impl Replica {
             p.clone(),
         );
         let id = p.id.clone();
+        let observes_rows = d.entries.is_some();
         let mut repair = true;
         if let Some(i) = self.cache_index(&id) {
             let previous = &mut self.details[i];
@@ -815,7 +859,20 @@ impl Replica {
             previous.playlist.summary = p;
             previous.playlist.token.clear();
             previous.playlist.stale = repair;
+            if !repair && observes_rows {
+                accept(AcceptedPlaylist::Complete(&previous.playlist));
+            } else {
+                accept(AcceptedPlaylist::Summary {
+                    summary: &previous.playlist.summary,
+                    invalidates_membership: d.rows_invalid || observes_rows,
+                });
+            }
             self.evict_details();
+        } else {
+            accept(AcceptedPlaylist::Summary {
+                summary: &p,
+                invalidates_membership: d.rows_invalid || observes_rows,
+            });
         }
         if self.desired.as_deref() != Some(&id) {
             return Ok(None);
@@ -913,7 +970,7 @@ fn visible_count_matches(summary: &PlaylistSummary, len: usize) -> bool {
 }
 
 fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange>) -> bool {
-    let rows = &mut d.playlist.rows;
+    let rows = &d.playlist.rows;
     let Some(e) = edit else {
         // Summary-only deltas can rename a playlist; a changed visible count
         // without a row operation requires a scoped replacement.
@@ -935,7 +992,7 @@ fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange
                 return false;
             }
             d.bytes = d.bytes.saturating_add(row_bytes(&row));
-            rows.push(row);
+            Arc::make_mut(&mut d.playlist.rows).push(row);
         }
         (None, Some(id), None, None) => {
             let Some(i) = rows.iter().position(|r| r.id == id) else {
@@ -944,6 +1001,7 @@ fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange
             if !visible_count_matches(p, rows.len() - 1) {
                 return false;
             }
+            let rows = Arc::make_mut(&mut d.playlist.rows);
             d.bytes = d.bytes.saturating_sub(row_bytes(&rows.remove(i)));
             if rows.capacity() > rows.len().saturating_mul(2) {
                 rows.shrink_to_fit();
@@ -970,6 +1028,7 @@ fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange
             // slots; the slots need not be consecutive (hidden/deleted rows).
             let range = from.min(to)..=from.max(to);
             let slots: Vec<_> = rows[range.clone()].iter().map(|r| r.position).collect();
+            let rows = Arc::make_mut(&mut d.playlist.rows);
             let row = rows.remove(from);
             rows.insert(to, row);
             for (row, slot) in rows[range].iter_mut().zip(slots) {

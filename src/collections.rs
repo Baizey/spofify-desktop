@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     api::{ApiError, Item, PAGE_SIZE, library::PlaylistKind},
     desk::Access,
-    offline::{self, OfflineStore},
-    pages::{Page, Route, Row, RowKey},
+    offline::{self, Download, OfflineStore},
+    pages::{self, Credit, MusicMetadata, Page, Route, Row, RowKey},
     playlist_pin_store::{Membership, Target as PinTarget},
     storage as local_storage,
 };
@@ -74,10 +74,10 @@ const NOT_FOUND: ApiError = ApiError {
 };
 
 pub async fn list(access: &Access, include_playlists: bool) -> Result<Vec<Row>, ApiError> {
-    let access = access.clone();
-    blocking(move || {
-        let scope = scope(&access)?;
-        let index = IndexDir::open_default()?.read()?;
+    let disk_access = access.clone();
+    let entries = blocking(move || {
+        let scope = scope(&disk_access)?;
+        let index = IndexDir::read_existing()?;
         let mut entries: Vec<_> = index
             .in_scope(&scope)
             .filter(|entry| {
@@ -85,53 +85,90 @@ pub async fn list(access: &Access, include_playlists: bool) -> Result<Vec<Row>, 
             })
             .collect();
         entries.sort_unstable_by(|a, b| a.title.cmp(&b.title).then_with(|| a.key.cmp(&b.key)));
-        let available = if entries.is_empty() {
-            HashMap::new()
-        } else {
-            let store = OfflineStore::open_default().map_err(audio_error)?;
-            available_tracks(&access, &store)?
-        };
-        check_live(&access)?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| list_row(entry, &available))
-            .collect())
+        Ok(entries)
     })
-    .await
+    .await?;
+    let ids = entries
+        .iter()
+        .flat_map(|entry| entry.tracks.iter().cloned())
+        .collect();
+    let available = browse_tracks(access, ids).await?;
+    check_live(access)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| list_row(entry, &available))
+        .collect())
 }
 
 pub async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> {
     if !hex_digest(id) {
         return Err(NOT_FOUND);
     }
-    let access = access.clone();
+    let disk_access = access.clone();
     let id = id.to_owned();
-    blocking(move || {
-        let scope = scope(&access)?;
-        let entry = IndexDir::open_default()?
-            .read()?
+    let entry = blocking(move || {
+        let scope = scope(&disk_access)?;
+        IndexDir::read_existing()?
             .in_scope(&scope)
             .find(|e| e.key == id)
-            .ok_or(NOT_FOUND)?;
-        let store = OfflineStore::open_default().map_err(audio_error)?;
-        let available = available_tracks(&access, &store)?;
-        check_live(&access)?;
-        Ok(entry.detail_page(&available))
+            .ok_or(NOT_FOUND)
     })
-    .await
+    .await?;
+    let available = browse_tracks(access, entry.tracks.iter().cloned().collect()).await?;
+    check_live(access)?;
+    Ok(entry.detail_page(&available))
+}
+
+/// Legacy v1 collections omit the source ID. Only callers with a known source
+/// may recover its membership, using its exact account-scoped playlist key.
+pub(crate) struct LegacyPlaylist {
+    pub(crate) title: String,
+    pub(crate) kind: PlaylistKind,
+    pub(crate) tracks: Vec<String>,
+}
+
+pub(crate) fn legacy_playlist(
+    access: &Access,
+    playlist_key: &str,
+) -> Result<Option<LegacyPlaylist>, ApiError> {
+    let principal = scope(access)?;
+    let playlist = IndexDir::read_existing()?.playlist(&principal, playlist_key);
+    check_live(access)?;
+    Ok(playlist)
+}
+
+/// Load the legacy snapshots of already identified source playlists in one
+/// index read. Keys are exact account-scoped hashes, not lookup labels.
+pub(crate) fn legacy_playlists(
+    access: &Access,
+    source_by_key: &HashMap<String, String>,
+) -> Result<HashMap<String, LegacyPlaylist>, ApiError> {
+    let principal = scope(access)?;
+    if source_by_key.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let playlists = IndexDir::read_existing()?
+        .in_scope(&principal)
+        .filter_map(|entry| {
+            let source = source_by_key.get(&entry.key)?;
+            Some((source.clone(), entry.into_playlist()?))
+        })
+        .collect();
+    check_live(access)?;
+    Ok(playlists)
 }
 
 fn available_tracks(
     access: &Access,
     store: &OfflineStore,
-) -> Result<HashMap<String, Item>, ApiError> {
-    // Local track headers supply safe metadata; full byte verification is
-    // deferred to OfflineStore::read when the user initiates playback.
+) -> Result<HashMap<String, Download>, ApiError> {
+    // Local headers supply metadata and identity; full byte verification is
+    // deferred to playback.
     Ok(store
         .list(&access.api, &access.session)
         .map_err(audio_error)?
         .into_iter()
-        .map(|d| (d.item.id.clone(), d.item))
+        .map(|d| (d.item.id.clone(), d))
         .collect())
 }
 
@@ -144,27 +181,49 @@ pub(crate) fn saved_playlist_row(
     collection_row(key.into(), title.into(), kind.into(), status)
 }
 
-/// Disk I/O only; call on a blocking worker. Missing audio leaves the ordered
-/// membership in place, just as it does for a saved album or artist.
-pub(crate) fn saved_playlist_page(
+/// Project the playable subset of the saved membership without mutating the
+/// original ordered occurrences.
+pub(crate) async fn saved_playlist_page(
     access: &Access,
     title: String,
     kind: PlaylistKind,
     tracks: Vec<String>,
 ) -> Result<Page, ApiError> {
     check_live(access)?;
-    let available = if tracks.is_empty() {
-        HashMap::new()
-    } else if let Some(store) = OfflineStore::open_existing().map_err(audio_error)? {
-        available_tracks(access, &store)?
-    } else {
-        HashMap::new()
-    };
+    let available = browse_tracks(access, tracks.iter().cloned().collect()).await?;
     check_live(access)?;
     Ok(detail_page(title, kind.into(), &tracks, &available))
 }
 
-fn list_row(entry: StoredCollection, available: &HashMap<String, Item>) -> Row {
+/// Scoped structural inventory for browsing only; playback reopens and
+/// verifies the recording. Never hash audio payloads to populate a page.
+pub(crate) async fn browse_tracks(
+    access: &Access,
+    ids: HashSet<String>,
+) -> Result<HashMap<String, Download>, ApiError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if access.offline {
+        return offline::VerifiedDownloads::new(access.api.clone(), access.session.clone())
+            .map_err(audio_error)?
+            .verified_records(Some(ids.into_iter().collect()))
+            .await
+            .map_err(audio_error);
+    }
+    let access = access.clone();
+    blocking(move || {
+        let Some(store) = OfflineStore::open_existing().map_err(audio_error)? else {
+            return Ok(HashMap::new());
+        };
+        let mut tracks = available_tracks(&access, &store)?;
+        tracks.retain(|id, _| ids.contains(id));
+        Ok(tracks)
+    })
+    .await
+}
+
+fn list_row(entry: StoredCollection, available: &HashMap<String, Download>) -> Row {
     let detail = entry.summary(available).label();
     collection_row(entry.key, entry.title, entry.kind, detail)
 }
@@ -185,46 +244,72 @@ fn detail_page(
     title: String,
     kind: Kind,
     tracks: &[String],
-    available: &HashMap<String, Item>,
+    available: &HashMap<String, Download>,
 ) -> Page {
     let summary = SaveSummary::from_tracks(tracks, available);
     let rows = tracks
         .iter()
         .enumerate()
-        .map(|(position, id)| {
-            let mut row = Row {
-                kind: "track".into(),
-                id: id.clone(),
-                key: RowKey::Track(id.clone()),
-                position: Some(position as u64),
-                ..Row::default()
-            };
-            if let Some(item) = available.get(id) {
-                row.title.clone_from(&item.name);
-                row.subtitle.clone_from(&item.artists);
-                row.detail.clone_from(&item.album_name);
-                row.playable = true;
-                row.item = Some(item.clone());
-            } else {
-                row.title = "Unavailable song".into();
-                row.detail = "Not saved on this device".into();
-            }
-            row
+        .filter_map(|(position, id)| {
+            let download = local_track(available, id)?;
+            Some(local_track_row(
+                download,
+                RowKey::Track(id.clone()),
+                position as u64,
+            ))
         })
         .collect();
-    let missing = summary.total - summary.present;
     Page {
         title,
         subtitle: format!("{} · {}", kind.label(), summary.label()),
         kind: "saved-collection".into(),
         total: Some(summary.total as u64),
-        status: if missing > 0 {
-            format!("{} not available on this device.", song_count(missing))
-        } else {
-            String::new()
-        },
         rows,
         ..Page::default()
+    }
+}
+
+pub(crate) fn local_track<'a>(
+    available: &'a HashMap<String, Download>,
+    id: &str,
+) -> Option<&'a Download> {
+    available.get(id).filter(|download| {
+        let item = &download.item;
+        item.id == id && item.kind == "track" && item.has_audio
+    })
+}
+
+pub(crate) fn local_track_row(download: &Download, key: RowKey, position: u64) -> Row {
+    let item = &download.item;
+    let album_name = pages::ui_text(&item.album_name);
+    Row {
+        kind: "track".into(),
+        id: item.id.clone(),
+        title: item.name.clone(),
+        subtitle: item.artists.clone(),
+        detail: pages::duration_label(item.duration_ms),
+        music: MusicMetadata {
+            album: (!album_name.is_empty()).then_some(Credit {
+                name: album_name,
+                target: None,
+            }),
+            ..MusicMetadata::default()
+        },
+        key,
+        position: Some(position),
+        playable: true,
+        item: Some(item.clone()),
+        local_recording: Some(download.recording),
+        ..Row::default()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_download(item: Item) -> Download {
+    Download {
+        item,
+        bytes: 123,
+        recording: offline::Recording::fixture(),
     }
 }
 
@@ -263,11 +348,11 @@ pub struct SaveSummary {
     pub total: usize,
 }
 impl SaveSummary {
-    fn from_tracks(tracks: &[String], available: &HashMap<String, Item>) -> Self {
+    fn from_tracks(tracks: &[String], available: &HashMap<String, Download>) -> Self {
         Self {
             present: tracks
                 .iter()
-                .filter(|id| available.contains_key(*id))
+                .filter(|id| local_track(available, id).is_some())
                 .count(),
             total: tracks.len(),
         }
@@ -890,11 +975,24 @@ struct StoredCollection {
     tracks: Vec<String>,
 }
 impl StoredCollection {
-    fn summary(&self, available: &HashMap<String, Item>) -> SaveSummary {
+    fn into_playlist(self) -> Option<LegacyPlaylist> {
+        let kind = match self.kind {
+            Kind::Manual => PlaylistKind::Manual,
+            Kind::Derived => PlaylistKind::Derived,
+            _ => return None,
+        };
+        Some(LegacyPlaylist {
+            title: self.title,
+            kind,
+            tracks: self.tracks,
+        })
+    }
+
+    fn summary(&self, available: &HashMap<String, Download>) -> SaveSummary {
         SaveSummary::from_tracks(&self.tracks, available)
     }
 
-    fn detail_page(self, available: &HashMap<String, Item>) -> Page {
+    fn detail_page(self, available: &HashMap<String, Download>) -> Page {
         detail_page(self.title, self.kind, &self.tracks, available)
     }
 }
@@ -911,6 +1009,12 @@ impl Index {
             .into_iter()
             .filter(move |entry| entry.scope == scope)
     }
+    fn playlist(self, scope: &str, playlist_key: &str) -> Option<LegacyPlaylist> {
+        self.in_scope(scope)
+            .find(|entry| entry.key == playlist_key)?
+            .into_playlist()
+    }
+
     fn empty() -> Self {
         Self {
             version: 1,
@@ -950,6 +1054,13 @@ struct IndexDir(OwnedFd);
 impl IndexDir {
     fn open_default() -> Result<Self, ApiError> {
         storage(local_storage::open_default(ROOT)).map(Self)
+    }
+    fn read_existing() -> Result<Index, ApiError> {
+        match local_storage::open_default_existing(ROOT) {
+            Ok(dir) => Self(dir).read(),
+            Err(Errno::NOENT) => Ok(Index::empty()),
+            Err(err) => storage(Err(err)),
+        }
     }
     #[cfg(test)]
     fn open(path: &std::path::Path) -> Result<Self, ApiError> {
@@ -1177,6 +1288,7 @@ fn audio_error(e: offline::Error) -> ApiError {
         Busy => error("The download store is busy. Try again shortly."),
         Storage => error("Unable to access private download storage."),
         Damaged => error("The downloaded file or store layout is invalid."),
+        RecordingChanged => error("This download changed."),
         UnsupportedAudio => error("This audio cannot be played on this device."),
         InvalidMedia => error("Unable to verify a track’s download."),
         Offline => OFFLINE,
@@ -1393,6 +1505,7 @@ mod tests {
         for err in [
             offline::Error::Api(CHANGED),
             offline::Error::InvalidMedia,
+            offline::Error::RecordingChanged,
             offline::Error::Full,
         ] {
             assert_eq!(handle_track_error(err), Err(audio_error(err)));
@@ -1532,6 +1645,7 @@ mod tests {
             PlaylistKind::Manual,
             membership.tracks,
         )
+        .await
         .unwrap();
         assert_eq!(page.total, Some(0));
         assert!(page.rows.is_empty());
@@ -1766,8 +1880,8 @@ mod tests {
         let _admission = disk.admit().unwrap();
         let principal = "a".repeat(64);
         let foreign = "b".repeat(64);
-        let key = "c".repeat(64);
-        let sibling_key = "d".repeat(64);
+        let key = collection_key(&principal, "playlists", "known-source");
+        let sibling_key = collection_key(&principal, "albums", "known-source");
         let ids: Vec<_> = ["saved", "missing", "saved", "another-missing"]
             .into_iter()
             .cycle()
@@ -1784,6 +1898,22 @@ mod tests {
         ]});
         create_v1_fixture(&path, &fixture);
 
+        let untouched = stdfs::read(path.join(INDEX)).unwrap();
+        let exact = disk.read().unwrap().playlist(&principal, &key).unwrap();
+        assert_eq!(exact.title, "Legacy playlist");
+        assert_eq!(
+            exact.tracks.iter().map(String::as_str).collect::<Vec<_>>(),
+            ids
+        );
+        for key in [
+            sibling_key.clone(),
+            collection_key(&principal, "playlists", "other-source"),
+            collection_key(&foreign, "playlists", "known-source"),
+        ] {
+            assert!(disk.read().unwrap().playlist(&principal, &key).is_none());
+        }
+        assert_eq!(stdfs::read(path.join(INDEX)).unwrap(), untouched);
+
         let entry = disk
             .read()
             .unwrap()
@@ -1794,20 +1924,27 @@ mod tests {
             .unwrap()
             .project()
             .unwrap();
-        let available = HashMap::from([("saved".into(), saved)]);
+        let available = HashMap::from([("saved".into(), synthetic_download(saved))]);
         assert_eq!(
             list_row(entry.clone(), &available).detail,
             "581 of 1161 songs available"
         );
+        let empty = entry.clone().detail_page(&HashMap::new());
+        assert_eq!(empty.total, Some(TOTAL as u64));
+        assert!(empty.rows.is_empty() && empty.status.is_empty());
         let page = entry.detail_page(&available);
         assert_eq!(page.total, Some(TOTAL as u64));
-        assert_eq!(page.status, "580 songs not available on this device.");
-        assert_eq!(page.rows.len(), TOTAL);
-        for (i, (row, id)) in page.rows.iter().zip(ids).enumerate() {
-            assert_eq!(row.position, Some(i as u64));
+        assert!(page.status.is_empty());
+        assert_eq!(page.rows.len(), 581);
+        for (row, (position, id)) in page
+            .rows
+            .iter()
+            .zip(ids.into_iter().enumerate().filter(|(_, id)| *id == "saved"))
+        {
+            assert_eq!(row.position, Some(position as u64));
             assert_eq!(row.id, id);
-            assert_eq!(row.playable, id == "saved");
-            assert_eq!(row.item.is_some(), row.playable);
+            assert!(row.playable && row.item.is_some());
+            assert_eq!(row.local_recording.as_ref(), Some(&available[id].recording));
             assert!(row.playback.is_none());
         }
 
@@ -1986,14 +2123,20 @@ mod tests {
                 .unwrap()
         };
         let mut available = HashMap::from([
-            ("two".into(), fixture_item("two")),
-            ("one".into(), fixture_item("one")),
+            ("two".into(), synthetic_download(fixture_item("two"))),
+            ("one".into(), synthetic_download(fixture_item("one"))),
         ]);
         assert_eq!(
             list_row(entry.clone(), &available).detail,
             "3 of 3 songs available"
         );
-        assert!(entry.clone().detail_page(&available).status.is_empty());
+        let full = entry.clone().detail_page(&available);
+        assert!(full.status.is_empty());
+        assert!(
+            full.rows
+                .iter()
+                .all(|row| { row.local_recording.as_ref() == Some(&available[&row.id].recording) })
+        );
         available.remove("two"); // A single removal invalidates both duplicate slots.
         assert_eq!(
             entry.summary(&available),
@@ -2014,18 +2157,12 @@ mod tests {
                 .iter()
                 .map(|r| (r.position, r.id.as_str(), r.playable))
                 .collect::<Vec<_>>(),
-            [
-                (Some(0), "two", false),
-                (Some(1), "one", true),
-                (Some(2), "two", false)
-            ]
+            [(Some(1), "one", true)]
         );
-        assert!(
-            page.rows
-                .iter()
-                .all(|r| r.playback.is_none() && r.playable == r.item.is_some())
-        );
-        assert_eq!(page.status, "2 songs not available on this device.");
+        assert!(page.rows.iter().all(|r| r.playback.is_none()
+            && r.playable == r.item.is_some()
+            && r.local_recording.as_ref() == Some(&available[&r.id].recording)));
+        assert!(page.status.is_empty());
 
         let foreign = account("https://other.invalid");
         let foreign_scope = scope(&foreign).unwrap();
