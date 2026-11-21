@@ -5,11 +5,12 @@ import { OverflowMenu } from "overflow-menu.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
 import { DockLayout, PlayerBar } from "playback.slint";
+import { DeviceRow } from "output-picker.slint";
 import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings, SettingCard } from "settings.slint";
 import { PlaybackTools, WorkspaceRail } from "workspace-parts.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { ArtistCredit }
+export { ArtistCredit, DeviceRow }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
@@ -19,8 +20,6 @@ export struct QueueRow {
     key: string, track-id: string, title: string, subtitle: string, current: bool, upcoming: bool,
     credits: [ArtistCredit], album-id: string, album-name: string,
 }
-export struct DeviceRow { id: string, name: string, selected: bool, available: bool, can-play: bool }
-
 export component AppWindow inherits Window {
     title: "Spofify Desktop";
     icon: @image-url("../assets/spofify-logo.svg");
@@ -600,7 +599,8 @@ export component AppWindow inherits Window {
                                 spacing: 6px;
                                 for device in root.device-rows: SettingCard {
                                     title: device.name;
-                                    detail: device.selected ? "Selected output" : !device.available ? "Not available" : device.can-play ? "Available for playback" : "Cannot play audio";
+                                    detail: !device.available ? "Not available" : device.selected ? "Selected output"
+                                        : device.can-play ? "Available for playback" : "Cannot play audio";
                                     FlexboxLayout {
                                         flex-wrap: wrap; spacing: 6px;
                                         if !device.selected: Action {
@@ -608,7 +608,7 @@ export component AppWindow inherits Window {
                                             primary: true; clicked => { root.device-action("select", device.id); }
                                         }
                                         if device.selected: Action {
-                                            text: "Rename device"; enabled: !root.local-mode;
+                                            text: "Rename device"; enabled: !root.local-mode && device.available;
                                             property <int> resume: root.form-focus-serial;
                                             changed resume => { if root.form-return == "device-rename" { self.take-focus(); } }
                                             clicked => { root.form-return = "device-rename"; root.form-name = device.name; root.form-mode = "device-rename"; root.device-action("prepare-rename", device.id); }
@@ -836,6 +836,11 @@ export component AppWindow inherits Window {
             }
             x: 0px; y: parent.height - root.player-height; width: parent.width; height: root.player-height;
             track: root.now-title; subtitle: root.now-detail; output: root.output-name;
+            devices: root.device-rows;
+            device-status: root.reconnecting ? "Connecting…" : root.device-status;
+            device-picker-context: root.page-kind + "|" + root.page-key + "|" + root.account-label
+                + (root.dock-visible && root.signed-in ? "|shown" : "|hidden");
+            select-output(id) => { root.device-action("select", id); }
             credits: root.now-credits; metadata-enabled: !root.local-mode;
             album-id: root.now-album-id; album-name: root.now-album-name;
             status: root.playback-status;

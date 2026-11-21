@@ -23,7 +23,7 @@ from time import monotonic, sleep
 sys.dont_write_bytecode = True
 from audio_smoke_wire import audio_fixture, SECONDS, TITLE, TRACK_ID
 from fixture import Failure, check, private_env
-from native import COMPACT, WIDE, assert_dock_layout, bounds, desktop, element_type, verify, wait
+from native import COMPACT, ESCAPE, WIDE, assert_dock_layout, bounds, desktop, element_type, verify, wait
 
 
 @contextmanager
@@ -191,13 +191,15 @@ def check_mini_player(win, peer, cursor, pcm):
     print("PASS repeat modes and shuffle through the selected account; app-only PCM attenuation, mute, and keyboard restore", flush=True)
 
     win.click_element(control("Playback devices"))
-    win.title("Devices")
-    win.click("Back")
+    win.find("Close playback devices", roles=("Button",))
+    win.absent("Devices", roles=("Text",))
+    win.key(ESCAPE)
+    win.absent("Close playback devices", roles=("Button",))
     win.click_element(control("Lyrics"))
     win.find(r"Fixture verse[\s\S]*", roles=("Text",))
     win.click("Back")
     control("Lyrics")
-    print("PASS dock opens the existing device selector and server-backed Lyrics in Now Playing", flush=True)
+    print("PASS dock opens the anchored device selector and server-backed Lyrics in Now Playing", flush=True)
 
 
 def run(win, ready, admitted, media, requests, pcm):

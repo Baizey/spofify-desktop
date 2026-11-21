@@ -848,10 +848,15 @@ def playlist_overflow(window):
 
 def empty_devices(window, restore, *, wide, observer=False, capture=None):
     window.click("Playback devices")
+    window.click("Manage devices")
     window.title("Devices")
     if observer:
-        window.find("Selected output")
         window.absent("Deselect", roles=("Button",))
+        selected = window.title("Selected output")
+        selected_card = containing_item(window.elements(), "SettingCard", selected)
+        check(selected_card and any(window.matches(e, "Rename device") and e.get("accessibleEnabled")
+                                    for e in window.subtree(selected_card)),
+              "the selected desktop output must still offer rename")
         name = window.title("Acceptance observer")
         card = containing_item(window.elements(), "SettingCard", name)
         check(card, "missing Devices card for the real Go observer")

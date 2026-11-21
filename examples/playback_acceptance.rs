@@ -1,7 +1,83 @@
 //! Disposable AppWindow fixture: no account, network, audio, or profile workers.
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode, VecModel};
+use std::{
+    fs::{self, File},
+    io::Write,
+    path::PathBuf,
+    rc::Rc,
+    time::Duration,
+};
 
 slint::include_modules!();
+
+fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
+    let journal_path = PathBuf::from(std::env::var_os("SPOFIFY_PICKER_FIXTURE_JOURNAL")?);
+    let journal =
+        Rc::new(File::create(&journal_path).expect("create disposable device picker journal"));
+    let row = |id: &str, name: &str, selected, available, can_play| DeviceRow {
+        id: id.into(),
+        name: name.into(),
+        selected,
+        available,
+        can_play,
+    };
+    let mut rows = vec![
+        row("desktop-1", "Desktop speakers", true, true, true),
+        row("remote-7", "Studio receiver", false, true, true),
+        row("remote-12", "Travel speaker", false, false, true),
+        row("viewer-6", "Library browser", false, true, false),
+    ];
+    rows.extend((1..=8).map(|i| {
+        row(
+            &format!("extra-{i}"),
+            &format!("Room output {i:02}"),
+            false,
+            true,
+            true,
+        )
+    }));
+    ui.set_output_name(rows[0].name.clone());
+    ui.set_device_rows(ModelRc::new(VecModel::from(rows)));
+
+    let weak = ui.as_weak();
+    let events = journal.clone();
+    ui.on_device_action(move |op, id| {
+        writeln!(&*events, "device\t{op}\t{id}").expect("record device action");
+        if op == "select" {
+            let ui = weak.unwrap();
+            let mut rows: Vec<_> = ui.get_device_rows().iter().collect();
+            if let Some(chosen) = rows
+                .iter()
+                .find(|device| device.id == id && device.available && device.can_play)
+            {
+                ui.set_output_name(chosen.name.clone());
+                for device in &mut rows {
+                    device.selected = device.id == id;
+                }
+                // Match the engine's snapshot replacement, without claiming a real output.
+                ui.set_device_rows(ModelRc::new(VecModel::from(rows)));
+            }
+        }
+    });
+
+    let control = journal_path.with_extension("control");
+    let timer = Timer::default();
+    let weak = ui.as_weak();
+    timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
+        let Ok(command) = fs::read_to_string(&control) else {
+            return;
+        };
+        let ui = weak.unwrap();
+        match command.trim() {
+            "change-page-key" => ui.set_page_key("fixture-new-history-context".into()),
+            "drop-dock" => ui.set_now_track_id("".into()),
+            "restore-dock" => ui.set_now_track_id("one".into()),
+            _ => panic!("unknown disposable picker control: {command:?}"),
+        }
+        fs::remove_file(&control).expect("acknowledge disposable picker control");
+    });
+    Some((journal, timer))
+}
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
@@ -49,10 +125,15 @@ fn main() -> Result<(), slint::PlatformError> {
         .collect::<Vec<_>>();
     ui.set_queue_rows(ModelRc::new(VecModel::from(rows)));
 
+    let (picker_journal, _picker_control) = picker_fixture(&ui).unzip();
     let weak = ui.as_weak();
     ui.on_navigate(move |route| {
         let ui = weak.unwrap();
-        ui.set_can_back(route == "now");
+        if let Some(events) = &picker_journal {
+            writeln!(&**events, "navigate\t{route}").expect("record navigation");
+            ui.set_page_title(if route == "devices" { "Devices" } else { "" }.into());
+        }
+        ui.set_can_back(route == "now" || (picker_journal.is_some() && route == "devices"));
         ui.set_page_kind(if route == "back" {
             "history".into()
         } else {
