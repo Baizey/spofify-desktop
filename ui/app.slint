@@ -1307,20 +1307,27 @@ export component AppWindow inherits Window {
                         if root.queue-has-upcoming: Action { text: "Clear upcoming"; height: 32px; quiet: true; enabled: root.queue-controls && !root.editor-open; clicked => { root.queue-action("clear", ""); } }
                     }
                     Divider { }
-                    queue-order := ReorderList {
+                    Rectangle {
                         visible: shell.queue-order-edit;
                         vertical-stretch: self.visible ? 1 : 0;
                         min-height: 0px;
                         max-height: self.visible ? 65535px : 0px;
-                        rows: root.queue-order-rows;
-                        initial-index: 1;
-                        writable: root.queue-order-writable;
-                        commit-pending: root.queue-order-awaiting-echo;
-                        scope-key: self.visible && root.queue-shown ? root.queue-order-token : "";
-                        line-variant: root.inspection-reorder-line;
-                        reduced-motion: root.reduced-motion;
-                        placed(key, after) => {
-                            if self.scope-key != "" { root.queue-order-drop(self.scope-key, key, after); }
+                        queue-order := ReorderList {
+                            // Use the same overlay-scrollbar margin as normal Queue.
+                            x: 0px; y: 0px; width: parent.width + queue-pane.inset-right; height: parent.height;
+                            visible: parent.visible;
+                            rows: root.queue-order-rows;
+                            queue-style: true;
+                            scrollbar-margin: queue-pane.inset-right;
+                            initial-index: 1;
+                            writable: root.queue-order-writable;
+                            commit-pending: root.queue-order-awaiting-echo;
+                            scope-key: self.visible && root.queue-shown ? root.queue-order-token : "";
+                            line-variant: root.inspection-reorder-line;
+                            reduced-motion: root.reduced-motion;
+                            placed(key, after) => {
+                                if self.scope-key != "" { root.queue-order-drop(self.scope-key, key, after); }
+                            }
                         }
                     }
                     queue-lane := FocusScope {
