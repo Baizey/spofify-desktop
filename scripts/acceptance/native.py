@@ -81,18 +81,13 @@ class Window:
         # through the dock. A returned player root doesn't prove the transport
         # was returned, so replace any partial dock with its complete subtree.
         if tree["truncated"]:
-            player = element_id(elements, "player")
-            if player:
-                handles = [player["handle"]]
-            else:
-                lookup = self.mcp.value("find_elements_by_id", {
-                    "windowHandle": self.handle, "elementsId": "AppWindow::player"})
-                # Slint's protobuf JSON omits the repeated field when there are no matches.
-                check(isinstance(lookup, dict) and (not lookup or "elementHandles" in lookup),
-                      "invalid playback dock lookup response")
-                handles = lookup.get("elementHandles", [])
-                check(isinstance(handles, list), "invalid playback dock handles")
-            check(len(handles) <= 1, "unexpected duplicate playback dock")
+            lookup = self.mcp.value("find_elements_by_id", {
+                "windowHandle": self.handle, "elementsId": "AppWindow::player"})
+            # Slint's protobuf JSON omits the repeated field when there are no matches.
+            check(isinstance(lookup, dict) and (not lookup or "elementHandles" in lookup),
+                  "invalid playback dock lookup response")
+            handles = lookup.get("elementHandles", [])
+            check(isinstance(handles, list) and len(handles) <= 1, "invalid or duplicate playback dock handles")
             for handle in handles:
                 dock = self.subtree({"handle": handle})
                 def handle_key(element):
@@ -111,9 +106,10 @@ class Window:
     def matches(element, pattern):
         return re.fullmatch(pattern, element.get("accessibleLabel") or "", re.IGNORECASE) is not None
 
-    def find(self, pattern, timeout=10, roles=None):
+    def find(self, pattern, timeout=10, roles=None, *, within=None):
         def matches():
-            return next((element for element in self.elements() if self.matches(element, pattern)
+            elements = self.elements() if within is None else self.subtree(within, max_elements=1000)
+            return next((element for element in elements if self.matches(element, pattern)
                          and (roles is None or element.get("accessibleRole") in roles)), None)
         return wait(pattern, matches, timeout)
 
@@ -140,8 +136,8 @@ class Window:
         self.mcp.call("click_element", {"elementHandle": element["handle"],
                                         "action": "DoubleClick" if double else "SingleClick"})
 
-    def click(self, pattern):
-        element = self.find(pattern, roles=("Button", "Checkbox"))
+    def click(self, pattern, *, within=None):
+        element = self.find(pattern, roles=("Button", "Checkbox"), within=within)
         check(element.get("accessibleEnabled", True), f"native control disabled: {pattern}")
         self.click_element(element)
 
@@ -183,16 +179,22 @@ class Window:
     def title(self, name, timeout=10):
         return self.find(re.escape(name), timeout=timeout, roles=("Text",))
 
-    def scroll_catalog(self, delta):
-        width = self.window_properties()["size"]["width"] / self.properties["scaleFactor"]
+    def scroll_catalog(self, delta, *, within=None):
+        if within is None:
+            x, y = self.dimensions()[0] / 2, 350
+        else:
+            left, top, right, bottom = bounds(within)
+            x, y = (left + right) / 2, (top + bottom) / 2
         self.mcp.call("dispatch_pointer_scroll", {"windowHandle": self.handle,
-            "position": {"x": width / 2, "y": 350}, "deltaX": 0, "deltaY": delta})
+            "position": {"x": x, "y": y}, "deltaX": 0, "deltaY": delta})
 
-    def drag_slider(self, fraction):
-        slider = self.find("Playback position", roles=("Slider",))
+    def drag_slider(self, fraction, *, within=None):
+        region = player_bar(self) if within is None else within
+        slider = self.find("Playback position", roles=("Slider",), within=region)
         check(slider.get("accessibleEnabled"), "playback slider is disabled")
-        # Drag the visible rail, not a model value or the hidden Slider's center.
-        rail = wait("rendered seek rail", lambda: element_type(self.elements(), "SeekBar"), 3)
+        # Drag the visible rail in the same surface, not the other player's rail.
+        rail = element_type(self.subtree(region, max_elements=1000), "SeekBar")
+        check(rail and contains(rail, slider), "playback slider is outside its rendered seek rail")
         x, y, right, bottom = bounds(rail)
         check(right - x >= 32 and bottom > y, f"rendered seek rail has no usable pointer target: {bounds(rail)}")
         self.mcp.call("drag_element", {"elementHandle": rail["handle"],
@@ -298,17 +300,69 @@ def named(window, elements, pattern, role="Button"):
     return next((e for e in elements if window.matches(e, pattern) and e.get("accessibleRole") == role), None)
 
 
-def assert_dock_layout(window, title=DOCK_TITLE):
-    elements = window.elements()
-    dock = element_type(elements, "PlayerBar")
-    catalog = element_id(elements, "catalog-scroll")
-    check(dock and catalog, "missing catalog viewport or dock in the Slint tree")
+def player_bar(window, elements=None):
+    elements = window.elements() if elements is None else elements
+    docks = [e for e in elements if element_type([e], "PlayerBar")]
+    check(len(docks) == 1, f"expected exactly one signed-in dock, found {len(docks)}")
+    check(not element_type(elements, "PlaybackTools") and not element_id(elements, "playback-tools"),
+          "removed playback toolbar is still present")
+    return docks[0]
+
+
+def assert_dock_anchor(window, elements=None):
+    elements = window.elements() if elements is None else elements
+    dock = player_bar(window, elements)
+    work = element_id(elements, "work")
+    check(work, "missing workspace above the dock")
     left, top, right, bottom = bounds(dock)
     width, height = window.dimensions()
-    check(abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
-    max_height = 150 if width < 820 else 100
+    check(abs(bounds(work)[3] - top) <= 1, "workspace and dock do not meet without overlap")
+    max_height = 160 if width < 820 else 100  # Compact metadata reserves extra height at large density.
     check(left == 0 and abs(right - width) <= 1 and abs(bottom - height) <= 1 and 48 < bottom - top <= max_height,
           f"dock not anchored to client bottom or unexpected height: {bounds(dock)}")
+    return dock
+
+
+def dock_identity(window, elements=None):
+    dock = assert_dock_anchor(window, elements)
+    return dock["handle"], bounds(dock)
+
+
+def assert_empty_dock(window):
+    dock = assert_dock_anchor(window)
+    elements = window.subtree(dock, max_elements=1000)
+    check(not any(element_type(elements, kind) for kind in ("Cover", "CreditLine", "AlbumLine", "Clock"))
+          and not any(window.matches(e, r"Now playing:.*|No song selected|(?:\d+:)?\d+:\d{2}") for e in elements),
+          "empty dock exposes track metadata, artwork, or clocks")
+    transport = element_type(elements, "Transport")
+    assert_transport(window, transport, "empty dock")
+    transport_controls = window.subtree(transport)
+    for label in ("Previous track", "Play|Pause", "Next track"):
+        check(not named(window, transport_controls, label).get("accessibleEnabled"), f"empty dock enables {label}")
+    seek = named(window, elements, "Playback position", "Slider")
+    assert_usable(seek, "disabled empty dock seek slider", 80, 20)
+    check(contains(dock, seek) and not seek.get("accessibleEnabled"), "empty dock seek is clipped or enabled")
+    controls = [("Transport", transport), ("Seek", seek)]
+    for label, role in (("Play queue", "Button"), ("Playback devices", "Button"),
+                        ("(Unmute|Mute) desktop playback", "Button"), ("Desktop volume", "Slider")):
+        control = named(window, elements, label, role)
+        check(control and contains(dock, control) and control.get("accessibleEnabled"),
+              f"empty dock clips or disables {label}")
+        controls.append((label, control))
+    assert_disjoint(controls)
+    lyrics = named(window, elements, "Lyrics")
+    check(not lyrics or not lyrics.get("accessibleEnabled"), "empty dock enables Lyrics without a track")
+    return dock["handle"], bounds(dock)
+
+
+def assert_dock_layout(window, title=DOCK_TITLE):
+    elements = window.elements()
+    dock = assert_dock_anchor(window, elements)
+    left, top, right, bottom = bounds(dock)
+    width, height = window.dimensions()
+    catalog = element_id(elements, "catalog-scroll")
+    check(catalog and abs(bounds(catalog)[3] - top) <= 1, "catalog viewport and dock do not meet without overlap")
+    check(bottom - top <= (150 if width < 820 else 100), "populated dock exceeds the default-density height budget")
     dock_controls = window.subtree(dock, max_elements=1000)
     transport = element_type(dock_controls, "Transport")
     assert_transport(window, transport, "dock")
@@ -335,6 +389,7 @@ def assert_dock_layout(window, title=DOCK_TITLE):
     # may shift to leave enough room for both metadata and output controls.
     check(bounds(track_info)[0] - left <= 36 and right - max(bounds(e)[2] for _, e in right_controls) <= 36,
           f"dock content is inset instead of using both window edges at {width:g}px")
+    check(right_controls[0][1].get("accessibleEnabled"), "dock Lyrics is disabled with a track")
     print(f"PASS dock geometry: {width:g}×{height:g} logical, height {bottom - top:g}, controls disjoint", flush=True)
 
 
@@ -360,20 +415,22 @@ def assert_queue_columns(window):
 
 
 def full_player(window, title, name, width, failures):
-    window.click(title)  # Strict pointer activation: no keyboard or accessibility fallback.
+    before = dock_identity(window)
+    window.click(title, within=player_bar(window))  # Strict pointer activation, no fallback.
     try:
-        wait("full-player page", lambda: element_type(window.elements(), "NowPlaying"), timeout=3)
+        page = wait("full-player page", lambda: element_type(window.elements(), "NowPlaying"), timeout=3)
     except Failure:
         window.pixels(name + "-pointer-failed", width)
         raise
     print(f"PASS {width}px dock identity opens full player by pointer", flush=True)
-    window.find("Play queue", roles=("Button",))
-    window.find("Playback devices", roles=("Button",))
-    window.find(r"Synthetic Tone \d{3}", roles=("Text",))
+    check(dock_identity(window) == before, "opening Now Playing replaced or moved the dock")
+    dock = player_bar(window)
+    for label in ("Play queue", "Playback devices", "Lyrics"):
+        control = window.find(label, roles=("Button",), within=dock)
+        check(control.get("accessibleEnabled"), f"dock {label} is disabled in Now Playing")
+    window.find(r"Synthetic Tone \d{3}", roles=("Text",), within=page)
     window.pixels(name, width)
     with verify(failures, name + " playback geometry"):
-        page = element_type(window.elements(), "NowPlaying")
-        check(page, "missing full-player page")
         elements = window.subtree(page, max_elements=1000)
         slider = named(window, elements, "Playback position", "Slider")
         rail = element_type(elements, "SeekBar")
@@ -382,11 +439,11 @@ def full_player(window, title, name, width, failures):
         check(rail and contains(rail, slider), "full-player seek slider escapes its rail")
         assert_transport(window, transport, "full player")
         assert_disjoint((("full-player seek rail", rail), ("full-player transport", transport)))
-    if not any(window.matches(e, "Lyrics") for e in window.elements()):
-        window.scroll_catalog(-360)
-        window.find("Lyrics", roles=("Text",), timeout=3)
+    if not named(window, window.subtree(page, max_elements=1000), "Lyrics", "Text"):
+        window.scroll_catalog(-360, within=page)
+        window.find("Lyrics", roles=("Text",), within=page, timeout=3)
         window.pixels(name + "-details", width)
-        window.scroll_catalog(360)
+        window.scroll_catalog(360, within=page)
 
 
 @contextmanager
@@ -573,6 +630,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         if ready is not None:
             window.resize(DESKTOP)
         window.find("Sign in")
+        check(not element_type(window.elements(), "PlayerBar"), "signed-out window renders a playback dock")
         def enabled_remember_login():
             option = login_options(window, required=True)
             return option if option.get("accessibleEnabled") else None
@@ -608,6 +666,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 real_playlist_actions(window, api, ready)
             return
         pane_layout(window, wide=True)
+        assert_empty_dock(window)
         window.pixels("02-signed-in", DESKTOP[0])
 
         if synthetic:
@@ -703,6 +762,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 baseline = pcm.stat().st_size
             # Short fixture clips can already advance by the time the native
             # click returns. Verify the cursor and queue in the original delta.
+            before_selection = assert_empty_dock(window)
             track_face(window, occurrence=1, double=True)
             delta = observe("double-click to replace the Go queue", lambda _: True, timeout=20, replacement=True)
             rows, cursor = delta["queue"].get("rows", []), delta.get("cursor", {})
@@ -714,7 +774,8 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 with verify(failures, "real Go online PCM"):
                     wait("220 Hz Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                     print("PASS real Go online track rendered 220 Hz PCM", flush=True)
-            window.find(DOCK_TITLE, roles=("Button",))
+            window.find(DOCK_TITLE, roles=("Button",), within=player_bar(window))
+            check(dock_identity(window) == before_selection, "starting playback moved or replaced the empty dock")
             window.click("Back")
             restore_playlists()
             window.absent("Back", roles=("Button",))
@@ -724,7 +785,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 if mode != DESKTOP:
                     window.resize(mode)
                 window.title(PLAYLIST)
-                pane_layout(window, wide=True, docked=True, can_go_back=True)
+                pane_layout(window, wide=True, can_go_back=True)
                 queue_state(window, populated=True)
                 window.pixels(f"04-dock-{mode[0]}", mode[0])
                 with verify(failures, f"dock geometry at {mode[0]}"):
@@ -738,13 +799,15 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 with verify(failures, f"dock geometry at {mode[0]}"):
                     assert_dock_layout(window)
             window.resize(COMPACT)
-            window.find(DOCK_TITLE, roles=("Button",))
-            pane_layout(window, wide=False, docked=True, can_go_back=True)
+            dock = player_bar(window)
+            window.find(DOCK_TITLE, roles=("Button",), within=dock)
+            before_pause = dock_identity(window)
+            pane_layout(window, wide=False, can_go_back=True)
             window.pixels("05-dock-compact", COMPACT[0])
             with verify(failures, "compact dock geometry"):
                 assert_dock_layout(window)
-            if any(window.matches(e, "Pause") and e.get("accessibleRole") == "Button" for e in window.elements()):
-                window.click("Pause")
+            if named(window, window.subtree(dock), "Pause"):
+                window.click("Pause", within=dock)
 
             def paused_selection(snapshot):
                 player = snapshot["player"]
@@ -753,8 +816,9 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                     cursor["key"] == row["key"] for row in player["queue"])
 
             observe("paused or finished playback retains a canonical queue occurrence", paused_selection)
-            wait("paused dock transport", lambda: not any(window.matches(e, "Pause") for e in window.elements()))
-            pane_layout(window, wide=False, docked=True, can_go_back=True)
+            window.find("Play", roles=("Button",), within=dock)
+            check(dock_identity(window) == before_pause, "pausing moved or replaced the dock")
+            pane_layout(window, wide=False, can_go_back=True)
             assert_dock_layout(window)
             window.pixels("06-dock-paused-compact", COMPACT[0])
             print("PASS canonical paused selection retains the dock and its controls", flush=True)
@@ -762,6 +826,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             full_player(window, DOCK_TITLE, "07-player-compact", COMPACT[0], failures)
             window.click("Back")
             window.title(PLAYLIST)
+            check(dock_identity(window) == before_pause, "Back from Now Playing moved or replaced the dock")
             window.resize(WIDE)
 
         album = next(target["name"] for target in ready["targets"] if target["kind"] == "album")
@@ -782,13 +847,15 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         window.section(SAVED)
         window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
         pane_layout(window, wide=True)
+        before_saved_play = assert_empty_dock(window)
         window.find(f"Play {TRACK}", timeout=15, roles=("Button",))
         window.pixels("11-offline-ready")
         if pcm is not None:
             baseline = pcm.stat().st_size
         track_face(window, double=True)
         window.section(SAVED)
-        window.find("Now playing: Synthetic Tone 001")
+        window.find("Now playing: Synthetic Tone 001", roles=("Button",), within=player_bar(window))
+        check(dock_identity(window) == before_saved_play, "offline Play moved or replaced the empty dock")
         window.pixels("12-offline-dock")
         if pcm is not None:
             with verify(failures, "real Go saved/offline PCM"):
@@ -798,6 +865,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
         full_player(window, f"Now playing: {TRACK}", "13-now-playing-wide", WIDE[0], failures)
         window.click("Back")
         window.section(SAVED)
+        check(dock_identity(window) == before_saved_play, "Back to Saved offline moved or replaced the dock")
         window.click("Settings")
         window.click("Go online")
         window.find("Work offline", roles=("Button",))

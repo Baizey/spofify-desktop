@@ -15,6 +15,7 @@ export component SeekBar inherits Rectangle {
     in property <bool> enabled;
     in property <[float]> waveform;
     in property <color> track-background: Theme.bg;
+    in property <bool> position-known: true;
     callback seek(float);
     height: 24px;
     min-width: 0px;
@@ -50,7 +51,7 @@ export component SeekBar inherits Rectangle {
         background: root.track-background;
         accessible-role: none;
         Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: parent.width - 16px; height: 3px; background: Theme.line; border-radius: 2px; }
-        if root.waveform.length == 0: Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: (parent.width - 16px) * root.ratio; height: 3px; background: root.accent; border-radius: 2px; }
+        if root.position-known && root.waveform.length == 0: Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: (parent.width - 16px) * root.ratio; height: 3px; background: root.accent; border-radius: 2px; }
         for sample[i] in root.waveform: Rectangle {
             x: 8px + (parent.width - 16px) * i / max(1, root.waveform.length);
             width: max(1px, (parent.width - 16px) / max(1, root.waveform.length) - 1px);
@@ -59,7 +60,7 @@ export component SeekBar inherits Rectangle {
             border-radius: 1px;
             background: i < root.ratio * root.waveform.length ? root.accent : Theme.line;
         }
-        Rectangle { x: 3px + (parent.width - 16px) * root.ratio; y: (parent.height - 11px) / 2; width: 11px; height: 11px; border-radius: 6px; background: root.enabled ? root.accent : Theme.muted; }
+        if root.position-known: Rectangle { x: 3px + (parent.width - 16px) * root.ratio; y: (parent.height - 11px) / 2; width: 11px; height: 11px; border-radius: 6px; background: root.enabled ? root.accent : Theme.muted; }
     }
 }
 
@@ -102,7 +103,8 @@ export component Transport inherits Rectangle {
             clicked => { root.previous(); }
         }
         PlaybackAction {
-            width: 42px; height: 42px; primary: true; round: true; icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available;
+            width: 42px; height: 42px; primary: root.available; round: true;
+            icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available;
             accessible-label: root.playing ? "Pause" : "Play";
             changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.toggle(); }
@@ -135,20 +137,24 @@ component Clock inherits Caption {
 component VolumeSlider inherits Rectangle {
     in property <float> level;
     in property <bool> muted;
+    in property <bool> enabled;
     callback adjusted(float);
-    property <color> accent: SeekBarStyle.accent(slider.has-focus, root.muted ? Theme.muted : Theme.primary);
+    property <color> accent: SeekBarStyle.accent(root.enabled && slider.has-focus, root.muted ? Theme.muted : Theme.primary);
     height: 38px;
+    opacity: root.enabled ? 1 : 0.48;
+    function adjust(value: float) { if root.enabled { root.adjusted(value); } }
     changed level => { slider.value = root.level; }
     slider := Slider {
         y: 3px; width: parent.width; height: 26px;
+        enabled: root.enabled;
         minimum: 0; maximum: 100; step: 5;
         value: root.level;
         accessible-label: "Desktop volume";
         accessible-description: root.muted ? "This app only · Muted" : "This app only";
-        accessible-action-increment => { root.adjusted(min(100, self.value + self.step)); }
-        accessible-action-decrement => { root.adjusted(max(0, self.value - self.step)); }
-        accessible-action-set-value(value) => { if value.is-float() { root.adjusted(clamp(value.to-float(), 0, 100)); } }
-        changed(value) => { root.adjusted(value); }
+        accessible-action-increment => { root.adjust(min(100, self.value + self.step)); }
+        accessible-action-decrement => { root.adjust(max(0, self.value - self.step)); }
+        accessible-action-set-value(value) => { if value.is-float() { root.adjust(clamp(value.to-float(), 0, 100)); } }
+        changed(value) => { root.adjust(value); }
     }
     Rectangle {
         y: slider.y; height: slider.height;
@@ -172,14 +178,16 @@ export global DockLayout {
     out property <length> compact-metadata-height: 62px + 40px * max(0, Theme.density - 1);
     out property <length> status-height: 18px;
 
-    // Reserve both lanes while a track is present: requests can change the
-    // message and available duration without moving the dock or workspace.
+    // Reserve both lanes across empty and active playback, including requests
+    // that change the message or duration without moving the workspace.
     public pure function height(layered: bool) -> length {
         return self.status-height + (layered ? self.compact-metadata-height + 69px : 82px);
     }
 }
 
 export component PlayerBar inherits Rectangle {
+    in property <bool> has-track;
+    in property <bool> locked;
     in property <string> track;
     in property <string> subtitle;
     in property <string> output;
@@ -201,12 +209,11 @@ export component PlayerBar inherits Rectangle {
     in property <bool> modes-enabled;
     in property <float> volume;
     in property <bool> muted;
-    in property <string> page;
+    in property <bool> on-now-page;
     in property <bool> queue-open;
     in property <[ArtistCredit]> credits;
     in property <string> album-id;
     in property <string> album-name;
-    in property <bool> metadata-enabled: true;
     callback page-action(string, string);
     callback previous();
     callback next();
@@ -222,7 +229,8 @@ export component PlayerBar inherits Rectangle {
         if by-pointer { queue-trigger.take-pointer-focus(); }
         else { queue-trigger.take-focus(); }
     }
-    public function focus-lyrics() { lyrics-trigger.take-focus(); }
+    public function focus-lyrics() { if lyrics-trigger.enabled { lyrics-trigger.take-focus(); } }
+    public function dismiss-devices() { devices-trigger.dismiss(); }
     property <length> edge: clamp(root.width * 0.018, 12px, 24px);
     property <length> column-gap: root.layered ? 10px : 16px;
     property <length> inner-width: root.width - 2 * root.edge;
@@ -248,25 +256,32 @@ export component PlayerBar inherits Rectangle {
         border-width: root.title-repaint-phase ? 1px : 0px;
         property <bool> show-cover: self.width >= 150px;
         Cover {
-            visible: parent.show-cover;
+            visible: root.has-track && parent.show-cover;
             x: 0px; width: root.layered ? 40px : 48px; height: self.width;
             y: (parent.height - self.height)/2; artwork: root.artwork;
         }
-        VerticalLayout {
-            x: parent.show-cover ? (root.layered ? 49px : 61px) : 0px;
+        if !root.has-track: Caption {
+            x: 4px; width: max(0px, parent.width - self.x); height: parent.height;
+            text: "Nothing playing";
+            vertical-alignment: center;
+            accessible-role: text; accessible-label: self.text;
+        }
+        if root.has-track: VerticalLayout {
+            x: track-info.show-cover ? (root.layered ? 49px : 61px) : 0px;
             width: max(0px, parent.width - self.x); height: parent.height;
             alignment: center;
             TextTarget {
                 text: root.track; label: "Now playing: " + root.track; font-weight: 700;
+                interactive: !root.locked && !root.on-now-page;
                 activated => { root.navigate("now"); }
             }
             if root.credits.length > 0 || root.subtitle != "": CreditLine {
-                credits: root.credits; fallback: root.subtitle; interactive: root.metadata-enabled;
+                credits: root.credits; fallback: root.subtitle; interactive: !root.locked;
                 height: max(20px, self.font-size + 6px);
                 activated(id) => { root.page-action("artist", id); }
             }
             if root.album-name != "": AlbumLine {
-                text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
+                text: root.album-name; album-id: root.album-id; links-enabled: !root.locked;
                 activated => { root.page-action("album", root.album-id); }
             }
         }
@@ -284,43 +299,59 @@ export component PlayerBar inherits Rectangle {
         Transport {
             x: (parent.width - self.width)/2;
             y: root.layered ? 0px : 7px;
-            playing: root.playing; available: root.can-toggle; skip-enabled: root.can-skip;
-            shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.modes-enabled;
+            playing: root.has-track && root.playing;
+            available: root.has-track && !root.locked && root.can-toggle;
+            skip-enabled: root.has-track && !root.locked && root.can-skip;
+            shuffle: root.shuffle; repeat-mode: root.repeat-mode;
+            modes-enabled: !root.locked && root.modes-enabled;
             previous => { root.previous(); } toggle => { root.toggle(); } next => { root.next(); }
             queue-action(op, key) => { root.queue-action(op, key); }
         }
-        if root.duration > 0: HorizontalLayout { y: root.layered ? 44px : 52px; height: 22px; spacing: 4px;
-            Clock { seconds: root.elapsed; }
-            SeekBar { elapsed: root.elapsed; duration: root.duration; track-background: Theme.rail; enabled: root.can-seek; horizontal-stretch: 1; seek(v) => { root.seek(v); } }
-            Clock { seconds: root.duration; }
+        HorizontalLayout {
+            y: root.layered ? 44px : 52px; height: 22px; spacing: 4px;
+            visible: !root.has-track || root.duration > 0;
+            property <bool> show-time: root.has-track && root.duration > 0;
+            Clock { seconds: root.elapsed; visible: parent.show-time; }
+            SeekBar {
+                elapsed: parent.show-time ? root.elapsed : 0;
+                duration: parent.show-time ? root.duration : 0;
+                position-known: parent.show-time;
+                track-background: Theme.rail; horizontal-stretch: 1;
+                enabled: parent.show-time && !root.locked && root.can-seek;
+                seek(v) => { root.seek(v); }
+            }
+            Clock { seconds: root.duration; visible: parent.show-time; }
         }
     }
     output-tools := HorizontalLayout {
         x: root.width - self.width - root.edge; width: self.preferred-width; y: (root.metadata-height - self.height)/2; height: 38px; spacing: 3px;
         lyrics-trigger := PlaybackAction {
             width: 36px; icon: "lyrics"; quiet: true; accessible-label: "Lyrics";
+            enabled: root.has-track && !root.locked;
             clicked => { root.navigate("lyrics"); }
         }
         queue-trigger := PlaybackAction {
-            width: 36px; icon: "≡"; quiet: true; selected: root.queue-open || root.page == "queue";
-            accessible-label: "Play queue"; accessible-expanded: root.queue-open;
+            width: 36px; icon: "≡"; quiet: true; selected: root.queue-open;
+            enabled: !root.locked;
+            accessible-label: "Play queue"; accessible-expandable: true; accessible-expanded: root.queue-open;
             clicked => { root.toggle-queue(self.pointer-focused); }
         }
-        OutputPicker {
+        devices-trigger := OutputPicker {
             width: 36px; window-width: root.width;
+            enabled: !root.locked;
             devices: root.devices; output: root.output; status: root.device-status;
             context-key: root.device-picker-context; offline: root.offline;
             device-action(op, id, name) => { root.device-action(op, id, name); }
         }
         PlaybackAction {
             width: 36px; icon: root.muted || root.volume == 0 ? "volume-muted" : "volume";
-            quiet: true; selected: root.muted;
+            quiet: true; selected: root.muted; enabled: !root.locked;
             accessible-label: root.muted ? "Unmute desktop playback" : "Mute desktop playback";
             clicked => { root.mute-toggle(); }
         }
         VolumeSlider {
             width: clamp(root.width * 0.085, 64px, 116px);
-            level: root.volume * 100; muted: root.muted;
+            level: root.volume * 100; muted: root.muted; enabled: !root.locked;
             adjusted(value) => { root.volume-change(value / 100); }
         }
     }

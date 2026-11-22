@@ -20,7 +20,7 @@ sys.dont_write_bytecode = True
 from fixture import Failure, check, private_env
 from native import (COMPACT, DESKTOP, ESCAPE, MINIMUM, RETURN, ULTRAWIDE, WIDE,
                     assert_dock_layout, assert_queue_columns, assert_transport, bounds,
-                    contains, desktop, element_id, element_type, named, wait)
+                    contains, desktop, dock_identity, element_id, element_type, named, player_bar, wait)
 
 
 TAB = "\t"
@@ -40,8 +40,8 @@ def move_off(window):
     window.mcp.call("move_pointer", {"windowHandle": window.handle, "position": {"x": 5, "y": 5}})
 
 
-def button(window, label):
-    return window.find(label, roles=("Button",))
+def button(window, label, *, within=None):
+    return window.find(label, roles=("Button",), within=within)
 
 
 def rect_pixels(image, element):
@@ -56,8 +56,8 @@ def has_ring(image, control):
                for y in range(top, top + 3)) >= 6
 
 
-def ring(window, label, visible):
-    control = button(window, label)
+def ring(window, label, visible, *, within=None):
+    control = button(window, label, within=within)
     image = frame(window)
     check(has_ring(image, control) == visible,
           f"{label}: expected {'a visible keyboard ring' if visible else 'no pointer ring'}")
@@ -167,13 +167,38 @@ def live_sliders(window):
     print("PASS seek and volume drags reach their UI callbacks", flush=True)
 
 
+def wide_now_transport(window):
+    # WIDE is a compositor mode; compensate for its decoration to hit the
+    # exact 720px client height and the non-short single-column layout.
+    _, height = window.dimensions()
+    if height != WIDE[1]:
+        window.resize((WIDE[0], round(2 * WIDE[1] - height)))
+    check(window.dimensions() == WIDE, f"expected the exact {WIDE} Now Playing client")
+    check(element_id(window.elements(), "queue-pane"), "wide fixture must start with Queue open")
+    dock = player_bar(window)
+    window.click("Now playing: Synthetic Tone 001", within=dock)
+    page = wait("wide Now Playing", lambda: element_type(window.elements(), "NowPlaying"))
+    elements = window.subtree(page, max_elements=1000)
+    viewport = element_id(elements, "scroll")
+    transport = element_type(elements, "Transport")
+    check(viewport and transport and contains(viewport, transport, slack=0),
+          "1280×720 Now Playing transport is clipped before scrolling with Queue open")
+    check(element_id(window.elements(), "queue-pane"), "entering wide Now Playing closed the default Queue")
+    move_off(window)
+    painted_transport(window, transport, "1280×720 Now Playing with Queue open")
+    window.click("Back")
+    window.section("History")
+
+
 def run(window):
     for mode in (MINIMUM, COMPACT, (819, 640), (820, 640), WIDE, DESKTOP, ULTRAWIDE):
         window.resize(mode)
         assert_dock_layout(window)
+        if mode == WIDE:
+            wide_now_transport(window)
         if mode == ULTRAWIDE:
             queue_pixels(window)
-            dock = element_type(window.elements(), "PlayerBar")
+            dock = player_bar(window)
             transport = element_type(window.subtree(dock, max_elements=1000), "Transport")
             painted_transport(window, transport, "ultrawide dock (pause)")
         if mode == MINIMUM:
@@ -184,51 +209,71 @@ def run(window):
 
     window.resize(COMPACT)
     focus_checks(window)
-    dock = element_type(window.elements(), "PlayerBar")
-    transport = element_type(window.subtree(dock, max_elements=1000), "Transport")
-    painted_transport(window, transport, "compact dock (pause)")
-    window.click("Previous track")
-    window.absent("Playback position", roles=("Slider",))
-    no_seek = element_type(window.elements(), "PlayerBar")
-    check(bounds(no_seek) == bounds(dock), "compact dock moved when the seek control was unavailable")
-    window.click("Next track")
+    dock = player_bar(window)
+    before = dock_identity(window)
+    dock_transport = element_type(window.subtree(dock, max_elements=1000), "Transport")
+    painted_transport(window, dock_transport, "compact dock (pause)")
+    window.click("Previous track", within=dock_transport)
+    check(not named(window, window.subtree(dock), "Playback position", "Slider"),
+          "dock shows a seek control for a track of unknown duration")
+    check(dock_identity(window) == before, "unknown duration moved or replaced the dock")
+    window.click("Next track", within=dock_transport)
     title = "Now playing: Synthetic Tone 002"
-    button(window, title)
+    button(window, title, within=dock)
     assert_dock_layout(window)
-    window.click("Next track")
+    window.click("Next track", within=dock_transport)
     long_title = title + " — with a longer title"
-    title_box = tuple(map(round, bounds(button(window, long_title))))
+    title_box = tuple(map(round, bounds(button(window, long_title, within=dock))))
     move_off(window)
     long_frame = frame(window).crop(title_box)
-    window.click("Next track")
-    button(window, title)
+    window.click("Next track", within=dock_transport)
+    button(window, title, within=dock)
     move_off(window)
     difference = ImageChops.difference(long_frame, frame(window).crop(title_box)).getbbox()
     check(difference and difference[2] - difference[0] >= 12, "dock title fixture did not visibly change")
-    window.click("Pause")
+    window.click("Pause", within=dock_transport)
     move_off(window)
-    ring(window, "Play", False)
-    painted_transport(window, transport, "compact dock (play)")
-    window.click(title)
+    ring(window, "Play", False, within=dock_transport)
+    window.key(" ")
+    ring(window, "Pause", True, within=dock_transport)
+    window.key(" ")
+    ring(window, "Play", True, within=dock_transport)
+    painted_transport(window, dock_transport, "compact dock (play)")
+    check(dock_identity(window) == before, "skip or play/pause moved or replaced the dock")
+
+    window.click(title, within=dock)
     page = wait("Now Playing after pointer activation", lambda: element_type(window.elements(), "NowPlaying"))
-    window.absent(re.escape(title), roles=("Button",))
-    window.scroll_catalog(-150)
+    check(dock_identity(window) == before, "entering Now Playing moved or replaced the dock")
+    check(not named(window, window.subtree(dock), re.escape(title)), "dock title repeats the active Now Playing route")
+    window.scroll_catalog(-150, within=page)
     transport = element_type(window.subtree(page, max_elements=1000), "Transport")
     move_off(window)
     painted_transport(window, transport, "compact Now Playing (play)")
-    ring(window, "Play", False)
-    window.click("Play")
+    ring(window, "Play", False, within=transport)
+    window.click("Play", within=transport)
     move_off(window)
-    ring(window, "Pause", False)
+    ring(window, "Pause", False, within=transport)
     painted_transport(window, transport, "compact Now Playing (pause)")
+    button(window, "Pause", within=dock_transport)
     window.key(" ")
-    ring(window, "Play", True)
+    ring(window, "Play", True, within=transport)
+    ring(window, "Play", False, within=dock_transport)
     window.key(TAB)
-    ring(window, "Play", False)
-    ring(window, "Next track", True)
+    ring(window, "Play", False, within=transport)
+    ring(window, "Next track", True, within=transport)
+    check(dock_identity(window) == before, "in-page transport moved or replaced the dock")
+
+    window.click("Lyrics", within=dock)
+    heading = window.find("Lyrics", roles=("Text",), within=page)
+    check(contains(page, heading), "dock Lyrics did not reveal the reader inside the active compact player")
     window.key(ESCAPE)
-    button(window, title)
-    print("PASS dock title changes, navigates by pointer, hides, and returns on Back", flush=True)
+    window.section("History")
+    button(window, title, within=dock)
+    lyrics = button(window, "Lyrics", within=dock)
+    wait("visible dock Lyrics focus after asynchronous Back", lambda: has_ring(frame(window), lyrics))
+    check(dock_identity(window) == before, "Back from Now Playing moved or replaced the dock")
+    print("PASS one bottom dock survives track, transport, Now Playing and Back; keyboard focus stays on the active surface",
+          flush=True)
 
 
 def main():

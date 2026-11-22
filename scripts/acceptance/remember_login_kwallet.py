@@ -22,10 +22,10 @@ from xml.sax.saxutils import escape
 
 sys.dont_write_bytecode = True
 from fixture import Api, Failure, check, fixture, private_env, stop
-from native import REMEMBER_LOGIN, bounds, desktop, element_id, login_options, verify, wait
+from native import REMEMBER_LOGIN, bounds, desktop, element_id, login_options, player_bar, verify, wait
 from remember_login import SERVER, assert_idle, disabled_login, interrupted, no_profile_secrets, store_metadata
 from remember_login_wire import recorded_origin, vacant_output
-from workspace_checks import open_manual, open_playlists
+from workspace_checks import open_manual, open_playlists, play_manual
 
 DBUS = "org.freedesktop.DBus"
 NAME = "org.freedesktop.secrets"
@@ -161,7 +161,7 @@ def play_pause(window, receipt, pcm):
     open_manual(window)
     mark = len(receipt.events())
     baseline = pcm.stat().st_size
-    window.click("Play")
+    play_manual(window)
     wait("owned canonical Go playlist selection", lambda: ("owned-playlist-selection",) in receipt.events(mark),
          timeout=15)
     events = receipt.events(mark)
@@ -174,7 +174,7 @@ def play_pause(window, receipt, pcm):
     wait("Go media request after explicit Play", lambda: ("media",) in receipt.events(mark))
     wait("220 Hz from restored desktop", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
     pause_mark = len(receipt.events())
-    window.click("Pause")
+    window.click("Pause", within=player_bar(window))
     wait("Go Pause command", lambda: ("client", "pause") in receipt.events(pause_mark))
     print("PASS native Pause reached real Go (private null output)", flush=True)
 

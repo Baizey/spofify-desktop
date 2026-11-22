@@ -165,6 +165,7 @@ export component Action inherits Rectangle {
             if reason != FocusReason.window-activation { root.keyboard-focus-changed(false); }
         }
         key-pressed(event) => {
+            if !root.enabled || !root.keyboard-focusable { return reject; }
             if event.text == Key.Space || event.text == Key.Return {
                 root.pointer-focused = false;
                 if !event.repeat { root.clicked(); }
@@ -363,7 +364,7 @@ export component Field inherits Rectangle {
         edited => { root.edited(); }
         accepted => { root.accepted(); }
     }
-    if root.clearable && root.text != "": Action { x: parent.width - 35px; y: (parent.height - 28px)/2; width: 28px; height: 28px; quiet: true; icon: "×"; accessible-label: "Clear search"; clicked => { root.text = ""; root.cleared(); root.take-focus(); } }
+    if root.clearable && root.text != "": Action { x: parent.width - 35px; y: (parent.height - 28px)/2; width: 28px; height: 28px; quiet: true; icon: "×"; enabled: root.enabled; accessible-label: "Clear search"; clicked => { root.text = ""; root.cleared(); root.take-focus(); } }
 }
 
 export component Cover inherits Rectangle {

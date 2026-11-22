@@ -189,8 +189,10 @@ export component NowPlaying inherits Rectangle {
     property <length> stage-width: max(0px, min(root.split ? 1152px : 520px, scroll.visible-width - 2 * root.gutter));
     property <length> deck-lane: root.split ? root.stage-width * 0.46 : root.stage-width;
     property <length> lane-gap: root.split ? clamp(root.stage-width * 0.065, 44px, 76px) : 0px;
+    // Fit the deck transport in the usual single-column viewport above the dock.
+    property <length> deck-reserve: 286px + 36px * max(0, Theme.density - 1);
     property <length> art-size: min(root.deck-lane, root.short ? clamp(scroll.visible-height - 260px, 44px, 164px)
-        : root.split ? clamp(scroll.visible-height - 307px, 164px, 450px) : clamp(scroll.visible-height - 242px, 145px, 342px));
+        : root.split ? clamp(scroll.visible-height - 307px, 164px, 450px) : clamp(scroll.visible-height - root.deck-reserve, 145px, 342px));
     property <length> record-width: min(root.deck-lane, max(root.split ? 334px : 370px, root.art-size));
     property <length> deck-top: root.short ? 47px : root.split ? 65px : 55px;
     property <bool> has-context: root.context-id != "" && root.context-name != "" &&

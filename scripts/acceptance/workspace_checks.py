@@ -5,7 +5,8 @@ from time import monotonic, sleep
 
 from fixture import Failure, check
 from native import (ALT, CONTROL, DESKTOP, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
-                    RETURN, SAVED, TRACK, assert_disjoint, bounds, contains, element_id, element_type, wait)
+                    RETURN, SAVED, TRACK, assert_disjoint, assert_dock_anchor, assert_empty_dock, bounds, contains,
+                    dock_identity, element_id, element_type, named, player_bar, wait)
 from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
                      LARGE_MANUAL, LARGE_PLAYLIST_COUNT, LARGE_RULE, NAME_ONLY,
                      NEGATIVE_PLAYLISTS, SINGLE_TRACK, SUMMARY)
@@ -24,6 +25,12 @@ def open_playlists(window):
 def open_manual(window):
     window.click(f"Open {PLAYLIST}")
     manual_detail(window)
+
+
+def play_manual(window):
+    actions = element_id(window.elements(), "playlist-tools")
+    check(actions, "missing playlist actions for Play")
+    window.click("Play", within=actions)
 
 
 def manual_detail(window, timeout=10):
@@ -110,9 +117,11 @@ def editor_actions(summary):
 
 def cancel_and_reopen_editor(window, title, action, activate):
     heading, field = EDITORS[action]
+    dock = dock_identity(window)
 
     def opened():
         window.title(heading)
+        check(dock_identity(window) == dock, f"opening {action} moved or replaced the dock")
         if field:
             item = window.find(field, roles=("TextInput",))
             if action == "Rename":
@@ -130,6 +139,7 @@ def cancel_and_reopen_editor(window, title, action, activate):
     window.key(ESCAPE)
     window.title(title)
     window.absent("Cancel", roles=("Button",))
+    check(dock_identity(window) == dock, f"cancelling {action} moved or replaced the dock")
 
 
 def manual_actions(window, *, capture=None):
@@ -455,8 +465,10 @@ def playlist_row_menu(window):
 
 
 def rules_editor(window, capture=None):
+    dock = dock_identity(window)
     window.click("New rules playlist")
     window.title("New rules playlist")
+    check(dock_identity(window) == dock, "opening the new rules editor moved or replaced the dock")
     window.find("Playlist rules definition", roles=("TextInput",))
     window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
     window.fill("Playlist name", "Cancelled synthetic draft")
@@ -468,6 +480,7 @@ def rules_editor(window, capture=None):
     window.absent("Playlist rules definition")
     window.absent("Open Cancelled synthetic draft")
     window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
+    check(dock_identity(window) == dock, "cancelling the new rules editor moved or replaced the dock")
     print("PASS rules editor has no connection switch and Cancel restores the playlist listing", flush=True)
 
 
@@ -769,11 +782,11 @@ def check_shortcut_back(window):
     window.absent("Back", roles=("Button",))
 
 
-def search_layout(window, elements, toolbar, *, docked):
+def search_layout(window, elements, toolbar):
     # TextInput excludes the icon and clear affordance; measure the painted Field.
     field = element_id(elements, "search")
-    hero = element_id(elements, "detail-hero")
-    check(field and hero, "missing rendered Search field or catalog content inset")
+    header = element_id(elements, "header-slot")
+    check(field and header, "missing rendered Search field or catalog content inset")
     input_target = window.find("Search (tracks, albums or artists|downloads)", roles=("TextInput",))
     brand = window.title("Spofify")
     tx, ty, tright, tbottom = bounds(toolbar)
@@ -784,33 +797,26 @@ def search_layout(window, elements, toolbar, *, docked):
     check(abs((y + bottom - ty - tbottom) / 2) <= 1
           and abs((y + bottom - bounds(brand)[1] - bounds(brand)[3]) / 2) <= 10,
           f"Search is not centered in the toolbar and aligned with the rail brand: {bounds(field)}")
-    content_left, _, content_right, _ = bounds(hero)
+    content_left, _, content_right, _ = bounds(header)
     inset = x - tx
     check(0 < inset <= 40 and abs(x - content_left) <= 2,
           f"Search is not aligned with the catalog gutter: {x:g} vs {content_left:g}")
     usable_right = tright - inset
     check(abs(content_right - usable_right) <= 2,
           f"catalog content does not fill its usable width: ends at {content_right:g}, expected {usable_right:g}")
-    tools = element_id(elements, "playback-tools")
-    if docked:
-        check(abs(right - usable_right) <= 2,
-              f"Search leaves unused toolbar space: field ends at {right:g}, usable edge at {usable_right:g}")
-    else:
-        check(tools, "missing playback shortcuts in the toolbar without a dock")
-        cx, cy, cr, cb = bounds(tools)
-        check(0 <= cx - right <= 12 and ty <= cy < cb <= tbottom and abs(cr - usable_right) <= 2,
-              f"Search and playback shortcuts do not fill the toolbar: {bounds(field)}, {bounds(tools)}")
+    check(abs(right - usable_right) <= 2,
+          f"Search leaves unused toolbar space: field ends at {right:g}, usable edge at {usable_right:g}")
     return x, right - x
 
 
-def pane_layout(window, *, wide, docked=False, queue_open=None, can_go_back=False):
+def pane_layout(window, *, wide, queue_open=None, can_go_back=False):
     elements = window.elements()
     work = element_id(elements, "work")
     rail = element_id(elements, "rail")
     toolbar = element_id(elements, "toolbar")
     catalog = element_id(elements, "catalog-scroll")
     queue = element_id(elements, "queue-pane")
-    dock = element_type(elements, "PlayerBar")
+    dock = assert_dock_anchor(window, elements)
     check(work and rail and toolbar and catalog, "missing work area, navigation rail, toolbar or catalog viewport")
     width, height = window.dimensions()
     x, y, right, bottom = bounds(catalog)
@@ -820,17 +826,11 @@ def pane_layout(window, *, wide, docked=False, queue_open=None, can_go_back=Fals
     check(wx == rx == wy == ry == 0 and wright == width
           and abs(rright - x) <= 2 and abs(rbottom - bottom) <= 2 and abs(wbottom - bottom) <= 2,
           f"navigation rail and workspace do not line up: {bounds(rail)}, {bounds(work)}, {bounds(catalog)}")
-    if docked:
-        check(dock and abs(bottom - bounds(dock)[1]) <= 1, "workspace does not meet the populated dock")
-    else:
-        check(not dock, "empty state renders a playback dock")
-        check(abs(bottom - height) <= 1,
-              f"empty state reserves a bottom strip: viewport ends at {bottom:g}, client ends at {height:g}")
-        window.absent("No song selected|Now playing: Nothing playing")
+    check(abs(bottom - bounds(dock)[1]) <= 1, "catalog viewport does not meet the dock")
     tx, ty, tright, tbottom = bounds(toolbar)
     check(ty == 0 and abs(tx - x) <= 1 and abs(tright - right) <= 1,
           f"toolbar and catalog have different edges: {bounds(toolbar)}, {bounds(catalog)}")
-    search = search_layout(window, elements, toolbar, docked=docked)
+    search = search_layout(window, elements, toolbar)
     if can_go_back:
         back = window.find("Back", roles=("Button",))
         bx, by, br, bb = bounds(back)
@@ -860,27 +860,32 @@ def pane_layout(window, *, wide, docked=False, queue_open=None, can_go_back=Fals
 def root_navigation(window, *, wide):
     window.section("History")
     expected_search = pane_layout(window, wide=wide)
+    dock = assert_empty_dock(window)
     # Exercise the actual rail, including both ways away from Saved offline.
     for label in ("Playlists", "Saved offline", "History", "Saved offline", "Settings", "Playlists"):
         window.click(label)
         window.section(label)
         actual_search = pane_layout(window, wide=wide)
+        check(dock_identity(window) == dock, f"root {label} moved or replaced the empty dock")
         check(all(abs(a - b) <= 1 for a, b in zip(actual_search, expected_search)),
               f"Search x/width moved on root {label}: {actual_search} vs {expected_search}")
     window.find(f"Open {PLAYLIST}", roles=("Button",))
     width, _ = window.dimensions()
-    print(f"PASS {width:g}px no empty dock/strip; rail roots (including Saved offline) have no Back and preserve Search x/width",
+    print(f"PASS {width:g}px rail roots preserve the empty dock and Search x/width without adding Back",
           flush=True)
 
 
 def playlist_back(window, *, wide):
     before = pane_layout(window, wide=wide)
+    dock = dock_identity(window)
     open_manual(window)
     detail = pane_layout(window, wide=wide, can_go_back=True)
+    check(dock_identity(window) == dock, "opening the playlist detail moved or replaced the dock")
     check(all(abs(a - b) <= 1 for a, b in zip(detail, before)),
           f"Back shifted Search: root {before}, detail {detail}")
     window.click("Back")
     playlists_root(window)
+    check(dock_identity(window) == dock, "returning from playlist detail moved or replaced the dock")
     print(f"PASS {window.dimensions()[0]:g}px playlist detail Back returns to the Playlists root", flush=True)
 
 
@@ -989,9 +994,9 @@ def playlist_overflow(window):
 
 
 def empty_devices(window, restore, *, wide, observer=False, capture=None):
-    # The no-track toolbar uses the same popup as the playback dock.
-    window.absent(r"Now playing: .+", roles=("Button",))
-    window.click("Playback devices")
+    dock = assert_empty_dock(window)
+    switch = window.find("Playback devices", roles=("Button",), within=player_bar(window))
+    window.click_element(switch)
     window.title("Playback devices")
     window.absent("Back|Manage devices|Deselect", roles=("Button",))
     restore()
@@ -1013,27 +1018,32 @@ def empty_devices(window, restore, *, wide, observer=False, capture=None):
     window.click("Close playback devices")
     restore()
     window.absent("Back", roles=("Button",))
-    print(f"PASS {window.dimensions()[0]:g}px no-track toolbar device popup preserves page and focus", flush=True)
+    check(dock_identity(window) == dock, "opening and dismissing devices moved or replaced the empty dock")
+    print(f"PASS {window.dimensions()[0]:g}px empty-dock device popup preserves page and focus", flush=True)
 
 
 def queue_state(window, populated):
     window.title(QUEUE_TITLE)
-    window.find("Close play queue", roles=("Button",))
+    pane = element_id(window.elements(), "queue-pane")
+    check(pane, "missing queue pane")
+    window.find("Close play queue", roles=("Button",), within=pane)
     if populated:
         for label in QUEUE_CONTROLS:
-            control = window.find(label, roles=("Button",))
+            control = window.find(label, roles=("Button",), within=pane)
             check(control.get("accessibleEnabled"), f"populated queue has disabled {label}")
         window.title("Now playing")
         window.find("Up next|Played", roles=("Text",))
         window.find(r"Synthetic Tone \d{3}", roles=("Text",))
     else:
-        window.find(r"The queue is empty\..*", roles=("Text",))
+        window.find(r"The queue is empty\..*", roles=("Text",), within=pane)
+        elements = window.subtree(pane, max_elements=1000)
         for label in QUEUE_CONTROLS:
-            window.absent(label, roles=("Button",))
+            check(not named(window, elements, label), f"empty queue pane exposes {label}")
 
 
 def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
     before = window.elements()
+    dock = dock_identity(window, before)
     catalog = element_id(before, "catalog-scroll")
     queue = element_id(before, "queue-pane")
     check(catalog and queue, "wide queue toggle requires both panes")
@@ -1044,10 +1054,12 @@ def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
     resized = element_id(closed, "catalog-scroll")
     check(resized and abs(bounds(resized)[2] - bounds(queue)[2]) <= 2,
           "closing the desktop queue does not give its width back to the catalog")
-    expanded = pane_layout(window, wide=True, docked=populated, queue_open=False, can_go_back=can_go_back)
-    window.click("Play queue")
+    expanded = pane_layout(window, wide=True, queue_open=False, can_go_back=can_go_back)
+    check(dock_identity(window) == dock, "closing the wide queue moved or replaced the dock")
+    window.click("Play queue", within=player_bar(window))
     restore()
-    narrowed = pane_layout(window, wide=True, docked=populated, can_go_back=can_go_back)
+    narrowed = pane_layout(window, wide=True, can_go_back=can_go_back)
+    check(dock_identity(window) == dock, "restoring the wide queue moved or replaced the dock")
     queue_left, _, queue_right, _ = bounds(queue)
     # Each pane uses its own responsive gutter on both sides. Account for
     # that change, not just the width released by the queue pane.
@@ -1060,9 +1072,11 @@ def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
 
 
 def compact_queue(window, restore, *, capture=None, populated=False):
-    window.click("Play queue")
+    dock = dock_identity(window)
+    window.click("Play queue", within=player_bar(window))
     queue_state(window, populated)
     elements = window.elements()
+    check(dock_identity(window, elements) == dock, "opening the compact queue moved or replaced the dock")
     queue = element_id(elements, "queue-pane")
     work = element_id(elements, "work")
     toolbar = element_id(elements, "toolbar")
@@ -1073,12 +1087,13 @@ def compact_queue(window, restore, *, capture=None, populated=False):
           f"compact queue does not fill the workspace below the toolbar: {bounds(queue)}")
     if capture:
         window.pixels(capture)
-    window.click("Play queue")
+    window.click("Play queue", within=player_bar(window))
     restore()
     window.absent("Close play queue", roles=("Button",))
-    window.click("Play queue")
+    window.click("Play queue", within=player_bar(window))
     window.title(QUEUE_TITLE)
     window.click("Close play queue")
     restore()
     window.absent("Close play queue", roles=("Button",))
+    check(dock_identity(window) == dock, "closing the compact queue moved or replaced the dock")
     print("PASS compact queue opens and closes by pointer without losing the catalog route", flush=True)

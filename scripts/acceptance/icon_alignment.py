@@ -14,10 +14,12 @@ def check_frame(path, playing, dock, *, if_clipped=None):
         im = img.convert('RGB')
     w, h = im.size
     # Find the round 42px control from its *painted fill*, not widget coordinates.
-    # The dock is bottom anchored, but the circle need not be window-centered.
-    top = max(0, h - 145) if dock else 0
+    # The default-density captures include the dock even in Now Playing.
+    # Split the two surfaces at the dock edge, not at a transport x coordinate.
+    dock_top = h - (149 if w < 820 else 100)
+    top, bottom = (dock_top, h) if dock else (0, dock_top)
     pixels = im.load()
-    points = {(x, y) for y in range(top, h) for x in range(w)
+    points = {(x, y) for y in range(top, bottom) for x in range(w)
               if pixels[x, y][1] > 170 and pixels[x, y][1] > 1.38 * pixels[x, y][0]
               and 0.7 < pixels[x, y][2] / pixels[x, y][1] < 0.88}
     controls = []

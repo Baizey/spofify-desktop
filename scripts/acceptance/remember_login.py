@@ -25,7 +25,7 @@ sys.dont_write_bytecode = True
 from fixture import Api, check, fixture, private_env, stop
 from native import REMEMBER_LOGIN, bounds, desktop, login_options, wait
 from remember_login_wire import recorded_origin, vacant_output
-from workspace_checks import open_manual, open_playlists
+from workspace_checks import open_manual, open_playlists, play_manual
 
 
 SERVER = "Server( origin| URL| address)?"
@@ -200,7 +200,7 @@ def checks(binary, root, env, go, ready, receipt, keyring, first_socket_after, p
             open_playlists(window)
             open_manual(window)
             play_mark = len(receipt.events())
-            window.click("Play")
+            play_manual(window)
             wait("canonical playlist selection", lambda: ("owned-playlist-selection",) in receipt.events(play_mark))
             wait("post-Play presence", lambda: ("client", "presence") in receipt.events(play_mark))
             events = receipt.events(play_mark)
