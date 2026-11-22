@@ -245,12 +245,12 @@ export component PlayerBar inherits Rectangle {
     property <length> edge: clamp(root.width * 0.018, 12px, 24px);
     property <length> column-gap: root.layered ? 10px : 16px;
     property <length> inner-width: root.width - 2 * root.edge;
-    // After reserving the right-hand controls, give the seek lane two shares
-    // and metadata one, with room for cover and title at the inline breakpoint.
-    // The compact seek lane spans the full bar below the track and tools.
-    property <length> track-and-transport: root.inner-width - output-tools.width - 2 * root.column-gap;
-    property <length> transport-width: root.layered ? root.inner-width
-        : clamp(root.track-and-transport * 2 / 3, 214px, root.track-and-transport - 188px);
+    // The inline lane claims a little under half the inner width to leave
+    // room for titles, with equal clearance on each side for the tools.
+    // The stacked lane has no neighbors; neither lane needs an ultrawide rail.
+    property <length> inline-transport-space: root.inner-width - 2 * (output-tools.width + root.column-gap);
+    property <length> transport-width: min(640px, root.layered ? root.inner-width
+        : min(root.inner-width * 0.46, root.inline-transport-space));
     property <length> metadata-height: root.layered ? DockLayout.compact-metadata-height : root.height - DockLayout.status-height;
     property <bool> title-repaint-phase;
     changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
@@ -268,7 +268,7 @@ export component PlayerBar inherits Rectangle {
     Divider { y: 0px; }
     track-info := Rectangle {
         x: root.edge; y: 0px;
-        width: max(0px, root.layered ? output-tools.x - self.x - root.column-gap : root.track-and-transport - root.transport-width);
+        width: max(0px, (root.layered ? output-tools.x : transport-lane.x) - self.x - root.column-gap);
         height: root.metadata-height;
         // Damage the whole metadata area on title changes, rather than relying
         // on a partial software repaint of the old and new glyphs.
@@ -346,8 +346,8 @@ export component PlayerBar inherits Rectangle {
         text: root.status; color: Theme.tertiary;
         accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
     }
-    Rectangle {
-        width: root.transport-width; x: root.layered ? root.edge : track-info.x + track-info.width + root.column-gap;
+    transport-lane := Rectangle {
+        width: root.transport-width; x: (root.width - self.width) / 2;
         y: root.layered ? root.metadata-height + DockLayout.status-height : 0px;
         height: root.layered ? root.height - self.y : root.metadata-height;
         Transport {

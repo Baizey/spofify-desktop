@@ -9,7 +9,9 @@ use std::{path::Path, time::Duration};
 slint::include_modules!();
 
 type Crop = [u32; 4]; // left, top, right, bottom (exclusive)
-const DOCK: Crop = [391, 637, 939, 665];
+// The seek lane is centered below transport at this fixture's standard size.
+const DOCK: Crop = [320, 637, 960, 665];
+const SEEK_Y: u32 = 649;
 const VOLUME: Crop = [1146, 605, 1258, 641];
 const MUTE_BUTTON: Crop = [1107, 606, 1145, 645];
 const PRIMARY: Rgba<u8> = Rgba([0x66, 0xe3, 0xb4, 255]);
@@ -122,21 +124,30 @@ fn drag(ui: &AppWindow, frames: &Path, label: &str, crop: Crop, x: f32, y: f32, 
     });
 }
 
-fn check_timeline(ui: &AppWindow, frames: &Path, label: &str, crop: Crop, x: f32, y: f32) {
+fn check_timeline(ui: &AppWindow, frames: &Path, label: &str, crop: Crop) -> u32 {
     ui.set_elapsed(96.0);
-    focus(ui, frames, label, crop, PRIMARY, false);
+    let focused = focus(ui, frames, label, crop, PRIMARY, false);
+    // The thumb extends beyond the active track. Sample just inside its
+    // painted right edge instead of assuming the old timeline width.
+    let thumb_x = ink(&focused, crop, FOCUS)
+        .into_iter()
+        .map(|(x, _)| x)
+        .max()
+        .unwrap()
+        - 4;
     press(ui, Key::RightArrow);
     assert!(
         (ui.get_elapsed() - 97.0).abs() < 0.01,
         "{label}: Right did not commit a seek"
     );
-    drag(ui, frames, label, crop, x, y, 50.0);
+    drag(ui, frames, label, crop, thumb_x as f32, SEEK_Y as f32, 50.0);
     assert!(
         ui.get_elapsed() > 107.0,
         "{label}: drag did not commit a seek"
     );
     press(ui, Key::Tab);
     println!("PASS {label}: arrow and drag seek");
+    thumb_x
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -169,9 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     Timer::single_shot(Duration::from_millis(300), move || {
         let ui = weak.unwrap();
-        check_timeline(&ui, &frames, "now-dock-waveform", DOCK, 613.0, 649.0);
+        check_timeline(&ui, &frames, "now-dock-waveform", DOCK);
         ui.set_page_kind("history".into());
-        check_timeline(&ui, &frames, "dock", DOCK, 613.0, 649.0);
+        let thumb_x = check_timeline(&ui, &frames, "dock", DOCK);
         let unmuted = focus(&ui, &frames, "volume", VOLUME, PRIMARY, false);
         press(&ui, Key::RightArrow);
         assert!(
@@ -207,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let disabled = frame(&ui);
         disabled.save(frames.join("disabled-dock.png")).unwrap();
         assert_eq!(
-            *disabled.get_pixel(612, 649),
+            *disabled.get_pixel(thumb_x, SEEK_Y),
             MUTED,
             "disabled seek thumb lost its muted styling"
         );

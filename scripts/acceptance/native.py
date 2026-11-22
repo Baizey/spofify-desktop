@@ -329,6 +329,26 @@ def dock_identity(window, elements=None):
     return dock["handle"], bounds(dock)
 
 
+def assert_dock_center(dock, primary, seek, clocks=()):
+    def midpoint(item):
+        left, _, right, _ = bounds(item)
+        return (left + right) / 2
+
+    row_left, _, row_right, _ = bounds(seek)
+    if clocks:
+        elapsed, duration = clocks
+        row_left, _, elapsed_right, _ = bounds(elapsed)
+        duration_left, _, row_right, _ = bounds(duration)
+        check(elapsed_right <= bounds(seek)[0] and bounds(seek)[2] <= duration_left,
+              "elapsed, seek and duration must be disjoint and in order")
+    dock_cx = midpoint(dock)
+    for label, cx in (("Play/Pause", midpoint(primary)), ("seek", midpoint(seek)),
+                      ("timeline", (row_left + row_right) / 2)):
+        check(abs(cx - dock_cx) <= 1, f"dock {label} center {cx:g} misses dock midpoint {dock_cx:g}")
+    # Approximate user-facing width budget, including the clocks when visible.
+    check(row_right - row_left <= 656, f"dock timeline exceeds the ~640px cap: {row_right - row_left:g}px")
+
+
 def assert_empty_dock(window):
     dock = assert_dock_anchor(window)
     elements = window.subtree(dock, max_elements=1000)
@@ -343,6 +363,7 @@ def assert_empty_dock(window):
     seek = named(window, elements, "Playback position", "Slider")
     assert_usable(seek, "disabled empty dock seek slider", 80, 20)
     check(contains(dock, seek) and not seek.get("accessibleEnabled"), "empty dock seek is clipped or enabled")
+    assert_dock_center(dock, named(window, transport_controls, "Play|Pause"), seek)
     controls = [("Transport", transport), ("Seek", seek)]
     for label, role in (("Play queue", "Button"), ("Playback devices", "Button"),
                         ("(Unmute|Mute) desktop playback", "Button"), ("Desktop volume", "Slider")):
@@ -385,13 +406,16 @@ def assert_dock_layout(window, title=DOCK_TITLE):
     right_controls = [(label, named(window, dock_controls, label)) for label in
                       ("Lyrics", "Play queue", "Playback devices", "(Unmute|Mute) desktop playback")]
     right_controls.append(("Desktop volume", volume))
-    controls = [("Transport", transport), ("Seek rail", rail), ("Track information", track_info), *right_controls]
+    clocks = [(label, named(window, dock_controls, rf"{label} [\d:]+", "Text"))
+              for label in ("Elapsed", "Duration")]
+    controls = [("Transport", transport), ("Seek rail", rail), ("Track information", track_info),
+                *clocks, *right_controls]
     for label, control in controls:
         check(control, f"missing dock control {label}")
         check(contains(dock, control), f"dock control {label} is clipped: {bounds(control)}")
     assert_disjoint(controls)
-    # Measure the occupied edges, not the window midpoint: the middle lane
-    # may shift to leave enough room for both metadata and output controls.
+    assert_dock_center(dock, named(window, dock_controls, "Play|Pause"), rail, [e for _, e in clocks])
+    # The centered lane must not pull metadata or output tools away from the window edges.
     check(bounds(track_info)[0] - left <= 36 and right - max(bounds(e)[2] for _, e in right_controls) <= 36,
           f"dock content is inset instead of using both window edges at {width:g}px")
     check(right_controls[0][1].get("accessibleEnabled"), "dock Lyrics is disabled with a track")
