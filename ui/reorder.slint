@@ -389,7 +389,9 @@ export component ReorderList inherits Rectangle {
 
     function activate-row(index: int) {
         if root.grab == Grab.settling { return; }
-        if root.grab == Grab.keyboard && index == root.source { root.place(); }
+        // The destination delegate receives keyboard accessibility focus in
+        // Queue. Its default action must place the carried occurrence.
+        if root.grab == Grab.keyboard && (index == root.source || index == root.accessible-index) { root.place(); }
         else {
             root.cancel-grab();
             root.select-row(index, true);
@@ -574,8 +576,9 @@ export component ReorderList inherits Rectangle {
             // A little taller than the queue card so the slot stays visible
             // even when the pointer holds the card exactly over its destination.
             property <length> inset: root.queue-style ? (root.line-variant ? 0px : 1px) : 3px;
-            y: clamp(root.slot-top + self.inset, self.inset,
-                max(self.inset, scroll.visible-height - (root.line-variant ? 6px : self.height + 1px)));
+            y: root.queue-style && !root.line-variant ? root.slot-top + self.inset
+                : clamp(root.slot-top + self.inset, self.inset,
+                    max(self.inset, scroll.visible-height - (root.line-variant ? 6px : self.height + 1px)));
             width: root.card-width; height: root.pitch - (root.queue-style && !root.line-variant ? 2px : 6px);
             visible: root.slot-in-view;
             accessible-role: none;
