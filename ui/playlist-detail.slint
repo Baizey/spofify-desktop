@@ -143,17 +143,6 @@ export component PlaylistDetailHeader inherits Rectangle {
                         changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); } }
                         clicked => { root.command("play"); }
                     }
-                    if root.add-songs: DetailCommand {
-                        enabled: root.active;
-                        text: "Add songs"; icon: "+"; height: 42px;
-                        click-scope: root.click-scope;
-                        property <int> resume-add-songs: root.add-songs-focus;
-                        changed resume-add-songs => { if self.enabled { self.take-focus(); } }
-                        changed has-focus => {
-                            if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); }
-                        }
-                        clicked => { root.command("add-songs"); }
-                    }
                     if root.queue: DetailCommand {
                         enabled: root.queue-enabled;
                         text: "Add to queue"; icon: root.tight ? "" : "queue-add"; quiet: true; height: 42px;
@@ -188,6 +177,19 @@ export component PlaylistDetailHeader inherits Rectangle {
                     min-width: self.preferred-width;
                     accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
                 }
+            }
+            // Let the online-only action wrap independently, leaving Play, Queue,
+            // and Save anchored as one shared group in both modes.
+            if root.add-songs: DetailCommand {
+                enabled: root.active;
+                text: "Add songs"; icon: "+"; height: 42px;
+                click-scope: root.click-scope;
+                property <int> resume-add-songs: root.add-songs-focus;
+                changed resume-add-songs => { if self.enabled { self.take-focus(); } }
+                changed has-focus => {
+                    if self.has-focus { root.focused(stack.y + toolbar.y + self.y, self.height); }
+                }
+                clicked => { root.command("add-songs"); }
             }
             manage := HorizontalLayout {
                 horizontal-stretch: 0;

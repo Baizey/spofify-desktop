@@ -322,6 +322,10 @@ def manual_route(view):
     w.click(re.escape("Open " + LONG))
     w.title(LONG)
     action = view.require(ADD, "Button")
+    left, top, right, bottom = bounds(action)
+    port_left, port_top, port_right, port_bottom = bounds(view.viewport())
+    check(port_left <= left < right <= port_right and port_top <= top < bottom <= port_bottom,
+          "Add songs is clipped in the playlist viewport")
     view.park()
     view.capture("manual-01-initiating-route")
     search_field = bounds(view.part("search"))
@@ -544,8 +548,9 @@ def main():
                     popup_cases(view, TYPICAL)
                     resize(window, CONSTRAINED)
                     popup_cases(view, CONSTRAINED)
-                    resize(window, TYPICAL)
+                    resize(window, (480, 790))
                     manual_route(view)
+                    resize(window, TYPICAL)
                     quick_add(view, wire)
                     hidden_continuation(view, wire)
                     if args.explicit_repeat:
