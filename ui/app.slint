@@ -1224,12 +1224,22 @@ export component AppWindow inherits Window {
                                         quick-add-state: self.index < root.search-add-row-states.length ? root.search-add-row-states[self.index] : "";
                                         quick-add-target: root.search-add-selection.name + (root.search-add-selection.detail == "" ? "" : ", " + root.search-add-selection.detail);
                                         quick-add-scope: root.search-add-scope + "|" + self.menu-key + "|" + self.entry.track-id;
+                                        quick-add-focus-changed(owns, pointer) => {
+                                            if owns {
+                                                root.catalog-focused-part = pointer ? "quick-add-pointer" : "quick-add";
+                                            } else if !catalog-scroll.restore-catalog && root.catalog-focused-row == self.index
+                                                && (root.catalog-focused-part == "quick-add" || root.catalog-focused-part == "quick-add-pointer") {
+                                                root.catalog-focused-part = "";
+                                            }
+                                        }
                                         quick-add-focus-evicted(unavailable) => {
-                                            if unavailable { search.take-focus(); }
-                                            else { history-pane.focus(); }
-                                            root.catalog-focused-row = -1;
-                                            root.catalog-focused-part = "";
-                                            root.search-focus-owner = -1;
+                                            if !catalog-scroll.restore-catalog || root.catalog-return-row < 0 {
+                                                if unavailable { search.take-focus(); }
+                                                else { history-pane.focus(); }
+                                                root.catalog-focused-row = -1;
+                                                root.catalog-focused-part = "";
+                                                root.search-focus-owner = -1;
+                                            }
                                         }
                                         quick-add => { root.quick-add-search-track(root.search-add-selection.id, self.entry.track-id, self.index); }
                                         keyboard-focus-changed(owns, on-body) => {

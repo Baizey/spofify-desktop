@@ -323,7 +323,7 @@ def manual_route(view):
     w.title(LONG)
     action = view.require(ADD, "Button")
     left, top, right, bottom = bounds(action)
-    port_left, port_top, port_right, port_bottom = bounds(view.viewport())
+    port_left, port_top, port_right, port_bottom = view.viewport()
     check(port_left <= left < right <= port_right and port_top <= top < bottom <= port_bottom,
           "Add songs is clipped in the playlist viewport")
     view.park()

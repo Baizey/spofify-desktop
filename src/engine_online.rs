@@ -422,6 +422,14 @@ impl Engine {
         }
     }
     fn handle_event(&mut self, event: Event) {
+        let stamp = event.personal_stamp;
+        self.apply_event(event);
+        if let (Some(stamp), Some(socket)) = (stamp, &self.socket) {
+            socket.mark_personal_applied(stamp);
+        }
+    }
+
+    fn apply_event(&mut self, event: Event) {
         let generation = event.generation;
         if self.link() != Link::Connected(generation) {
             return;

@@ -34,6 +34,7 @@ fn signals() -> (
     (
         Signals {
             order_gate: Arc::default(),
+            personal_applied: watch::channel(0).0,
             link: link_tx,
             authority: authority_tx,
             direct_start: Arc::default(),
@@ -141,7 +142,16 @@ async fn quick_add_writer_discards_stale_scoped_reads_before_age_and_keeps_accou
 async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
     use crate::{personal_bridge::PersonalHub, quick_add::Outcome};
 
-    for blocked_by in ["selection", "account", "mode", "expiry", "wire", ""] {
+    for blocked_by in [
+        "selection",
+        "account",
+        "mode",
+        "expiry",
+        "wire",
+        "present",
+        "unrelated",
+        "",
+    ] {
         let (signals, link, authority, events) = signals();
         let (outbound, mut written) = mpsc::channel(2);
         let (actual, _) = watch::channel(None);
@@ -156,6 +166,7 @@ async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
             actual,
             resume_sequence: AtomicU64::new(0),
             order_gate: signals.order_gate.clone(),
+            personal_applied: signals.personal_applied.clone(),
             session: session.clone(),
             task: tokio::spawn(pending()),
         };
@@ -191,6 +202,7 @@ async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
                 .is_ok()
         }));
         let frame = written.try_recv().unwrap();
+        let mut socket = socket;
         match blocked_by {
             "selection" => {
                 a.quick_select(7, None);
@@ -205,9 +217,20 @@ async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
             "expiry" => {
                 session.retire_local_grant();
             }
-            "wire" => {
+            "wire" | "present" | "unrelated" => {
+                let value = if blocked_by == "present" {
+                    let mut summary = quick_playlist("target");
+                    summary["trackCount"] = json!(1);
+                    summary["availableCount"] = json!(1);
+                    summary["revision"] = json!(2);
+                    json!({"change":{"playlist":summary,"entries":{"added":{"id":"occurrence","position":0,
+                        "track":{"kind":"track","id":"song","name":"Song","hasAudio":true,
+                            "coverage":{"tracks":1,"inLibrary":1,"albums":1}}}}}})
+                } else {
+                    json!({"change":{}})
+                };
                 signals
-                    .event(13, EventKind::Personal(json!({"change":{}})), false)
+                    .event(13, EventKind::Personal(value), false)
                     .unwrap();
             }
             "" => {}
@@ -219,17 +242,41 @@ async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
         let ScopedWrite::Quick(quick) = *frame.scoped.unwrap() else {
             panic!("quick write retains its guard")
         };
-        send_quick(&mut ws, frame.raw, quick, &signals)
-            .await
-            .unwrap();
+        let writer = async {
+            let deadline = frame.at + MAX_QUEUE_AGE;
+            if quick_ready(&signals, Some(deadline)).await {
+                send_quick(&mut ws, frame.raw, quick, deadline).await
+            } else {
+                quick.personal.quick_cancel(&quick.ticket);
+                Ok(())
+            }
+        };
+        let apply = async {
+            if matches!(blocked_by, "present" | "unrelated") {
+                // The socket has published but not yet applied an update. Once
+                // applied, only its exact membership can block this write.
+                tokio::task::yield_now().await;
+                let update = socket.events.try_recv().unwrap();
+                let EventKind::Personal(value) = update.kind else {
+                    unreachable!()
+                };
+                hub.receive(7, 13, serde_json::from_value(value).unwrap())
+                    .unwrap();
+                socket.mark_personal_applied(update.personal_stamp.unwrap());
+            }
+        };
+        let (result, ()) = tokio::join!(writer, apply);
+        result.unwrap();
         drop(ws);
-        if blocked_by.is_empty() {
+        if matches!(blocked_by, "" | "unrelated") {
             assert_eq!(
                 read_json(&mut server).await,
                 json!({"type":"personal","command":{"type":"addEntry","playlistId":"target","trackId":"song"}})
             );
             hub.disconnect(7, 13);
-            a.quick_view(7, |v| assert_eq!(v.notice, Some(Outcome::Unconfirmed)));
+            a.quick_view(7, |v| {
+                assert_eq!(v.row("song").outcome, Some(Outcome::Unconfirmed))
+            });
         } else {
             assert!(
                 !matches!(server.next().await, Some(Ok(Message::Text(_)))),
@@ -237,12 +284,109 @@ async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
             );
             a.quick_view(7, |v| {
                 assert_eq!(
-                    v.notice,
-                    (blocked_by != "selection").then_some(Outcome::NotSent)
+                    v.row("song").outcome,
+                    (!matches!(blocked_by, "selection" | "present")).then_some(Outcome::NotSent)
                 );
             });
         }
     }
+}
+
+#[tokio::test]
+async fn quick_add_writer_parks_unapplied_ingress_without_blocking_normal_writes() {
+    use crate::personal_bridge::PersonalHub;
+
+    let (signals, link, authority, events) = signals();
+    let (actual, mut output) = output_state();
+    let mut connection = begin(NEW, "", &mut output, &signals);
+    let generation = connection.generation;
+    let api = Api::new(crate::api::Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
+    let session = api.test_session();
+    let (outbound, mut input) = mpsc::channel(OUTBOUND_CAPACITY);
+    let mut socket = Socket {
+        link,
+        authority,
+        direct_start: signals.direct_start.clone(),
+        events,
+        outbound,
+        actual,
+        resume_sequence: AtomicU64::new(0),
+        order_gate: signals.order_gate.clone(),
+        personal_applied: signals.personal_applied.clone(),
+        session: session.clone(),
+        task: tokio::spawn(pending()),
+    };
+    assert!(matches!(
+        socket.events.try_recv().unwrap().kind,
+        EventKind::Snapshot { .. }
+    ));
+
+    let epoch = 7;
+    let hub = PersonalHub::default();
+    let personal = hub.access();
+    let list = quick_playlist("target");
+    let receive = |update| {
+        hub.receive(epoch, generation, serde_json::from_value(update).unwrap())
+            .unwrap();
+    };
+    hub.begin(epoch, generation);
+    receive(json!({"snapshot":{"playlists":[list.clone()],"recent":[]}}));
+    personal.quick_watch(epoch, true, None);
+    personal.quick_select(epoch, Some("target")).unwrap();
+    receive(json!({"part":{"summary":list,"token":"t","offset":0,"rows":[],"more":false}}));
+    let mode = *session.network_changes().borrow();
+    let ticket = personal.quick_stage(epoch, mode, "target", "song").unwrap();
+    assert!(hub.admit_quick_add(&ticket, || {
+        socket
+            .personal_quick_add(
+                personal.clone(),
+                ticket.clone(),
+                Arc::new(AtomicU64::new(epoch)),
+            )
+            .is_ok()
+    }));
+    signals
+        .event(generation, EventKind::Personal(json!({"change":{}})), false)
+        .unwrap();
+    socket
+        .personal(generation, &PersonalCommand::ClearHistory)
+        .unwrap();
+
+    let (client, server) = tokio::io::duplex(4096);
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+    let script = async {
+        assert_eq!(read_json(&mut server).await["type"], "presence");
+        // Only ClearHistory can pass before the actor applies the published
+        // event, despite being behind Quick Add in the outbound queue.
+        assert_eq!(
+            read_json(&mut server).await,
+            json!({"type":"personal","command":{"type":"clearHistory"}})
+        );
+        let event = socket.events.try_recv().unwrap();
+        let EventKind::Personal(update) = event.kind else {
+            panic!("personal ingress")
+        };
+        let stamp = event.personal_stamp.unwrap();
+        assert_ne!(*signals.personal_applied.borrow(), stamp);
+        receive(update);
+        socket.mark_personal_applied(stamp);
+        assert_eq!(
+            read_json(&mut server).await,
+            json!({"type":"personal","command":{"type":"addEntry","playlistId":"target","trackId":"song"}})
+        );
+        assert!(
+            time::timeout(Duration::from_millis(50), server.next())
+                .await
+                .is_err()
+        );
+        drop(server);
+    };
+    let (ended, ()) = tokio::join!(
+        connection.drive(&mut ws, DEVICE, &mut input, &mut output, &signals),
+        script
+    );
+    assert_eq!(ended, Err(End::Transport));
 }
 
 #[tokio::test]
@@ -261,6 +405,7 @@ async fn order_admission_rejects_published_updates_and_retired_mode() {
         actual,
         resume_sequence: AtomicU64::new(0),
         order_gate: signals.order_gate.clone(),
+        personal_applied: signals.personal_applied.clone(),
         session: session.clone(),
         task: tokio::spawn(pending()),
     };

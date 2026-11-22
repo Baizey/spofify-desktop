@@ -181,7 +181,7 @@ fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
         let song = v.row("song");
         assert!(song.pending && song.visible && !song.can_add);
         assert_eq!(song.membership, Membership::Absent);
-        assert_eq!(v.notice, None);
+        assert_eq!(song.outcome, None);
     });
     receive(
         &hub,
@@ -201,9 +201,209 @@ fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
         let song = v.row("song");
         assert!(!song.pending && !song.visible && !song.can_add);
         assert_eq!(song.membership, Membership::Present);
-        assert_eq!(v.notice, None); // Plain membership; no success/receipt state exists.
+        assert_eq!(song.outcome, None); // Plain membership; no success/receipt state exists.
     });
     a.read(|_, r| assert!(r.playlist().is_some_and(|p| p.stale && p.rows.is_empty())));
+}
+
+#[test]
+fn quick_add_three_distinct_writes_start_and_observe_out_of_order() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    a.quick_filter(EPOCH, true);
+    let first = stage(&a, "a", "first");
+    dispatch(&hub, &a, &first);
+    let second = stage(&a, "a", "second");
+    let third = stage(&a, "a", "third");
+    assert!(a.quick_stage(EPOCH, 2, "a", "third").is_none());
+    assert!(hub.admit_quick_add(&second, || true));
+    assert!(a.quick_stage(EPOCH, 2, "a", "second").is_none());
+    assert!(hub.admit_quick_add(&third, || true));
+    assert!(a.start_quick_add(&third, || true));
+    assert!(a.start_quick_add(&second, || true));
+    a.quick_view(EPOCH, |v| {
+        for song in ["first", "second", "third"] {
+            let row = v.row(song);
+            assert_eq!(row.membership, Membership::Absent);
+            assert!(row.pending && row.visible && !row.can_add && row.outcome.is_none());
+        }
+        assert!(v.row("unused").can_add && !v.at_capacity);
+    });
+    for (index, song) in ["third", "second"].into_iter().enumerate() {
+        receive(
+            &hub,
+            GENERATION,
+            json!({"change": {"playlist": summary("a", index + 1, index as u64 + 2),
+                "entries": {"added": entry(song, song, index)}}}),
+        );
+        a.quick_view(EPOCH, |v| {
+            let row = v.row(song);
+            assert_eq!(row.membership, Membership::Present);
+            assert!(!row.pending && !row.visible && !row.can_add && row.outcome.is_none());
+            assert!(v.row("first").pending);
+            assert_eq!(v.row("second").pending, index == 0);
+        });
+    }
+    elapse(&a, 31);
+    a.quick_view(EPOCH, |v| {
+        assert_eq!(v.row("first").outcome, Some(Outcome::Unconfirmed));
+        assert!(v.row("second").outcome.is_none());
+        assert!(v.row("third").outcome.is_none());
+    });
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change": {"playlist": summary("a", 3, 4),
+            "entries": {"added": entry("foreign-first", "first", 2)}}}),
+    );
+    a.quick_view(EPOCH, |v| {
+        let row = v.row("first");
+        assert_eq!(row.membership, Membership::Present);
+        assert!(!row.pending && !row.visible && !row.can_add && row.outcome.is_none());
+    });
+}
+
+#[test]
+fn quick_add_live_capacity_covers_all_phases_and_releases_one_slot_at_a_time() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let tickets: Vec<_> = (0..8).map(|i| stage(&a, "a", &format!("s{i}"))).collect();
+    dispatch(&hub, &a, &tickets[0]);
+    assert!(hub.admit_quick_add(&tickets[1], || true));
+    a.quick_view(EPOCH, |v| {
+        assert!(v.at_capacity && !v.session_limit && !v.row("extra").can_add);
+        for i in 0..8 {
+            assert!(v.row(&format!("s{i}")).pending);
+        }
+    });
+    assert!(a.quick_stage(EPOCH, 2, "a", "extra").is_none());
+    assert!(a.quick_stage(EPOCH, 2, "a", "s0").is_none());
+    assert!(a.quick_stage(EPOCH, 2, "a", "s1").is_none());
+    assert!(a.quick_stage(EPOCH, 2, "a", "s2").is_none());
+    assert!(!hub.admit_quick_add(&tickets[2], || false));
+    a.quick_view(EPOCH, |v| {
+        assert!(!v.at_capacity && v.row("extra").can_add);
+        assert_eq!(v.row("s2").outcome, Some(Outcome::NotSent));
+        assert!(v.row("s2").can_add && !v.row("s2").pending);
+        assert!(v.row("s0").pending && v.row("s1").pending && v.row("s3").pending);
+    });
+    let replacement = stage(&a, "a", "extra");
+    assert!(a.quick_stage(EPOCH, 2, "a", "s2").is_none());
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change": {"playlist": summary("a", 1, 2),
+            "entries": {"added": entry("foreign-queued", "s1", 0)}}}),
+    );
+    assert!(!a.start_quick_add(&tickets[1], || panic!("already present")));
+    a.quick_view(EPOCH, |v| {
+        assert!(!v.at_capacity && v.row("extra").pending);
+        assert_eq!(v.row("s1").membership, Membership::Present);
+        assert!(v.row("s1").outcome.is_none());
+        assert_eq!(v.row("s2").outcome, Some(Outcome::NotSent));
+    });
+    let restaged = stage(&a, "a", "s2");
+    assert!(!hub.admit_quick_add(&tickets[2], || panic!("stale ticket for restaged row")));
+    a.quick_cancel(&tickets[2]);
+    a.quick_view(EPOCH, |v| {
+        assert!(v.at_capacity && v.row("s2").pending && v.row("s2").outcome.is_none());
+    });
+    assert!(hub.admit_quick_add(&restaged, || true));
+    assert!(hub.admit_quick_add(&replacement, || true));
+    assert!(a.start_quick_add(&replacement, || true));
+}
+
+#[test]
+fn quick_add_observation_window_begins_at_actual_start_and_deadlines_are_independent() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let mut state = a.state.lock().unwrap();
+    let State {
+        status,
+        replica,
+        quick,
+        ..
+    } = &mut *state;
+    let status = *status;
+    let now = Instant::now();
+    let after = |s| now + Duration::from_secs(s);
+    let early = quick.stage(status, replica, 2, "a", "early", now).unwrap();
+    let late = quick
+        .stage(status, replica, 2, "a", "late", after(1))
+        .unwrap();
+    assert!(quick.admit(status, replica, &early, now, || true));
+    assert!(quick.admit(status, replica, &late, after(2), || true));
+    assert!(quick.start(status, replica, &late, after(5), || true));
+    assert_eq!(quick.view(true, replica, status).due, Some(after(13)));
+    assert_eq!(
+        quick.view(true, replica, status).row("early").outcome,
+        Some(Outcome::NotSent)
+    );
+    assert!(!quick.start(status, replica, &early, after(5), || panic!("expired")));
+    assert!(quick.take_probe_due(after(13)));
+    assert_eq!(quick.view(true, replica, status).due, Some(after(35)));
+    assert!(!quick.tick(after(34)));
+    assert!(quick.view(true, replica, status).row("late").pending);
+    assert!(!quick.tick(after(35)));
+    let view = quick.view(true, replica, status);
+    assert!(view.due.is_none());
+    assert_eq!(view.row("late").outcome, Some(Outcome::Unconfirmed));
+    assert_eq!(view.row("early").outcome, Some(Outcome::NotSent));
+    assert!(view.row("early").can_add && !view.row("late").can_add);
+}
+
+#[test]
+fn quick_add_dispatch_rechecks_exact_absence_during_multipart_repair() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    a.quick_filter(EPOCH, true);
+    let started = stage(&a, "a", "started");
+    dispatch(&hub, &a, &started);
+    let queued = stage(&a, "a", "queued");
+    assert!(hub.admit_quick_add(&queued, || true));
+    let staged = stage(&a, "a", "staged");
+    let updated = summary("a", 2, 2);
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change":{"playlist":updated, "rowsInvalid":true}}),
+    );
+    part(
+        &hub,
+        GENERATION,
+        updated.clone(),
+        "repair",
+        0,
+        vec![entry("e0", "other", 0)],
+        true,
+    );
+    a.quick_view(EPOCH, |v| {
+        for song in ["started", "queued", "staged"] {
+            let row = v.row(song);
+            assert_eq!(row.membership, Membership::Unknown);
+            assert!(row.pending && row.visible && !row.can_add);
+        }
+    });
+    assert!(!hub.admit_quick_add(&staged, || panic!("unknown is not absent at admission")));
+    assert!(!a.start_quick_add(&queued, || panic!("unknown is not absent at socket start")));
+    part(
+        &hub,
+        GENERATION,
+        updated,
+        "repair",
+        1,
+        vec![entry("e1", "another", 1)],
+        false,
+    );
+    a.quick_view(EPOCH, |v| {
+        assert!(v.row("started").pending);
+        for song in ["queued", "staged"] {
+            let row = v.row(song);
+            assert_eq!(row.membership, Membership::Absent);
+            assert_eq!(row.outcome, Some(Outcome::NotSent));
+            assert!(row.can_add && !row.pending);
+        }
+    });
 }
 
 #[test]
@@ -212,12 +412,15 @@ fn quick_add_dropped_no_diff_and_reconnect_never_rearm_old_reader_attempt() {
     empty_a(&hub, &a);
     let t = stage(&a, "a", "song");
     dispatch(&hub, &a, &t);
-    elapse(&a, 6);
+    elapse(&a, 29);
+    a.quick_view(EPOCH, |v| assert!(v.row("song").pending));
+    elapse(&a, 31);
     assert!(a.quick_stage(EPOCH, 2, "a", "song").is_none());
     a.quick_view(EPOCH, |v| {
         let song = v.row("song");
         assert!(!song.pending && song.visible && !song.can_add);
-        assert_eq!(v.notice, Some(Outcome::Unconfirmed));
+        assert_eq!(song.outcome, Some(Outcome::Unconfirmed));
+        assert_eq!(v.row("another-song").outcome, None);
         assert!(v.row("another-song").can_add);
     });
     assert!(a.refresh_playlist(EPOCH).is_some());
@@ -268,6 +471,46 @@ fn quick_add_dropped_no_diff_and_reconnect_never_rearm_old_reader_attempt() {
 }
 
 #[test]
+fn quick_add_link_loss_distinguishes_started_and_unsent_rows() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let began = stage(&a, "a", "began");
+    dispatch(&hub, &a, &began);
+    let queued = stage(&a, "a", "queued");
+    assert!(hub.admit_quick_add(&queued, || true));
+    let staged = stage(&a, "a", "staged");
+    hub.disconnect(EPOCH, GENERATION);
+    assert!(!a.start_quick_add(&queued, || panic!("old link started queued write")));
+    assert!(!hub.admit_quick_add(&staged, || panic!("old link admitted staged write")));
+    hub.begin(EPOCH, GENERATION + 1);
+    lists(&hub, GENERATION + 1, vec![summary("a", 0, 1)]);
+    part(
+        &hub,
+        GENERATION + 1,
+        summary("a", 0, 1),
+        "no-diff",
+        0,
+        vec![],
+        false,
+    );
+    a.quick_view(EPOCH, |v| {
+        let began = v.row("began");
+        assert_eq!(began.membership, Membership::Absent);
+        assert_eq!(began.outcome, Some(Outcome::Unconfirmed));
+        assert!(!began.pending && !began.can_add);
+        for song in ["queued", "staged"] {
+            let row = v.row(song);
+            assert_eq!(row.membership, Membership::Absent);
+            assert_eq!(row.outcome, Some(Outcome::NotSent));
+            assert!(!row.pending && row.can_add);
+        }
+        assert_eq!(v.row("another-song").outcome, None);
+    });
+    assert!(a.quick_stage(EPOCH, 4, "a", "began").is_none());
+    assert!(a.quick_stage(EPOCH, 4, "a", "queued").is_some());
+}
+
+#[test]
 fn quick_add_foreign_present_then_removed_does_not_rearm_a_started_add() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
@@ -279,8 +522,9 @@ fn quick_add_foreign_present_then_removed_does_not_rearm_a_started_add() {
         json!({"change":{"playlist":summary("a", 1, 2), "entries":{"added":entry("foreign", "song", 0)}}}),
     );
     a.quick_view(EPOCH, |v| {
-        assert_eq!(v.row("song").membership, Membership::Present);
-        assert!(!v.row("song").pending && v.notice.is_none());
+        let song = v.row("song");
+        assert_eq!(song.membership, Membership::Present);
+        assert!(!song.pending && song.outcome.is_none());
     });
     receive(
         &hub,
@@ -291,6 +535,7 @@ fn quick_add_foreign_present_then_removed_does_not_rearm_a_started_add() {
         let song = v.row("song");
         assert_eq!(song.membership, Membership::Absent);
         assert!(song.visible && !song.pending && !song.can_add);
+        assert_eq!(song.outcome, Some(Outcome::Unconfirmed));
         assert!(v.row("another-song").can_add);
     });
     assert!(a.quick_stage(EPOCH, 2, "a", "song").is_none());
@@ -304,14 +549,37 @@ fn quick_add_late_outcome_is_projected_only_for_its_exact_target() {
     let delayed = stage(&a, "a", "song");
     dispatch(&hub, &a, &delayed);
     a.quick_select(EPOCH, Some("b"));
-    elapse(&a, 6);
+    part(
+        &hub,
+        GENERATION,
+        summary("b", 0, 1),
+        "empty-b",
+        0,
+        vec![],
+        false,
+    );
+    let other = stage(&a, "b", "song");
+    dispatch(&hub, &a, &other);
+    elapse(&a, 31);
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change":{"playlist":summary("b", 1, 2), "entries":{"added":entry("foreign-b", "song", 0)}}}),
+    );
     a.quick_view(EPOCH, |v| {
-        assert!(v.target.unwrap().id == "b" && v.notice.is_none())
+        assert_eq!(v.target.unwrap().id, "b");
+        let row = v.row("song");
+        assert_eq!(row.membership, Membership::Present);
+        assert!(row.outcome.is_none() && !row.pending);
     });
     a.quick_select(EPOCH, Some("a"));
-    a.quick_view(EPOCH, |v| assert_eq!(v.notice, Some(Outcome::Unconfirmed)));
+    a.quick_view(EPOCH, |v| {
+        assert_eq!(v.row("song").outcome, Some(Outcome::Unconfirmed))
+    });
     a.quick_select(EPOCH, None);
-    a.quick_view(EPOCH, |v| assert!(v.target.is_none() && v.notice.is_none()));
+    a.quick_view(EPOCH, |v| {
+        assert!(v.target.is_none() && v.row("song").outcome.is_none())
+    });
 }
 
 #[test]
@@ -322,14 +590,34 @@ fn quick_add_attempt_budget_does_not_evict_a_hold_or_affect_explicit_add() {
     assert!(!hub.admit_quick_add(&refused, || false));
     let still_eligible = stage(&a, "a", "not-sent");
     a.quick_cancel(&still_eligible);
-    for index in 0..4096 {
+    for index in 0..4093 {
         let ticket = stage(&a, "a", &format!("song-{index}"));
         dispatch(&hub, &a, &ticket);
-        elapse(&a, 6);
+        elapse(&a, 31);
     }
+    let started = stage(&a, "a", "last-started");
+    dispatch(&hub, &a, &started);
+    let queued = stage(&a, "a", "last-queued");
+    assert!(hub.admit_quick_add(&queued, || true));
+    let staged = stage(&a, "a", "last-staged");
+    assert!(a.quick_stage(EPOCH, 2, "a", "no-slot").is_none());
+    a.quick_view(EPOCH, |v| {
+        assert!(v.at_capacity && !v.session_limit);
+        assert!(v.row("last-staged").pending && !v.row("no-slot").can_add);
+    });
+    a.quick_cancel(&staged);
+    a.quick_view(EPOCH, |v| {
+        assert!(!v.at_capacity && v.row("no-slot").can_add)
+    });
+    let replacement = stage(&a, "a", "replacement");
+    assert!(!hub.admit_quick_add(&staged, || panic!("stale reservation")));
+    assert!(a.start_quick_add(&queued, || true));
+    dispatch(&hub, &a, &replacement);
+    elapse(&a, 31);
     a.quick_view(EPOCH, |v| {
         let row = v.row("new-song");
-        assert!(v.session_limit && row.visible && !row.can_add);
+        assert!(v.session_limit && !v.at_capacity && row.visible && !row.can_add);
+        assert_eq!(v.row("song-0").outcome, Some(Outcome::Unconfirmed));
     });
     for song in ["song-0", "new-song"] {
         assert!(a.quick_stage(EPOCH, 2, "a", song).is_none());
@@ -405,7 +693,7 @@ fn quick_add_held_unsent_target_rights_route_and_account_are_fenced() {
     a.quick_view(EPOCH, |v| {
         assert_eq!(v.target.unwrap().id, "b");
         assert!(!v.hide);
-        assert_eq!(v.notice, None); // The unsent ticket was for A.
+        assert_eq!(v.row("song").outcome, None); // The unsent ticket was for A.
     });
     part(&hub, GENERATION, summary("b", 0, 1), "b", 0, vec![], false);
     a.quick_filter(EPOCH, true);
@@ -428,7 +716,7 @@ fn quick_add_held_unsent_target_rights_route_and_account_are_fenced() {
     assert!(!hub.admit_quick_add(&leaving, || panic!("old account ticket")));
     for epoch in [EPOCH, EPOCH + 1] {
         a.quick_view(epoch, |v| {
-            assert!(v.target.is_none() && !v.hide && v.notice.is_none())
+            assert!(v.target.is_none() && !v.hide && v.row("song").outcome.is_none())
         });
     }
 }
@@ -614,9 +902,292 @@ fn quick_add_stalled_or_invalid_partial_read_never_proves_absence() {
             assert!(v.row(track).visible);
         }
     });
-    elapse(&a, 7);
-    assert!(!hub.authorizes(EPOCH, GENERATION, &repair.unwrap()));
+    elapse(&a, 21);
+    let repair = repair.unwrap();
+    assert!(
+        hub.authorizes(EPOCH, GENERATION, &repair),
+        "a slow read can still repair the scope"
+    );
     a.quick_view(EPOCH, |v| assert!(v.read_stalled && v.hide));
+    elapse(&a, 121);
+    assert!(!hub.authorizes(EPOCH, GENERATION, &repair));
     assert!(a.quick_watch(EPOCH, false, Some("b".into())).is_some());
     assert!(a.quick_watch(EPOCH, true, None).is_some());
+}
+
+#[test]
+fn quick_add_lost_broadcast_catches_up_once_without_inventing_a_receipt() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    for song in ["observed-by-read", "silent"] {
+        let t = stage(&a, "a", song);
+        dispatch(&hub, &a, &t);
+    }
+    let now = Instant::now();
+    let timer = |elapsed| {
+        a.state
+            .lock()
+            .unwrap()
+            .run_quick_timer(now + Duration::from_secs(elapsed))
+    };
+    assert!(timer(7).is_none());
+    let probe = timer(9).unwrap();
+    assert_eq!(
+        serde_json::to_value(&probe).unwrap(),
+        json!({"type":"syncPlaylist","playlistId":"a","known":"empty"})
+    );
+    assert!(a.start_playlist_sync(EPOCH, GENERATION, &probe, || true));
+    assert!(
+        timer(10).is_none(),
+        "one read coalesces both started intents"
+    );
+    a.quick_view(EPOCH, |v| {
+        assert!(
+            v.row("third").can_add,
+            "a conditional probe does not invalidate all absence"
+        );
+        assert!(v.row("observed-by-read").pending && v.row("silent").pending);
+    });
+    // No broadcast (e.g. a lost tail projection). Only scoped rows can restore
+    // membership. Even this proves only current presence, not who added it.
+    part(
+        &hub,
+        GENERATION,
+        summary("a", 1, 2),
+        "after-probe",
+        0,
+        vec![entry("e", "observed-by-read", 0)],
+        false,
+    );
+    assert!(timer(31).is_none());
+    a.quick_view(EPOCH, |v| {
+        assert_eq!(v.row("observed-by-read").membership, Membership::Present);
+        assert_eq!(v.row("observed-by-read").outcome, None);
+        assert_eq!(v.row("silent").outcome, Some(Outcome::Unconfirmed));
+        assert!(v.row("third").can_add);
+    });
+    assert!(a.quick_stage(EPOCH, 2, "a", "silent").is_none());
+}
+
+#[test]
+fn quick_add_silent_matching_probe_never_marks_presence_or_rearms() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let t = stage(&a, "a", "song");
+    dispatch(&hub, &a, &t);
+    let now = Instant::now();
+    let timer = |elapsed| {
+        a.state
+            .lock()
+            .unwrap()
+            .run_quick_timer(now + Duration::from_secs(elapsed))
+    };
+    let probe = timer(9).unwrap();
+    assert!(a.start_playlist_sync(EPOCH, GENERATION, &probe, || true));
+    // Go emits no frame when known equals the projection token.
+    assert!(timer(31).is_none());
+    a.quick_view(EPOCH, |v| {
+        let row = v.row("song");
+        assert!(!row.pending && row.visible && !row.can_add && !v.read_stalled);
+        assert_eq!(row.outcome, Some(Outcome::Unconfirmed));
+        assert!(v.row("elsewhere").can_add);
+    });
+    assert!(!a.start_quick_add(&t, || panic!("must not replay")));
+}
+
+#[test]
+fn quick_add_catchup_stays_optional_when_detail_inherits_the_watch() {
+    for tokenless in [false, true] {
+        let (hub, a) = ready();
+        empty_a(&hub, &a);
+        let ticket = stage(&a, "a", "pending");
+        dispatch(&hub, &a, &ticket);
+        if tokenless {
+            receive(
+                &hub,
+                GENERATION,
+                json!({"change":{"playlist":summary("a", 1, 2),
+                "entries":{"added":entry("other", "other", 0)}}}),
+            );
+        }
+        let probe = a
+            .state
+            .lock()
+            .unwrap()
+            .run_quick_timer(Instant::now() + Duration::from_secs(9))
+            .unwrap();
+        assert!(
+            matches!(probe, PersonalCommand::SyncPlaylist { ref known, .. } if known.is_none() == tokenless)
+        );
+        assert!(a.quick_watch(EPOCH, false, Some("a".into())).is_none());
+        assert_eq!(
+            a.inspect_playlist_sync(EPOCH, GENERATION, &probe, |optional| optional),
+            Some(true)
+        );
+        let before = a.read(|status, _| status.refused);
+        hub.send_playlist_sync(EPOCH, GENERATION, &probe, || false);
+        assert_eq!(a.read(|status, _| status.refused), before);
+    }
+}
+
+#[test]
+fn quick_add_hard_read_cutoff_does_not_depend_on_browser_timer_order() {
+    let (hub, a) = ready();
+    let summary = summary("a", 1, 2);
+    let command = {
+        let mut state = a.state.lock().unwrap();
+        state
+            .quick
+            .select(Some(serde_json::from_value(summary.clone()).unwrap()));
+        let command = state.quick_watch().1.unwrap();
+        state.quick_read(
+            Some(&command),
+            false,
+            Instant::now() - Duration::from_secs(121),
+        );
+        command
+    };
+    assert!(hub.authorizes(EPOCH, GENERATION, &command));
+    // Ingress wins the wakeup race against the browser timer. The abandoned
+    // generation still cannot become authoritative after its hard cutoff.
+    part(
+        &hub,
+        GENERATION,
+        summary,
+        "expired",
+        0,
+        vec![entry("e", "late", 0)],
+        false,
+    );
+    assert!(!hub.authorizes(EPOCH, GENERATION, &command));
+    a.quick_view(EPOCH, |v| {
+        assert!(v.read_retired && v.read_stalled);
+        assert_eq!(v.row("late").membership, Membership::Unknown);
+    });
+}
+
+#[test]
+fn quick_add_large_repair_ignores_old_continuation_and_accepts_late_final_part() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    a.quick_filter(EPOCH, true);
+    let ticket = stage(&a, "a", "exact-tail");
+    dispatch(&hub, &a, &ticket);
+    let first_gen = summary("a", 1501, 2);
+    let fresh = summary("a", 1502, 3);
+    // Go budgets each frame (including the envelope), not a fixed row count.
+    let chunk = |s: &Value, token: &str, offset: usize| {
+        let total = s["trackCount"].as_u64().unwrap() as usize;
+        let empty = json!({"type":"personal","update":{"part":{"summary":s,"token":token,
+            "offset":offset,"rows":[],"more":false}}});
+        let mut remaining = (256 << 10) - serde_json::to_vec(&empty).unwrap().len();
+        let mut rows = Vec::new();
+        for i in offset..total {
+            let track = if i == 1501 { "exact-tail" } else { "unrelated" };
+            let mut row = entry(&format!("e{i}"), track, i);
+            row["track"]["name"] = json!("x".repeat(300 + i % 130));
+            let size = serde_json::to_vec(&row).unwrap().len() + usize::from(!rows.is_empty());
+            if size > remaining {
+                break;
+            }
+            remaining -= size;
+            rows.push(row);
+        }
+        assert!(!rows.is_empty());
+        let end = offset + rows.len();
+        (rows, end, end < total)
+    };
+    let (old_rows, old_end, old_more) = chunk(&first_gen, "before-peer-edit", 0);
+    assert!(old_more);
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change":{"playlist":first_gen,"rowsInvalid":true}}),
+    );
+    let old_next = part(
+        &hub,
+        GENERATION,
+        first_gen.clone(),
+        "before-peer-edit",
+        0,
+        old_rows,
+        old_more,
+    )
+    .unwrap();
+    // An unsolicited invalidation makes the previous token/offset obsolete;
+    // Go may restart an already-sent continuation at offset zero.
+    let repair = receive(
+        &hub,
+        GENERATION,
+        json!({"change":{"playlist":fresh,"rowsInvalid":true}}),
+    )
+    .unwrap();
+    assert!(!hub.authorizes(EPOCH, GENERATION, &old_next));
+    assert!(hub.authorizes(EPOCH, GENERATION, &repair));
+    let (stale_rows, _, stale_more) = chunk(&first_gen, "before-peer-edit", old_end);
+    assert!(
+        part(
+            &hub,
+            GENERATION,
+            first_gen,
+            "before-peer-edit",
+            old_end,
+            stale_rows,
+            stale_more
+        )
+        .is_none()
+    );
+    let mut offset = 0;
+    let mut chunks = 0;
+    let (final_rows, next) = loop {
+        let (rows, end, more) = chunk(&fresh, "after-peer-edit", offset);
+        if !more {
+            break (
+                rows,
+                a.read(|_, replica| replica.pending_sync().unwrap().clone()),
+            );
+        }
+        let continuation = part(
+            &hub,
+            GENERATION,
+            fresh.clone(),
+            "after-peer-edit",
+            offset,
+            rows,
+            true,
+        )
+        .unwrap();
+        assert!(a.start_playlist_sync(EPOCH, GENERATION, &continuation, || true));
+        offset = end;
+        chunks += 1;
+    };
+    assert!(chunks >= 2);
+    elapse(&a, 21);
+    a.quick_view(EPOCH, |v| {
+        let tail = v.row("exact-tail");
+        assert!(v.read_stalled && tail.pending && tail.visible);
+        assert_eq!(tail.membership, Membership::Unknown);
+    });
+    assert!(
+        hub.authorizes(EPOCH, GENERATION, &next),
+        "soft deadline leaves the pull scoped"
+    );
+    assert!(
+        part(
+            &hub,
+            GENERATION,
+            fresh,
+            "after-peer-edit",
+            offset,
+            final_rows,
+            false
+        )
+        .is_none()
+    );
+    a.quick_view(EPOCH, |v| {
+        let tail = v.row("exact-tail");
+        assert_eq!(tail.membership, Membership::Present);
+        assert!(!tail.pending && !tail.visible && !v.read_stalled);
+        assert!(v.row("not-a-member").can_add);
+    });
 }

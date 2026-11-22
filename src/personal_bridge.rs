@@ -166,6 +166,21 @@ impl State {
         }
     }
 
+    fn expire_quick_read(&mut self, now: Instant) {
+        if self.quick.retire_expired_read(now) {
+            self.quick_watch();
+        }
+    }
+
+    fn run_quick_timer(&mut self, now: Instant) -> Option<PersonalCommand> {
+        self.quick_tick(now);
+        if self.status.link == Link::Ready && self.quick.take_probe_due(now) {
+            self.replica.probe_playlist()
+        } else {
+            None
+        }
+    }
+
     fn interrupt(&mut self) {
         self.replica.disconnected();
         self.quick.interrupted();
@@ -405,12 +420,14 @@ impl PersonalAccess {
         }
     }
 
-    pub(crate) fn quick_tick(&self, epoch: u64) {
+    pub(crate) fn quick_tick(&self, epoch: u64) -> Option<(u64, PersonalCommand)> {
         let mut state = self.state.lock().expect("personal state");
-        if state.status.epoch == epoch {
-            state.quick_tick(Instant::now());
-            self.signal();
+        if state.status.epoch != epoch {
+            return None;
         }
+        let command = state.run_quick_timer(Instant::now());
+        self.signal();
+        Some((state.status.generation, command?))
     }
 
     pub(crate) fn inspect_playlist_sync<R>(
@@ -423,7 +440,7 @@ impl PersonalAccess {
         let state = self.state.lock().expect("personal state");
         state
             .accepts_playlist_sync(epoch, generation, command)
-            .then(|| check(state.quick.searching()))
+            .then(|| check(state.quick.searching() || state.replica.is_catchup_sync()))
     }
 
     pub(crate) fn start_playlist_sync(
@@ -437,7 +454,9 @@ impl PersonalAccess {
         if !state.accepts_playlist_sync(epoch, generation, command) || !start() {
             return false;
         }
-        state.quick.started_read(generation, command);
+        if state.replica.playlist().is_none_or(|p| p.stale) {
+            state.quick.started_read(generation, command);
+        }
         true
     }
 
@@ -681,6 +700,7 @@ impl PersonalHub {
         let snapshot = matches!(&update, PersonalUpdate::Snapshot(_));
         let part = matches!(&update, PersonalUpdate::Part(_));
         let now = Instant::now();
+        state.expire_quick_read(now);
         if snapshot && state.status.link != Link::Ready && state.quick.searching() {
             // Reappraise a direct target only while its selection has a
             // revalidation budget. A capped snapshot can't clear that budget.
@@ -689,7 +709,6 @@ impl PersonalHub {
             }
             state.quick_watch();
         }
-        state.quick_tick(now);
         if !snapshot && state.status.link != Link::Ready {
             // A repair snapshot may be queued behind older in-flight updates.
             if state.status.link == Link::Gap {
@@ -760,7 +779,15 @@ impl PersonalHub {
                     command = state.quick_watch().1;
                 }
                 let progressed = matches!(command, Some(PersonalCommand::SyncPlaylist { offset, .. }) if offset > 0);
+                // A valid part at the deadline is evidence, not a timeout.
+                // Reduce it before ticking the optional Search read budget.
                 state.quick_read(command.as_ref(), progressed, now);
+                state.quick_tick(now);
+                if let Some(candidate) = &command
+                    && !state.replica.accepts_sync(candidate)
+                {
+                    command = None;
+                }
                 if progressed {
                     state.status.playlist_progress = state.status.playlist_progress.wrapping_add(1);
                 }
@@ -822,7 +849,7 @@ impl PersonalHub {
         if !state.accepts_playlist_sync(epoch, generation, command) {
             return;
         }
-        if !send() && !state.quick.searching() {
+        if !send() && !state.quick.searching() && !state.replica.is_catchup_sync() {
             state.status.refused = state.status.refused.wrapping_add(1);
             self.0.signal();
         }

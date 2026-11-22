@@ -280,7 +280,16 @@ impl QuickProjection {
             && (indices_changed || filtered_changed)
             && (was_filtered || self.hide))
             .then(|| {
-                let focused = ui.get_search_focus_owner();
+                let part = ui.get_catalog_focused_part();
+                let quick_focus = matches!(part.as_str(), "quick-add" | "quick-add-pointer");
+                let owner = ui.get_search_focus_owner();
+                // Virtualization can detach the slot before its exact row has
+                // been restored. Carry that row across a second reflow.
+                let focused = if owner < 0 && quick_focus {
+                    ui.get_catalog_focused_row()
+                } else {
+                    owner
+                };
                 let before = if was_filtered {
                     previous.iter().position(|i| i == focused)
                 } else {
@@ -291,7 +300,11 @@ impl QuickProjection {
                 } else {
                     usize::try_from(focused).ok()
                 };
-                if before != after && before.is_some() {
+                let restore_focus = (before != after || owner < 0)
+                    && before.is_some()
+                    && after.is_some()
+                    && quick_focus;
+                if before != after && before.is_some() && !restore_focus {
                     focus_search(ui);
                     ui.set_catalog_focused_row(-1);
                     ui.set_search_focus_owner(-1);
@@ -314,8 +327,21 @@ impl QuickProjection {
                             .unwrap_or(-1),
                     }
                 };
-                (y, anchor, offset)
+                (y, anchor, offset, restore_focus.then_some((focused, part)))
             });
+        if let Some((y, anchor, offset, focus)) =
+            position.filter(|(y, _, _, focus)| *y < 0.0 || focus.is_some())
+        {
+            ui.set_catalog_return_key(ui.get_page_key());
+            ui.set_catalog_return_y(y);
+            ui.set_catalog_return_anchor(anchor);
+            ui.set_catalog_return_offset(offset);
+            let (row, part) = focus.unwrap_or((-1, Default::default()));
+            ui.set_catalog_return_row(row);
+            ui.set_catalog_return_part(part);
+            ui.set_catalog_return_credit(Default::default());
+            ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
+        }
         if indices_changed {
             ui.set_search_add_visible_indices(ModelRc::new(VecModel::from(self.visible)));
         }
@@ -353,14 +379,6 @@ impl QuickProjection {
         }
         ui.set_search_add_status(self.status);
         ui.set_search_add_blocked(self.blocked);
-        if let Some((y, anchor, offset)) = position.filter(|(y, _, _)| *y < 0.0) {
-            ui.set_catalog_return_key(ui.get_page_key());
-            ui.set_catalog_return_y(y);
-            ui.set_catalog_return_anchor(anchor);
-            ui.set_catalog_return_offset(offset);
-            ui.set_catalog_return_row(-1);
-            ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
-        }
     }
 }
 
@@ -1338,7 +1356,21 @@ impl Browser {
                         match state.filter(|_| quick_track(row)) {
                             Some(s) if s.pending => "pending",
                             Some(s) if s.membership == quick_add::Membership::Present => "member",
+                            Some(s) if s.outcome == Some(quick_add::Outcome::Unconfirmed) => {
+                                "unconfirmed"
+                            }
+                            Some(s)
+                                if s.can_add && s.outcome == Some(quick_add::Outcome::NotSent) =>
+                            {
+                                "not-sent"
+                            }
                             Some(s) if s.can_add => "ready",
+                            Some(s)
+                                if view.at_capacity
+                                    && s.membership == quick_add::Membership::Absent =>
+                            {
+                                "at-capacity"
+                            }
                             Some(_) => "unavailable",
                             None => "",
                         }
@@ -1346,18 +1378,12 @@ impl Browser {
                     );
                 }
             }
-            let status = match view.notice {
-                _ if view.read_stalled && !offline => {
-                    "Couldn’t load the playlist to check which songs are already in it."
-                }
-                Some(quick_add::Outcome::NotSent) => "The song was not sent to the playlist.",
-                Some(quick_add::Outcome::Unconfirmed) => {
-                    "Couldn’t verify that the song is in the playlist."
-                }
-                None if view.session_limit && view.target.is_some() => {
-                    "Quick add is unavailable for the rest of this session. Use ⋯ to add songs."
-                }
-                None => "",
+            let status = if !offline && view.read_retired {
+                "Couldn’t load the playlist to check which songs are already in it."
+            } else if !offline && view.session_limit && view.target.is_some() {
+                "Quick add is unavailable for the rest of this session. Use ⋯ to add songs."
+            } else {
+                ""
             };
             QuickProjection {
                 scope: view.scope(mode).into(),
@@ -1369,8 +1395,10 @@ impl Browser {
                 status: status.into(),
                 blocked: if offline {
                     "Offline".into()
-                } else if view.read_stalled && view.target.is_some() {
+                } else if view.read_retired && view.target.is_some() {
                     "Unavailable".into()
+                } else if view.read_stalled && view.target.is_some() {
+                    "Checking playlist".into()
                 } else {
                     Default::default()
                 },
@@ -2171,11 +2199,12 @@ impl Browser {
 
     fn personal_timeout(&mut self) {
         let now = tokio::time::Instant::now();
-        if let Some(a) = &self.access
+        if let Some(a) = self.access.clone()
             && a.personal
                 .quick_view(a.epoch, |view| view.due.is_some_and(|due| due <= now))
         {
-            a.personal.quick_tick(a.epoch);
+            let request = a.personal.quick_tick(a.epoch);
+            self.quick_request(&a, request);
             if matches!(self.route, Route::Search(_)) {
                 self.render(false);
             }

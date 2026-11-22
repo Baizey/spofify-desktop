@@ -211,14 +211,17 @@ export component MediaLine inherits Rectangle {
     in property <string> quick-add-target;
     in property <string> quick-add-scope;
     callback quick-add();
-    callback quick-add-focus();
+    callback quick-add-focus-changed(bool /* owns */, bool /* pointer */);
     callback quick-add-focus-evicted(bool /* unavailable */);
-    property <bool> quick-add-ready: root.quick-add-state == "ready";
-    property <bool> quick-add-unavailable: root.quick-add-state == "unavailable";
+    property <bool> quick-add-not-sent: root.quick-add-state == "not-sent";
+    property <bool> quick-add-ready: root.quick-add-state == "ready" || root.quick-add-not-sent;
+    property <bool> quick-add-at-capacity: root.quick-add-state == "at-capacity";
+    property <bool> quick-add-unavailable: root.quick-add-state == "unavailable" || root.quick-add-at-capacity;
     property <bool> quick-add-pending: root.quick-add-state == "pending";
     property <bool> quick-add-member: root.quick-add-state == "member";
-    property <bool> has-quick-add: root.quick-add-visible
-        && (root.quick-add-ready || root.quick-add-unavailable || root.quick-add-pending || root.quick-add-member);
+    property <bool> quick-add-unconfirmed: root.quick-add-state == "unconfirmed";
+    property <bool> has-quick-add: root.quick-add-visible && root.quick-add-state != "";
+    property <length> quick-add-width: (root.quick-add-unconfirmed || root.quick-add-not-sent) && !root.compact ? 100px : 37px;
     property <bool> quick-add-focused;
     property <string> quick-add-focus-scope;
     property <bool> quick-add-clipped: root.play-viewport-height > 0px
@@ -279,7 +282,8 @@ export component MediaLine inherits Rectangle {
             || (part == "album" && (credit != root.album-id || (root.title-opens-album ? !song-title.interactive : !root.show-album-line)))
             || (part == "menu" && root.actions.length == 0) {
             if root.body-focusable { root.take-row-focus(); }
-        } else if part == "artist" || part == "album" || part == "menu" {
+        } else if part == "artist" || part == "album" || part == "menu"
+            || ((part == "quick-add" || part == "quick-add-pointer") && root.has-quick-add) {
             root.resume-credit = credit;
             root.resume-part = part;
             root.resume-serial += 1;
@@ -381,8 +385,9 @@ export component MediaLine inherits Rectangle {
 
         HorizontalLayout {
             x: -row-face.x;
-            width: max(0px, root.width - (root.actions.length > 0 || root.has-quick-add ? 37px + root.word-gap : 0px)
-                - (root.has-quick-add && root.actions.length > 0 ? 40px : 0px));
+            width: max(0px, root.width - (root.actions.length > 0 || root.has-quick-add ? root.word-gap : 0px)
+                - (root.has-quick-add ? root.quick-add-width : 0px)
+                - (root.actions.length > 0 ? 37px : 0px) - (root.has-quick-add && root.actions.length > 0 ? 3px : 0px));
             height: parent.height;
             padding-top: 6px; padding-bottom: 6px;
             spacing: root.word-gap;
@@ -523,36 +528,56 @@ export component MediaLine inherits Rectangle {
             Glyph { x: 2px; y: 2px; width: 13px; height: self.width; name: root.type-mark; ink: Theme.text; }
         }
         if root.has-quick-add: Action {
-            x: parent.width - (root.actions.length > 0 ? 77px : 37px); y: root.menu-top;
-            width: 37px; height: 38px; min-width: 0px; quiet: true;
+            x: parent.width - self.width - (root.actions.length > 0 ? 40px : 0px); y: root.menu-top;
+            width: root.quick-add-width; height: 38px; min-width: 0px; quiet: true;
             icon: root.quick-add-ready || root.quick-add-unavailable ? "+" : "";
-            secondary-ink: root.quick-add-unavailable ? Theme.muted.with-alpha(0.55) : Theme.primary;
+            text: root.quick-add-not-sent && !root.compact ? "Not sent" : "";
+            secondary-ink: root.quick-add-not-sent ? Theme.tertiary
+                : root.quick-add-unavailable ? Theme.muted.with-alpha(0.55) : Theme.primary;
             pointer-focus-visible: false;
-            pointer-enabled: !root.quick-add-unavailable;
+            pointer-enabled: root.quick-add-ready;
             // Keep a previously focused target through a temporary status change,
             // but skip disabled targets when tabbing into the row. Status slots
             // still consume pointer clicks rather than activating the track behind them.
-            keyboard-focusable: root.quick-add-ready || self.has-focus;
+            property <bool> restore-quick: root.resume-part == "quick-add" || root.resume-part == "quick-add-pointer";
+            property <int> resume: self.restore-quick ? root.resume-serial : 0;
+            keyboard-focusable: root.quick-add-ready || self.has-focus || self.restore-quick;
+            changed resume => {
+                if self.resume != 0 {
+                    if root.resume-part == "quick-add-pointer" { self.take-pointer-focus(); }
+                    else { self.take-focus(); }
+                    root.resume-part = "";
+                }
+            }
             accessible-enabled: root.quick-add-ready;
             accessible-label: root.quick-add-member ? "In playlist: " + root.quick-add-target
+                : root.quick-add-unconfirmed ? "Add unconfirmed for " + root.title + " in " + root.quick-add-target
+                : root.quick-add-at-capacity ? "Quick add queue is full"
                 : root.quick-add-unavailable ? "Quick add unavailable for " + root.quick-add-target
                 : (root.quick-add-ready ? "Add " : "Adding ") + root.title + " to " + root.quick-add-target;
-            accessible-description: root.quick-add-member || root.quick-add-unavailable ? root.title : "";
-            accessible-live-region: self.has-focus && root.quick-add-pending ? polite : off;
+            accessible-description: root.quick-add-unconfirmed ? "Use song actions to add another copy if intended."
+                : root.quick-add-not-sent ? "Previous add was not sent."
+                : root.quick-add-member || root.quick-add-unavailable ? root.title : "";
+            accessible-live-region: self.has-focus && (root.quick-add-pending || root.quick-add-unconfirmed) ? polite : off;
             click-scope: root.quick-add-scope;
             keyboard-focus-changed(owns) => {
                 if owns {
                     root.focused();
-                    root.quick-add-focus();
                     root.quick-add-focus-scope = root.quick-add-scope;
                 }
+                root.quick-add-focus-changed(owns, self.pointer-focused);
                 root.quick-add-focused = owns;
                 root.keyboard-focus-changed(owns, false);
             }
             clicked => { if root.quick-add-ready && !root.quick-add-clipped && !root.quick-add-evicted { root.quick-add(); } }
-            if root.quick-add-unavailable: TouchArea {
+            if !root.quick-add-ready: TouchArea {
                 width: parent.width; height: parent.height;
                 mouse-cursor: MouseCursor.default;
+            }
+            if root.quick-add-unconfirmed: Caption {
+                width: parent.width; height: parent.height;
+                horizontal-alignment: center; color: Theme.tertiary;
+                text: root.compact ? "?" : "Unconfirmed"; accessible-role: none;
             }
             if root.quick-add-pending || root.quick-add-member: Image {
                 width: 18px; height: self.width; image-fit: contain;

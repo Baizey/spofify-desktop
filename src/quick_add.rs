@@ -1,7 +1,7 @@
 //! Search quick-add intent is not an occurrence or a write receipt. The
 //! account socket publishes shared state only, including other clients' adds.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -15,14 +15,20 @@ use crate::{
 
 pub(crate) use crate::personal::Membership;
 
-const WRITE_WAIT: Duration = Duration::from_secs(5);
+const SEND_WAIT: Duration = Duration::from_secs(5);
+const MAX_LIVE: usize = 8;
+// Go admits into a shared FIFO, and a dequeued job can take 15 seconds.
+// Wait from actual socket start, then show uncertainty, never failure.
+// Later authoritative membership still settles the row.
+const OBSERVE_WAIT: Duration = Duration::from_secs(30);
+const PROBE_AFTER: Duration = Duration::from_secs(8);
 // The legacy wire cannot order or attribute an outstanding add to this
 // client across either shared projections or reconnects. Fail closed on
 // exhaustion instead of expiring an attempt or evicting its hold.
 // 4 MiB of key data at worst (two ≤512-byte IDs per valid command),
 // plus bounded map/set storage; repeated targets share one key.
 const MAX_ATTEMPTS: usize = 4096;
-const READ_IDLE: Duration = Duration::from_secs(6);
+const READ_IDLE: Duration = Duration::from_secs(20);
 const READ_LIMIT: Duration = Duration::from_secs(120);
 // A capped Initial cannot prove that a remembered direct target still exists.
 // A bad scoped read can close the whole Go connection, with no not-found frame.
@@ -72,6 +78,7 @@ struct Pending {
     ticket: Ticket,
     phase: Phase,
     due: Instant,
+    probe_due: Option<Instant>,
 }
 
 struct Read {
@@ -89,23 +96,25 @@ struct Revalidation {
 pub(crate) struct View<'a> {
     pub(crate) target: Option<&'a PlaylistSummary>,
     pub(crate) hide: bool,
-    pub(crate) notice: Option<Outcome>,
+    pub(crate) at_capacity: bool,
     pub(crate) due: Option<Instant>,
     pub(crate) read_stalled: bool,
+    pub(crate) read_retired: bool,
     pub(crate) session_limit: bool,
     status: Status,
     selection_version: u64,
     replica: &'a Replica,
     ready: bool,
-    busy: bool,
-    pending: Option<&'a str>,
+    pending: &'a [Pending],
     attempted: Option<&'a HashSet<Box<str>>>,
+    not_sent: &'a VecDeque<Ticket>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Row {
     pub(crate) membership: Membership,
     pub(crate) pending: bool,
+    pub(crate) outcome: Option<Outcome>,
     pub(crate) visible: bool,
     pub(crate) can_add: bool,
 }
@@ -130,17 +139,33 @@ impl View<'_> {
             .map_or(Membership::Unknown, |target| {
                 self.replica.membership(&target.id, track_id)
             });
-        let pending = self.pending == Some(track_id);
+        let matches = |ticket: &Ticket| {
+            self.target.is_some_and(|target| target.id == ticket.target) && track_id == ticket.track
+        };
+        let present = membership == Membership::Present;
+        let pending = !present && self.pending.iter().any(|p| matches(&p.ticket));
+        let held = self
+            .attempted
+            .is_some_and(|tracks| tracks.contains(track_id));
+        let outcome = if present || pending {
+            None
+        } else if held {
+            Some(Outcome::Unconfirmed)
+        } else if self.not_sent.iter().any(matches) {
+            Some(Outcome::NotSent)
+        } else {
+            None
+        };
         Row {
             membership,
             pending,
-            visible: pending || !self.hide || membership != Membership::Present,
+            outcome,
+            visible: !self.hide || !present,
             can_add: membership == Membership::Absent
-                && !self.busy
-                && !self.session_limit
-                && !self
-                    .attempted
-                    .is_some_and(|tracks| tracks.contains(track_id)),
+                && !pending
+                && !held
+                && !self.at_capacity
+                && !self.session_limit,
         }
     }
 }
@@ -153,8 +178,10 @@ pub(crate) struct QuickAdd {
     searching: bool,
     selection_version: u64,
     nonce: u64,
-    pending: Option<Pending>,
-    notice: Option<(Ticket, Outcome)>,
+    pending: Vec<Pending>,
+    // Never-sent intents have no replay hold. Keep only a bounded recent
+    // history for the rows; evicting it doesn't change write eligibility.
+    not_sent: VecDeque<Ticket>,
     attempted: HashMap<Box<str>, HashSet<Box<str>>>,
     attempt_count: usize,
     read: Option<Read>,
@@ -174,26 +201,20 @@ impl QuickAdd {
         status: Status,
     ) -> View<'a> {
         let target = self.target.as_ref().filter(|_| scoped);
-        let pending = self.pending.as_ref();
         View {
             target,
             hide: scoped && self.hide,
-            notice: self
-                .notice
-                .as_ref()
-                .filter(|(ticket, _)| target.is_some_and(|p| p.id == ticket.target))
-                .map(|(_, outcome)| *outcome),
+            at_capacity: scoped && self.at_capacity(),
             due: scoped.then(|| self.due()).flatten(),
             read_stalled: scoped && self.read_unavailable(),
+            read_retired: scoped && self.read_unavailable() && self.watched().is_none(),
             session_limit: scoped && self.attempt_count >= MAX_ATTEMPTS,
             status,
             selection_version: self.selection_version,
             ready: scoped && self.searching && self.authorized && status.link == Link::Ready,
-            busy: pending.is_some(),
             attempted: target.and_then(|t| self.attempted.get(t.id.as_str())),
-            pending: pending
-                .filter(|p| target.is_some_and(|t| t.id == p.ticket.target))
-                .map(|p| p.ticket.track.as_str()),
+            not_sent: &self.not_sent,
+            pending: &self.pending,
             replica,
         }
     }
@@ -211,8 +232,11 @@ impl QuickAdd {
     }
 
     pub(crate) fn watched(&self) -> Option<&str> {
-        self.selected()
-            .filter(|_| self.searching && !self.read_unavailable())
+        self.selected().filter(|_| {
+            self.searching
+                && !self.revalidation.exhausted
+                && !(self.read_stalled && self.read.is_none())
+        })
     }
 
     fn read_unavailable(&self) -> bool {
@@ -283,18 +307,24 @@ impl QuickAdd {
         let present = |ticket: &Ticket| {
             replica.membership(&ticket.target, &ticket.track) == Membership::Present
         };
-        if self.pending.as_ref().is_some_and(|p| present(&p.ticket)) {
-            // Membership stops the spinner, not the dispatch hold. A foreign
-            // add could be removed before our own delayed command is applied.
-            self.pending = None;
-        }
-        if self
-            .notice
-            .as_ref()
-            .is_some_and(|(ticket, outcome)| *outcome == Outcome::Unconfirmed && present(ticket))
-        {
-            self.notice = None;
-        }
+        // Membership stops checking, not the dispatch hold. A foreign add
+        // could be removed before our own delayed command is applied.
+        self.pending.retain(|p| !present(&p.ticket));
+        self.not_sent.retain(|ticket| !present(ticket));
+    }
+
+    fn at_capacity(&self) -> bool {
+        // Staged and queued intents reserve space in the never-evicted hold
+        // set. Starting consumes that reservation without increasing the sum.
+        self.pending.len() >= MAX_LIVE
+            || (self.attempt_count < MAX_ATTEMPTS
+                && self.attempt_count
+                    + self
+                        .pending
+                        .iter()
+                        .filter(|p| p.phase != Phase::Started)
+                        .count()
+                    >= MAX_ATTEMPTS)
     }
 
     pub(crate) fn stage(
@@ -309,8 +339,12 @@ impl QuickAdd {
         self.expire_pending(now);
         if self.selected() != Some(expected_target)
             || !self.writable(status, replica, expected_target, track)
-            || self.pending.is_some()
+            || self.at_capacity()
             || self.attempt_count >= MAX_ATTEMPTS
+            || self
+                .pending
+                .iter()
+                .any(|p| p.ticket.target == expected_target && p.ticket.track == track)
             || self
                 .attempted
                 .get(expected_target)
@@ -319,7 +353,10 @@ impl QuickAdd {
         {
             return None;
         }
-        self.nonce = self.nonce.wrapping_add(1);
+        self.nonce = self
+            .nonce
+            .checked_add(1)
+            .expect("quick add nonce exhausted");
         let ticket = Ticket {
             nonce: self.nonce,
             epoch: status.epoch,
@@ -332,11 +369,13 @@ impl QuickAdd {
         if !ticket.command().valid() {
             return None;
         }
-        self.notice = None;
-        self.pending = Some(Pending {
+        self.not_sent
+            .retain(|t| !(t.target == expected_target && t.track == track));
+        self.pending.push(Pending {
             ticket: ticket.clone(),
             phase: Phase::Staged,
-            due: now + WRITE_WAIT,
+            due: now + SEND_WAIT,
+            probe_due: None,
         });
         Some(ticket)
     }
@@ -399,42 +438,46 @@ impl QuickAdd {
         send: impl FnOnce() -> bool,
     ) -> bool {
         self.expire_pending(now);
-        if !self
+        let Some(i) = self
             .pending
-            .as_ref()
-            .is_some_and(|p| p.ticket == *ticket && p.phase == from)
-        {
+            .iter()
+            .position(|p| p.ticket == *ticket && p.phase == from)
+        else {
             return false;
-        }
+        };
         if !ticket.matches(status)
             || !self.writable(status, replica, &ticket.target, &ticket.track)
             || !send()
         {
-            self.settle();
+            self.settle(i);
             return false;
         }
+        let pending = &mut self.pending[i];
+        pending.phase = into;
         if into == Phase::Started {
-            // One pending ticket reserves a slot at staging. Keep this hold
-            // even if foreign membership resolves the presentation, and even
-            // across links: a new reader may queue its read ahead of an old
-            // reader that's still authenticating an earlier addEntry.
-            self.attempted
+            pending.due = now + OBSERVE_WAIT;
+            pending.probe_due = Some(now + PROBE_AFTER);
+            // Keep the hold even if foreign membership resolves checking,
+            // and across links: a new reader may queue its read ahead of an
+            // old reader that's still authenticating an earlier addEntry.
+            let new = self
+                .attempted
                 .entry(ticket.target.as_str().into())
                 .or_default()
                 .insert(ticket.track.as_str().into());
+            debug_assert!(new && self.attempt_count < MAX_ATTEMPTS);
             self.attempt_count += 1;
         }
-        self.pending.as_mut().expect("checked pending").phase = into;
         true
     }
 
     pub(crate) fn cancel(&mut self, ticket: &Ticket) -> bool {
-        if self
+        if let Some(i) = self
             .pending
-            .as_ref()
-            .is_some_and(|p| p.ticket == *ticket && p.phase != Phase::Started)
+            .iter()
+            .position(|p| p.ticket == *ticket && p.phase != Phase::Started)
         {
-            self.settle();
+            self.settle(i);
             true
         } else {
             false
@@ -442,23 +485,30 @@ impl QuickAdd {
     }
 
     fn cancel_unsent(&mut self) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.phase != Phase::Started)
-        {
-            self.settle();
+        self.settle_matching(|p| p.phase != Phase::Started);
+    }
+
+    fn settle_matching(&mut self, matching: impl Fn(&Pending) -> bool) {
+        let mut i = 0;
+        while i < self.pending.len() {
+            if matching(&self.pending[i]) {
+                self.settle(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
-    fn settle(&mut self) {
-        if let Some(pending) = self.pending.take() {
-            let outcome = match pending.phase {
-                Phase::Started => Outcome::Unconfirmed,
-                Phase::Staged | Phase::Queued => Outcome::NotSent,
-            };
-            self.notice = Some((pending.ticket, outcome));
+    fn settle(&mut self, i: usize) {
+        let pending = self.pending.remove(i);
+        if pending.phase != Phase::Started {
+            if self.not_sent.len() >= MAX_LIVE {
+                self.not_sent.pop_front();
+            }
+            self.not_sent.push_back(pending.ticket);
         }
+        // Started rows fall back to Unconfirmed from the permanent hold if
+        // they are not currently present. No extra outcome to evict or clear.
     }
 
     pub(crate) fn started_read(&mut self, generation: u64, command: &PersonalCommand) {
@@ -481,6 +531,7 @@ impl QuickAdd {
             // Called on a committed part set, never an account summary,
             // stale cache, partial result, or a metadata/entries broadcast.
             self.revalidation = Revalidation::default();
+            self.reset_read();
         }
     }
 
@@ -488,7 +539,7 @@ impl QuickAdd {
         self.authorized = false;
         self.reset_read();
         self.revalidation.exhausted = self.revalidation.links >= MAX_UNVERIFIED_LINKS;
-        self.settle();
+        self.settle_matching(|_| true);
     }
 
     pub(crate) fn on_read(
@@ -498,11 +549,11 @@ impl QuickAdd {
         progressed: bool,
         now: Instant,
     ) {
-        if !self.searching || self.read_unavailable() {
+        if self.watched().is_none() {
             return;
         }
         if complete {
-            self.read = None; // A matched conditional probe may send no part.
+            self.reset_read(); // An optional conditional probe may send no part.
         } else if matches!(issued, Some(PersonalCommand::SyncPlaylist { .. })) {
             let read = self.read.get_or_insert_with(|| Read {
                 due: now + READ_IDLE,
@@ -510,6 +561,7 @@ impl QuickAdd {
             });
             if progressed {
                 read.due = (now + READ_IDLE).min(read.limit);
+                self.read_stalled = false;
             }
         }
     }
@@ -520,30 +572,72 @@ impl QuickAdd {
     }
 
     fn due(&self) -> Option<Instant> {
+        let watched = self.watched();
         self.pending
-            .as_ref()
-            .map(|p| p.due)
-            .into_iter()
-            .chain(self.read.as_ref().map(|r| r.due))
+            .iter()
+            .flat_map(|p| {
+                [
+                    Some(p.due),
+                    p.probe_due.filter(|_| watched == Some(&p.ticket.target)),
+                ]
+            })
+            .flatten()
+            .chain(
+                self.read
+                    .as_ref()
+                    .map(|r| if self.read_stalled { r.limit } else { r.due }),
+            )
             .min()
     }
 
-    fn expire_pending(&mut self, now: Instant) {
-        if self.pending.as_ref().is_some_and(|p| now >= p.due) {
-            self.settle();
+    /// One optional catch-up read for this group of unresolved started intents.
+    /// When a multipart repair already owns the scope, it serves the same purpose.
+    pub(crate) fn take_probe_due(&mut self, now: Instant) -> bool {
+        let Some(watched) = self.watched() else {
+            return false;
+        };
+        if !self
+            .pending
+            .iter()
+            .any(|p| p.ticket.target == watched && p.probe_due.is_some_and(|due| due <= now))
+        {
+            return false;
         }
+        let watched = self.target.as_ref().expect("watched target").id.as_str();
+        for p in &mut self.pending {
+            if p.ticket.target == watched {
+                p.probe_due = None;
+            }
+        }
+        true
+    }
+
+    fn expire_pending(&mut self, now: Instant) {
+        self.settle_matching(|p| now >= p.due);
+    }
+
+    pub(crate) fn retire_expired_read(&mut self, now: Instant) -> bool {
+        if self.read.as_ref().is_some_and(|r| now >= r.limit) {
+            self.read = None;
+            self.read_stalled = true;
+            self.cancel_unsent();
+            return true;
+        }
+        false
     }
 
     /// Return whether the live quick pull must be retired. This never retries a write.
     pub(crate) fn tick(&mut self, now: Instant) -> bool {
         self.expire_pending(now);
+        if self.retire_expired_read(now) {
+            return true;
+        }
         if self.read.as_ref().is_some_and(|r| now >= r.due) {
-            self.read = None;
+            // Slow or queued legacy part jobs may still yield valid data.
+            // Keep accepting the scoped reply until the whole pull's bound.
             self.read_stalled = true;
             self.cancel_unsent();
-            true
-        } else {
-            false
         }
+        false
     }
 }

@@ -407,6 +407,8 @@ enum Pull {
     Idle,
     /// A matching token produces no frame; never wait for an ACK.
     Probe,
+    /// An optional quick-add verification read, including after navigation.
+    Catchup,
     /// An initial full part or continuation is in flight.
     Required,
 }
@@ -550,6 +552,30 @@ impl Replica {
             Some(_) => Membership::Absent,
             None => Membership::Unknown,
         }
+    }
+
+    /// Catch up after an unobserved add. This is a read, not a receipt or a
+    /// write retry. Leave a complete projection usable until a new part set
+    /// actually arrives; a matching token might emit no frame at all.
+    pub(crate) fn probe_playlist(&mut self) -> Option<Command> {
+        if !self.ready || self.unavailable || self.pull == Pull::Required {
+            return None;
+        }
+        let id = self.desired.clone()?;
+        let detail = &self.cached(&id)?.playlist;
+        if detail.stale {
+            return None;
+        }
+        let known = (!detail.token.is_empty()).then(|| detail.token.clone());
+        let command = self.sync(id, known, 0);
+        // Even an unconditional catch-up shouldn't suppress a later repair:
+        // this optional request can be dropped at local queue admission.
+        self.pull = Pull::Catchup;
+        Some(command)
+    }
+
+    pub(crate) fn is_catchup_sync(&self) -> bool {
+        self.pull == Pull::Catchup
     }
 
     pub(crate) fn refresh_playlist(&mut self) -> Option<Command> {

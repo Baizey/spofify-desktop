@@ -134,6 +134,7 @@ impl DirectStartFence {
 pub(crate) struct Event {
     pub(crate) generation: Generation,
     pub(crate) kind: EventKind,
+    pub(crate) personal_stamp: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -163,6 +164,7 @@ pub(crate) struct Socket {
     outbound: mpsc::Sender<WriteFrame>,
     resume_sequence: AtomicU64,
     order_gate: Arc<Mutex<u64>>,
+    personal_applied: watch::Sender<u64>,
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
@@ -183,8 +185,10 @@ pub(crate) fn spawn(
     let (actual, _) = watch::channel(None);
     let direct_start: Arc<DirectStartFence> = Arc::default();
     let order_gate = Arc::new(Mutex::new(0));
+    let personal_applied = watch::channel(0).0;
     let signals = Signals {
         order_gate: order_gate.clone(),
+        personal_applied: personal_applied.clone(),
         link: link_out,
         authority: authority_out,
         direct_start: direct_start.clone(),
@@ -206,6 +210,7 @@ pub(crate) fn spawn(
         outbound,
         resume_sequence: AtomicU64::new(0),
         order_gate,
+        personal_applied,
         actual,
         session,
         task,
@@ -317,8 +322,7 @@ impl Socket {
         ticket: Ticket,
         epoch: Arc<AtomicU64>,
     ) -> Result<(), SocketError> {
-        let gate = self.order_gate.lock().expect("socket order admission gate");
-        if !self.events.is_empty() || epoch.load(Ordering::SeqCst) != ticket.epoch {
+        if epoch.load(Ordering::SeqCst) != ticket.epoch {
             return Err(SocketError::Busy);
         }
         let command = ticket.command();
@@ -333,10 +337,13 @@ impl Socket {
                 personal,
                 ticket,
                 epoch,
-                wire_stamp: *gate,
                 session: self.session.clone(),
             })),
         )
+    }
+
+    pub(crate) fn mark_personal_applied(&self, stamp: u64) {
+        self.personal_applied.send_replace(stamp);
     }
 
     /// The server responds with a fresh player snapshot and personal initial
@@ -466,6 +473,7 @@ impl Socket {
             outbound,
             resume_sequence: AtomicU64::new(0),
             order_gate: Arc::default(),
+            personal_applied: watch::channel(0).0,
             actual,
             session,
             task: tokio::spawn(pending()),
@@ -528,7 +536,6 @@ struct QuickWrite {
     personal: PersonalAccess,
     ticket: Ticket,
     epoch: Arc<AtomicU64>,
-    wire_stamp: u64,
     session: Session,
 }
 
@@ -566,6 +573,7 @@ enum End {
 
 struct Signals {
     order_gate: Arc<Mutex<u64>>,
+    personal_applied: watch::Sender<u64>,
     link: watch::Sender<Link>,
     authority: watch::Sender<Option<OutputAuthority>>,
     direct_start: Arc<DirectStartFence>,
@@ -582,10 +590,15 @@ impl Signals {
         if first {
             self.link.send_replace(Link::Connected(generation));
         }
-        if matches!(kind, EventKind::Personal(_)) {
+        let personal_stamp = matches!(kind, EventKind::Personal(_)).then(|| {
             *gate = gate.wrapping_add(1);
-        }
-        permit.send(Event { generation, kind });
+            *gate
+        });
+        permit.send(Event {
+            generation,
+            kind,
+            personal_stamp,
+        });
         Ok(())
     }
 }
@@ -821,13 +834,13 @@ async fn send_playlist_read<S: AsyncRead + AsyncWrite + Unpin>(
     // connection failure before we notice that its exact local scope retired.
     let allowed =
         read.personal
-            .inspect_playlist_sync(read.epoch, generation, &read.command, |quick| {
+            .inspect_playlist_sync(read.epoch, generation, &read.command, |optional| {
                 if !read.account_current() {
                     Ok(false)
                 } else if queued.elapsed() <= MAX_QUEUE_AGE {
                     Ok(true)
-                } else if quick {
-                    Ok(false) // Leave a current quick read to its own bounded timeout.
+                } else if optional {
+                    Ok(false) // Leave the optional Search read to its own bounded timeout.
                 } else {
                     Err(End::Backpressure)
                 }
@@ -867,24 +880,37 @@ async fn send_playlist_read<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn quick_ready(signals: &Signals, deadline: Option<Instant>) -> bool {
+    let Some(deadline) = deadline else {
+        return pending().await;
+    };
+    let published = *signals
+        .order_gate
+        .lock()
+        .expect("socket order admission gate");
+    let mut applied = signals.personal_applied.subscribe();
+    matches!(
+        time::timeout_at(
+            deadline.into(),
+            applied.wait_for(|stamp| *stamp == published)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 async fn send_quick<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
     raw: String,
     quick: QuickWrite,
-    signals: &Signals,
+    deadline: Instant,
 ) -> Result<(), End> {
-    wait_write_ready(ws).await?;
-    // Reader and writer share this actor. If a newer personal frame was
-    // published after buffering the command, don't assume the engine has
-    // reduced it yet; refuse this exact ticket rather than enqueue it again.
-    if *signals
-        .order_gate
-        .lock()
-        .expect("socket order admission gate")
-        != quick.wire_stamp
-    {
-        quick.personal.quick_cancel(&quick.ticket);
-        return Ok(());
+    match time::timeout_at(deadline.into(), wait_write_ready(ws)).await {
+        Ok(result) if Instant::now() <= deadline => result?,
+        _ => {
+            quick.personal.quick_cancel(&quick.ticket);
+            return Ok(());
+        }
     }
     let mut result = Ok(());
     let started = {
@@ -1134,8 +1160,12 @@ impl Connection {
         self.pulse(ws, output).await?;
         let mut pulse = Instant::now() + PRESENCE_INTERVAL;
         let mut idle = Instant::now() + SOCKET_IDLE;
+        // Park only Quick Add frames until the engine has applied everything
+        // this socket read. Ordinary controls and ingress keep flowing.
+        let mut quick_writes: VecDeque<(String, QuickWrite, Instant)> = VecDeque::new();
         loop {
             output.expire(signals);
+            let quick_deadline = quick_writes.front().map(|(_, _, at)| *at);
             // Keep each websocket read cancel-safe: Pong flushing happens
             // after the select, not inside a future that another branch drops.
             tokio::select! {
@@ -1153,18 +1183,30 @@ impl Connection {
                     tokio::select! {
                         m = ws.next() => Drive::Read(m),
                         msg = input.recv() => Drive::Write(msg),
+                        ready = quick_ready(signals, quick_deadline) => Drive::Quick(ready),
                     }
                 } => match selected {
+                    Drive::Quick(ready) => {
+                        let (raw, quick, deadline) = quick_writes.pop_front().expect("scoped quick write");
+                        // No other actor can publish a newer wire frame between
+                        // this select branch and start_send; the reducer can
+                        // still veto on rights, account, mode or membership.
+                        if ready && Instant::now() <= deadline {
+                            send_quick(ws, raw, quick, deadline).await?;
+                        } else {
+                            quick.personal.quick_cancel(&quick.ticket);
+                        }
+                    }
                     Drive::Write(Some(frame)) => {
                         if frame.generation != self.generation { continue; }
                         let now = Instant::now();
                         if let Some(scoped) = frame.scoped {
                             match *scoped {
                                 ScopedWrite::Quick(quick) => {
-                                    if now.duration_since(frame.at) > MAX_QUEUE_AGE {
+                                    if now.duration_since(frame.at) > MAX_QUEUE_AGE || quick_writes.len() >= OUTBOUND_CAPACITY {
                                         quick.personal.quick_cancel(&quick.ticket);
                                     } else {
-                                        send_quick(ws, frame.raw, quick, signals).await?;
+                                        quick_writes.push_back((frame.raw, quick, frame.at + MAX_QUEUE_AGE));
                                     }
                                 }
                                 ScopedWrite::Playlist(read) => {
@@ -1204,6 +1246,7 @@ impl Connection {
 enum Drive {
     Read(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Write(Option<WriteFrame>),
+    Quick(bool),
 }
 
 fn classify_wire_error(err: tokio_tungstenite::tungstenite::Error) -> End {

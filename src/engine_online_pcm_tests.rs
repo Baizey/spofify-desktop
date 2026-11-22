@@ -65,6 +65,7 @@ fn fixture(owner: &str) -> (Engine, TestPeer, MixerSource) {
     e.audio = Some(audio);
     e.handle_event(Event {
         generation: GEN,
+        personal_stamp: None,
         kind: EventKind::Snapshot {
             connection_id: "desktop".into(),
             player: State {
@@ -109,6 +110,7 @@ fn update(peer: &TestPeer, kind: EventKind) {
     peer.events
         .try_send(Event {
             generation: GEN,
+            personal_stamp: None,
             kind,
         })
         .unwrap();
