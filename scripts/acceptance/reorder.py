@@ -395,8 +395,7 @@ class Review:
             sleep(.035)
 
     def after(self, row, x):
-        # Drag from a centered grip to a final slot, allowing for up to one
-        # autoscroll tick between sampling the anchor and leaving the edge.
+        # A centered press and fresh row bounds address the same logical slot.
         self.device.move(x, center(row)[1])
 
     def stationary_no_write(self):
@@ -465,6 +464,8 @@ class Review:
                     self.frame(f"{name}-{i:02d}-cross")
                 sleep(.18)
                 self.frame(name + "-06-held")
+                check([r.get("accessibleDescription") for r in self.lifted()] == ["Lifted, after Fixture row 007"],
+                      "the lifted occurrence did not expose the final target")
                 self.expect(before)
                 self.frame(name + "-06b-held-stationary")
                 if cancel:
@@ -564,19 +565,41 @@ class Review:
             with self.hold(point):
                 sleep(.32)
                 self.device.move(x, bounds(viewport)[3] - 3)
-                after = None
                 for i in range(30):
                     self.frame(f"{name}-{i + 1:02d}-held")
                     _, visible = self.rows()
                     candidates = [r for r in visible[1:-2] if number(r) >= minimum_anchor]
                     if candidates:
-                        dest = candidates[0]
-                        after = number(dest)
-                        self.after(dest, x)  # Leave the edge before dropping at a known anchor.
-                        self.frame(name + "-32-target", self.layout())
+                        anchor = number(candidates[0])
                         break
                     sleep(.10)
-                check(after is not None, f"stationary held pointer did not reveal new row {minimum_anchor:03d}")
+                else:
+                    raise Failure(f"stationary held pointer did not reveal new row {minimum_anchor:03d}")
+
+                # A tree poll can take several edge timer ticks to return.
+                # Park the pointer away from the edge first; only aim at the
+                # requested occurrence after its position stops changing.
+                self.device.move(x, center(viewport)[1])
+                prior = None
+
+                def stationary_rows():
+                    nonlocal prior
+                    _, rows = self.rows()
+                    snapshot = [(number(r), bounds(r)) for r in rows]
+                    unchanged = snapshot == prior
+                    prior = snapshot
+                    return rows if unchanged else None
+
+                visible = wait("edge scrolling to stop", stationary_rows, timeout=3)
+                fresh = [r for r in visible[1:-2] if number(r) >= minimum_anchor]
+                check(fresh, "no newly revealed row in the stationary viewport interior")
+                dest = next((r for r in fresh if number(r) == anchor), fresh[0])
+                after = number(dest)
+                self.after(dest, x)
+                layout = self.layout()
+                check(any(r["label"] == dest["accessibleLabel"] and r["box"] == bounds(dest) for r in layout["rows"]),
+                      "drop target moved after leaving the edge")
+                self.frame(name + "-32-target", layout)
                 self.expect(before)
             self.expect(before, self.command(98, after))
             self.expect_adjacent(98, after)
