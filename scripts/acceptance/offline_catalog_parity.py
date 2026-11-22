@@ -407,7 +407,7 @@ class Review(View):
         query(self.window, ROW_TITLE)
         self.window.title("Search")
         self.clicked("recording title opens its album", lambda: self.find("Open album for " + name_filter(ROW_TITLE)))
-        self.window.title(name_filter(ALBUM["name"]))
+        self.window.title(ALBUM["name"])
         for name in TITLES[:-1]:
             self.find("Play track: " + name_filter(name))
         unsaved_play = "Play track: " + name_filter(TITLES[-1])
