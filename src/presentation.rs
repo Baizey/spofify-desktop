@@ -163,6 +163,19 @@ async fn read_with_backoff<T>(
         .unwrap_or(Err(TIMEOUT))
 }
 
+// The dock is much narrower than the service's envelope. Keep evenly timed
+// peak buckets rather than overlapping thousands of individual bar items.
+fn timeline_peaks(bins: &[u8]) -> Vec<f32> {
+    let count = bins.len().min(128);
+    (0..count)
+        .map(|i| {
+            let start = i * bins.len() / count;
+            let end = (i + 1) * bins.len() / count;
+            f32::from(bins[start..end].iter().copied().max().unwrap_or(0)) / 255.0
+        })
+        .collect()
+}
+
 fn retry_artwork_or_waveform(error: ApiError) -> bool {
     matches!(error.status, 0 | 408 | 429) || error.status >= 500
 }
@@ -687,12 +700,9 @@ impl Delivery {
                     if let Some(envelope) = data.waveform {
                         let actual = Duration::try_from_secs_f32(ui.get_duration()).ok();
                         if actual.is_some_and(|duration| envelope.matches_duration(duration)) {
-                            let waveform = envelope
-                                .bins
-                                .into_iter()
-                                .map(|bin| f32::from(bin) / 255.0)
-                                .collect::<Vec<_>>();
-                            ui.set_waveform(ModelRc::new(VecModel::from(waveform)));
+                            ui.set_waveform(ModelRc::new(VecModel::from(timeline_peaks(
+                                &envelope.bins,
+                            ))));
                         } else {
                             complete = false;
                         }
@@ -715,6 +725,22 @@ impl Delivery {
 mod tests {
     use super::*;
     use crate::api::Origin;
+
+    #[test]
+    fn dock_waveform_keeps_peaks_at_both_edges_and_bounds_bar_count() {
+        assert!(timeline_peaks(&[]).is_empty());
+        assert_eq!(timeline_peaks(&[255, 0]), [1.0, 0.0]);
+        let mut bins = vec![0; 2047];
+        bins[0] = 255;
+        bins[1015] = 128;
+        bins[2046] = 64;
+        let peaks = timeline_peaks(&bins);
+        assert_eq!(peaks.len(), 128);
+        assert_eq!(peaks[0], 1.0);
+        assert_eq!(peaks[63], 128.0 / 255.0);
+        assert_eq!(peaks[127], 64.0 / 255.0);
+        assert_eq!(peaks.iter().filter(|&&peak| peak != 0.0).count(), 3);
+    }
 
     #[test]
     fn a_display_rebind_invalidates_receipts_even_when_the_track_returns() {

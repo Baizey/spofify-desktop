@@ -1809,27 +1809,6 @@ impl PlayerView {
             } else {
                 "".into()
             });
-            ui.set_time_label(
-                format!(
-                    "{}:{:02} / {}:{:02}",
-                    self.elapsed as u64 / 60,
-                    self.elapsed as u64 % 60,
-                    self.duration as u64 / 60,
-                    self.duration as u64 % 60
-                )
-                .into(),
-            );
-            let upcoming = self.queue.iter().find(|r| r.upcoming);
-            ui.set_next_title(
-                upcoming
-                    .map(|r| r.title.as_str().into())
-                    .unwrap_or_default(),
-            );
-            ui.set_next_subtitle(
-                upcoming
-                    .map(|r| r.subtitle.as_str().into())
-                    .unwrap_or_default(),
-            );
             let queue = ui.get_queue_rows();
             if queue.row_count() != self.queue.len()
                 || !self

@@ -390,12 +390,9 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
         wait(f"GET {path} responses {statuses}", arrived, 6)
 
-    def now_page():
-        return wait("Now Playing", lambda: element_type(win.elements(), "NowPlaying"))
-
     def next_track(track, **cursor):
         exact_gets()
-        win.click("Next track", within=now_page())
+        win.click("Next track", within=player_bar(win))
         peer.command("next")
         peer.cursor(key=TRACKS.index(track) + 1, **cursor)
         now_playing_title(track)
@@ -476,15 +473,15 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     peer.cursor(observed=True, elapsed=16.25)
     win.find(r"Elapsed 0:(16|17)", roles=("Text",))
-    win.click("Pause", within=now_page())
+    win.click("Pause", within=player_bar(win))
     peer.command("pause")
     peer.cursor(run=4, elapsed=16.25, playing=False, desired=False)
-    win.find("Play", roles=("Button",), within=now_page())
+    win.find("Play", roles=("Button",), within=player_bar(win))
     sleep(2.2)  # A still-advancing cursor would cross the next line's 18s boundary.
     win.title("Elapsed 0:16", timeout=2)
     timed("05-paused-second-line", 1)
 
-    win.drag_slider(0.56, within=now_page())
+    win.drag_slider(0.56, within=player_bar(win))
     seek = peer.command("seek")["value"]
     check(abs(seek - 0.56 * DURATION) < 0.6, f"unexpected native seek target: {seek!r}")
     peer.cursor(run=5, elapsed=seek)
@@ -493,7 +490,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     # Start after all old authored starts: a leaked timed model could still be active.
     next_track(PLAIN, run=6, visit=3, elapsed=22.0, playing=True, desired=True)
-    win.find("Pause", roles=("Button",), within=now_page())
+    win.find("Pause", roles=("Button",), within=player_bar(win))
     fetched(PLAIN, 200)
 
     def plain():

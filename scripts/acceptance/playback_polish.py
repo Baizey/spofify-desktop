@@ -158,9 +158,10 @@ def queue_pixels(window):
 
 
 def live_sliders(window):
-    window.find("0:46", roles=("Text",))
+    dock = player_bar(window)
+    window.find("Elapsed 0:46", roles=("Text",), within=dock)
     window.drag_slider(0.72)
-    window.find(r"[12]:\d{2}", roles=("Text",))
+    window.find(r"Elapsed [12]:\d{2}", roles=("Text",), within=dock)
     button(window, "Unmute desktop playback")
     slider = window.find("Desktop volume", roles=("Slider",))
     x, y, right, bottom = bounds(slider)
@@ -171,8 +172,8 @@ def live_sliders(window):
 
 
 def wide_now_transport(window):
-    # WIDE is a compositor mode; compensate for its decoration to hit the
-    # exact 720px client height and the non-short single-column layout.
+    # WIDE is a compositor mode; compensate for decorations to hit the
+    # exact 720px client height.
     _, height = window.dimensions()
     if height != WIDE[1]:
         window.resize((WIDE[0], round(2 * WIDE[1] - height)))
@@ -182,13 +183,13 @@ def wide_now_transport(window):
     window.click("Open Now Playing", within=dock)
     page = wait("wide Now Playing", lambda: element_type(window.elements(), "NowPlaying"))
     elements = window.subtree(page, max_elements=1000)
-    viewport = element_id(elements, "scroll")
-    transport = element_type(elements, "Transport")
-    check(viewport and transport and contains(viewport, transport, slack=0),
-          "1280×720 Now Playing transport is clipped before scrolling with Queue open")
+    check(not element_type(elements, "Transport") and not element_type(elements, "SeekBar"),
+          "1280×720 Now Playing duplicates the dock's playback controls")
     check(element_id(window.elements(), "queue-pane"), "entering wide Now Playing closed the default Queue")
+    transport = element_type(window.subtree(dock, max_elements=1000), "Transport")
+    check(transport and contains(dock, transport, slack=0), "Now Playing clips the dock transport")
     move_off(window)
-    painted_transport(window, transport, "1280×720 Now Playing with Queue open")
+    painted_transport(window, transport, "1280×720 dock with Now Playing and Queue open")
     window.click("Back")
     window.section("History")
 

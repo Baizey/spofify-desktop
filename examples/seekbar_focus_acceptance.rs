@@ -1,6 +1,6 @@
 //! Disposable native AppWindow fixture: no account, network, audio, or stores.
 //! Run with the software backend in a private scale-1 Cage session; pass a new
-//! directory for before/after PNGs. The 1280×685 client is on a 1280×720 output.
+//! directory for before/after PNGs and set the headless output to 1280×685.
 use image::{Rgba, RgbaImage};
 use slint::platform::{Key, PointerEventButton::Left, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, ModelRc, Timer, VecModel};
@@ -9,8 +9,6 @@ use std::{path::Path, time::Duration};
 slint::include_modules!();
 
 type Crop = [u32; 4]; // left, top, right, bottom (exclusive)
-// Now Playing places the responsive header's waveform above Lyrics.
-const NOW: Crop = [224, 238, 711, 270];
 const DOCK: Crop = [391, 637, 939, 665];
 const VOLUME: Crop = [1146, 605, 1258, 641];
 const MUTE_BUTTON: Crop = [1107, 606, 1145, 645];
@@ -147,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir(&frames)?;
     let ui = AppWindow::new()?;
     ui.set_inspection_width(1280.0);
-    ui.set_inspection_height(720.0);
+    ui.set_inspection_height(685.0);
     ui.set_page_kind("now".into());
     ui.set_signed_in(true);
     ui.set_can_control(true);
@@ -171,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     Timer::single_shot(Duration::from_millis(300), move || {
         let ui = weak.unwrap();
-        check_timeline(&ui, &frames, "now-waveform", NOW, 418.0, 254.0);
+        check_timeline(&ui, &frames, "now-dock-waveform", DOCK, 613.0, 649.0);
         ui.set_page_kind("history".into());
         check_timeline(&ui, &frames, "dock", DOCK, 613.0, 649.0);
         let unmuted = focus(&ui, &frames, "volume", VOLUME, PRIMARY, false);

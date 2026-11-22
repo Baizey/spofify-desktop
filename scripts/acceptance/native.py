@@ -431,6 +431,7 @@ def assert_queue_columns(window):
 
 def full_player(window, name, width, failures):
     before = dock_identity(window)
+    before_seek = window.find("Playback position", roles=("Slider",), within=player_bar(window))
     window.click(OPEN_NOW_PLAYING, within=player_bar(window))  # Strict pointer activation, no fallback.
     try:
         page = wait("full-player page", lambda: element_type(window.elements(), "NowPlaying"), timeout=3)
@@ -445,15 +446,23 @@ def full_player(window, name, width, failures):
         check(control.get("accessibleEnabled"), f"dock {label} is disabled in Now Playing")
     window.find(r"Synthetic Tone \d{3}", roles=("Text",), within=page)
     window.pixels(name, width)
-    with verify(failures, name + " playback geometry"):
+    with verify(failures, name + " sole dock playback geometry"):
         elements = window.subtree(page, max_elements=1000)
-        slider = named(window, elements, "Playback position", "Slider")
-        rail = element_type(elements, "SeekBar")
-        transport = element_type(elements, "Transport")
-        assert_usable(slider, "full-player seek slider", 32, 20)
-        check(rail and contains(rail, slider), "full-player seek slider escapes its rail")
-        assert_transport(window, transport, "full player")
-        assert_disjoint((("full-player seek rail", rail), ("full-player transport", transport)))
+        check(not any(element_type(elements, kind) for kind in ("SeekBar", "Transport", "Clock"))
+              and not named(window, elements, "Playback position", "Slider"),
+              "Now Playing duplicates dock playback controls or clocks")
+        check(not any(window.matches(e, r"Up next.*") for e in elements),
+              "Now Playing duplicates Queue's upcoming tracks")
+        controls = window.subtree(dock, max_elements=1000)
+        slider = named(window, controls, "Playback position", "Slider")
+        assert_usable(slider, "sole playback position slider", 80, 20)
+        check(slider["handle"] == before_seek["handle"] and bounds(slider) == bounds(before_seek),
+              "opening Now Playing replaced or moved the dock seek slider")
+        rail = element_type(controls, "SeekBar")
+        transport = element_type(controls, "Transport")
+        check(rail and contains(rail, slider), "dock seek slider escapes its rail")
+        assert_transport(window, transport, "dock in Now Playing")
+        assert_disjoint((("dock seek rail", rail), ("dock transport", transport)))
     if not named(window, window.subtree(page, max_elements=1000), "Lyrics", "Text"):
         window.scroll_catalog(-360, within=page)
         window.find("Lyrics", roles=("Text",), within=page, timeout=3)

@@ -15,7 +15,6 @@ export component SeekBar inherits Rectangle {
     in property <float> duration;
     in property <bool> enabled;
     in property <[float]> waveform;
-    in property <color> track-background: Theme.bg;
     in property <bool> position-known: true;
     callback seek(float);
     height: 24px;
@@ -49,17 +48,24 @@ export component SeekBar inherits Rectangle {
         released(value) => { root.commit(value); }
     }
     Rectangle {
-        background: root.track-background;
+        background: Theme.rail;
         accessible-role: none;
-        Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: parent.width - 16px; height: 3px; background: Theme.line; border-radius: 2px; }
-        if root.position-known && root.waveform.length == 0: Rectangle { x: 8px; y: (parent.height - 3px) / 2; width: (parent.width - 16px) * root.ratio; height: 3px; background: root.accent; border-radius: 2px; }
+        if root.waveform.length == 0: Rectangle {
+            x: 8px; y: (parent.height - 3px) / 2; width: parent.width - 16px; height: 3px;
+            background: Theme.line; border-radius: 2px;
+            if root.position-known: Rectangle {
+                x: 0px; width: parent.width * root.ratio; height: parent.height;
+                background: root.accent; border-radius: 2px;
+            }
+        }
         for sample[i] in root.waveform: Rectangle {
-            x: 8px + (parent.width - 16px) * i / max(1, root.waveform.length);
-            width: max(1px, (parent.width - 16px) / max(1, root.waveform.length) - 1px);
-            height: 2px + clamp(sample, 0, 1) * (parent.height - 8px);
+            property <length> slot: (parent.width - 16px) / max(1, root.waveform.length);
+            x: 8px + (i + 0.5) * self.slot - self.width / 2;
+            width: max(1px, min(3px, self.slot - 1px));
+            height: 3px + clamp(sample, 0, 1) * 10px;
             y: (parent.height - self.height) / 2;
             border-radius: 1px;
-            background: i < root.ratio * root.waveform.length ? root.accent : Theme.line;
+            background: i + 0.5 < root.ratio * root.waveform.length ? root.accent : Theme.subtle.with-alpha(0.36);
         }
         if root.position-known: Rectangle { x: 3px + (parent.width - 16px) * root.ratio; y: (parent.height - 11px) / 2; width: 11px; height: 11px; border-radius: 6px; background: root.enabled ? root.accent : Theme.muted; }
     }
@@ -82,7 +88,6 @@ export component Transport inherits Rectangle {
     callback toggle();
     callback next();
     callback queue-action(string, string);
-    callback focused();
     width: 214px;
     height: 44px;
     horizontal-stretch: 0;
@@ -95,24 +100,20 @@ export component Transport inherits Rectangle {
             width: 36px; height: 42px; icon: "shuffle"; quiet: true; selected: root.shuffle;
             enabled: root.modes-enabled;
             accessible-label: "Shuffle"; accessible-description: root.shuffle ? "On" : "Off";
-            changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.queue-action("shuffle", ""); }
         }
         PlaybackAction {
             width: 39px; height: 42px; icon: "|◀"; quiet: true; accessible-label: "Previous track"; enabled: root.skip-enabled;
-            changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.previous(); }
         }
         PlaybackAction {
             width: 42px; height: 42px; primary: root.available; round: true;
             icon: root.playing ? "Ⅱ" : "▶"; enabled: root.available;
             accessible-label: root.playing ? "Pause" : "Play";
-            changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.toggle(); }
         }
         PlaybackAction {
             width: 39px; height: 42px; icon: "▶|"; quiet: true; accessible-label: "Next track"; enabled: root.skip-enabled;
-            changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.next(); }
         }
         PlaybackAction {
@@ -121,7 +122,6 @@ export component Transport inherits Rectangle {
             enabled: root.modes-enabled;
             accessible-label: "Repeat";
             accessible-description: root.repeat-mode == "one" ? "Repeat track" : root.repeat-mode == "all" ? "Repeat queue" : "Off";
-            changed has-focus => { if self.has-focus { root.focused(); } }
             clicked => { root.queue-action("repeat", ""); }
         }
     }
@@ -133,6 +133,7 @@ component Clock inherits Caption {
     property <int> remainder: mod(whole, 60);
     text: floor(whole / 60) + ":" + (remainder < 10 ? "0" : "") + remainder;
     font-family: "JetBrains Mono"; font-size: 11px; width: 41px; horizontal-alignment: center;
+    accessible-role: text;
 }
 
 component VolumeSlider inherits Rectangle {
@@ -200,6 +201,7 @@ export component PlayerBar inherits Rectangle {
     in property <image> artwork;
     in property <float> elapsed;
     in property <float> duration;
+    in property <[float]> waveform;
     in property <bool> can-seek;
     in property <bool> playing;
     in property <bool> can-toggle;
@@ -363,16 +365,24 @@ export component PlayerBar inherits Rectangle {
             y: root.layered ? 44px : 52px; height: 22px; spacing: 4px;
             visible: !root.has-track || root.duration > 0;
             property <bool> show-time: root.has-track && root.duration > 0;
-            Clock { seconds: root.elapsed; visible: parent.show-time; }
+            Clock {
+                seconds: root.elapsed; visible: parent.show-time;
+                accessible-label: "Elapsed " + self.text;
+            }
             SeekBar {
                 elapsed: parent.show-time ? root.elapsed : 0;
                 duration: parent.show-time ? root.duration : 0;
                 position-known: parent.show-time;
-                track-background: Theme.rail; horizontal-stretch: 1;
+                // Change only the painting, not the slider, clocks, or dock bounds.
+                waveform: root.on-now-page && parent.show-time ? root.waveform : [];
+                horizontal-stretch: 1;
                 enabled: parent.show-time && !root.locked && root.can-seek;
                 seek(v) => { root.seek(v); }
             }
-            Clock { seconds: root.duration; visible: parent.show-time; }
+            Clock {
+                seconds: root.duration; visible: parent.show-time;
+                accessible-label: "Duration " + self.text;
+            }
         }
     }
     output-tools := HorizontalLayout {

@@ -20,9 +20,11 @@ mod now_playing_checks;
 mod now_playing_sleeve;
 
 use std::{
+    cell::RefCell,
     fs::File,
     io::BufWriter,
     path::{Path, PathBuf},
+    rc::Rc,
     time::Duration,
 };
 
@@ -123,8 +125,6 @@ fn select(ui: &AppWindow, selected: usize) {
     ui.set_cover_art(now_playing_sleeve::sleeve(selected as u32));
     ui.set_elapsed(if selected == 0 { 7.0 } else { 0.0 });
     ui.set_playing(false);
-    ui.set_next_title(recordings.get(selected + 1).map_or("", |row| row.1).into());
-    ui.set_next_subtitle(ARTIST.into());
     ui.set_queue_rows(model(
         recordings
             .into_iter()
@@ -217,9 +217,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_duration(248.0);
     ui.set_local_volume(0.65);
     ui.set_waveform(model(
-        (0..240)
+        (0..128)
             .map(|i| {
-                let phase = i as f32 / 239.0;
+                let phase = i as f32 / 127.0;
                 let envelope = 0.28 + 0.47 * (phase * 11.0).sin().abs();
                 envelope * (0.35 + 0.65 * (i * 13 % 23) as f32 / 23.0)
             })
@@ -269,7 +269,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => (),
         }
     });
-    if !checks {
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    if checks {
+        let actions = actions.clone();
+        ui.on_page_action(move |kind, id| actions.borrow_mut().push((kind, id)));
+    } else {
         ui.set_page_kind("now".into());
         ui.set_can_back(true);
     }
@@ -282,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slint::quit_event_loop().unwrap();
         };
         if checks {
-            now_playing_checks::run(&ui, evidence, finish);
+            now_playing_checks::run(&ui, evidence, &actions, finish);
         } else {
             if !queue_open {
                 // Expose the full central design at the requested size.

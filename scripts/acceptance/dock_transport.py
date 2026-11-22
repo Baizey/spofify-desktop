@@ -88,9 +88,10 @@ def glyph_paint(image, glyph, button, primary):
 
 def capture(window, phase, pictures, *, status="", playing=False, ticked=False, focus=None, known=True):
     label = "Pause" if playing else "Play"
-    clock = window.title("1:01" if ticked else "0:46") if known else None
+    dock = player_bar(window)
+    clock = window.find("Elapsed 1:01" if ticked else "Elapsed 0:46", roles=("Text",), within=dock) if known else None
     caption = window.title(status) if status else None
-    window.find(label, roles=("Button",), within=player_bar(window))
+    window.find(label, roles=("Button",), within=dock)
     if not status:
         window.absent(f"{REQUEST}|{BUFFERING}", roles=("Text",))
     elements = window.elements()
@@ -124,7 +125,8 @@ def capture(window, phase, pictures, *, status="", playing=False, ticked=False, 
         layout |= {"seek rail": bounds(rail), "seek target": bounds(seek)}
     else:
         check(not rail and not seek, "unknown duration exposed a seek rail or target")
-        window.absent("0:46|1:01|3:13", roles=("Text",))
+        check(not named(window, children, r"(?:Elapsed|Duration) \d+:\d{2}", "Text"),
+              "unknown duration exposed dock clocks")
     width, height = window.dimensions()
     check(layout["dock"][0] == 0 and layout["dock"][2:] == (width, height)
           and abs(layout["dock"][1] - layout["catalog viewport"][3]) <= 1,

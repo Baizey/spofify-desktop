@@ -1,16 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { ArtistCredit, WrappingCredits } from "credits.slint";
 import { Action, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
-import { SeekBar, Transport } from "playback.slint";
-
-component PlayerTime inherits Caption {
-    in property <float> seconds;
-    property <int> whole: floor(max(0, seconds));
-    property <int> remainder: mod(whole, 60);
-    text: floor(whole / 60) + ":" + (remainder < 10 ? "0" : "") + remainder;
-    font-family: "JetBrains Mono";
-    font-size: 11px * Theme.density;
-}
 
 export struct TimedLyricLine { start-ms: int, text: string }
 
@@ -213,7 +203,6 @@ export component NowPlaying inherits Rectangle {
     in property <string> album-id;
     in property <string> album-name;
     in property <[ArtistCredit]> credits;
-    in property <bool> metadata-interactive: true;
     in property <string> context-kind;
     in property <string> context-id;
     in property <string> context-name;
@@ -224,25 +213,8 @@ export component NowPlaying inherits Rectangle {
     in property <int> active-lyric-line: -1;
     in property <string> lyrics-status;
     in property <bool> offline;
-    in property <[float]> waveform;
-    in property <float> elapsed;
-    in property <float> duration;
-    in property <bool> playing;
-    in property <bool> can-seek;
-    in property <bool> can-toggle;
-    in property <bool> can-skip;
-    in property <bool> shuffle;
-    in property <string> repeat-mode: "off";
-    in property <bool> can-change-modes;
-    in property <string> next-title;
-    in property <string> next-subtitle;
 
-    callback previous();
-    callback toggle();
-    callback next();
-    callback seek(float);
     callback page-action(string, string);
-    callback queue-action(string, string);
 
     horizontal-stretch: 1;
     vertical-stretch: 1;
@@ -251,22 +223,19 @@ export component NowPlaying inherits Rectangle {
     background: Theme.bg;
 
     property <bool> has-track: root.track-id != "";
-    property <bool> header: root.stage-width >= 555px;
-    property <bool> header-wide: root.stage-width >= 1120px;
+    property <bool> inline: root.stage-width >= 400px;
+    property <bool> wide: root.stage-width >= 960px;
     property <bool> short: scroll.visible-height < 640px;
     property <length> gutter: clamp(scroll.visible-width * 0.038, 18px, 66px);
     property <length> stage-width: max(0px, min(1440px, scroll.visible-width - 2 * root.gutter));
-    property <length> deck-lane: root.header ? root.stage-width : min(root.stage-width, 460px);
-    property <length> art-size: min(root.deck-lane,
-        root.header-wide ? 138px : root.header ? 112px : clamp(scroll.visible-height - 350px, 100px, 248px));
-    property <length> header-controls-width: min(390px, root.stage-width * 0.27);
-    property <length> deck-top: 44px;
+    property <length> art-size: min(root.stage-width, root.wide ? 112px : root.inline ? 96px : 100px);
+    property <length> deck-top: 34px;
     property <bool> has-context: root.context-id != "" && root.context-name != "" &&
         (root.context-kind == "album" || root.context-kind == "artist" || root.context-kind == "playlist" || root.context-kind == "derived" || root.context-kind == "saved");
     property <bool> context-is-album: root.has-context && root.context-kind == "album" && root.context-id == root.album-id;
-    property <bool> link-album: root.metadata-interactive && root.album-id != "";
+    property <bool> link-album: root.album-id != "";
     property <bool> show-album: root.link-album || root.album-label != "";
-    property <bool> show-context: root.metadata-interactive && root.has-context && !root.context-is-album;
+    property <bool> show-context: root.has-context && !root.context-is-album;
     property <string> album-label: root.album-name != "" ? root.album-name : root.context-is-album ? root.context-name : "";
     public function focus-lyrics() {
         lyrics.take-focus();
@@ -307,17 +276,7 @@ export component NowPlaying inherits Rectangle {
             y: root.short ? 8px : 16px;
             height: !root.has-track ? 176px : max(deck.y + deck.height, lyrics.y + lyrics.height);
 
-            HorizontalLayout {
-                y: 0px; height: 38px; spacing: root.short ? 6px : 11px;
-                Eyebrow { text: "NOW PLAYING"; }
-                Rectangle { horizontal-stretch: 1; }
-                if root.next-title != "": Caption {
-                    text: "Up next · " + root.next-title + (root.next-subtitle == "" ? "" : " · " + root.next-subtitle);
-                    horizontal-alignment: right;
-                    min-width: 0px; max-width: root.header ? 420px : 210px;
-                    horizontal-stretch: 2;
-                }
-            }
+            Eyebrow { x: 0px; y: 0px; height: 28px; text: "NOW PLAYING"; }
 
             if !root.has-track: VerticalLayout {
                 y: 59px; height: 100px; alignment: start; spacing: 6px;
@@ -331,48 +290,47 @@ export component NowPlaying inherits Rectangle {
 
             deck := Rectangle {
                 visible: root.has-track;
-                x: (stage.width - self.width) / 2; y: root.deck-top;
-                width: root.deck-lane;
-                property <length> stack-identity-y: root.art-size + (root.short ? 10px : 16px);
-                property <length> identity-row-height: max(root.art-size, identity.height, root.header-wide ? controls.height : 0px);
-                property <length> stack-controls-y: (root.header ? self.identity-row-height : self.stack-identity-y + identity.height) + 10px;
-                height: root.header-wide ? self.identity-row-height : self.stack-controls-y + controls.height;
+                y: root.deck-top;
+                width: stage.width;
+                property <length> stacked-identity-y: root.art-size + 10px;
+                height: root.inline ? max(root.art-size, identity.height) : self.stacked-identity-y + identity.height;
 
                 Cover {
-                    x: root.header ? 0px : (parent.width - self.width) / 2;
-                    y: root.header ? (deck.identity-row-height - self.height) / 2 : 0px;
+                    x: root.inline ? 0px : (parent.width - self.width) / 2;
+                    y: root.inline ? (deck.height - self.height) / 2 : 0px;
                     artwork: root.artwork; width: root.art-size; height: root.art-size;
                 }
                 identity := VerticalLayout {
-                    x: root.header ? root.art-size + 26px : 0px;
-                    y: root.header ? (deck.identity-row-height - self.height) / 2 : deck.stack-identity-y;
-                    width: max(0px, parent.width - self.x - (root.header-wide ? root.header-controls-width + 36px : 0px));
+                    x: root.inline ? root.art-size + (root.wide ? 22px : 16px) : 0px;
+                    y: root.inline ? (deck.height - self.height) / 2 : deck.stacked-identity-y;
+                    width: max(0px, parent.width - self.x);
                     height: self.preferred-height; alignment: start; spacing: 3px;
                     Text {
                         text: root.track;
-                        horizontal-alignment: root.header ? left : center;
+                        horizontal-alignment: root.inline ? left : center;
                         color: Theme.text;
-                        font-size: (root.short ? 24px : root.header-wide ? 35px : 30px) * Theme.density;
+                        font-size: (root.short ? 24px : root.wide ? 32px : 27px) * Theme.density;
                         font-weight: 750;
                         letter-spacing: -0.45px;
                         wrap: word-wrap;
                         accessible-label: root.track;
                     }
                     if root.subtitle != "" || root.credits.length > 0: artist-line := WrappingCredits {
-                        credits: root.credits; fallback: root.subtitle; centered: !root.header;
-                        interactive: root.metadata-interactive;
+                        credits: root.credits; fallback: root.subtitle; centered: !root.inline;
                         font-size: 15px * Theme.density;
                         focused(y, h) => { root.reveal(stage.y + deck.y + identity.y + artist-line.y + y, h); }
                         activated(id) => { root.page-action("artist", id); }
                     }
                     if root.show-album || root.show-context: source-line := HorizontalLayout {
-                        height: 34px; spacing: 8px;
+                        height: 34px; spacing: 8px; alignment: root.inline ? start : center;
+                        property <length> link-limit: root.show-album && root.show-context ? max(0px, (self.width - 8px) / 2) : self.width;
                         if root.link-album: Rectangle {
-                            width: min(album.min-width, parent.width * (root.show-context ? 0.49 : 1));
+                            width: min(album.min-width, source-line.link-limit);
                             album := Action {
                                 width: parent.width; height: parent.height;
                                 text: root.album-label == "" ? "Album" : root.album-label;
-                                icon: "◎"; quiet: true; leading: true;
+                                icon: "◎"; quiet: true; leading: true; leading-inset: 4px;
+                                click-scope: root.album-id;
                                 accessible-label: root.album-label == "" ? "Open album" : "Open album: " + root.album-label;
                                 changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + identity.y + source-line.y, source-line.height); } }
                                 clicked => { root.page-action("album", root.album-id); }
@@ -380,58 +338,19 @@ export component NowPlaying inherits Rectangle {
                         }
                         if root.show-album && !root.link-album: Caption {
                             min-width: 0px;
-                            max-width: root.show-context ? parent.width * 0.49 : parent.width;
+                            max-width: source-line.link-limit;
                             text: root.album-label;
                         }
-                        if root.show-context: Action {
-                            min-width: 0px; height: 34px; horizontal-stretch: 1;
-                            text: "From " + root.context-name; icon: "↗"; quiet: true; leading: true;
-                            accessible-label: "Open playback source: " + root.context-name;
-                            changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + identity.y + source-line.y, source-line.height); } }
-                            clicked => { root.page-action("context-" + root.context-kind, root.context-id); }
-                        }
-                        if !root.show-context: Rectangle { horizontal-stretch: 1; }
-                    }
-                }
-                controls := Rectangle {
-                    property <bool> side-by-side: root.header && !root.header-wide && root.duration > 0;
-                    property <length> seek-height: root.duration > 0 ? 49px : 0px;
-                    property <length> transport-gap: root.duration > 0 ? (root.short ? 3px : 9px) : 0px;
-                    x: root.header-wide ? parent.width - self.width : 0px;
-                    y: root.header-wide ? (deck.identity-row-height - self.height) / 2 : deck.stack-controls-y;
-                    width: root.header-wide ? root.header-controls-width : parent.width;
-                    height: self.side-by-side ? max(self.seek-height, playback-row.height) : self.seek-height + self.transport-gap + playback-row.height;
-                    VerticalLayout {
-                        x: 0px; y: 0px;
-                        width: controls.side-by-side ? max(0px, parent.width - playback-row.width - 20px) : parent.width;
-                        height: controls.seek-height;
-                        if root.duration > 0: SeekBar {
-                            height: 30px;
-                            elapsed: root.elapsed; duration: root.duration;
-                            enabled: root.has-track && root.can-seek;
-                            waveform: root.waveform;
-                            seek(value) => { root.seek(value); }
-                        }
-                        if root.duration > 0: HorizontalLayout {
-                            height: 19px; padding-left: 2px; padding-right: 2px;
-                            PlayerTime { seconds: min(root.elapsed, root.duration); accessible-label: "Elapsed " + self.text; }
-                            Rectangle { horizontal-stretch: 1; }
-                            PlayerTime { seconds: root.duration; accessible-label: "Duration " + self.text; }
-                        }
-                    }
-                    playback-row := HorizontalLayout {
-                        x: controls.side-by-side ? parent.width - self.width : 0px;
-                        y: controls.side-by-side ? (controls.seek-height - self.height) / 2 : controls.seek-height + controls.transport-gap;
-                        width: controls.side-by-side ? self.preferred-width : parent.width;
-                        height: 44px; alignment: center;
-                        Transport {
-                            playing: root.playing; available: root.has-track && root.can-toggle; skip-enabled: root.has-track && root.can-skip;
-                            shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.has-track && root.can-change-modes;
-                            previous => { root.previous(); }
-                            toggle => { root.toggle(); }
-                            next => { root.next(); }
-                            focused => { root.reveal(stage.y + deck.y + controls.y + playback-row.y, playback-row.height); }
-                            queue-action(op, key) => { root.queue-action(op, key); }
+                        if root.show-context: Rectangle {
+                            width: min(source.min-width, source-line.link-limit);
+                            source := Action {
+                                width: parent.width; height: parent.height;
+                                text: "From " + root.context-name; icon: "↗"; quiet: true; leading: true; leading-inset: 4px;
+                                click-scope: root.context-kind + "/" + root.context-id;
+                                accessible-label: "Open playback source: " + root.context-name;
+                                changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + identity.y + source-line.y, source-line.height); } }
+                                clicked => { root.page-action("context-" + root.context-kind, root.context-id); }
+                            }
                         }
                     }
                 }
@@ -440,7 +359,7 @@ export component NowPlaying inherits Rectangle {
             lyrics := LyricsReader {
                 visible: root.has-track;
                 width: stage.width;
-                y: deck.y + deck.height + 22px;
+                y: deck.y + deck.height + 18px;
                 height: self.preferred-height;
                 reading-height: max(112px, scroll.visible-height - stage.y - self.y - self.heading-height - 26px);
                 active: root.has-track;

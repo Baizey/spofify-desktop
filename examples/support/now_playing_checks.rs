@@ -1,16 +1,19 @@
 //! Scale-1 native input/paint checks without Slint MCP or a loopback listener.
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use image::{Rgba, RgbaImage};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
-use slint::{ComponentHandle, LogicalPosition, Timer};
+use slint::{ComponentHandle, LogicalPosition, SharedString, Timer};
 
 use crate::{AppWindow, FIRST, click, delivery, frame, save_png};
 
 const DOCK_TOP: u32 = 1080; // DockLayout's wide, standard-density 100px lane.
+const TIMELINE: Rect = [525, 1133, 1300, 1156];
+const DOCK_PLAY: (f32, f32) = (912.0, 1110.0);
 const FOCUS: Rgba<u8> = Rgba([223, 189, 120, 255]);
 const ACCENT: Rgba<u8> = Rgba([102, 227, 180, 255]);
 const MUTED: Rgba<u8> = Rgba([180, 189, 203, 255]);
@@ -164,38 +167,60 @@ fn authored_timed(image: &RgbaImage, reader: Rect) -> Vec<Rect> {
     rows
 }
 
-fn waveform_focus(ui: &AppWindow) {
+fn dock_timeline(ui: &AppWindow, base: &Path) {
     ui.set_elapsed(60.0);
+    let samples = ui.get_waveform();
+    ui.set_waveform(Default::default());
+    let fallback = frame(ui);
+    ui.set_waveform(samples.clone());
     let resting = frame(ui);
-    // The active waveform and thumb must change color in place (not gain an
-    // outline), independently of where the candidate places its deck controls.
+    let in_timeline =
+        |x, y| (TIMELINE[0]..TIMELINE[2]).contains(&x) && (TIMELINE[1]..TIMELINE[3]).contains(&y);
+    assert!(ink_points(TIMELINE).any(|(x, y)| resting.get_pixel(x, y) != fallback.get_pixel(x, y)));
+    assert!(
+        resting
+            .enumerate_pixels()
+            .all(|(x, y, p)| in_timeline(x, y) || p == fallback.get_pixel(x, y)),
+        "arrival of waveform samples moved or repainted outside the seek rail"
+    );
+    shot(base, "dock-waveform", &resting);
     for _ in 0..28 {
         press(ui, Key::Tab);
         let focused = frame(ui);
-        let recolored = mask_bounds(&focused, |x, y, p| {
-            (120..DOCK_TOP).contains(&y) && *p == FOCUS && *resting.get_pixel(x, y) == ACCENT
-        });
-        if let Some([l, t, r, b]) =
-            recolored.filter(|[l, t, r, b]| r - l >= 32 && (7..27).contains(&(b - t)))
-        {
-            assert!(
-                !ink_points([l, t, r, b]).any(|(x, y)| {
-                    *focused.get_pixel(x, y) == FOCUS && *resting.get_pixel(x, y) != ACCENT
-                }),
-                "waveform focus painted outside the active bars/thumb"
-            );
-            press(ui, Key::RightArrow);
-            assert!(
-                (ui.get_elapsed() - 61.0).abs() < 0.01,
-                "focused waveform Right did not seek"
-            );
-            println!(
-                "PASS in-page waveform focus recolors the bars/thumb and Right seeks only here"
-            );
-            return;
+        if !has_color(&focused, TIMELINE, FOCUS) {
+            continue;
         }
+        assert!(
+            ink_points(TIMELINE).all(|(x, y)| {
+                (*focused.get_pixel(x, y) == FOCUS) == (*resting.get_pixel(x, y) == ACCENT)
+            }),
+            "focus must recolor only the active waveform and thumb, without an outline or geometry shift"
+        );
+        shot(base, "dock-waveform-focus", &focused);
+        press(ui, Key::RightArrow);
+        assert!(
+            (ui.get_elapsed() - 61.0).abs() < 0.01,
+            "focused dock Right did not seek"
+        );
+        ui.set_waveform(Default::default());
+        press(ui, Key::RightArrow);
+        ui.set_waveform(samples);
+        press(ui, Key::RightArrow);
+        assert!(
+            (ui.get_elapsed() - 63.0).abs() < 0.01,
+            "replacing waveform paint lost seek focus"
+        );
+        click(ui, 925.0, 1144.0);
+        assert!(
+            (107.0..140.0).contains(&ui.get_elapsed()),
+            "dock pointer did not seek near the center"
+        );
+        println!(
+            "PASS dock waveform arrival and Tab change only paint; focus survives; arrow and pointer seek"
+        );
+        return;
     }
-    panic!("Tab did not reach the painted Now Playing waveform");
+    panic!("Tab did not reach the dock waveform");
 }
 
 fn has_status(image: &RgbaImage, reader: Rect) -> bool {
@@ -211,7 +236,7 @@ fn has_status(image: &RgbaImage, reader: Rect) -> bool {
         == 25
 }
 
-fn transitions(ui: &AppWindow) {
+fn transitions(ui: &AppWindow, base: &Path) {
     ui.invoke_next();
     assert_eq!(ui.get_now_track_id().as_str(), "plain");
     assert_eq!(
@@ -228,6 +253,7 @@ fn transitions(ui: &AppWindow) {
     );
     delivery(ui, true);
     let plain = frame(ui);
+    shot(base, "plain-lyrics", &plain);
     let reader = reader_ink(&plain);
     let rows = lines(&plain, reader);
     let width = reader[2] - reader[0];
@@ -462,7 +488,12 @@ fn reading(ui: &AppWindow, base: &Path) {
     );
 }
 
-pub(super) fn run(ui: &AppWindow, evidence: PathBuf, finish: impl FnOnce(RgbaImage) + 'static) {
+pub(super) fn run(
+    ui: &AppWindow,
+    evidence: PathBuf,
+    actions: &RefCell<Vec<(SharedString, SharedString)>>,
+    finish: impl FnOnce(RgbaImage) + 'static,
+) {
     close_queue(ui);
     click(ui, 48.0, 1121.0); // Dock cover: “Open Now Playing” from History.
     assert_eq!(
@@ -478,6 +509,48 @@ pub(super) fn run(ui: &AppWindow, evidence: PathBuf, finish: impl FnOnce(RgbaIma
         None,
         "ordinary Now Playing entry stole lyrics arrow focus"
     );
+    let elapsed = ui.get_elapsed();
+    click(ui, 1460.0, 214.0); // The old in-page waveform lane.
+    click(ui, 1426.0, 280.0); // The old in-page Play button.
+    assert_eq!(
+        ui.get_elapsed(),
+        elapsed,
+        "obsolete in-page pointer target sought playback"
+    );
+    assert!(
+        !ui.get_playing(),
+        "obsolete in-page pointer target toggled playback"
+    );
+    click(ui, DOCK_PLAY.0, DOCK_PLAY.1);
+    assert!(
+        ui.get_playing(),
+        "dock Play did not toggle after opening Now Playing"
+    );
+    press(ui, Key::Space);
+    assert!(
+        !ui.get_playing(),
+        "keyboard activation of dock Pause did not toggle playback"
+    );
+    println!(
+        "PASS sole dock transport: former in-page targets inert, pointer Play and keyboard Pause work"
+    );
+    click(ui, 520.0, 222.0); // Artist credit.
+    click(ui, 490.0, 254.0); // Album.
+    click(ui, 710.0, 254.0); // Playlist source.
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|(kind, id)| (kind.as_str(), id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("artist", "lantern-house-artist"),
+            ("album", "lantern-house-album"),
+            ("context-playlist", "lantern-house-playlist")
+        ],
+        "Now Playing identity links did not route to their entities"
+    );
+    println!("PASS artist, album, and playback-source links dispatch their entity actions");
     click(ui, QUEUE.0, QUEUE.1);
     let queue_open = frame(ui);
     assert!(
@@ -485,19 +558,20 @@ pub(super) fn run(ui: &AppWindow, evidence: PathBuf, finish: impl FnOnce(RgbaIma
             .any(|x| (15..400).any(|y| opened.get_pixel(x, y) != queue_open.get_pixel(x, y))),
         "queue action did not paint its pane"
     );
+    shot(&evidence, "queue", &queue_open);
     close_queue(ui);
     click(ui, LYRICS.0, LYRICS.1);
     let weak = ui.as_weak();
     Timer::single_shot(Duration::from_millis(40), move || {
         let ui = weak.unwrap();
         reading(&ui, &evidence);
-        waveform_focus(&ui);
+        dock_timeline(&ui, &evidence);
         click(&ui, LYRICS.0, LYRICS.1);
         let weak = ui.as_weak();
         Timer::single_shot(Duration::from_millis(40), move || {
             let ui = weak.unwrap();
             press(&ui, Key::RightArrow); // Switch tracks with a nonzero horizontal pan.
-            transitions(&ui);
+            transitions(&ui, &evidence);
             press(&ui, Key::Escape);
             let weak = ui.as_weak();
             Timer::single_shot(Duration::from_millis(50), move || {

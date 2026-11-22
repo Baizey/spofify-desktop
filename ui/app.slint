@@ -94,7 +94,6 @@ export component AppWindow inherits Window {
     in property <string> output-name;
     in property <float> elapsed;
     in property <float> duration;
-    in property <string> time-label;
     callback sign-in();
     callback sign-out();
     callback cancel-sign-in();
@@ -186,9 +185,6 @@ export component AppWindow inherits Window {
     in property <string> now-album-id;
     in property <string> now-album-name;
     in property <[ArtistCredit]> now-credits;
-    in property <string> next-title;
-    in property <string> next-subtitle;
-    in property <string> now-artist-id;
     in property <string> now-context-kind;
     in property <string> now-context-id;
     in property <string> now-context-name;
@@ -717,9 +713,8 @@ export component AppWindow inherits Window {
                             }
                         }
                         track-id: root.now-track-id; track: root.now-title; subtitle: root.now-detail;
-                        credits: root.now-credits; metadata-interactive: true;
+                        credits: root.now-credits;
                         album-name: root.now-album-name; album-id: root.now-album-id;
-                        next-title: root.next-title; next-subtitle: root.next-subtitle;
                         context-kind: root.now-context-kind; context-id: root.now-context-id;
                         context-name: root.now-context-name;
                         artwork: root.cover-art;
@@ -729,14 +724,9 @@ export component AppWindow inherits Window {
                         lyrics-attribution: self.lyrics-current ? root.lyrics-attribution : "";
                         lyrics-status: self.lyrics-current ? root.lyrics-status : "";
                         offline: root.local-mode;
-                        waveform: root.waveform; elapsed: root.elapsed; duration: root.duration;
                         active-lyric-line: !self.offline && self.lyrics-lines.length > 0
-                            ? root.resolve-active-lyric(self.lyrics-lines, self.elapsed, self.duration) : -1;
-                        playing: root.playing; can-seek: root.can-seek && (!root.local-mode || root.local-playback); can-toggle: root.can-control && (!root.local-mode || root.local-playback);
-                        can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
-                        shuffle: root.shuffle; repeat-mode: root.repeat-mode; can-change-modes: root.queue-controls;
-                        previous => { root.previous(); } toggle => { root.toggle-play(); } next => { root.next(); } seek(v) => { root.seek(v); }
-                        page-action(op, id) => { shell.entity(op, id, -1); } queue-action(op, key) => { root.queue-action(op, key); }
+                            ? root.resolve-active-lyric(self.lyrics-lines, root.elapsed, root.duration) : -1;
+                        page-action(op, id) => { shell.entity(op, id, -1); }
                     }
                     catalog-scroll := ScrollView {
                         visible: !root.is-now && !shell.playlist-order-edit;
@@ -1440,6 +1430,7 @@ export component AppWindow inherits Window {
             title-focus-serial: shell.dock-title-focus-serial;
             status: root.playback-status;
             artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
+            waveform: root.waveform;
             can-seek: root.can-seek && (!root.local-mode || root.local-playback);
             playing: root.playing; can-toggle: root.can-control && (!root.local-mode || root.local-playback);
             can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;

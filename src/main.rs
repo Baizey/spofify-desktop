@@ -76,8 +76,6 @@ fn clear(ui: &AppWindow) {
     ui.set_media_track_token("".into());
     ui.set_now_album_id("".into());
     ui.set_now_album_name("".into());
-    ui.set_next_title("".into());
-    ui.set_next_subtitle("".into());
     ui.set_now_credits(Default::default());
     presentation::clear(ui);
     ui.set_now_title("Nothing playing".into());

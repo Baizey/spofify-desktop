@@ -166,12 +166,9 @@ def assert_view(window, entry):
         page = wait("Now Playing", lambda: element_type(window.elements(), "NowPlaying"))
         window.scroll_catalog(1000, within=page)
         window.find("Synthetic Tone 001", roles=TEXT, within=page)
-        times = ("Elapsed 0:46", "Duration 3:13")
-        elements = window.subtree(page, max_elements=1000)
-        if not all((clock := named(window, elements, label, "Text")) and contains(page, clock) for label in times):
-            window.scroll_catalog(-100, within=page)  # Minimum-height client can clip the page clocks.
-        for label in times:
-            check(contains(page, window.find(label, roles=TEXT, within=page)), f"Now Playing clips {label}")
+        dock = player_bar(window)
+        for label in ("Elapsed 0:46", "Duration 3:13"):
+            check(contains(dock, window.find(label, roles=TEXT, within=dock)), f"Now Playing clips dock {label}")
     else:
         window.section("History")
         window.absent("Back", roles=BUTTON)
