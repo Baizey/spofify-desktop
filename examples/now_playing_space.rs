@@ -90,6 +90,7 @@ fn delivery(ui: &AppWindow, overflow: bool) {
                     .enumerate()
                     .map(|(i, text)| TimedLyricLine {
                         start_ms: (i as i32 + 1) * 3_000,
+                        sung: !text.trim().is_empty(),
                         text: text.into(),
                     })
                     .collect(),

@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _covers = artwork::install(&ui, access.clone(), pages);
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx, art);
     desk.bind(&ui, mode, access.clone());
-    let _media = presentation::install(&ui, access, epoch.clone());
+    let _media = presentation::install(&ui, access, epoch.clone(), |_, _, _, _| {});
 
     let window = ui.as_weak();
     let login = auth_tx.clone();

@@ -83,7 +83,7 @@ async fn bulk_order_waits_for_the_latest_primary_personal_publication() {
     let order = socket.bulk_order();
     let mut changes = order.changes();
     assert_eq!(order.when_applied(|| 0), Some(0));
-    *socket.order_gate.lock().unwrap() = 2;
+    socket.order_gate.lock().unwrap().personal = 2;
     socket.mark_personal_applied(1);
     assert_eq!(*changes.borrow_and_update(), 1);
     assert_eq!(order.when_applied(|| 1), None);

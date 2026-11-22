@@ -747,7 +747,33 @@ impl Engine {
         }
     }
 
+    pub(super) fn seek_online_lyric(
+        &mut self,
+        value: f64,
+        snapshot: crate::presentation::LyricSnapshot,
+    ) {
+        let Some(state) = &self.online.state else {
+            return;
+        };
+        let scope = socket::LyricSeekScope {
+            cursor: state.cursor.clone(),
+            snapshot,
+            epoch: self.epoch,
+            current_epoch: self.shared_epoch.clone(),
+        };
+        self.send_online_command_scoped(socket::Command::Seek { value }, false, Some(scope));
+    }
+
     fn send_online_command(&mut self, command: socket::Command, explicit: bool) {
+        self.send_online_command_scoped(command, explicit, None);
+    }
+
+    fn send_online_command_scoped(
+        &mut self,
+        command: socket::Command,
+        explicit: bool,
+        lyric_scope: Option<socket::LyricSeekScope>,
+    ) {
         let replaced_start = self.online.starting_locally();
         if matches!(
             command,
@@ -821,7 +847,13 @@ impl Engine {
         } else {
             None
         };
-        self.action_status = if let Ok(resume) = socket.command(generation, command.clone()) {
+        let admission = match (&command, lyric_scope) {
+            (socket::Command::Seek { value }, Some(scope)) => {
+                socket.seek_lyric(generation, *value, scope).map(|()| None)
+            }
+            _ => socket.command(generation, command.clone()),
+        };
+        self.action_status = if let Ok(resume) = admission {
             self.online.receipts.sent(&command, resume);
             if let Some(mut start) = start {
                 // This cache contains only the current account's previously

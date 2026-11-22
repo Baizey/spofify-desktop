@@ -41,6 +41,7 @@ use crate::{
     personal::{PersonalCommand, PersonalUpdate},
     personal_bridge::PersonalAccess,
     playlist_pin_store::PUBLICATION_GATE,
+    presentation::LyricSnapshot,
     quick_add::{BULK_WINDOW, Ticket},
 };
 use wire::{Incoming, Outgoing};
@@ -163,18 +164,24 @@ pub(crate) struct Socket {
     pub(crate) events: mpsc::Receiver<Event>,
     outbound: mpsc::Sender<WriteFrame>,
     resume_sequence: AtomicU64,
-    order_gate: Arc<Mutex<u64>>,
+    order_gate: Arc<Mutex<IngressSequence>>,
     personal_applied: watch::Sender<u64>,
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct IngressSequence {
+    personal: u64,
+    queue: u64,
+}
+
 /// Primary personal ingress fence. Call while holding the Personal state lock,
 /// as for order admission; the closure must not wait or perform async I/O.
 #[derive(Clone)]
 pub(crate) struct BulkOrder {
-    order_gate: Arc<Mutex<u64>>,
+    order_gate: Arc<Mutex<IngressSequence>>,
     applied: watch::Receiver<u64>,
 }
 
@@ -182,7 +189,7 @@ impl BulkOrder {
     pub(crate) fn when_applied<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
         let published = self.order_gate.lock().expect("socket order admission gate");
         let applied = *self.applied.borrow();
-        (applied == *published).then(f)
+        (applied == published.personal).then(f)
     }
 
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
@@ -204,7 +211,7 @@ pub(crate) fn spawn(
     let (authority_out, authority) = watch::channel(None);
     let (actual, _) = watch::channel(None);
     let direct_start: Arc<DirectStartFence> = Arc::default();
-    let order_gate = Arc::new(Mutex::new(0));
+    let order_gate = Arc::new(Mutex::new(IngressSequence::default()));
     let personal_applied = watch::channel(0).0;
     let signals = Signals {
         order_gate: order_gate.clone(),
@@ -256,6 +263,39 @@ impl Socket {
             .then(|| self.resume_sequence.fetch_add(1, Ordering::Relaxed) + 1);
         self.submit(generation, class, &command, resume)?;
         Ok(resume)
+    }
+
+    pub(crate) fn seek_lyric(
+        &self,
+        generation: Generation,
+        value: f64,
+        scope: LyricSeekScope,
+    ) -> Result<(), SocketError> {
+        let command = Command::Seek { value };
+        if !command.valid() {
+            return Err(SocketError::Invalid);
+        }
+        // Like queue drops, do not use the engine's basis while a newer
+        // update is waiting to be reduced. Capture the same ingress fence for
+        // dispatch, including queue edits that don't change the cursor.
+        let ingress = self.order_gate.lock().expect("socket order admission gate");
+        if !self.events.is_empty() {
+            return Err(SocketError::Busy);
+        }
+        let mode = *self.session.network_changes().borrow();
+        self.submit_fenced(
+            generation,
+            Class::Choice,
+            &command,
+            None,
+            Some(mode),
+            Some(ScopedWrite::LyricSeek(ScopedLyricSeek {
+                scope,
+                queue: ingress.queue,
+                mode,
+                session: self.session.clone(),
+            })),
+        )
     }
 
     pub(crate) fn reorder(
@@ -536,14 +576,37 @@ struct WriteFrame {
     resume: Option<u64>,
     at: Instant,
     raw: String,
-    // The common playback/write queue stays small; only the two paths with
-    // final personal-state admission allocate local metadata.
+    // Only writes with final admission checks allocate local metadata.
     scoped: Option<Box<ScopedWrite>>,
 }
 
 enum ScopedWrite {
     Quick(QuickWrite),
     Playlist(PlaylistRead),
+    LyricSeek(ScopedLyricSeek),
+}
+
+pub(crate) struct LyricSeekScope {
+    pub(crate) cursor: Cursor,
+    pub(crate) snapshot: LyricSnapshot,
+    pub(crate) epoch: u64,
+    pub(crate) current_epoch: Arc<AtomicU64>,
+}
+
+impl LyricSeekScope {
+    fn matches(&self, canonical: &Cursor) -> bool {
+        self.cursor.same_run(canonical)
+            && self.cursor.desired == canonical.desired
+            && self.current_epoch.load(Ordering::SeqCst) == self.epoch
+            && self.snapshot.is_current()
+    }
+}
+
+struct ScopedLyricSeek {
+    scope: LyricSeekScope,
+    queue: u64,
+    mode: u64,
+    session: Session,
 }
 
 struct PlaylistRead {
@@ -599,7 +662,7 @@ enum End {
 }
 
 struct Signals {
-    order_gate: Arc<Mutex<u64>>,
+    order_gate: Arc<Mutex<IngressSequence>>,
     personal_applied: watch::Sender<u64>,
     link: watch::Sender<Link>,
     authority: watch::Sender<Option<OutputAuthority>>,
@@ -618,9 +681,15 @@ impl Signals {
             self.link.send_replace(Link::Connected(generation));
         }
         let personal_stamp = matches!(kind, EventKind::Personal(_)).then(|| {
-            *gate = gate.wrapping_add(1);
-            *gate
+            gate.personal = gate.personal.wrapping_add(1);
+            gate.personal
         });
+        if matches!(
+            &kind,
+            EventKind::Snapshot { .. } | EventKind::Player(PlayerDelta { queue: Some(_), .. })
+        ) {
+            gate.queue = gate.queue.wrapping_add(1);
+        }
         permit.send(Event {
             generation,
             kind,
@@ -1246,10 +1315,11 @@ async fn quick_ready(signals: &Signals, deadline: Option<Instant>) -> bool {
     let Some(deadline) = deadline else {
         return pending().await;
     };
-    let published = *signals
+    let published = signals
         .order_gate
         .lock()
-        .expect("socket order admission gate");
+        .expect("socket order admission gate")
+        .personal;
     let mut applied = signals.personal_applied.subscribe();
     matches!(
         time::timeout_at(
@@ -1596,6 +1666,30 @@ impl Connection {
                                 }
                                 ScopedWrite::Playlist(read) => {
                                     send_playlist_read(ws, frame.raw, read, self.generation, frame.at).await?;
+                                }
+                                ScopedWrite::LyricSeek(lyric) => {
+                                    // The socket can see a canonical change before the engine
+                                    // applies it. This is still the ordinary wire Seek, so an
+                                    // unobserved server-side change cannot be guarded here.
+                                    if now.duration_since(frame.at) > MAX_QUEUE_AGE || !lyric.scope.matches(&self.canonical)
+                                        || signals.order_gate.lock().expect("socket order admission gate").queue != lyric.queue
+                                    {
+                                        continue;
+                                    }
+                                    let ready = wait_write_ready(ws).await;
+                                    {
+                                        let _publication = PUBLICATION_GATE.lock().expect("account publication gate");
+                                        let mode = lyric.session.network_changes();
+                                        let mode = mode.borrow();
+                                        if *mode != lyric.mode || lyric.session.is_expired() || frame.at.elapsed() > MAX_QUEUE_AGE
+                                            || !lyric.scope.matches(&self.canonical)
+                                        {
+                                            continue;
+                                        }
+                                        ready?;
+                                        Pin::new(&mut *ws).start_send(Message::Text(frame.raw.into())).map_err(|_| End::Transport)?;
+                                    }
+                                    flush_scoped(ws).await?;
                                 }
                             }
                             continue;

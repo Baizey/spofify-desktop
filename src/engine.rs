@@ -68,6 +68,11 @@ pub enum Command {
         command: PersonalCommand,
     },
     Guarded(String, Action),
+    SeekLyric {
+        room: String,
+        snapshot: crate::presentation::LyricSnapshot,
+        start_ms: i32,
+    },
     ReorderQueue {
         basis: String,
         key: u64,
@@ -102,6 +107,23 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
 const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_PLAY_TIMEOUT: Duration = Duration::from_secs(10);
+const LYRIC_SEEK_LEAD_MS: i32 = 250;
+
+fn lyric_seek_before_ms(duration: f64) -> i32 {
+    if !crate::player::seconds(duration) || duration == 0.0 {
+        return 0;
+    }
+    // Exclusive upper bound; compare in seconds to avoid rounding the authored
+    // timestamp or accepting a line exactly at the end of the recording.
+    let floor_ms = (duration * 1_000.0) as i32;
+    floor_ms + i32::from(f64::from(floor_ms) / 1_000.0 < duration)
+}
+
+fn lyric_seek_seconds(start_ms: i32, before_ms: i32) -> Option<f64> {
+    (0..before_ms)
+        .contains(&start_ms)
+        .then(|| f64::from(start_ms.saturating_sub(LYRIC_SEEK_LEAD_MS).max(0)) / 1_000.0)
+}
 
 struct Account {
     api: Arc<Api>,
@@ -194,6 +216,43 @@ impl Engine {
             .state
             .as_ref()
             .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
+    }
+    fn lyric_seek_before_ms(&self) -> i32 {
+        // Online Saved can also display fetched lyrics, without a room link.
+        if !self.network_allowed() || self.reconnect.is_some() {
+            return 0;
+        }
+        let (duration, executing) = if self.local_store.is_some() {
+            (
+                self.local.current().map(|row| row.track.duration),
+                self.local.desired,
+            )
+        } else {
+            // A detached/provisional clock is not an authoritative seek target.
+            if self.online.has_provisional_cursor()
+                || self.online.starting_locally()
+                || self.pending_initial_play.is_some()
+                || self.online_generation().is_none()
+            {
+                return 0;
+            }
+            (
+                self.online
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.current())
+                    .map(|row| row.duration),
+                self.online.execution.is_some(),
+            )
+        };
+        let mut before_ms = lyric_seek_before_ms(duration.unwrap_or_default());
+        if executing && let Some(audio) = self.audio.as_ref() {
+            let decoded = lyric_seek_before_ms(audio.facts().duration);
+            if decoded > 0 || self.local_store.is_some() {
+                before_ms = before_ms.min(decoded);
+            }
+        }
+        before_ms
     }
     fn can_queue_saved(&self) -> bool {
         self.current()
@@ -982,6 +1041,26 @@ impl Engine {
                     }
                 }
             }
+            Command::SeekLyric {
+                room,
+                snapshot,
+                start_ms,
+            } => {
+                // A bounded drain may have left newer cursor events waiting.
+                // Never submit a timestamp for a cursor we cannot revalidate.
+                if (self.local_store.is_some()
+                    || self.socket.as_ref().is_some_and(|s| s.events.is_empty()))
+                    && self.room_token().as_deref() == Some(room.as_str())
+                    && let Some(seconds) = lyric_seek_seconds(start_ms, self.lyric_seek_before_ms())
+                    && snapshot.is_current()
+                {
+                    if self.local_store.is_some() {
+                        self.action(Action::Seek(seconds));
+                    } else {
+                        self.seek_online_lyric(seconds, snapshot);
+                    }
+                }
+            }
             Command::Playback(action) if !action.depends_on_visible_queue() => self.action(action),
             #[cfg(target_os = "linux")]
             Command::GuardedToggle(token)
@@ -1500,6 +1579,7 @@ impl Engine {
             status: self.action_status,
             room_token: self.room_token().unwrap_or_default(),
             queue_order_token: self.queue_order_token().unwrap_or_default(),
+            lyric_seek_before_ms: self.lyric_seek_before_ms(),
             ..PlayerView::default()
         };
         if !self.offline {
@@ -1754,6 +1834,7 @@ struct PlayerView {
     queue_order_writable: bool,
     queue_order_awaiting_echo: bool,
     media_track_token: String,
+    lyric_seek_before_ms: i32,
     playing: bool,
     control: bool,
     transport: bool,
@@ -1816,6 +1897,7 @@ impl PlayerView {
             ui.set_can_control(self.control);
             ui.set_remote_controls(self.transport);
             ui.set_can_seek(self.transport && self.duration > 0.0);
+            ui.set_lyric_seek_before_ms(self.lyric_seek_before_ms);
             ui.set_elapsed(self.elapsed as f32);
             ui.set_duration(self.duration as f32);
             ui.set_player_status(self.status.into());
@@ -2341,6 +2423,92 @@ mod tests {
         e.command(Command::Guarded(current, Action::Seek(12.0)).scoped(7));
         assert_eq!(e.local.elapsed, 0.0);
     }
+    #[test]
+    fn lyric_seek_leads_by_exact_milliseconds_and_never_clamps_late_lines() {
+        let before = lyric_seek_before_ms(36_000.003);
+        assert_eq!(lyric_seek_seconds(36_000_002, before), Some(35_999.752));
+        assert_eq!(lyric_seek_seconds(36_000_003, before), None);
+        assert_eq!(lyric_seek_seconds(100, before), Some(0.0));
+        assert_eq!(lyric_seek_seconds(250, before), Some(0.0));
+        assert_eq!(lyric_seek_seconds(251, before), Some(0.001));
+        assert_eq!(lyric_seek_seconds(-1, before), None);
+        for duration in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(lyric_seek_seconds(0, lyric_seek_before_ms(duration)), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn lyric_seek_for_online_saved_is_paused_and_fenced_at_admission() {
+        use crate::presentation::LyricSnapshot;
+        use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Fixture(
+            std::env::temp_dir().join(format!("spofify-lyric-test-{}", uuid::Uuid::new_v4())),
+        );
+        fs::DirBuilder::new().mode(0o700).create(&dir.0).unwrap();
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        e.account = Some(Account {
+            session: api.test_session(),
+            api,
+        });
+        e.local_store = Some(OfflineStore::open(&dir.0).unwrap());
+        let track = LocalTrack {
+            id: "same-recording".into(),
+            duration: 12.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            e.local.replace(vec![track.clone(), track], 0, false),
+            Change::Start
+        );
+        e.action(Action::Pause);
+        let revision = Arc::new(AtomicU64::new(1));
+        let seek = |room: &str, observed, start_ms| {
+            Command::SeekLyric {
+                room: room.into(),
+                snapshot: LyricSnapshot::capture(&revision, observed),
+                start_ms,
+            }
+            .scoped(7)
+        };
+        let first = e.room_token().unwrap();
+        e.command(seek(&first, 1, 2345));
+        assert_eq!(e.local.elapsed, 2.095);
+        assert!(!e.local.desired && e.socket.is_none() && e.media.is_none());
+
+        let before_next = e.room_token().unwrap();
+        // Natural repeat/advance has a different room revision even if the
+        // same recording remains eligible and the old lyrics are retained.
+        e.command(Command::Guarded(before_next.clone(), Action::Next).scoped(7));
+        assert_eq!(e.local.position, Some(1));
+        e.action(Action::Pause);
+        e.command(seek(&before_next, 1, 9000));
+        assert_eq!(e.local.elapsed, 0.0);
+
+        let second = e.room_token().unwrap();
+        let stale_model = seek(&second, 1, 9000);
+        revision.store(2, Ordering::SeqCst);
+        e.command(stale_model);
+        e.command(seek(&second, 2, 12000));
+        assert_eq!(e.local.elapsed, 0.0);
+        assert_eq!(e.room_token().as_deref(), Some(second.as_str()));
+        e.command(seek(&second, 2, 7));
+        assert_eq!(e.local.elapsed, 0.0);
+        assert_ne!(e.room_token().as_deref(), Some(second.as_str()));
+        assert!(!e.local.desired);
+        let before_account_change = e.room_token().unwrap();
+        e.shared_epoch.store(8, Ordering::SeqCst);
+        e.command(seek(&before_account_change, 2, 2000));
+        assert_eq!(e.local.elapsed, 0.0);
+    }
+
     #[tokio::test]
     async fn saved_queue_is_admitted_online_only_for_the_current_mode_generation() {
         let dir = std::env::temp_dir().join(format!("spofify-saved-test-{}", uuid::Uuid::new_v4()));

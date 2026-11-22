@@ -55,6 +55,65 @@ fn quick_playlist(id: &str) -> Value {
 }
 
 #[tokio::test]
+async fn lyric_seek_writer_drops_retired_occurrences_snapshots_and_accounts() {
+    let (signals, _, _, _events) = signals();
+    let (actual, _) = watch::channel(None);
+    let mut output = OutputState {
+        lease: None,
+        actual,
+    };
+    let mut connection = begin(NEW, "", &mut output, &signals);
+    let generation = connection.generation;
+    let epoch = Arc::new(AtomicU64::new(7));
+    let lyrics = Arc::new(AtomicU64::new(1));
+    let api = Api::new(crate::api::Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
+    let (mut socket, mut peer) = Socket::test_peer(api.test_session(), generation);
+    socket.order_gate = signals.order_gate.clone();
+    let mut old_visit = connection.canonical.clone();
+    old_visit.visit = old_visit.visit.wrapping_add(1);
+    let mut observed_progress = connection.canonical.clone();
+    observed_progress.elapsed += 0.5; // a genuine observation is not a new occurrence
+    let scope = |cursor, observed, account| LyricSeekScope {
+        cursor,
+        snapshot: LyricSnapshot::capture(&lyrics, observed),
+        epoch: account,
+        current_epoch: epoch.clone(),
+    };
+    socket
+        .seek_lyric(generation, 5.0, scope(connection.canonical.clone(), 1, 7))
+        .unwrap();
+    // A new queue snapshot can retire the same cursor's duration/recording.
+    signals.order_gate.lock().unwrap().queue += 1;
+    for (value, basis) in [
+        (1.0, scope(old_visit, 1, 7)),
+        (2.0, scope(connection.canonical.clone(), 0, 7)),
+        (3.0, scope(connection.canonical.clone(), 1, 6)),
+        (4.021, scope(observed_progress, 1, 7)),
+    ] {
+        socket.seek_lyric(generation, value, basis).unwrap();
+    }
+    let (client, server) = tokio::io::duplex(4096);
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+    let script = async move {
+        assert_eq!(read_json(&mut server).await["type"], "presence");
+        assert_eq!(
+            read_json(&mut server).await,
+            json!({"type":"seek","value":4.021})
+        );
+    };
+    let (ended, ()) = time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            connection.drive(&mut ws, DEVICE, &mut peer.outbound, &mut output, &signals),
+            script
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended, Err(End::Transport));
+}
+
+#[tokio::test]
 async fn quick_add_writer_discards_stale_scoped_reads_before_age_and_keeps_account_socket() {
     use crate::personal_bridge::PersonalHub;
 

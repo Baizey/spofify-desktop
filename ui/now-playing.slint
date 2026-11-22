@@ -2,7 +2,7 @@ import { ScrollView } from "std-widgets.slint";
 import { ArtistCredit, WrappingCredits } from "credits.slint";
 import { Action, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
 
-export struct TimedLyricLine { start-ms: int, text: string }
+export struct TimedLyricLine { start-ms: int, text: string, sung: bool }
 
 // The standard scrollbar is too faint when idle. Keep the proportional thumb
 // visible and draggable in a lane that never covers the last row of lyrics.
@@ -49,7 +49,27 @@ component LyricsReader inherits Rectangle {
     in property <string> track-id;
     in property <length> reading-height;
     in property <bool> active;
+    in property <int> seek-before-ms;
+    in property <string> seek-room;
+    in property <string> seek-occurrence;
+    in property <string> seek-snapshot;
+    callback seek-line(int, string, string);
+    pure callback step-seek([TimedLyricLine], int, int, bool) -> int;
     callback reveal();
+    property <bool> can-seek: root.active && root.seek-before-ms > 0 && root.seek-room != "" && root.seek-snapshot != "";
+    property <int> chosen-line: -1;
+    property <int> gesture-revision;
+    function cancel-presses() {
+        root.gesture-revision += 1;
+        reading-focus.activation-key = "";
+    }
+    changed seek-room => { root.cancel-presses(); }
+    changed seek-occurrence => { root.chosen-line = -1; root.cancel-presses(); }
+    changed seek-snapshot => { root.chosen-line = -1; root.cancel-presses(); }
+    changed can-seek => {
+        if !root.can-seek { root.chosen-line = -1; }
+        root.cancel-presses();
+    }
     out property <bool> has-reading-focus: reading-focus.has-focus;
     public function take-focus() { reading-focus.focus(); }
     function pan(step: length) { reader.content-x = clamp(reader.content-x + step, -root.horizontal-limit, 0px); }
@@ -83,11 +103,40 @@ component LyricsReader inherits Rectangle {
         enabled: root.active;
         accessible-role: groupbox; accessible-label: "Lyrics";
         accessible-description: !root.has-lyrics ? root.status
+            : root.can-seek ? (root.horizontal-limit > 0px
+                ? "Up and Down select a line; Enter seeks. Left and Right read long lines."
+                : "Up and Down select a line; Enter seeks.")
             : root.horizontal-limit > 0px ? "Use Left and Right arrows to read long lines" : "";
         focus-on-click: false;
-        changed has-focus => { if self.has-focus { root.reveal(); } }
+        property <string> activation-key;
+        property <int> key-line: -1;
+        property <string> key-room;
+        property <string> key-occurrence;
+        property <string> key-snapshot;
+        changed has-focus => {
+            if self.has-focus { root.reveal(); }
+            else { self.activation-key = ""; root.chosen-line = -1; }
+        }
         key-pressed(event) => {
             if event.modifiers.control || event.modifiers.alt || event.modifiers.meta { return reject; }
+            if root.can-seek && (event.text == Key.UpArrow || event.text == Key.DownArrow) {
+                let next = root.step-seek(root.lines, root.seek-before-ms, root.chosen-line, event.text == Key.DownArrow);
+                if next >= 0 || root.chosen-line >= 0 {
+                    self.activation-key = "";
+                    if next >= 0 { root.chosen-line = next; }
+                    return accept;
+                }
+            }
+            if root.can-seek && root.chosen-line >= 0 && (event.text == Key.Return || event.text == Key.Space) {
+                if !event.repeat {
+                    self.activation-key = event.text;
+                    self.key-line = root.chosen-line;
+                    self.key-room = root.seek-room;
+                    self.key-occurrence = root.seek-occurrence;
+                    self.key-snapshot = root.seek-snapshot;
+                }
+                return accept;
+            }
             if event.text == Key.LeftArrow || event.text == Key.RightArrow {
                 if root.horizontal-limit <= 0px { return reject; }
                 root.pan(event.text == Key.LeftArrow ? 80px : -80px);
@@ -109,6 +158,19 @@ component LyricsReader inherits Rectangle {
             root.reveal();
             return accept;
         }
+        key-released(event) => {
+            if self.activation-key != "" && event.text == self.activation-key {
+                self.activation-key = "";
+                if root.can-seek && self.key-line == root.chosen-line
+                    && self.key-room == root.seek-room && self.key-occurrence == root.seek-occurrence
+                    && self.key-snapshot == root.seek-snapshot
+                    && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta {
+                    root.seek-line(self.key-line, self.key-room, self.key-snapshot);
+                }
+                return accept;
+            }
+            return reject;
+        }
         if !root.has-lyrics: Caption {
             x: root.edge; y: root.heading-height;
             width: parent.width - self.x;
@@ -125,6 +187,8 @@ component LyricsReader inherits Rectangle {
             // Reserve a little space at the far edge for the desktop scrollbars.
             content-width: max(self.visible-width, verses.preferred-width + 16px);
             content-height: max(self.visible-height, credit.y + credit.height + 8px);
+            changed content-x => { root.cancel-presses(); }
+            changed content-y => { root.cancel-presses(); }
             verses := VerticalLayout {
                 x: 0px; y: 3px;
                 width: max(0px, reader.content-width - 16px);
@@ -139,11 +203,37 @@ component LyricsReader inherits Rectangle {
                     }
                 }
                 for line[index] in root.lines: lyric-row := Rectangle {
-                    property <bool> current: index == root.active-line && line.text != "";
+                    property <bool> current: index == root.active-line && line.sung;
+                    property <bool> seekable: root.can-seek && line.sung && line.start-ms >= 0 && line.start-ms < root.seek-before-ms;
+                    property <bool> chosen: self.seekable && reading-focus.has-focus && index == root.chosen-line;
                     preferred-width: root.edge + words.preferred-width;
                     height: max(root.verse-size, words.preferred-height) + 6px;
-                    accessible-role: text; accessible-label: line.text;
-                    accessible-description: self.current ? "Current line" : "";
+                    if self.seekable: Rectangle {
+                        accessible-role: button;
+                        accessible-label: line.text;
+                        accessible-description: lyric-row.current ? "Current line" : "";
+                        accessible-item-selectable: true;
+                        accessible-item-selected: lyric-row.chosen;
+                        accessible-action-default => {
+                            if lyric-row.seekable { root.seek-line(index, root.seek-room, root.seek-snapshot); }
+                        }
+                    }
+                    if !self.seekable: Rectangle {
+                        accessible-role: text;
+                        accessible-label: line.text;
+                        accessible-description: lyric-row.current ? "Current line" : "";
+                    }
+                    changed chosen => {
+                        if self.chosen {
+                            let top = verses.y + self.y;
+                            let bottom = top + self.height;
+                            if top < -reader.content-y { reader.content-y = -top; }
+                            else if bottom > reader.visible-height - reader.content-y {
+                                reader.content-y = max(-top, reader.visible-height - bottom);
+                            }
+                            root.reveal();
+                        }
+                    }
                     if self.current: Rectangle {
                         x: 0px; y: 0px; width: min(parent.width, words.preferred-width + 2 * root.edge); height: parent.height;
                         border-radius: 4px; background: Theme.primary.with-alpha(0.11);
@@ -151,9 +241,65 @@ component LyricsReader inherits Rectangle {
                     words := Text {
                         x: root.edge; width: max(0px, parent.width - self.x);
                         height: parent.height; vertical-alignment: center;
-                        text: line.text; color: Theme.text;
+                        text: line.text;
+                        color: lyric-row.chosen ? Theme.tertiary
+                            : pointer.enabled && pointer.has-hover ? Theme.primary : Theme.text;
                         font-size: root.verse-size; font-weight: 500; wrap: no-wrap;
                         accessible-role: none;
+                    }
+                    pointer := TouchArea {
+                        // Clip the actionable words to the visible reading lane,
+                        // including the fixed leading gutter when panned.
+                        x: root.edge - reader.content-x;
+                        width: max(0px, min(reader.visible-width - root.edge, words.preferred-width + reader.content-x));
+                        height: parent.height;
+                        enabled: lyric-row.seekable && self.width > 0px;
+                        mouse-cursor: MouseCursor.pointer;
+                        property <string> down-room;
+                        property <string> down-occurrence;
+                        property <string> down-snapshot;
+                        property <int> down-revision;
+                        property <length> down-x;
+                        property <length> down-y;
+                        property <length> down-pan;
+                        changed enabled => { if !self.enabled { self.down-room = ""; } }
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down {
+                                self.down-room = "";
+                                // Slint 1.18 maps both completed and cancelled
+                                // touch taps to Up + Exit. Preserve touch panning,
+                                // but only arm mouse gestures (finger id zero).
+                                if event.button == PointerEventButton.left && event.touch-finger-id == 0 {
+                                    self.down-room = root.seek-room;
+                                    self.down-occurrence = root.seek-occurrence;
+                                    self.down-snapshot = root.seek-snapshot;
+                                    self.down-revision = root.gesture-revision;
+                                    self.down-x = self.absolute-position.x;
+                                    self.down-y = self.absolute-position.y;
+                                    self.down-pan = reader.content-x;
+                                }
+                            } else if event.kind == PointerEventKind.up {
+                                let y = self.absolute-position.y + self.mouse-y - reader.absolute-position.y;
+                                if event.button == PointerEventButton.left && event.touch-finger-id == 0
+                                    && self.down-room != "" && self.down-room == root.seek-room
+                                    && self.down-occurrence == root.seek-occurrence && self.down-snapshot == root.seek-snapshot
+                                    && self.down-revision == root.gesture-revision
+                                    && self.down-x == self.absolute-position.x && self.down-y == self.absolute-position.y
+                                    && self.down-pan == reader.content-x
+                                    && self.mouse-x >= 0px && self.mouse-x < self.width
+                                    && self.mouse-y >= 0px && self.mouse-y < self.height
+                                    && abs(self.mouse-x - self.pressed-x) <= 6px && abs(self.mouse-y - self.pressed-y) <= 6px
+                                    && y >= 0px && y < reader.visible-height {
+                                    root.seek-line(index, self.down-room, self.down-snapshot);
+                                }
+                                self.down-room = "";
+                            } else if event.kind == PointerEventKind.cancel
+                                || (event.kind == PointerEventKind.move && (event.touch-finger-id != 0
+                                    || abs(self.mouse-x - self.pressed-x) > 6px || abs(self.mouse-y - self.pressed-y) > 6px)) {
+                                self.down-room = "";
+                            }
+                        }
+                        scroll-event(_) => { self.down-room = ""; return reject; }
                     }
                     // Keep the leading marker and the text gutter fixed while
                     // the measured lyric line and its tint pan beneath them.
@@ -212,6 +358,12 @@ export component NowPlaying inherits Rectangle {
     in property <string> lyrics-attribution;
     in property <int> active-lyric-line: -1;
     in property <string> lyrics-status;
+    in property <int> lyric-seek-before-ms;
+    in property <string> lyric-seek-room;
+    in property <string> lyric-seek-occurrence;
+    in property <string> lyric-seek-snapshot;
+    callback seek-lyric(int, string, string);
+    pure callback step-lyric-seek([TimedLyricLine], int, int, bool) -> int;
     in property <bool> offline;
 
     callback page-action(string, string);
@@ -367,6 +519,12 @@ export component NowPlaying inherits Rectangle {
                 lines: root.offline ? [] : root.lyrics-lines;
                 attribution: root.offline ? "" : root.lyrics-attribution;
                 active-line: root.active-lyric-line;
+                seek-before-ms: root.lyric-seek-before-ms;
+                seek-room: root.lyric-seek-room;
+                seek-occurrence: root.lyric-seek-occurrence;
+                seek-snapshot: root.lyric-seek-snapshot;
+                seek-line(index, room, snapshot) => { root.seek-lyric(index, room, snapshot); }
+                step-seek(lines, before, index, down) => { root.step-lyric-seek(lines, before, index, down) }
                 status: root.offline ? "Lyrics unavailable offline." : root.lyrics-status != "" ? root.lyrics-status : "Loading lyrics…";
                 reveal => { root.align-lyrics(); }
             }

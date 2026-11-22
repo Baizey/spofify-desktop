@@ -251,6 +251,7 @@ fn update_demand<T: PartialEq>(tx: &watch::Sender<T>, next: T) -> bool {
 }
 
 pub(crate) fn clear(ui: &AppWindow) {
+    ui.invoke_renew_lyric_snapshot(false);
     ui.set_cover_art(Default::default());
     ui.set_lyrics_track_id(Default::default());
     ui.set_lyrics_text(Default::default());
@@ -264,9 +265,58 @@ pub(crate) fn clear(ui: &AppWindow) {
 /// UI-thread install. The timer observes local Slint state only; it does not
 /// poll the server. A result also checks live Slint state at delivery, so the
 /// observation interval can never let data from a different track publish.
-pub(crate) fn install(ui: &AppWindow, access: AccessRx, epoch: Arc<AtomicU64>) -> Presentation {
+pub(crate) fn install(
+    ui: &AppWindow,
+    access: AccessRx,
+    epoch: Arc<AtomicU64>,
+    seek: impl Fn(&AppWindow, String, LyricSnapshot, i32) + 'static,
+) -> Presentation {
+    let revision = Arc::new(AtomicU64::new(0));
+    {
+        let (weak, revision) = (ui.as_weak(), revision.clone());
+        ui.on_renew_lyric_snapshot(move |ready| {
+            let next = revision.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_lyrics_snapshot(if ready {
+                    next.to_string().into()
+                } else {
+                    Default::default()
+                });
+            }
+        });
+    }
+    let weak = ui.as_weak();
+    ui.on_seek_lyric(move |index, room, snapshot| {
+        let Some(ui) = weak.upgrade() else { return };
+        if room.is_empty()
+            || room != ui.get_room_token()
+            || snapshot != ui.get_lyrics_snapshot()
+            || !ui.get_can_seek_lyrics()
+            || ui.get_lyrics_track_id() != ui.get_now_track_id()
+        {
+            return;
+        }
+        let Ok(observed) = snapshot.parse() else {
+            return;
+        };
+        let Some(line) = usize::try_from(index)
+            .ok()
+            .and_then(|i| ui.get_lyrics_lines().row_data(i))
+        else {
+            return;
+        };
+        if seekable_line(&line, ui.get_lyric_seek_before_ms()) {
+            seek(
+                &ui,
+                room.into(),
+                LyricSnapshot::capture(&revision, observed),
+                line.start_ms,
+            );
+        }
+    });
     clear(ui);
     ui.on_resolve_active_lyric(displayed_lyric_line);
+    ui.on_step_lyric_seek(step_lyric_seek);
     let initial = demand(ui, 0);
     let (tx, rx) = watch::channel(initial.clone());
     let (lyrics_tx, lyrics_rx) = watch::channel(LyricDemand::from_ui(ui, initial.clone()));
@@ -472,10 +522,52 @@ fn lyric_model(lines: Vec<media::LyricLine>) -> ModelRc<TimedLyricLine> {
         .into_iter()
         .map(|line| TimedLyricLine {
             start_ms: line.start_ms as i32, // bounded by parse_lyrics
+            sung: !line.text.trim().is_empty(),
             text: lyric_display_text(line.text).into(),
         })
         .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(lines))
+}
+
+/// Recheck the immutable timed model at async engine admission as well as at
+/// gesture release. It is retired before a clear or replacement.
+pub(crate) struct LyricSnapshot {
+    revision: Arc<AtomicU64>,
+    observed: u64,
+}
+
+impl LyricSnapshot {
+    pub(crate) fn capture(revision: &Arc<AtomicU64>, observed: u64) -> Self {
+        Self {
+            revision: revision.clone(),
+            observed,
+        }
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.revision.load(Ordering::SeqCst) == self.observed
+    }
+}
+
+fn seekable_line(line: &TimedLyricLine, before_ms: i32) -> bool {
+    line.sung && (0..before_ms).contains(&line.start_ms)
+}
+
+fn step_lyric_seek(lines: ModelRc<TimedLyricLine>, before_ms: i32, index: i32, down: bool) -> i32 {
+    let count = lines.row_count() as i32;
+    let eligible = |i: &i32| {
+        lines
+            .row_data(*i as usize)
+            .is_some_and(|line| seekable_line(&line, before_ms))
+    };
+    if down {
+        (index + 1..count).find(eligible)
+    } else {
+        (0..if index < 0 { count } else { index })
+            .rev()
+            .find(eligible)
+    }
+    .unwrap_or(-1)
 }
 
 // Called from the reader's binding with the same projection as the seek bar.
@@ -498,7 +590,7 @@ fn displayed_lyric_line(lines: ModelRc<TimedLyricLine>, elapsed: f32, duration: 
     std::iter::once(latest)
         .chain((0..last).rev().map_while(|i| lines.row_data(i)))
         .take_while(|line| line.start_ms == timestamp)
-        .position(|line| !line.text.trim().is_empty())
+        .position(|line| line.sung)
         .map_or(-1, |offset| (last - offset) as i32)
 }
 
@@ -664,6 +756,7 @@ impl Delivery {
             request.view.clone(),
             move |ui| epoch.load(Ordering::SeqCst) == account_epoch && request.matches(ui),
             move |ui, track| {
+                ui.invoke_renew_lyric_snapshot(!lyrics.lines.is_empty());
                 ui.set_lyrics_text(lyrics.text.unwrap_or_default().into());
                 ui.set_lyrics_lines(lyric_model(lyrics.lines));
                 ui.set_lyrics_attribution(lyrics.attribution.into());

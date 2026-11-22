@@ -145,7 +145,28 @@ fn main() -> Result<(), slint::PlatformError> {
     let _covers = artwork::install(&ui, access.clone(), pages);
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx.clone(), art);
     desk.bind(&ui, mode.clone(), access.clone());
-    let _media = presentation::install(&ui, access.clone(), epoch.clone());
+    let _media = {
+        let (tx, epoch) = (tx.clone(), epoch.clone());
+        presentation::install(
+            &ui,
+            access.clone(),
+            epoch.clone(),
+            move |ui, room, snapshot, start_ms| {
+                send(
+                    &tx,
+                    scope(
+                        &epoch,
+                        Command::SeekLyric {
+                            room,
+                            snapshot,
+                            start_ms,
+                        },
+                    ),
+                    ui,
+                );
+            },
+        )
+    };
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let updates = update::start(&ui, mode.update_network());
     bind_auth(&ui, &auth_tx, &epoch);

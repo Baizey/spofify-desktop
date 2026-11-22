@@ -210,7 +210,12 @@ export component AppWindow inherits Window {
     in property <[TimedLyricLine]> lyrics-lines;
     in property <string> lyrics-attribution;
     in property <string> lyrics-status;
+    in property <string> lyrics-snapshot;
+    in property <int> lyric-seek-before-ms;
     in-out property <int> lyrics-open-generation;
+    callback renew-lyric-snapshot(bool);
+    callback seek-lyric(int, string, string);
+    pure callback step-lyric-seek([TimedLyricLine], int, int, bool) -> int;
     pure callback resolve-active-lyric([TimedLyricLine], float, float) -> int;
     in property <[float]> waveform;
     in property <string> media-status;
@@ -272,6 +277,8 @@ export component AppWindow inherits Window {
     property <bool> is-now: page-kind == "now";
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
     property <bool> local-mode: manual-offline || reconnecting;
+    out property <bool> can-seek-lyrics: signed-in && can-seek && !local-mode
+        && !editor-open && !compact-queue-open && is-now && lyric-seek-before-ms > 0;
     property <bool> queue-controls: local-playback ? queue-rows.length > 0 : !local-mode && remote-controls;
     property <bool> queue-has-upcoming: queue-rows.length > 0 && queue-rows[queue-rows.length - 1].upcoming;
     property <string> catalog-title: page-kind == "offline" ? "Saved offline" : page-title != "" ? page-title : Copy.title(page-kind);
@@ -767,6 +774,12 @@ export component AppWindow inherits Window {
                         lyrics-lines: self.lyrics-current ? root.lyrics-lines : [];
                         lyrics-attribution: self.lyrics-current ? root.lyrics-attribution : "";
                         lyrics-status: self.lyrics-current ? root.lyrics-status : "";
+                        lyric-seek-room: root.room-token;
+                        lyric-seek-occurrence: root.media-track-token;
+                        lyric-seek-snapshot: root.lyrics-snapshot;
+                        lyric-seek-before-ms: self.lyrics-current && root.can-seek-lyrics ? root.lyric-seek-before-ms : 0;
+                        seek-lyric(index, room, snapshot) => { root.seek-lyric(index, room, snapshot); }
+                        step-lyric-seek(lines, before, index, down) => { root.step-lyric-seek(lines, before, index, down) }
                         offline: root.local-mode;
                         active-lyric-line: !self.offline && self.lyrics-lines.length > 0
                             ? root.resolve-active-lyric(self.lyrics-lines, root.elapsed, root.duration) : -1;
