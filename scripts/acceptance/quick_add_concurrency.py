@@ -4,7 +4,7 @@ r"""Actual Desktop quick-add review on private Cage/Slint and synthetic wire.
 Build: SLINT_EMIT_DEBUG_INFO=1 cargo build --offline --locked --features slint/mcp
 Run with worker-local TCP approvals for localhost:39281 and localhost:39282:
   python3 -B scripts/acceptance/quick_add_concurrency.py --desktop target/debug/spofify-desktop \
-    --capture-dir ~/repos/spofify-desktop-temporary/manual-add-production/<new-run>
+    --capture-dir .tmp/search-bulk-add/<new-run>
 
 No Go server or installed state. The synthetic peer independently gates publication
 of playlist occurrences; this is not evidence of Go write execution or attribution.
@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 from fixture import Failure, check, private_env
-from manual_add import Review, TYPICAL, aligned, login, midpoint
+from manual_add import Review, TYPICAL, aligned, capture_directory, login, midpoint
 from manual_add_wire import LONG, NORMAL, QUERY, TARGET_ID, Wire, entry
 from native import ESCAPE, RETURN, TAB, assert_disjoint, bounds, contains, desktop, wait
 from settings import resize
@@ -168,15 +168,11 @@ class ConcurrencyView(Review):
         aligned((min(gy) + max(gy)) / 2, (h - 1) / 2, "ambiguity ink vertical center", 5)
 
 
-def start_scrolled(view, *, hide_members=False):
+def start_scrolled(view):
     view.input_query(QUERY)
     view.popup()
     view.select_playlist_row(LONG)
     wait("selected target's actual seed member", lambda: view.member(NORMAL[4]), 8)
-    if hide_members:
-        view.popup(opened_from=LONG)
-        view.toggle(True)
-        view.window.key(ESCAPE)
     toolbar = view.layout("toolbar before scroll", LONG)
     view.scroll(-255)
     wait("genuine nonzero Search scroll", lambda: NORMAL[0]["name"] not in view.visible_menus(), 4)
@@ -245,19 +241,15 @@ def scenario(view, wire):
     wait("newest pending row retains focus across an earlier confirmation", lambda: view.gold(controls[THIRD["name"]]), 2)
     captured("03-second-confirmed-first-and-third-held")
     wire.release(3)
-    state(((FIRST, "pending"), (SECOND, "member"), (THIRD, "member")), timeout=2)
+    controls = state(((FIRST, "pending"), (SECOND, "member"), (THIRD, "member")), timeout=2)
+    wait("newest keyboard focus persists as the row becomes a disabled member",
+         lambda: view.gold(controls[THIRD["name"]]), 2)
     captured("04-third-confirmed-first-still-held")
-    view.popup(opened_from=LONG)
-    view.toggle(True)
-    win.key(ESCAPE)
-    wait("hide-members keeps pending first row during held delivery", lambda: view.quick_control(FIRST, "pending")
-         and not view.node("Show actions for " + SECOND["name"])
-         and not view.node("Show actions for " + THIRD["name"]), 2)
-    view.expect_query(QUERY)
-    view.capture("04a-filter-keeps-pending")
-    view.popup(opened_from=LONG)
-    view.toggle(False)
-    win.key(ESCAPE)
+    win.key(RETURN)
+    check(len(wire.seen("add")) == 3, "Enter on focused member repeated the write")
+    win.key(TAB)
+    wait("Tab advances from the disabled focused member to its overflow", lambda: view.gold(view.row_menu(THIRD)), 2)
+    captured("04a-focus-moves-to-member-overflow")
 
     sleep(max(0, first["time"] + PROBE_SAMPLE - monotonic()))
     state(((FIRST, "pending"), (SECOND, "member"), (THIRD, "member")), timeout=2)
@@ -272,21 +264,13 @@ def scenario(view, wire):
     win.absent(r"Retry.*", roles=("Button",))
     assert_disjoint([("unconfirmed", ambiguous), ("overflow", view.row_menu(FIRST))])
     win.click_element(ambiguous)
-    # Show that filter hides only real members. The unresolved recording must
-    # stay visible and unavailable even after a user interacts with its slot.
-    view.popup(opened_from=LONG)
-    view.toggle(True)
-    win.key(ESCAPE)
-    wait("only actual members filtered", lambda: view.node("Show actions for " + FIRST["name"])
-         and not view.node("Show actions for " + SECOND["name"])
-         and not view.node("Show actions for " + THIRD["name"]), 4)
-    check(view.quick_control(FIRST, "ambiguous"), "filter changed unconfirmed row to a different state")
+    # The unresolved slot and both confirmed members stay disabled and
+    # stationary even when clicked; only their separate overflow can repeat.
+    for track in (SECOND, THIRD):
+        win.click_element(view.member(track))
+    state(((FIRST, "ambiguous"), (SECOND, "member"), (THIRD, "member")), timeout=2)
     view.expect_query(QUERY)
-    view.capture("06-filter-keeps-unconfirmed")
-    view.popup(opened_from=LONG)
-    view.toggle(False)
-    win.key(ESCAPE)
-    view.row_menu(THIRD)
+    check(view.menu_boxes() == boxes, "clicking a disabled slot moved Search")
     wire.release(1)
     wait("late authoritative first occurrence becomes membership", lambda: view.member(FIRST), 5)
     view.expect_query(QUERY)
@@ -312,35 +296,6 @@ def scenario(view, wire):
           "no repeat, stable slots/query/scroll and unchanged explicit ⋯ repeat", flush=True)
 
 
-def focus_filtered(view, wire):
-    win = view.window
-    toolbar, _ = start_scrolled(view, hide_members=True)
-    for ordinal, track in enumerate(PLAN[:2], 1):
-        win.click_element(view.row_add(track))
-        received(wire, ordinal)
-    focus_quick_add(view, THIRD)
-    win.key(RETURN)
-    received(wire, 3)
-    view.park()
-    wait("newest pending keyboard focus with Hide already added on",
-         lambda: view.gold(view.row_add(THIRD, pending=True)), 2)
-    view.capture("filter-focus-01-three-pending")
-    for ordinal, track in ((2, SECOND), (1, FIRST)):
-        wire.release(ordinal)
-        wait(f"confirmed {track['name']} leaves the filtered view", lambda: not view.node("Show actions for " + track["name"]), 4)
-        wait("keyboard focus followed the newest still-pending song through filtered reflow",
-             lambda: view.gold(view.row_add(THIRD, pending=True)), 3)
-        check(view.layout(f"filtered earlier write #{ordinal}", LONG) == toolbar, "filtered reflow moved sticky toolbar")
-        view.expect_query(QUERY)
-        view.capture(f"filter-focus-0{4 - ordinal}-older-confirmed")
-        win.key(RETURN)  # Focus is retained, but this pending shortcut cannot dispatch again.
-    wire.release(3)
-    wait("newest confirmed song also leaves filtered view", lambda: not view.node("Show actions for " + THIRD["name"]), 5)
-    check(len(wire.seen("add")) == 3 and wire.published == {1, 2, 3}, "filtered case emitted extra writes")
-    view.capture("filter-focus-04-all-confirmed")
-    print("PASS newest pending row visibly retains keyboard focus while earlier confirmations remove their rows", flush=True)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--desktop", type=Path, required=True)
@@ -348,17 +303,14 @@ def main():
     parser.add_argument("--wire-port", type=int, default=39281)
     parser.add_argument("--mcp-port", type=int, default=39282)
     parser.add_argument("--compact", action="store_true", help="run at 480px and verify the ? glyph")
-    parser.add_argument("--hide-members", action="store_true", help="run the separate focused-pending filtered reflow case")
+    parser.add_argument("--before", action="store_true", help="compare against the pre-change member accessibility name")
     args = parser.parse_args()
     check(all(1024 <= port <= 65535 for port in (args.wire_port, args.mcp_port)) and args.wire_port != args.mcp_port,
           "require two distinct unprivileged worker-local ports")
-    root_dir = (Path.home() / "repos/spofify-desktop-temporary/manual-add-production").resolve()
-    output, binary = args.capture_dir.resolve(), args.desktop.resolve(strict=True)
-    check(output != root_dir and output.is_relative_to(root_dir), f"use a new evidence directory under {root_dir}")
+    binary = args.desktop.resolve(strict=True)
     magick = shutil.which("magick") or shutil.which("convert")
     check(magick, "ImageMagick required for native focus pixels")
-    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    output.mkdir(mode=0o700)
+    output = capture_directory(args.capture_dir)
     with binary.open("rb") as source:
         (output / "binary.sha256").write_text(file_digest(source, "sha256").hexdigest() + "\n")
     wire = ConcurrentWire(output, args.wire_port)
@@ -373,9 +325,9 @@ def main():
             check(window.window_properties()["scaleFactor"] == 1, "require scale-1 native geometry")
             login(window, ready)
             wait("isolated synthetic account snapshot", lambda: wire.seen("snapshot"))
-            view = ConcurrencyView(window, output, magick)
+            view = ConcurrencyView(window, output, magick, before=args.before)
             try:
-                (focus_filtered if args.hide_members else scenario)(view, wire)
+                scenario(view, wire)
             except (RuntimeError, OSError, ValueError):
                 try:
                     view.capture("failure-last-visible-state")

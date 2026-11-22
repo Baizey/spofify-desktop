@@ -65,6 +65,8 @@ mod quick_add;
 mod replica;
 #[path = "../src/saved.rs"]
 mod saved;
+#[path = "../src/search_bulk.rs"]
+mod search_bulk;
 #[path = "../src/socket.rs"]
 mod socket;
 #[path = "../src/storage.rs"]

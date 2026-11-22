@@ -4,7 +4,8 @@ r"""Real-binary Desktop manual-add review on private Cage/Slint and synthetic wi
 Build: SLINT_EMIT_DEBUG_INFO=1 cargo build --offline --locked --features slint/mcp
 Run in an isolated worker with both exact worker-local TCP ports approved:
   python3 -B scripts/acceptance/manual_add.py --desktop /path/to/debug/spofify-desktop \
-    --capture-dir ~/repos/spofify-desktop-temporary/manual-add-production/<new-run>
+    --capture-dir .tmp/search-bulk-add/<new-run>
+Pass --before with the base binary to capture the legacy chooser for comparison.
 Requires Cage/Wayland, wlr-randr, and ImageMagick. No real account, Go, device,
 audio, or installed state. The supplied binary is the actual application.
 """
@@ -25,14 +26,15 @@ from time import monotonic, sleep
 sys.dont_write_bytecode = True
 from catalog_continuity import View as CatalogView, query
 from fixture import Failure, check, private_env
-from manual_add_wire import EMPTY, HIDDEN, HIDDEN_QUERY, LONG, NORMAL, QUERY, READ_ONLY, RULES, SHORT, Wire
+from manual_add_wire import EMPTY, LONG, NORMAL, QUERY, READ_ONLY, RULES, SHORT, STUDIES, STUDIES_QUERY, Wire
 from native import ESCAPE, RETURN, assert_disjoint, bounds, contains, desktop, element_id, element_type, wait
 from settings import resize
 
 TYPICAL, CONSTRAINED = (1280, 790), (640, 790)
 PICKER = "Add to playlist: "
 UNSELECTED = PICKER + "No destination"
-FILTER, CLEAR = "Hide already added", "Clear selection"
+LEGACY_FILTER, SKIP = "Hide already added", "Skip already added"
+CLEAR, MEMBER = "Clear selection", "In playlist"
 ADD = "Add songs"
 GOLD = bytes.fromhex("dfbd78")
 
@@ -45,9 +47,22 @@ def aligned(a, b, message, tolerance=1):
     check(abs(a - b) <= tolerance, f"{message}: {a:g} vs {b:g}")
 
 
+def capture_directory(path):
+    scratch = (Path(__file__).resolve().parents[2] / ".tmp").resolve()
+    legacy = (Path.home() / "repos/spofify-desktop-temporary/manual-add-production").resolve()
+    output = path.resolve()
+    check(any(root != output and output.is_relative_to(root) for root in (scratch, legacy)),
+          f"use a new evidence directory under {scratch}")
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    output.mkdir(mode=0o700)
+    return output
+
+
 class Review(CatalogView):
-    def __init__(self, window, output, magick):
-        self.window, self.output, self.magick = window, output, magick
+    def __init__(self, window, output, magick, *, before=False, track_only=False, legacy_member_name=False):
+        self.window, self.output, self.magick, self.before = window, output, magick, before
+        self.track_only = track_only
+        self.legacy_member_name = before or legacy_member_name
         self.timeline = output / "observations.jsonl"
 
     def nodes(self):
@@ -119,8 +134,7 @@ class Review(CatalogView):
                         field=bounds(field) if field else None, viewport=bounds(scroll) if scroll else None,
                         rows=self.menu_boxes(nodes),
                         title=[e["accessibleLabel"] for e in nodes if e.get("accessibleRole") == "Text"
-                               and e.get("accessibleLabel") in ("Search", LONG, "No matching results",
-                                                                 "Matching tracks are already in this playlist")])
+                               and e.get("accessibleLabel") in ("Search", LONG, "No matching results")])
             sleep(.04)
 
     def search(self):
@@ -144,12 +158,23 @@ class Review(CatalogView):
         self.window.click_element(self.picker(opened_from))
         return self.require("Add to playlist", "List")
 
-    def toggle(self, checked):
-        self.window.click_element(self.require(FILTER, "Checkbox"))
-        return wait(f"filter checked={checked}", lambda: self.checked(checked), 4)
+    def set_skip(self, checked):
+        switch = self.require(SKIP, "Checkbox")
+        check(switch.get("accessibleDescription") == "Album and artist adds only", "skip scope is not named")
+        if switch.get("accessibleChecked", False) != checked:
+            self.window.click_element(switch)
+        return wait(f"skip checked={checked}", lambda: self.destination_skip(checked), 4)
 
-    def checked(self, checked):
-        button = self.node(FILTER, "Checkbox")
+    def destination_skip(self, checked):
+        switch = self.node(SKIP, "Checkbox")
+        return switch if switch and switch.get("accessibleChecked", False) == checked else None
+
+    def legacy_toggle(self, checked):
+        self.window.click_element(self.require(LEGACY_FILTER, "Checkbox"))
+        return wait(f"legacy filter checked={checked}", lambda: self.legacy_checked(checked), 4)
+
+    def legacy_checked(self, checked):
+        button = self.node(LEGACY_FILTER, "Checkbox")
         return button if button and button.get("accessibleChecked", False) == checked else None
 
     def layout(self, group, target=None):
@@ -188,18 +213,30 @@ class Review(CatalogView):
         data = dict(panel=bounds(panel), title=bounds(title), rows=[bounds(e) for e in rows],
                     destination_names=[bounds(e) for e in names])
         if target:
-            tools = self.require(FILTER, "Checkbox"), self.require(CLEAR, "Button")
-            boxes = [bounds(e) for e in tools]
-            assert_disjoint(list(zip((FILTER, CLEAR), tools)))
-            aligned(midpoint(boxes[0])[1], midpoint(boxes[1])[1], "filter / clear control centers")
-            check(bounds(title)[3] <= boxes[0][1] < boxes[0][3] <= min(bounds(row)[1] for row in rows),
-                  "actions must be grouped between the popup title and destination rows")
-            captions = [self.part("tool-label", self.window.subtree(tool)) for tool in tools]
-            aligned(bounds(title)[0], bounds(captions[0])[0], "popup title / filter text guide")
-            aligned(midpoint(bounds(captions[0]))[1], midpoint(bounds(captions[1]))[1], "tool text alignment")
-            data.update(tools=boxes, tool_labels=[bounds(e) for e in captions])
+            clear = self.require(CLEAR, "Button")
+            clear_box = bounds(clear)
+            check(bounds(title)[3] <= clear_box[1] < clear_box[3] <= min(bounds(row)[1] for row in rows),
+                  "clear selection must be grouped between the popup title and destination rows")
+            data["clear"] = clear_box
         else:
-            check(not self.node(FILTER) and not self.node(CLEAR), "no target popup should not show target actions")
+            check(not self.node(LEGACY_FILTER) and not self.node(CLEAR), "no target popup should not show clear/hide")
+        if self.track_only:
+            check(not self.node(LEGACY_FILTER) and not self.node(SKIP), "unexpected filter in a track-only snapshot")
+            if target:
+                caption = self.part("clear-label", self.window.subtree(clear))
+                aligned(bounds(title)[0], bounds(caption)[0], "popup title / clear / destination text guide")
+                aligned(midpoint(clear_box)[1], midpoint(bounds(caption))[1], "clear control / caption center")
+        elif not self.before:
+            skip = self.require(SKIP, "Checkbox")
+            skip_caption = self.part("label", self.window.subtree(skip))
+            aligned(bounds(title)[0], bounds(skip_caption)[0], "popup title / skip / destination text guide")
+            data["skip"] = bounds(skip)
+            if target:
+                clear_caption = self.part("label", self.window.subtree(clear))
+                assert_disjoint([(SKIP, skip), (CLEAR, clear)])
+                aligned(midpoint(data["skip"])[1], midpoint(clear_box)[1], "skip / clear control centers")
+                aligned(midpoint(bounds(skip_caption))[1], midpoint(bounds(clear_caption))[1], "skip / clear text baseline")
+            check(not self.node(LEGACY_FILTER), "legacy Search filtering unexpectedly present")
         self.record(label, **data)
         return data
 
@@ -212,8 +249,13 @@ class Review(CatalogView):
 
     def member(self, item, *, nodes=None):
         nodes = self.nodes() if nodes is None else nodes
-        return next((e for e in nodes if (e.get("accessibleLabel") or "").startswith("In playlist:")
-                     and e.get("accessibleDescription") == item["name"]), None)
+        label = MEMBER + ": " + LONG if self.legacy_member_name else MEMBER
+        control = next((e for e in nodes if e.get("accessibleLabel") == label
+                        and e.get("accessibleDescription") == item["name"]
+                        and e.get("accessibleRole") == "Button"), None)
+        if control:
+            check(not control.get("accessibleEnabled", False), "membership must not be actionable")
+        return control
 
     def visible_menus(self, nodes=None):
         nodes = self.nodes() if nodes is None else nodes
@@ -276,29 +318,41 @@ def popup_cases(view, size):
     long_target = view.layout(prefix + " full long target", LONG)
     aligned(no_target[2][2], long_target[2][2], "picker right edge after selecting long destination")
     check(view.viewport()[1] >= no_target[0][3], "selected Search viewport overlaps the toolbar")
-    labels = {e.get("accessibleLabel") for e in view.nodes()}
-    check(all(f"Add {item['name']} to {LONG}" not in labels for item in NORMAL[1:4]),
-          "album, artist, or unavailable track incorrectly offered a quick-add")
+    w.absent(re.escape(f"Add {NORMAL[2]['name']} to {LONG}"), roles=("Button",))
     view.capture(prefix + "-03-long-target")
+    selected_rows = view.settled_menu_boxes()
+    vp = view.viewport()
+    expected = {name: box for name, box in original_rows.items() if vp[1] <= box[1] and box[3] <= vp[3]}
+    check(selected_rows == expected, "target selection removed or moved a result within the available viewport")
     view.popup(opened_from=LONG)
-    view.require(FILTER, "Checkbox")
-    check(view.checked(False), "new selection's filter was not off")
-    view.capture(prefix + "-04-popup-off")
-    off = view.popup_layout(prefix + " filter off", LONG)
-    view.toggle(True)
-    view.sample(prefix + "-filter-on")
-    view.capture(prefix + "-05-popup-on")
-    w.absent(re.escape(f"{len(NORMAL)} results"), roles=("Text",))
-    on = view.popup_layout(prefix + " filter on", LONG)
-    check(off == on, "filter toggling changed popup geometry")
-    view.expect_query(QUERY)
-    filtered_rows = view.settled_menu_boxes()
-    check(NORMAL[4]["name"] not in filtered_rows, "filter kept known member visible")
-    check(all(filtered_rows.get(item["name"]) == original_rows[item["name"]] for item in NORMAL[:4]
-              if item["name"] in original_rows), "filter moved a visible row above the one removed")
+    view.capture(prefix + "-04-selected-popup")
+    view.popup_layout(prefix + " selected popup", LONG)
+    if view.before:
+        check(view.legacy_checked(False), "base filter should initially be off")
+        view.legacy_toggle(True)
+        view.capture(prefix + "-05-legacy-hide-popup")
+        w.absent(re.escape(f"{len(NORMAL)} results"), roles=("Text",))
+    elif not view.track_only:
+        switch = view.require(SKIP, "Checkbox")
+        initial = switch.get("accessibleChecked", False)
+        view.set_skip(not initial)
+        check(view.popup_layout(prefix + " skip toggled", LONG)["skip"] == bounds(switch), "skip control moved")
+        check(view.settled_menu_boxes() == selected_rows and view.member(NORMAL[4]),
+              "bulk skip setting affected track rows")
+        view.capture(prefix + "-05-bulk-skip-toggled")
+        view.set_skip(initial)
     w.key(ESCAPE)
-    view.capture(prefix + "-06-filter-dismissed")
-    check(view.layout(prefix + " filter dismissed", LONG) == long_target, "filter moved sticky toolbar")
+    view.expect_query(QUERY)
+    active_rows = view.settled_menu_boxes()
+    if view.before:
+        check(NORMAL[4]["name"] in selected_rows and NORMAL[4]["name"] not in active_rows,
+              "base filter did not hide the initially visible member")
+    else:
+        check(NORMAL[4]["name"] in active_rows and active_rows == selected_rows,
+              "target selection or chooser dismissal removed or moved a Search hit")
+        view.require(f"{len(NORMAL)} results", "Text")
+    view.capture(prefix + "-06-selected-dismissed")
+    check(view.layout(prefix + " selected dismissed", LONG) == long_target, "chooser moved sticky toolbar")
     view.popup(opened_from=LONG)
     w.click_element(view.require(CLEAR, "Button"))
     view.sample(prefix + "-clear")
@@ -308,7 +362,7 @@ def popup_cases(view, size):
     check(view.layout(prefix + " cleared") == no_target, "clear did not restore no-target toolbar geometry")
     check(view.settled_menu_boxes() == original_rows, "clear did not restore the original result viewport")
     view.capture(prefix + "-07-cleared")
-    print(f"PASS {prefix}px chooser, full accessible name, eligibility, filter and clear", flush=True)
+    print(f"PASS {prefix}px chooser, full accessible name, eligibility, membership visibility and clear", flush=True)
 
 
 def manual_route(view):
@@ -410,51 +464,59 @@ def quick_add(view, wire):
     print("PASS sticky toolbar, plus/pending/check slots, one addEntry, and preserved scrolled query and viewport", flush=True)
 
 
-def hidden_continuation(view, wire):
-    view.input_query(HIDDEN_QUERY)
-    view.row_menu(HIDDEN[0])
-    check(not wire.seen("search", query=HIDDEN_QUERY, page=2), "continuation started before filtering")
-    view.popup(opened_from=LONG)
-    try:
-        view.toggle(True)
-        wait("filter-only hidden prefix requests the next Search cursor without scrolling",
-             lambda: wire.seen("search", query=HIDDEN_QUERY, page=2), 5)
-        view.window.key(ESCAPE)
-        view.capture("continuation-01-all-known-prefix-held")
-        check(not view.visible_menus(), "filter didn't hide the complete known prefix")
-        check(not view.node("No matching results") and not view.node("Matching tracks are already in this playlist"),
-              "premature terminal empty message while a cursor is in flight")
-    finally:
-        wire.continue_hidden.set()
-    view.sample("continuation-cursor")
-    view.row_menu(HIDDEN[-1])
-    check(set(view.visible_menus()) == {HIDDEN[-1]["name"]}, "expected only one not-added continuation result")
-    view.expect_query(HIDDEN_QUERY)
+def member_continuation(view, wire):
+    view.input_query(STUDIES_QUERY)
+    wait("visible seeded member at the start of Search", lambda: view.member(STUDIES[0]), 5)
+    check(STUDIES[0]["name"] in view.visible_menus(), "known-member prefix disappeared from Search")
+    check(not wire.seen("search", query=STUDIES_QUERY, page=2), "continuation started before scrolling")
     view.no_pagers()
-    view.capture("continuation-02-only-eligible-result")
-    check(len(wire.seen("search", query=HIDDEN_QUERY, page=2)) == 1, "continuation duplicated")
-    # The only visible row is index 0 of the filtered UI but the last source
-    # index in page 2. Wait for known-not-present membership before clicking.
-    appended = HIDDEN[-1]
+    view.park()
+    view.capture("continuation-01-seeded-member-prefix")
+    try:
+        view.scroll(-2000)
+        wait("scroll requests the next Search cursor", lambda: wire.seen("search", query=STUDIES_QUERY, page=2), 5)
+        check(STUDIES[0]["name"] not in view.visible_menus(), "Search viewport did not advance")
+        check(STUDIES[18]["name"] in view.visible_menus() and view.member(STUDIES[18]),
+              "first page's tail members vanished while continuation was held")
+        view.park()
+        view.capture("continuation-02-scrolled-cursor-held")
+    finally:
+        wire.continue_studies.set()
+    appended = STUDIES[-1]
+    # The list reports all accepted rows before the last row is mounted in
+    # Slint's virtualized viewport (and before it fits the root tree budget).
+    wait("full Search continuation is accepted", lambda: any(
+        node.get("accessibleItemCount") == len(STUDIES)
+        for node in view.dom_items("AppWindow::catalog-results")), 5)
+    view.no_pagers()
+    view.scroll(-650)
+    wait("appended row fully in viewport", lambda: appended["name"] in view.visible_menus(), 5)
+    check(len(wire.seen("search", query=STUDIES_QUERY, page=2)) == 1, "continuation duplicated")
+    previous_rows = view.settled_menu_boxes()
+    check(STUDIES[-2]["name"] in previous_rows and view.member(STUDIES[-2]),
+          "appended member beside the ready row is not visible")
     plus = view.row_add(appended)
     check(plus.get("accessibleEnabled"), "appended quick-add is not ready")
     ordinal = wire.expect_add(appended)
     try:
         view.window.click_element(plus)
-        wait("appended result sends its exact source track and selected destination",
-             lambda: wire.exact_add(ordinal, appended), 4)
-        view.row_add(appended, pending=True)
-        view.capture("continuation-03-appended-add-pending")
+        wait("write uses the appended source track and exact target", lambda: wire.exact_add(ordinal, appended), 4)
+        pending = view.row_add(appended, pending=True)
+        check(bounds(pending) == bounds(plus) and not pending.get("accessibleEnabled", False),
+              "appended row's pending control changed slots or remained enabled")
+        view.park()
+        view.capture("continuation-03-appended-pending")
     finally:
         wire.confirm.set()
-    wait("accepted append becomes hidden when it joins the target",
-         lambda: view.node("Matching tracks are already in this playlist"), 6)
-    view.expect_query(HIDDEN_QUERY)
-    check(not view.visible_menus() and not view.node("No matching results"), "incorrect filter-only terminal view")
+    member = wait("appended track stays visible as a confirmed member", lambda: view.member(appended), 6)
+    check(bounds(member) == bounds(plus) and view.menu_boxes() == previous_rows,
+          "confirmation removed or moved the scrolled row or its neighbors")
+    view.expect_query(STUDIES_QUERY)
+    view.accepted_results(len(STUDIES))
     wait("second authoritative echo", lambda: wire.seen("add-confirmed", ordinal=ordinal))
     check(wire.exact_add(ordinal, appended), "appended add was duplicated")
-    view.capture("continuation-04-appended-confirmed-hidden")
-    print("PASS hidden prefix continues without scrolling; visible appended + writes exact source ID and target", flush=True)
+    view.capture("continuation-04-appended-confirmed")
+    print("PASS live continuation through known members, exact appended write, and persistent confirmed row", flush=True)
 
 
 def explicit_repeat(view, wire):
@@ -463,10 +525,10 @@ def explicit_repeat(view, wire):
     w = view.window
     canary = NORMAL[5]
     view.input_query(QUERY)
-    view.popup(opened_from=LONG)
-    view.toggle(False)
-    w.key(ESCAPE)
     wait("quick toolbar shows membership for the same recording", lambda: view.member(canary), 6)
+    if canary["name"] not in view.visible_menus():
+        view.scroll(-255)
+        wait("explicit repeat row fully visible", lambda: canary["name"] in view.visible_menus(), 4)
     w.click_element(view.row_menu(canary))
     w.click(re.escape("Add to playlist · " + canary["name"]))
     w.title("Add to playlist")
@@ -512,16 +574,17 @@ def main():
     parser.add_argument("--mcp-port", type=int, default=39282)
     parser.add_argument("--smoke", action="store_true", help="prove native startup and isolated account sign-in only")
     parser.add_argument("--explicit-repeat", action="store_true", help="also exercise an intentional duplicate via ⋯")
+    compare = parser.add_mutually_exclusive_group()
+    compare.add_argument("--before", action="store_true", help="compare the pre-change binary and its legacy filter")
+    compare.add_argument("--track-only", action="store_true", help="compare a track-only intermediate without a bulk skip setting")
+    parser.add_argument("--legacy-member-name", action="store_true", help="capture an interim binary with the old target-inclusive member name")
     args = parser.parse_args()
     check(1024 <= args.wire_port <= 65535 and 1024 <= args.mcp_port <= 65535
           and args.wire_port != args.mcp_port, "specify two distinct unprivileged worker-local ports")
-    scratch = (Path.home() / "repos/spofify-desktop-temporary/manual-add-production").resolve()
-    output, binary = args.capture_dir.resolve(), args.desktop.resolve(strict=True)
-    check(output != scratch and output.is_relative_to(scratch), f"use a new evidence directory under {scratch}")
+    binary = args.desktop.resolve(strict=True)
     magick = shutil.which("magick") or shutil.which("convert")
     check(magick, "ImageMagick required to check native focus pixels")
-    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    output.mkdir(mode=0o700)
+    output = capture_directory(args.capture_dir)
     with binary.open("rb") as source:
         (output / "binary.sha256").write_text(file_digest(source, "sha256").hexdigest() + "\n")
     wire = Wire(output, args.wire_port)
@@ -543,7 +606,8 @@ def main():
                 if args.smoke:
                     print("PASS private Cage, native Slint MCP, and synthetic account sign-in", flush=True)
                     return
-                view = Review(window, output, magick)
+                view = Review(window, output, magick, before=args.before, track_only=args.track_only,
+                              legacy_member_name=args.legacy_member_name)
                 try:
                     popup_cases(view, TYPICAL)
                     resize(window, CONSTRAINED)
@@ -552,7 +616,7 @@ def main():
                     manual_route(view)
                     resize(window, TYPICAL)
                     quick_add(view, wire)
-                    hidden_continuation(view, wire)
+                    member_continuation(view, wire)
                     if args.explicit_repeat:
                         explicit_repeat(view, wire)
                 except (Failure, RuntimeError, OSError, ValueError):

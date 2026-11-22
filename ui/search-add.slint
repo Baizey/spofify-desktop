@@ -3,6 +3,7 @@ import { Action, Caption, Divider, Theme } from "theme.slint";
 import { Glyph } from "icon.slint";
 
 export struct SearchAddChoice { id: string, name: string, detail: string }
+export struct SearchAddRow { id: string, state: string }
 
 global DestinationGuides {
     // The title is in the shell; the rows and tools are inside its 1px border.
@@ -75,42 +76,76 @@ component DestinationRow inherits Action {
     }
 }
 
-// The destination actions are controls in the popup header, not list entries.
 component DestinationTool inherits Action {
     in property <string> title;
-    in property <bool> filter;
-    in property <bool> keyboard-highlight;
-    out property <length> natural-width: tool-label.x + tool-label.preferred-width + 12px;
-    property <color> ink: !root.enabled ? Theme.muted : root.selected ? Theme.primary : root.filter ? Theme.text : Theme.muted;
+    in property <bool> checkbox;
+    in property <bool> highlighted;
+    out property <length> natural-width: label.x + label.preferred-width + 12px;
 
-    height: 32px;
-    quiet: true;
-    keyboard-focusable: false;
+    height: 32px; min-width: 0px;
+    quiet: true; keyboard-focusable: false;
+    border-width: root.highlighted ? 2px : 0px; border-color: Theme.tertiary;
     accessible-label: root.title;
-    accessible-checkable: root.filter;
+    accessible-checkable: root.checkbox;
     accessible-checked: root.selected;
-    border-radius: 6px;
-    border-width: root.keyboard-highlight ? 2px : root.filter ? 1px : 0px;
-    border-color: root.keyboard-highlight ? Theme.tertiary
-        : root.selected && root.enabled ? Theme.primary.with-alpha(0.42) : Theme.line;
-    background: root.selected ? (root.enabled ? Theme.primary.with-alpha(0.16) : Theme.raised)
-        : root.has-hover ? Theme.raised : root.filter ? Theme.rail : transparent;
-
-    if root.filter: Path {
+    // The check belongs to the option, not to the whole tool background.
+    background: root.has-hover ? Theme.raised : transparent;
+    if root.checkbox: Rectangle {
         x: DestinationGuides.icon-center - DestinationGuides.tool-inset - self.width / 2;
         y: (parent.height - self.height) / 2;
-        width: 14px; height: 14px; viewbox-width: 16; viewbox-height: 16;
-        commands: "M2,3 H14 L9.5,8.5 V13 L6.5,11.5 V8.5 Z";
-        stroke: root.ink; stroke-width: 1.5px; accessible-role: none;
+        width: 15px; height: self.width; border-radius: 3px;
+        border-width: 1px; border-color: root.selected ? Theme.primary : Theme.subtle;
+        background: root.selected ? Theme.primary : Theme.bg;
+        if root.selected: DestinationCheck {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            stroke: Theme.on-primary;
+        }
     }
-    if !root.filter: Glyph {
-        x: 8px; y: (parent.height - self.height) / 2;
-        width: 15px; height: 15px; name: "×"; ink: root.ink;
+    if !root.checkbox: Glyph {
+        x: DestinationGuides.icon-center - DestinationGuides.tool-inset - self.width / 2;
+        y: (parent.height - self.height) / 2;
+        width: 15px; height: self.width; name: "×"; ink: Theme.muted;
     }
-    tool-label := Caption {
-        x: root.filter ? DestinationGuides.text-inset - DestinationGuides.tool-inset : 28px;
+    label := Caption {
+        x: DestinationGuides.text-inset - DestinationGuides.tool-inset;
         width: parent.width - self.x - 7px; height: parent.height;
-        text: root.title; color: root.ink; accessible-role: none;
+        text: root.title; color: root.checkbox ? Theme.text : Theme.muted; accessible-role: none;
+    }
+}
+
+export component SearchAddProgress inherits Rectangle {
+    in property <string> status;
+    in property <string> scope;
+    in property <string> cancel-scope;
+    in property <bool> error;
+    in property <bool> active;
+    callback cancel();
+    callback focus-fallback();
+
+    border-radius: Theme.container-radius;
+    border-width: 1px;
+    border-color: root.error ? Theme.error.with-alpha(0.40) : Theme.line;
+    background: root.error ? Theme.error.with-alpha(0.09) : Theme.panel;
+    property <bool> can-cancel: root.active && root.visible;
+    changed can-cancel => { if !self.can-cancel && cancel-action.has-focus { self.focus-fallback(); } }
+    changed scope => { if cancel-action.has-focus { self.focus-fallback(); } }
+    Text {
+        x: 12px; y: 5px;
+        width: max(0px, (root.active ? cancel-action.x - 8px : parent.width - 6px) - self.x);
+        height: max(0px, parent.height - 2 * self.y);
+        text: root.status; wrap: word-wrap; vertical-alignment: center;
+        font-size: 12px * Theme.density;
+        color: root.error ? Theme.error : Theme.text;
+        accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
+    }
+    cancel-action := Action {
+        x: parent.width - self.width - 6px;
+        y: (parent.height - self.height) / 2;
+        width: self.min-width; height: 32px; quiet: true;
+        visible: root.active; enabled: root.can-cancel;
+        text: "Cancel"; accessible-label: "Cancel bulk add";
+        click-scope: root.cancel-scope;
+        clicked => { if root.can-cancel { root.cancel(); } }
     }
 }
 
@@ -125,17 +160,15 @@ export component SearchAddPicker inherits Rectangle {
     in property <string> blocked;
     in property <string> scope;
     in property <bool> show-label;
-    in property <bool> hide-added;
+    in property <bool> skip-added: true;
     in property <length> available-width: root.width;
     callback choose(string);
-    callback toggle-hide();
+    callback toggle-skip();
     callback focus-fallback();
 
     height: 39px;
     property <bool> has-destination: root.destination != "";
     property <bool> offline: root.blocked == "Offline";
-    property <bool> filter-checked: root.has-destination && root.hide-added;
-    property <bool> filter-active: root.filter-checked && !root.offline;
     changed scope => { if picker.is-open { picker.close(); } }
     changed blocked => {
         let had-focus = trigger.has-focus || picker.is-open;
@@ -153,8 +186,7 @@ export component SearchAddPicker inherits Rectangle {
         pointer-focus-visible: false;
         accessible-label: "Add to playlist: " + (root.has-destination ? root.destination-name : "No destination")
             + (root.has-destination && root.destination-detail != "" ? ", " + root.destination-detail : "");
-        accessible-description: root.blocked + (root.filter-checked
-            ? (root.blocked == "" ? "" : " · ") + (root.offline ? "Hide already added paused" : "Hide already added on") : "");
+        accessible-description: root.blocked;
         accessible-expandable: true;
         accessible-expanded: picker.is-open;
         clicked => {
@@ -169,11 +201,6 @@ export component SearchAddPicker inherits Rectangle {
             x: 10px; y: (parent.height - self.height) / 2;
             width: 19px; height: self.width;
             name: "queue-add"; ink: trigger.selected ? Theme.primary : Theme.muted;
-        }
-        if root.filter-active: Rectangle {
-            x: glyph.x + glyph.width - 1px; y: glyph.y - 2px;
-            width: 5px; height: 5px; border-radius: 3px; background: Theme.primary;
-            accessible-role: none;
         }
         if root.show-label: Caption {
             x: 36px; y: 0px; width: parent.width - self.x - 10px; height: parent.height;
@@ -198,16 +225,14 @@ export component SearchAddPicker inherits Rectangle {
         property <length> list-height: self.show-empty ? 42px : min(rows.preferred-height, 276px);
         // Clearing the local destination does not require a connection.
         property <bool> can-clear: root.has-destination;
-        property <int> filter-index: 0;
-        property <int> clear-index: 1;
-        property <int> choice-start: (root.has-destination ? 1 : 0) + (self.can-clear ? 1 : 0);
-        // Keep accessibility indices stable even when the first tool is disabled.
-        property <int> first-index: root.offline && self.can-clear ? self.clear-index : 0;
+        property <bool> can-skip: !root.offline;
+        property <int> clear-index: self.can-skip ? 1 : 0;
+        property <int> choice-start: self.clear-index + (self.can-clear ? 1 : 0);
         property <int> last-index: self.choice-start + self.choice-count - 1;
-        property <length> actions-height: root.has-destination ? 48px : 0px;
+        property <length> actions-height: self.choice-start > 0 ? 40px : 0px;
         function select(index: int) {
-            if !root.offline && root.has-destination && index == self.filter-index {
-                root.toggle-hide();
+            if self.can-skip && index == 0 {
+                root.toggle-skip();
             } else if self.can-clear && index == self.clear-index {
                 self.close();
                 // An offline picker without a selection is disabled.
@@ -224,8 +249,8 @@ export component SearchAddPicker inherits Rectangle {
         }
         init => {
             self.keyboard-mode = !trigger.pointer-focused;
-            self.highlight = self.last-index < self.first-index ? -1
-                : self.choice-count == 0 ? self.first-index
+            self.highlight = self.last-index < 0 ? -1
+                : self.choice-count == 0 ? 0
                 : self.choice-start + clamp(root.destination-index - 1, 0, self.choice-count - 1);
             panel.focus();
         }
@@ -254,23 +279,26 @@ export component SearchAddPicker inherits Rectangle {
                 x: 1px + DestinationGuides.text-inset; y: picker.title-height - 2px; width: parent.width - self.x - 14px; height: 22px;
                 text: root.destination-name; accessible-role: none;
             }
-            if root.has-destination: tools := Rectangle {
-                x: 1px; y: picker.heading-height;
-                width: panel.width - 2px; height: picker.actions-height;
-                filter-tool := DestinationTool {
-                    x: DestinationGuides.tool-inset; y: (parent.height - self.height) / 2;
-                    width: min(self.natural-width, (parent.width - 32px) * 0.58);
-                    title: "Hide already added"; filter: true; accessible-role: checkbox;
-                    enabled: !root.offline; selected: root.filter-checked; click-scope: root.scope;
-                    accessible-description: root.offline ? "Unavailable offline" : "";
-                    keyboard-highlight: picker.highlight == picker.filter-index && panel.has-focus && picker.keyboard-mode;
-                    clicked => { picker.keyboard-mode = false; picker.highlight = picker.filter-index; picker.select(picker.filter-index); }
+            tools := Rectangle {
+                x: 1px + DestinationGuides.tool-inset; y: picker.heading-height + 2px;
+                width: parent.width - 2 * self.x; height: picker.actions-height;
+                property <length> gap: picker.can-clear && picker.can-skip ? 8px : 0px;
+                skip := DestinationTool {
+                    x: 0px; y: 0px;
+                    visible: picker.can-skip; enabled: self.visible;
+                    width: !self.visible ? 0px : min(self.natural-width, picker.can-clear ? (parent.width - tools.gap) * 0.58 : parent.width);
+                    title: "Skip already added"; checkbox: true; selected: root.skip-added;
+                    accessible-role: checkbox;
+                    accessible-description: "Album and artist adds only";
+                    click-scope: root.scope;
+                    highlighted: picker.highlight == 0 && panel.has-focus && picker.keyboard-mode;
+                    clicked => { picker.keyboard-mode = false; picker.highlight = 0; picker.select(0); }
                 }
                 if picker.can-clear: DestinationTool {
-                    x: filter-tool.x + filter-tool.width + 8px; y: filter-tool.y;
-                    width: min(self.natural-width, parent.width - self.x - 12px);
+                    x: skip.width + tools.gap; y: 0px;
+                    width: min(self.natural-width, parent.width - self.x);
                     title: "Clear selection"; click-scope: root.scope;
-                    keyboard-highlight: picker.highlight == picker.clear-index && panel.has-focus && picker.keyboard-mode;
+                    highlighted: picker.highlight == picker.clear-index && panel.has-focus && picker.keyboard-mode;
                     clicked => { picker.select(picker.clear-index); }
                 }
             }
@@ -311,17 +339,17 @@ export component SearchAddPicker inherits Rectangle {
             key-pressed(event) => {
                 if event.text == Key.Escape { picker.close(); return accept; }
                 if event.text == Key.Tab || event.text == Key.Backtab { picker.close(); return reject; }
-                if !root.offline && picker.can-clear && picker.highlight < picker.choice-start
+                if picker.can-skip && picker.can-clear && picker.highlight < picker.choice-start
                     && (event.text == Key.LeftArrow || event.text == Key.RightArrow) {
                     picker.keyboard-mode = true;
-                    picker.highlight = event.text == Key.LeftArrow ? picker.filter-index : picker.clear-index;
+                    picker.highlight = event.text == Key.LeftArrow ? 0 : picker.clear-index;
                     return accept;
                 }
                 if event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.Home || event.text == Key.End {
-                    if picker.last-index < picker.first-index { return accept; }
+                    if picker.last-index < 0 { return accept; }
                     picker.keyboard-mode = true;
-                    picker.highlight = event.text == Key.Home ? picker.first-index : event.text == Key.End ? picker.last-index
-                        : clamp(picker.highlight + (event.text == Key.DownArrow ? 1 : -1), picker.first-index, picker.last-index);
+                    picker.highlight = event.text == Key.Home ? 0 : event.text == Key.End ? picker.last-index
+                        : clamp(picker.highlight + (event.text == Key.DownArrow ? 1 : -1), 0, picker.last-index);
                     return accept;
                 }
                 if event.text == Key.Return || event.text == Key.Space {

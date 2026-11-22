@@ -31,6 +31,7 @@ mod presentation;
 mod quick_add;
 mod replica;
 mod saved;
+mod search_bulk;
 mod socket;
 mod storage;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -2,7 +2,7 @@
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
     AppWindow, ArtistCredit, BrowseRow, PlaylistActions, PlaylistOfflineState,
-    PlaylistSourceRestore, ReorderRow, SearchAddChoice, SearchAddSelection, actions,
+    PlaylistSourceRestore, ReorderRow, SearchAddChoice, SearchAddRow, SearchAddSelection, actions,
     api::{Api, ApiError, Session, library::PlaylistKind},
     engine::Command,
     pages::{self, Page, Route, RowKey},
@@ -68,14 +68,17 @@ enum Intent {
         scope: String,
         id: String,
     },
-    ToggleQuickFilter {
+    ToggleQuickSkip {
         scope: String,
-        id: String,
+    },
+    CancelQuickBulk {
+        scope: String,
     },
     QuickAdd {
         scope: String,
         target: String,
-        track: String,
+        kind: String,
+        source: String,
         index: usize,
     },
     PlaylistOrderDrop {
@@ -259,97 +262,26 @@ struct QuickProjection {
     selection: SearchAddSelection,
     choices: Vec<SearchAddChoice>,
     scope: slint::SharedString,
+    bulk_scope: slint::SharedString,
     status: slint::SharedString,
+    status_error: bool,
     blocked: slint::SharedString,
-    hide: bool,
-    states: Vec<slint::SharedString>,
-    visible: Vec<i32>,
+    skip: bool,
+    bulk_active: bool,
+    rows: Vec<SearchAddRow>,
 }
 
-fn focus_search(ui: &AppWindow) {
+fn focus_add_songs_search(ui: &AppWindow) {
     ui.set_search_add_open_serial(ui.get_search_add_open_serial().wrapping_add(1));
 }
 
 impl QuickProjection {
-    fn publish(self, ui: &AppWindow, preserve_position: bool) {
-        let previous = ui.get_search_add_visible_indices();
-        let was_filtered = ui.get_search_add_hide();
-        let indices_changed = !previous.iter().eq(self.visible.iter().copied());
-        let filtered_changed = was_filtered != self.hide;
-        let position = (preserve_position
-            && (indices_changed || filtered_changed)
-            && (was_filtered || self.hide))
-            .then(|| {
-                let part = ui.get_catalog_focused_part();
-                let quick_focus = matches!(part.as_str(), "quick-add" | "quick-add-pointer");
-                let owner = ui.get_search_focus_owner();
-                // Virtualization can detach the slot before its exact row has
-                // been restored. Carry that row across a second reflow.
-                let focused = if owner < 0 && quick_focus {
-                    ui.get_catalog_focused_row()
-                } else {
-                    owner
-                };
-                let before = if was_filtered {
-                    previous.iter().position(|i| i == focused)
-                } else {
-                    usize::try_from(focused).ok()
-                };
-                let after = if self.hide {
-                    self.visible.binary_search(&focused).ok()
-                } else {
-                    usize::try_from(focused).ok()
-                };
-                let restore_focus = (before != after || owner < 0)
-                    && before.is_some()
-                    && after.is_some()
-                    && quick_focus;
-                if before != after && before.is_some() && !restore_focus {
-                    focus_search(ui);
-                    ui.set_catalog_focused_row(-1);
-                    ui.set_search_focus_owner(-1);
-                }
-                let y = ui.get_catalog_scroll_y();
-                let old_anchor = ui.get_catalog_anchor_row();
-                let offset = ui.get_catalog_anchor_y() + y;
-                let anchor = if y >= 0.0 || old_anchor < 0 || offset > 0.0 {
-                    -1
-                } else if !self.hide {
-                    old_anchor
-                } else {
-                    match self.visible.binary_search(&old_anchor) {
-                        Ok(i) => self.visible[i],
-                        Err(i) => self
-                            .visible
-                            .get(i)
-                            .or_else(|| self.visible.last())
-                            .copied()
-                            .unwrap_or(-1),
-                    }
-                };
-                (y, anchor, offset, restore_focus.then_some((focused, part)))
-            });
-        if let Some((y, anchor, offset, focus)) =
-            position.filter(|(y, _, _, focus)| *y < 0.0 || focus.is_some())
-        {
-            ui.set_catalog_return_key(ui.get_page_key());
-            ui.set_catalog_return_y(y);
-            ui.set_catalog_return_anchor(anchor);
-            ui.set_catalog_return_offset(offset);
-            let (row, part) = focus.unwrap_or((-1, Default::default()));
-            ui.set_catalog_return_row(row);
-            ui.set_catalog_return_part(part);
-            ui.set_catalog_return_credit(Default::default());
-            ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
-        }
-        if indices_changed {
-            ui.set_search_add_visible_indices(ModelRc::new(VecModel::from(self.visible)));
-        }
-        if filtered_changed {
-            ui.set_search_add_hide(self.hide);
-        }
+    fn publish(self, ui: &AppWindow) {
         if ui.get_search_add_scope() != self.scope {
             ui.set_search_add_scope(self.scope);
+        }
+        if ui.get_search_add_bulk_scope() != self.bulk_scope {
+            ui.set_search_add_bulk_scope(self.bulk_scope);
         }
         if ui.get_search_add_selection() != self.selection {
             ui.set_search_add_selection(self.selection);
@@ -361,23 +293,25 @@ impl QuickProjection {
         {
             ui.set_search_add_choices(ModelRc::new(VecModel::from(self.choices)));
         }
-        let states = ui.get_search_add_row_states();
-        if !states.iter().eq(self.states.iter().cloned()) {
-            if let Some(model) = states
-                .as_any()
-                .downcast_ref::<VecModel<slint::SharedString>>()
-                && model.row_count() == self.states.len()
+        let rows = ui.get_search_add_rows();
+        if !rows.iter().eq(self.rows.iter().cloned()) {
+            if let Some(model) = rows.as_any().downcast_ref::<VecModel<SearchAddRow>>()
+                && model.row_count() == self.rows.len()
             {
-                for (index, state) in self.states.into_iter().enumerate() {
-                    if model.row_data(index).as_ref() != Some(&state) {
-                        model.set_row_data(index, state);
+                // Membership and bulk progress must not remount the ranked list.
+                for (index, row) in self.rows.into_iter().enumerate() {
+                    if model.row_data(index).as_ref() != Some(&row) {
+                        model.set_row_data(index, row);
                     }
                 }
             } else {
-                ui.set_search_add_row_states(ModelRc::new(VecModel::from(self.states)));
+                ui.set_search_add_rows(ModelRc::new(VecModel::from(self.rows)));
             }
         }
+        ui.set_search_add_skip(self.skip);
         ui.set_search_add_status(self.status);
+        ui.set_search_add_status_error(self.status_error);
+        ui.set_search_add_bulk_active(self.bulk_active);
         ui.set_search_add_blocked(self.blocked);
     }
 }
@@ -487,28 +421,44 @@ impl Desk {
             }
         });
         let (d, w) = (self.clone(), ui.as_weak());
-        ui.on_toggle_search_add_hide(move |id| {
+        ui.on_toggle_search_add_skip(move || {
             if let Some(ui) = w.upgrade() {
                 d.submit(
                     &ui,
-                    Intent::ToggleQuickFilter {
+                    Intent::ToggleQuickSkip {
                         scope: ui.get_search_add_scope().into(),
-                        id: id.into(),
                     },
                 );
             }
         });
         let (d, w) = (self.clone(), ui.as_weak());
-        ui.on_quick_add_search_track(move |target, track, index| {
+        ui.on_cancel_search_bulk(move || {
+            if let Some(ui) = w.upgrade() {
+                d.submit(
+                    &ui,
+                    Intent::CancelQuickBulk {
+                        scope: ui.get_search_add_bulk_scope().into(),
+                    },
+                );
+            }
+        });
+        let (d, w) = (self.clone(), ui.as_weak());
+        ui.on_quick_add_search_result(move |target, kind, source, index| {
             if let Some(ui) = w.upgrade()
                 && let Ok(index) = usize::try_from(index)
             {
+                let scope = if kind.as_str() == "track" {
+                    ui.get_search_add_scope()
+                } else {
+                    ui.get_search_add_bulk_scope()
+                };
                 d.submit(
                     &ui,
                     Intent::QuickAdd {
-                        scope: ui.get_search_add_scope().into(),
+                        scope: scope.into(),
                         target: target.into(),
-                        track: track.into(),
+                        kind: kind.into(),
+                        source: source.into(),
                         index,
                     },
                 );
@@ -806,10 +756,39 @@ fn search_track_unavailable(route: &Route, row: &pages::Row) -> bool {
     matches!(route, Route::Search(_)) && row.kind == "track" && !row.playable
 }
 
-fn quick_track(row: &pages::Row) -> bool {
-    row.kind == "track"
-        && row.playable
-        && matches!(&row.key, RowKey::Track(id) if !id.is_empty() && *id == row.id)
+fn quick_add_kind(row: &pages::Row) -> Option<&str> {
+    if row.id.is_empty() {
+        return None;
+    }
+    match (row.kind.as_str(), &row.key, &row.route) {
+        ("track", RowKey::Track(id), _) if row.playable && *id == row.id => Some("track"),
+        (kind @ "album", RowKey::Album(id), Some(Route::Album(route)))
+        | (kind @ "artist", RowKey::Artist(id), Some(Route::Artist(route)))
+            if *id == row.id && *route == row.id =>
+        {
+            Some(kind)
+        }
+        _ => None,
+    }
+}
+
+fn quick_track_state(view: &quick_add::View<'_>, id: &str) -> &'static str {
+    let track = view.row(id);
+    if track.pending {
+        "pending"
+    } else if track.membership == quick_add::Membership::Present {
+        "member"
+    } else if track.outcome == Some(quick_add::Outcome::Unconfirmed) {
+        "unconfirmed"
+    } else if track.can_add && track.outcome == Some(quick_add::Outcome::NotSent) {
+        "not-sent"
+    } else if track.can_add {
+        "ready"
+    } else if view.at_capacity && track.membership == quick_add::Membership::Absent {
+        "at-capacity"
+    } else {
+        "unavailable"
+    }
 }
 
 fn add_songs_eligible(route: &Route, page: &Page) -> bool {
@@ -1342,57 +1321,67 @@ impl Browser {
                     }
                 })
                 .unwrap_or_default();
-            let hide = !offline && view.hide;
-            let mut visible = Vec::new();
-            let mut states = Vec::new();
+            let bulk = view.bulk.filter(|_| !offline);
+            let bulk_active = bulk.is_some_and(|status| status.active);
+            let mut rows = Vec::new();
             if view.target.is_some() && !offline {
-                states.reserve(self.page.rows.len());
-                for (index, row) in self.page.rows.iter().enumerate() {
-                    let state = (row.kind == "track").then(|| view.row(&row.id));
-                    if hide && state.is_none_or(|s| s.visible) {
-                        visible.push(index as i32);
-                    }
-                    states.push(
-                        match state.filter(|_| quick_track(row)) {
-                            Some(s) if s.pending => "pending",
-                            Some(s) if s.membership == quick_add::Membership::Present => "member",
-                            Some(s) if s.outcome == Some(quick_add::Outcome::Unconfirmed) => {
-                                "unconfirmed"
-                            }
-                            Some(s)
-                                if s.can_add && s.outcome == Some(quick_add::Outcome::NotSent) =>
-                            {
-                                "not-sent"
-                            }
-                            Some(s) if s.can_add => "ready",
-                            Some(s)
-                                if view.at_capacity
-                                    && s.membership == quick_add::Membership::Absent =>
-                            {
-                                "at-capacity"
-                            }
-                            Some(_) => "unavailable",
-                            None => "",
+                rows = self
+                    .page
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let Some(kind) = quick_add_kind(row) else {
+                            return SearchAddRow::default();
+                        };
+                        let state = if kind == "track" {
+                            quick_track_state(&view, &row.id)
+                        } else if bulk.is_some_and(|status| {
+                            status.active && status.kind == kind && status.source == row.id
+                        }) {
+                            "pending"
+                        } else if view.bulk_ready {
+                            "ready"
+                        } else {
+                            "unavailable"
+                        };
+                        SearchAddRow {
+                            id: row.id.as_str().into(),
+                            state: state.into(),
                         }
-                        .into(),
-                    );
-                }
+                    })
+                    .collect();
             }
-            let status = if !offline && view.read_retired {
-                "Couldn’t load the playlist to check which songs are already in it."
+            let (status, status_error) = if let Some(bulk) =
+                bulk.filter(|status| status.active || !status.message.is_empty())
+            {
+                (
+                    if bulk.message.is_empty() {
+                        "Adding songs…"
+                    } else {
+                        bulk.message.as_str()
+                    },
+                    false,
+                )
+            } else if !offline && view.read_retired {
+                ("Couldn’t check playlist membership.", true)
             } else if !offline && view.session_limit && view.target.is_some() {
-                "Quick add is unavailable for the rest of this session. Use ⋯ to add songs."
+                (
+                    "Quick add is unavailable for this session. Use ⋯ to add songs.",
+                    true,
+                )
             } else {
-                ""
+                ("", false)
             };
             QuickProjection {
                 scope: view.scope(mode).into(),
+                bulk_scope: view.bulk_scope(mode).into(),
                 selection,
                 choices,
-                hide,
-                visible,
-                states,
+                skip: view.skip,
+                bulk_active,
+                rows,
                 status: status.into(),
+                status_error,
                 blocked: if offline {
                     "Offline".into()
                 } else if view.read_retired && view.target.is_some() {
@@ -1717,12 +1706,10 @@ impl Browser {
                 }
                 ui.set_playlist_order_scope(order.scope.into());
             }
-            let same_query =
-                matches!(&route, Route::Search(query) if ui.get_query().trim() == query);
-            quick.publish(&ui, same_query && !models && catalog_restore.is_none());
+            quick.publish(&ui);
             ui.set_playlist_add_songs(playlist_add_songs);
             if add_songs_open {
-                focus_search(&ui);
+                focus_add_songs_search(&ui);
             }
             if add_songs_return {
                 ui.set_search_add_return_serial(ui.get_search_add_return_serial().wrapping_add(1));
@@ -1837,6 +1824,7 @@ impl Browser {
         }
     }
     fn reset(&mut self, access: Option<Access>) {
+        self.abort_search_bulk();
         self.cancel();
         self.saved_reload_due = false;
         self.personal_due = None;
@@ -2315,6 +2303,14 @@ impl Browser {
         self.render(false);
     }
 
+    fn abort_search_bulk(&self) {
+        if matches!(self.route, Route::Search(_))
+            && let Some(a) = self.access.as_ref()
+        {
+            a.personal.quick_abort_bulk(a.epoch);
+        }
+    }
+
     fn visit(&mut self, navigation: Navigation) {
         self.visit_from(navigation, None);
     }
@@ -2343,6 +2339,10 @@ impl Browser {
         };
         self.row_editor = None;
         let changed = next != self.route;
+        if changed {
+            // A new query is a new source scope even if the destination stays selected.
+            self.abort_search_bulk();
+        }
         if changed
             && self.route.catalog_continuity()
             && !self.page.local_audio
@@ -2763,44 +2763,62 @@ impl Browser {
                 }
                 return;
             }
-            Intent::ToggleQuickFilter { scope, id }
+            Intent::ToggleQuickSkip { scope }
+                if i.generation == self.generation
+                    && matches!(self.route, Route::Search(_))
+                    && !offline =>
+            {
+                let mode = *a.session.network_changes().borrow();
+                if let Some(skip) = a.personal.quick_view(a.epoch, |view| {
+                    (view.scope(mode) == scope).then_some(!view.skip)
+                }) {
+                    a.personal.quick_skip(a.epoch, skip);
+                    self.render(false);
+                }
+                return;
+            }
+            Intent::CancelQuickBulk { scope }
                 if i.generation == self.generation && matches!(self.route, Route::Search(_)) =>
             {
                 let mode = *a.session.network_changes().borrow();
-                let hide = a.personal.quick_view(a.epoch, |view| {
-                    view.target
-                        .filter(|target| target.id == id && view.scope(mode) == scope)
-                        .map(|_| !view.hide)
-                });
-                if let Some(hide) = hide {
-                    a.personal.quick_filter(a.epoch, hide);
-                    self.render(false);
-                }
+                a.personal.quick_abort_bulk_scoped(a.epoch, mode, &scope);
+                self.render(false);
                 return;
             }
             Intent::QuickAdd {
                 scope,
                 target,
-                track,
+                kind,
+                source,
                 index,
             } if i.generation == self.generation && !offline => {
                 if matches!(self.route, Route::Search(_))
-                    && self
-                        .page
-                        .rows
-                        .get(index)
-                        .is_some_and(|row| quick_track(row) && row.id == track)
+                    && self.page.rows.get(index).is_some_and(|row| {
+                        quick_add_kind(row) == Some(kind.as_str()) && row.id == source
+                    })
                 {
                     let mode = *a.session.network_changes().borrow();
-                    if let Some(ticket) = a
-                        .personal
-                        .quick_stage_scoped(a.epoch, mode, &scope, &target, &track)
-                        && self
-                            .engine
-                            .try_send(Command::QuickAdd(ticket.clone()))
-                            .is_err()
-                    {
-                        a.personal.quick_cancel(&ticket);
+                    if kind == "track" {
+                        if let Some(ticket) = a
+                            .personal
+                            .quick_stage_scoped(a.epoch, mode, &scope, &target, &source)
+                            && self
+                                .engine
+                                .try_send(Command::QuickAdd(ticket.clone()))
+                                .is_err()
+                        {
+                            a.personal.quick_cancel(&ticket);
+                        }
+                    } else {
+                        crate::search_bulk::start(
+                            &a,
+                            self.epoch.clone(),
+                            mode,
+                            &scope,
+                            &target,
+                            &kind,
+                            &source,
+                        );
                     }
                     self.render(false);
                 }
@@ -3612,6 +3630,33 @@ mod tests {
         row.kind = "track".into();
         row.playable = true;
         assert!(!search_track_unavailable(&route, &row));
+    }
+
+    #[test]
+    fn search_quick_add_requires_a_typed_catalog_source() {
+        let mut row = pages::Row {
+            kind: "album".into(),
+            id: "source".into(),
+            key: RowKey::Album("source".into()),
+            route: Some(Route::Album("source".into())),
+            ..Default::default()
+        };
+        // Search coverage is a hint; bulk reads the authoritative collection.
+        assert!(!row.playable);
+        assert_eq!(quick_add_kind(&row), Some("album"));
+        row.route = Some(Route::Album("wrong-source".into()));
+        assert_eq!(quick_add_kind(&row), None);
+        row.kind = "artist".into();
+        row.route = Some(Route::Artist("source".into()));
+        assert_eq!(quick_add_kind(&row), None);
+        row.key = RowKey::Artist("source".into());
+        assert_eq!(quick_add_kind(&row), Some("artist"));
+        row.kind = "track".into();
+        row.key = RowKey::Track("source".into());
+        row.route = None;
+        assert_eq!(quick_add_kind(&row), None);
+        row.playable = true;
+        assert_eq!(quick_add_kind(&row), Some("track"));
     }
 
     #[test]

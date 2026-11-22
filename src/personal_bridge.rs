@@ -6,11 +6,14 @@ use crate::{
     desk::Access,
     personal::{AcceptedPlaylist, PersonalCommand, PersonalUpdate, Replica},
     playlist_observations::Writer,
-    quick_add::{self, QuickAdd, Ticket},
+    quick_add::{self, BulkEnd, BulkTicket, BulkWrite, QuickAdd, Ticket},
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::{sync::watch, time::Instant};
 
@@ -224,12 +227,24 @@ impl State {
 pub struct PersonalAccess {
     state: Arc<Mutex<State>>,
     changed: watch::Sender<u64>,
+    // The installation's existing output identity, not an account capability.
+    bulk_device: Arc<Mutex<Option<BulkDevice>>>,
 }
+
+#[derive(Clone)]
+pub(crate) struct BulkDevice {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) link: watch::Receiver<crate::socket::Link>,
+    pub(crate) order: crate::socket::BulkOrder,
+}
+
 impl Default for PersonalAccess {
     fn default() -> Self {
         Self {
             state: Arc::default(),
             changed: watch::channel(0).0,
+            bulk_device: Arc::default(),
         }
     }
 }
@@ -348,14 +363,6 @@ impl PersonalAccess {
         Some((state.status.generation, command?))
     }
 
-    pub(crate) fn quick_filter(&self, epoch: u64, hide: bool) {
-        let mut state = self.state.lock().expect("personal state");
-        if state.status.epoch == epoch {
-            state.quick.filter(hide);
-            self.signal();
-        }
-    }
-
     pub(crate) fn quick_view<R>(
         &self,
         epoch: u64,
@@ -367,6 +374,157 @@ impl PersonalAccess {
                 .quick
                 .view(state.status.epoch == epoch, &state.replica, state.status),
         )
+    }
+
+    pub(crate) fn quick_bulk_device(&self) -> Option<BulkDevice> {
+        self.bulk_device
+            .lock()
+            .expect("bulk device identity")
+            .clone()
+    }
+
+    pub(crate) fn quick_skip(&self, epoch: u64, skip: bool) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch == epoch {
+            state.quick.bulk_skip(skip);
+            self.signal();
+        }
+    }
+
+    pub(crate) fn quick_abort_bulk(&self, epoch: u64) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch == epoch && state.quick.abort_bulk(BulkEnd::Cancelled) {
+            self.signal();
+        }
+    }
+
+    pub(crate) fn quick_abort_bulk_scoped(&self, epoch: u64, mode: u64, scope: &str) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch == epoch
+            && state
+                .quick
+                .view(true, &state.replica, state.status)
+                .bulk_scope(mode)
+                == scope
+            && state.quick.abort_bulk(BulkEnd::Cancelled)
+        {
+            self.signal();
+        }
+    }
+
+    pub(crate) fn quick_begin_bulk(
+        &self,
+        epoch: u64,
+        mode: u64,
+        scope: &str,
+        target: &str,
+        kind: &str,
+        source: &str,
+    ) -> Option<BulkTicket> {
+        let mut state = self.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        if status.epoch != epoch || quick.view(true, replica, *status).bulk_scope(mode) != scope {
+            return None;
+        }
+        let ticket = quick.begin_bulk(*status, replica, mode, target, kind, source)?;
+        self.signal();
+        Some(ticket)
+    }
+
+    pub(crate) fn quick_bulk_current(&self, ticket: &BulkTicket) -> bool {
+        let state = self.state.lock().expect("personal state");
+        state.quick.bulk_current(state.status, ticket)
+    }
+
+    pub(crate) fn quick_bulk_revision(&self, ticket: &BulkTicket) -> Option<u64> {
+        let state = self.state.lock().expect("personal state");
+        state
+            .quick
+            .bulk_revision(state.status, &state.replica, ticket)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quick_bulk_send(
+        &self,
+        ticket: &BulkTicket,
+        track: &str,
+        start: impl FnOnce() -> bool,
+    ) -> BulkWrite {
+        self.quick_bulk_send_ordered(ticket, track, None, &AtomicU64::new(ticket.epoch), start)
+    }
+
+    pub(crate) fn quick_bulk_send_ordered(
+        &self,
+        ticket: &BulkTicket,
+        track: &str,
+        primary: Option<&BulkDevice>,
+        current_epoch: &AtomicU64,
+        start: impl FnOnce() -> bool,
+    ) -> BulkWrite {
+        // Actual writes call this while holding PUBLICATION_GATE, just as
+        // individual quick adds do. Do not wait for Engine to retire Access.
+        if current_epoch.load(Ordering::SeqCst) != ticket.epoch {
+            return BulkWrite::Stop;
+        }
+        let mut state = self.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        let outcome = if let Some(primary) = primary {
+            // Follow the ordinary personal order-admission lock ordering.
+            // The actual write guard additionally owns PUBLICATION_GATE.
+            primary
+                .order
+                .when_applied(|| {
+                    let link = primary.link.borrow();
+                    if *link != crate::socket::Link::Connected(ticket.generation) {
+                        return BulkWrite::Stop;
+                    }
+                    quick.bulk_start(*status, replica, ticket, track, start)
+                })
+                .unwrap_or(BulkWrite::Wait)
+        } else {
+            quick.bulk_start(*status, replica, ticket, track, start)
+        };
+        if outcome == BulkWrite::Started {
+            self.signal();
+        }
+        outcome
+    }
+
+    pub(crate) fn quick_bulk_ack(&self, ticket: &BulkTicket, revision: u64) -> bool {
+        let mut state = self.state.lock().expect("personal state");
+        let ok = state.quick.bulk_ack(ticket, revision);
+        if ok {
+            self.signal();
+        }
+        ok
+    }
+
+    pub(crate) fn quick_bulk_checkpoint(&self, ticket: &BulkTicket) {
+        let mut state = self.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        quick.bulk_checkpoint(*status, replica, ticket);
+        self.signal();
+    }
+
+    pub(crate) fn quick_finish_bulk(&self, ticket: &BulkTicket, end: BulkEnd) {
+        let mut state = self.state.lock().expect("personal state");
+        state.quick.finish_bulk(ticket, end);
+        self.signal();
     }
 
     #[cfg(test)]
@@ -590,6 +748,10 @@ impl PersonalAccess {
 #[derive(Default)]
 pub struct PersonalHub(PersonalAccess);
 impl PersonalHub {
+    pub(crate) fn set_bulk_device(&self, identity: BulkDevice) {
+        *self.0.bulk_device.lock().expect("bulk device identity") = Some(identity);
+    }
+
     pub fn access(&self) -> PersonalAccess {
         self.0.clone()
     }

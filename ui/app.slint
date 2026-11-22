@@ -10,7 +10,7 @@ import { DeviceRow } from "output-picker.slint";
 import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings } from "settings.slint";
 import { WorkspaceRail } from "workspace-parts.slint";
-import { SearchAddChoice, SearchAddPicker } from "search-add.slint";
+import { SearchAddChoice, SearchAddPicker, SearchAddProgress, SearchAddRow } from "search-add.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
 export { ArtistCredit, DeviceRow, ReorderRow, SearchAddChoice }
 export struct SearchAddSelection { id: string, name: string, detail: string, option-index: int }
@@ -101,19 +101,21 @@ export component AppWindow inherits Window {
     callback search-edited();
     in property <SearchAddSelection> search-add-selection;
     in property <[SearchAddChoice]> search-add-choices;
-    in property <bool> search-add-hide;
     in property <string> search-add-blocked;
     in property <string> search-add-scope;
+    in property <string> search-add-bulk-scope;
     in property <string> search-add-status;
-    in property <[string]> search-add-row-states;
-    in property <[int]> search-add-visible-indices;
+    in property <bool> search-add-status-error;
+    in property <bool> search-add-bulk-active;
+    in property <bool> search-add-skip: true;
+    in property <[SearchAddRow]> search-add-rows;
     in property <bool> playlist-add-songs;
     in property <int> search-add-open-serial;
     in property <int> search-add-return-serial;
-    in-out property <int> search-focus-owner: -1;
     callback choose-search-add-destination(string);
-    callback toggle-search-add-hide(string);
-    callback quick-add-search-track(string, string, int);
+    callback toggle-search-add-skip();
+    callback quick-add-search-result(string, string, string, int);
+    callback cancel-search-bulk();
     callback toggle-play();
     callback previous();
     callback next();
@@ -263,8 +265,6 @@ export component AppWindow inherits Window {
     property <bool> editor-open: form-mode != "" && form-mode != "closed";
     property <bool> is-search: page-kind == "search";
     property <bool> show-search-add: root.signed-in && root.is-search && !root.editor-open;
-    property <bool> filter-search-add: root.is-search && root.search-add-hide;
-    property <int> catalog-result-count: root.filter-search-add ? root.search-add-visible-indices.length : root.browse-rows.length;
     property <bool> is-history: page-kind == "history" || page-kind == "recent";
     property <bool> is-playlist: page-kind == "playlist" || page-kind == "playlist-manual" || page-kind == "playlist-rules";
     property <bool> playlist-detail: self.is-playlist || self.page-kind == "saved-collection";
@@ -688,13 +688,13 @@ export component AppWindow inherits Window {
                     }
                     if root.show-search-add: SearchAddPicker {
                         width: toolbar.picker-width; x: parent.width - main.inset - self.width; y: search.y;
-                        show-label: toolbar.picker-label; hide-added: root.search-add-hide;
+                        show-label: toolbar.picker-label; skip-added: root.search-add-skip;
                         choices: root.search-add-choices; destination: root.search-add-selection.id;
                         destination-name: root.search-add-selection.name; destination-detail: root.search-add-selection.detail;
                         destination-index: root.search-add-selection.option-index;
                         scope: root.search-add-scope; blocked: root.search-add-blocked; available-width: toolbar.tools-width;
                         choose(id) => { root.choose-search-add-destination(id); }
-                        toggle-hide => { root.toggle-search-add-hide(root.search-add-selection.id); }
+                        toggle-skip => { root.toggle-search-add-skip(); }
                         focus-fallback => { search.take-focus(); }
                     }
                 }
@@ -774,7 +774,7 @@ export component AppWindow inherits Window {
                     }
                     catalog-scroll := ScrollView {
                         visible: !root.is-now && !shell.playlist-order-edit;
-                        x: 0px; y: 0px; width: parent.width; height: parent.height;
+                        x: 0px; y: 0px; width: parent.width; height: max(0px, parent.height - search-status-lane.height);
                         horizontal-scrollbar-policy: always-off; content-width: self.visible-width;
                         property <string> scroll-key: root.is-search ? "search|" + root.query
                             : root.page-key != "" ? root.page-key : root.page-kind + "|" + root.catalog-title;
@@ -784,7 +784,6 @@ export component AppWindow inherits Window {
                         changed scroll-key => {
                             root.catalog-focused-row = -1;
                             root.catalog-anchor-row = -1;
-                            root.search-focus-owner = -1;
                             shell.destination-scrolled();
                         }
                         property <int> return-serial: root.catalog-return-serial;
@@ -815,7 +814,7 @@ export component AppWindow inherits Window {
                             running: catalog-scroll.visible && catalog-scroll.catalog-results-route
                                 && !root.editor-open && !root.compact-queue-open && !catalog-scroll.restore-catalog
                                 && root.catalog-request-key != "" && root.catalog-request-key != catalog-scroll.issued-request
-                                && (root.catalog-result-count == 0 || catalog.y + catalog-results.y + catalog-results.height + catalog-scroll.content-y
+                                && (root.browse-rows.length == 0 || catalog.y + catalog-results.y + catalog-results.height + catalog-scroll.content-y
                                     <= catalog-scroll.visible-height + min(280px, catalog-scroll.visible-height / 2));
                             triggered => {
                                 catalog-scroll.issued-request = root.catalog-request-key;
@@ -823,7 +822,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         changed content-height => {
-                            if root.playlist-detail || root.filter-search-add { self.set-scroll(self.content-y); }
+                            if root.playlist-detail { self.set-scroll(self.content-y); }
                             shell.apply-return-scroll();
                         }
                         property <bool> loading: root.page-busy;
@@ -856,7 +855,6 @@ export component AppWindow inherits Window {
                                         Hero {
                                             title: root.is-settings ? "Settings" : root.catalog-title;
                                             subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
-                                            hide-subtitle: root.filter-search-add;
                                             section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : "";
                                             glyph: Copy.mark(root.page-kind);
                                             artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
@@ -930,10 +928,6 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            if root.filter-search-add && root.browse-rows.length > 0 && root.catalog-result-count == 0
-                                && root.catalog-request-key == "" && root.catalog-continuation-status == ""
-                                && !root.catalog-loading && !root.page-busy && !root.page-error:
-                                EmptyState { glyph: Copy.mark(root.page-kind); title: "Matching tracks are already in this playlist"; }
                             if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
@@ -953,7 +947,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.query = root.catalog-title; shell.edited-search(); search.take-focus(); }
                                 }
                             }
-                            if root.catalog-result-count > 0 && root.page-kind != "playlists" && !root.playlist-detail: Eyebrow {
+                            if root.browse-rows.length > 0 && root.page-kind != "playlists" && !root.playlist-detail: Eyebrow {
                                 height: 30px; color: Theme.muted;
                                 text: root.is-search ? "RESULTS" : root.is-history ? "RECENTLY PLAYED" : root.page-kind == "artist" ? "DISCOGRAPHY"
                                     : root.page-kind == "album" ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
@@ -1162,29 +1156,28 @@ export component AppWindow inherits Window {
                                 }
                             }
                             catalog-results := VerticalLayout {
-                                visible: catalog-scroll.catalog-results-route && root.catalog-result-count > 0;
+                                visible: catalog-scroll.catalog-results-route && root.browse-rows.length > 0;
                                 accessible-role: list;
                                 accessible-label: root.catalog-title;
-                                accessible-item-count: root.catalog-result-count;
+                                accessible-item-count: root.browse-rows.length;
                                 accessible-orientation: vertical;
                                 spacing: 2px;
                                 // Layout slots give the one scroll surface exact geometry. Only
                                 // mount rich row controls around the viewport and keyboard focus.
-                                for i in (catalog-scroll.catalog-results-route ? root.catalog-result-count : 0): slot := Rectangle {
-                                    property <int> absolute-index: root.filter-search-add ? root.search-add-visible-indices[i] : i;
-                                    property <BrowseRow> browse-entry: root.browse-rows[self.absolute-index];
+                                for i in (catalog-scroll.catalog-results-route ? root.browse-rows.length : 0): slot := Rectangle {
+                                    property <BrowseRow> browse-entry: root.browse-rows[i];
                                     property <bool> album-line: Copy.show-browse-album(root.page-kind, browse-entry.kind, browse-entry.album-name);
                                     height: Copy.row-height(browse-entry.credits.length > 0 || browse-entry.subtitle != "", self.album-line);
                                     property <length> row-y: catalog.y + catalog-results.y + self.y;
                                     property <length> visible-y: self.row-y + catalog-scroll.content-y;
                                     property <bool> near-viewport: self.visible-y + self.height >= -catalog-scroll.visible-height
                                         && self.visible-y <= 2 * catalog-scroll.visible-height;
-                                    property <bool> near-focus: root.catalog-focused-row >= 0 && abs(self.absolute-index - root.catalog-focused-row) <= 2;
-                                    property <bool> restoring: catalog-scroll.restore-catalog && self.absolute-index == root.catalog-return-row;
+                                    property <bool> near-focus: root.catalog-focused-row >= 0 && abs(i - root.catalog-focused-row) <= 2;
+                                    property <bool> restoring: catalog-scroll.restore-catalog && i == root.catalog-return-row;
                                     property <bool> is-anchor: self.visible-y <= 0px && self.visible-y + self.height + catalog-results.spacing > 0px;
                                     function publish-anchor() {
                                         if self.is-anchor {
-                                            root.catalog-anchor-row = self.absolute-index;
+                                            root.catalog-anchor-row = i;
                                             root.catalog-anchor-y = self.row-y / 1px;
                                         }
                                     }
@@ -1192,13 +1185,13 @@ export component AppWindow inherits Window {
                                     changed row-y => { self.publish-anchor(); }
                                     property <int> restore-anchor: catalog-scroll.return-anchor-serial;
                                     changed restore-anchor => {
-                                        if self.absolute-index == root.catalog-return-anchor {
+                                        if i == root.catalog-return-anchor {
                                             catalog-scroll.set-scroll(clamp(root.catalog-return-offset * 1px, -self.height, 0px) - self.row-y);
                                         }
                                     }
                                     if slot.near-viewport || slot.near-focus || slot.restoring: BrowseLine {
                                         width: parent.width; height: parent.height;
-                                        entry: slot.browse-entry; index: slot.absolute-index; page-kind: root.page-kind;
+                                        entry: slot.browse-entry; index: i; page-kind: root.page-kind;
                                         align-credit-fallback: true;
                                         paint-left: main.inset; paint-right: main.inset;
                                         artwork: self.index < root.browse-artwork.length ? root.browse-artwork[self.index] : root.no-artwork;
@@ -1208,33 +1201,19 @@ export component AppWindow inherits Window {
                                         window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + self.index;
                                         quick-add-visible: root.show-search-add && root.search-add-selection.id != "" && !root.local-mode;
-                                        quick-add-state: self.index < root.search-add-row-states.length ? root.search-add-row-states[self.index] : "";
+                                        property <SearchAddRow> add-row: self.index < root.search-add-rows.length ? root.search-add-rows[self.index] : { };
+                                        quick-add-state: self.add-row.state;
                                         quick-add-target: root.search-add-selection.name + (root.search-add-selection.detail == "" ? "" : ", " + root.search-add-selection.detail);
-                                        quick-add-scope: root.search-add-scope + "|" + self.menu-key + "|" + self.entry.track-id;
-                                        quick-add-focus-changed(owns, pointer) => {
-                                            if owns {
-                                                root.catalog-focused-part = pointer ? "quick-add-pointer" : "quick-add";
-                                            } else if !catalog-scroll.restore-catalog && root.catalog-focused-row == self.index
-                                                && (root.catalog-focused-part == "quick-add" || root.catalog-focused-part == "quick-add-pointer") {
-                                                root.catalog-focused-part = "";
-                                            }
-                                        }
-                                        quick-add-focus-evicted(unavailable) => {
+                                        quick-add-scope: root.search-add-scope + "|" + self.menu-key + "|" + self.entry.kind + "|" + self.add-row.id;
+                                        quick-add-click-scope: self.entry.kind == "track" ? self.quick-add-scope
+                                            : root.search-add-bulk-scope + "|" + self.quick-add-scope;
+                                        quick-add-focus-evicted => {
                                             if !catalog-scroll.restore-catalog || root.catalog-return-row < 0 {
-                                                if unavailable { search.take-focus(); }
-                                                else { history-pane.focus(); }
+                                                history-pane.focus();
                                                 root.catalog-focused-row = -1;
-                                                root.catalog-focused-part = "";
-                                                root.search-focus-owner = -1;
                                             }
                                         }
-                                        quick-add => { root.quick-add-search-track(root.search-add-selection.id, self.entry.track-id, self.index); }
-                                        keyboard-focus-changed(owns, on-body) => {
-                                            if root.is-search {
-                                                if owns { root.search-focus-owner = self.index; }
-                                                else if root.search-focus-owner == self.index { root.search-focus-owner = -1; }
-                                            }
-                                        }
+                                        quick-add => { root.quick-add-search-result(root.search-add-selection.id, self.entry.kind, self.add-row.id, self.index); }
                                         title-focus-key: root.page-key + "/" + self.entry.track-id;
                                         menu-scroll-window-width: root.is-search ? root.width : 0px;
                                         menu-scrolled(delta) => { catalog-scroll.set-scroll(catalog-scroll.content-y + delta); }
@@ -1290,12 +1269,23 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.is-search && root.search-add-status != "" && !root.compact-queue-open: Notice {
+                    search-status-lane := Rectangle {
                         width: min(460px, parent.width - 2 * main.inset);
                         x: parent.width - main.inset - self.width;
-                        y: parent.height - main.inset - self.height;
-                        height: self.min-height;
-                        text: root.search-add-status; error: true;
+                        y: parent.height - self.height;
+                        // Reserve the footer before adds start; updates and completion
+                        // never resize the viewport or cover the last row's actions.
+                        height: root.is-search && (root.search-add-selection.id != "" || root.search-add-status != "")
+                            ? (self.width < 400px ? 68px : 56px) : 0px;
+                        SearchAddProgress {
+                            x: 0px; y: 0px; width: parent.width; height: max(0px, parent.height - 8px);
+                            visible: root.is-search && root.search-add-status != "" && !root.compact-queue-open;
+                            status: root.search-add-status; error: root.search-add-status-error;
+                            active: root.search-add-bulk-active; scope: root.search-add-scope;
+                            cancel-scope: root.search-add-bulk-scope;
+                            cancel => { root.cancel-search-bulk(); }
+                            focus-fallback => { history-pane.focus(); }
+                        }
                     }
                     playlist-order-pane := VerticalLayout {
                         x: main.inset; y: 0px; width: parent.width - 2 * main.inset; height: parent.height;

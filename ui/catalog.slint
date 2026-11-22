@@ -42,7 +42,6 @@ export global Copy {
 export component Hero inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
-    in property <bool> hide-subtitle;
     in property <string> section;
     in property <string> glyph;
     in property <image> artwork;
@@ -77,12 +76,7 @@ export component Hero inherits Rectangle {
                 text: root.title; color: Theme.text; font-size: (root.compact ? 28px : 37px) * Theme.density;
                 font-weight: 700; letter-spacing: -1px; overflow: elide; wrap: word-wrap; max-height: root.compact ? 61px : 86px;
             }
-            if root.subtitle != "" && !root.hide-subtitle: Caption { text: root.subtitle; wrap: word-wrap; max-height: 40px; }
-            if root.subtitle != "" && root.hide-subtitle: Caption {
-                // Reserve the measured space, without exposing the unfiltered count.
-                text: root.subtitle; wrap: word-wrap; max-height: 40px;
-                opacity: 0; accessible-role: none;
-            }
+            if root.subtitle != "": Caption { text: root.subtitle; wrap: word-wrap; max-height: 40px; }
             if root.credits.length > 0: hero-credits := WrappingCredits {
                 credits: root.credits; interactive: root.metadata-enabled;
                 activated(id) => { root.page-action("artist", id); }
@@ -209,10 +203,11 @@ export component MediaLine inherits Rectangle {
     // Empty hides the control; only ready can activate it.
     in property <string> quick-add-state;
     in property <string> quick-add-target;
+    // Focus follows the target and row. The click can be fenced more narrowly.
     in property <string> quick-add-scope;
+    in property <string> quick-add-click-scope: root.quick-add-scope;
     callback quick-add();
-    callback quick-add-focus-changed(bool /* owns */, bool /* pointer */);
-    callback quick-add-focus-evicted(bool /* unavailable */);
+    callback quick-add-focus-evicted();
     property <bool> quick-add-not-sent: root.quick-add-state == "not-sent";
     property <bool> quick-add-ready: root.quick-add-state == "ready" || root.quick-add-not-sent;
     property <bool> quick-add-at-capacity: root.quick-add-state == "at-capacity";
@@ -224,6 +219,8 @@ export component MediaLine inherits Rectangle {
     property <length> quick-add-width: (root.quick-add-unconfirmed || root.quick-add-not-sent) && !root.compact ? 100px : 37px;
     property <bool> quick-add-focused;
     property <string> quick-add-focus-scope;
+    property <string> quick-add-subject: root.kind == "album" ? "album " + root.title
+        : root.kind == "artist" ? "songs by " + root.title : root.title;
     property <bool> quick-add-clipped: root.play-viewport-height > 0px
         && (root.row-viewport-y + root.menu-top + 38px <= 0px || root.row-viewport-y + root.menu-top >= root.play-viewport-height);
     property <bool> quick-add-evicted: root.quick-add-focused
@@ -231,7 +228,7 @@ export component MediaLine inherits Rectangle {
     changed quick-add-evicted => {
         if root.quick-add-evicted {
             root.quick-add-focused = false;
-            root.quick-add-focus-evicted(!root.has-quick-add);
+            root.quick-add-focus-evicted();
         }
     }
     in property <[ArtistCredit]> credits;
@@ -282,8 +279,7 @@ export component MediaLine inherits Rectangle {
             || (part == "album" && (credit != root.album-id || (root.title-opens-album ? !song-title.interactive : !root.show-album-line)))
             || (part == "menu" && root.actions.length == 0) {
             if root.body-focusable { root.take-row-focus(); }
-        } else if part == "artist" || part == "album" || part == "menu"
-            || ((part == "quick-add" || part == "quick-add-pointer") && root.has-quick-add) {
+        } else if part == "artist" || part == "album" || part == "menu" {
             root.resume-credit = credit;
             root.resume-part = part;
             root.resume-serial += 1;
@@ -539,33 +535,23 @@ export component MediaLine inherits Rectangle {
             // Keep a previously focused target through a temporary status change,
             // but skip disabled targets when tabbing into the row. Status slots
             // still consume pointer clicks rather than activating the track behind them.
-            property <bool> restore-quick: root.resume-part == "quick-add" || root.resume-part == "quick-add-pointer";
-            property <int> resume: self.restore-quick ? root.resume-serial : 0;
-            keyboard-focusable: root.quick-add-ready || self.has-focus || self.restore-quick;
-            changed resume => {
-                if self.resume != 0 {
-                    if root.resume-part == "quick-add-pointer" { self.take-pointer-focus(); }
-                    else { self.take-focus(); }
-                    root.resume-part = "";
-                }
-            }
+            keyboard-focusable: root.quick-add-ready || self.has-focus;
             accessible-enabled: root.quick-add-ready;
-            accessible-label: root.quick-add-member ? "In playlist: " + root.quick-add-target
+            accessible-label: root.quick-add-member ? "In playlist"
                 : root.quick-add-unconfirmed ? "Add unconfirmed for " + root.title + " in " + root.quick-add-target
                 : root.quick-add-at-capacity ? "Quick add queue is full"
-                : root.quick-add-unavailable ? "Quick add unavailable for " + root.quick-add-target
-                : (root.quick-add-ready ? "Add " : "Adding ") + root.title + " to " + root.quick-add-target;
+                : root.quick-add-unavailable ? "Quick add unavailable: " + root.quick-add-subject + " to " + root.quick-add-target
+                : (root.quick-add-ready ? "Add " : "Adding ") + root.quick-add-subject + " to " + root.quick-add-target;
             accessible-description: root.quick-add-unconfirmed ? "Use song actions to add another copy if intended."
                 : root.quick-add-not-sent ? "Previous add was not sent."
                 : root.quick-add-member || root.quick-add-unavailable ? root.title : "";
             accessible-live-region: self.has-focus && (root.quick-add-pending || root.quick-add-unconfirmed) ? polite : off;
-            click-scope: root.quick-add-scope;
+            click-scope: root.quick-add-click-scope;
             keyboard-focus-changed(owns) => {
                 if owns {
                     root.focused();
                     root.quick-add-focus-scope = root.quick-add-scope;
                 }
-                root.quick-add-focus-changed(owns, self.pointer-focused);
                 root.quick-add-focused = owns;
                 root.keyboard-focus-changed(owns, false);
             }

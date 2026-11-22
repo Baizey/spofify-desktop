@@ -6,11 +6,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
+    hash::{BuildHasher, RandomState},
     io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
+    os::unix::fs::FileExt,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use ring::digest::{Context, SHA256};
@@ -653,6 +656,465 @@ async fn fetch_manifest<T: ManifestTracks>(
     }
 }
 
+// Include cancelled workers until an in-flight filesystem call returns. The
+// spool and its permit are always owned by either the operation or its worker.
+static SEARCH_SPOOL_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+const SEARCH_SLOT_WAIT: Duration = Duration::from_secs(10);
+const SEARCH_STORAGE: ApiError = error("Unable to stage songs for quick add.");
+const SEARCH_NO_SPACE: ApiError = error("Not enough space to stage songs for quick add.");
+const SEARCH_CANCELLED: ApiError = error("Adding songs was cancelled.");
+const SEARCH_OFFLINE: ApiError = error("Work online to add songs from search.");
+
+/// Read the entire album or artist manifest before the caller can start any
+/// writes. Personal writes can invalidate the manifest fence between pages.
+pub(crate) async fn spool_search_source(
+    access: &Access,
+    kind: &str,
+    id: &str,
+    live: impl Fn() -> bool,
+) -> Result<SearchSourceSpool, ApiError> {
+    let target = match (kind, valid_id(id)) {
+        ("album", true) => Target::Album(id),
+        ("artist", true) => Target::Artist(id),
+        _ => return Err(INVALID),
+    };
+    let mut network = access.session.network_changes();
+    let generation = *network.borrow_and_update();
+    if access.offline || generation & 1 != 0 {
+        return Err(SEARCH_OFFLINE);
+    }
+    let fence = network.clone();
+    let check = || {
+        if !live() {
+            return Err(SEARCH_CANCELLED);
+        }
+        if *fence.borrow() != generation {
+            return Err(SEARCH_OFFLINE);
+        }
+        check_live(access)
+    };
+    check()?;
+    let cancel = Cancellation::new();
+    let cancelled = cancel.0.clone();
+    tokio::select! {
+        biased;
+        _ = network.changed() => Err(SEARCH_OFFLINE),
+        // Also observe guard changes while awaiting a network/disk operation,
+        // even when the caller has no separate cancellation future.
+        error = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Err(error) = check() { break error; }
+            }
+        } => Err(error),
+        result = async {
+            let permit = tokio::time::timeout(SEARCH_SLOT_WAIT, SEARCH_SPOOL_SLOTS.acquire())
+                .await.map_err(|_| SEARCH_STORAGE)?.map_err(|_| SEARCH_STORAGE)?;
+            let domain = target.domain();
+            let id = target.id().to_owned();
+            let mut source = search_disk(move || {
+                let dir = local_storage::open_default("spofify-search-spool").map_err(search_errno)?;
+                SearchStaging::open(dir, domain, id, permit, cancelled)
+            }).await?;
+            let mut cursor: Option<String> = None;
+            loop {
+                check()?;
+                let body = access.api.offline_collection_manifest(
+                    &access.session, target.domain(), target.id(), cursor.as_deref(),
+                ).await?;
+                check()?;
+                (source, cursor) = search_disk(move || {
+                    let cursor = source.append(&body)?;
+                    Ok((source, cursor))
+                }).await?;
+                check()?;
+                if cursor.is_none() { break; }
+            }
+            let spool = search_disk(move || source.finish()).await?;
+            check()?;
+            Ok(spool)
+        } => result,
+    }
+}
+
+async fn search_disk<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    // Index growth and final allocation checks can depend on source size.
+    // Keep them cancellable without setting an implicit source-size limit.
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| SEARCH_STORAGE)?
+}
+
+pub(crate) struct SearchSourceSpool {
+    total: u64,
+    replay: Option<SearchReplay>,
+}
+
+impl SearchSourceSpool {
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Read up to `limit` track IDs in server order, never more than one
+    /// manifest page. An empty positive-sized batch means end of source.
+    pub(crate) async fn next_batch(&mut self, limit: usize) -> Result<Vec<String>, ApiError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut replay = self.replay.take().ok_or(SEARCH_STORAGE)?;
+        if replay.remaining == 0 {
+            self.replay = Some(replay);
+            return Ok(Vec::new());
+        }
+        let (replay, ids) = search_disk(move || {
+            let ids = replay.read_batch(limit.min(PAGE_SIZE as usize))?;
+            Ok((replay, ids))
+        })
+        .await?;
+        self.replay = Some(replay);
+        Ok(ids)
+    }
+}
+
+struct SearchReplay {
+    file: BufReader<File>,
+    remaining: u64,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl SearchReplay {
+    fn read_batch(&mut self, limit: usize) -> Result<Vec<String>, ApiError> {
+        let mut ids = Vec::with_capacity(limit);
+        let mut key = [0; SEARCH_KEY_CAPACITY];
+        while self.remaining > 0 && ids.len() < limit {
+            let mut header = [0; 3];
+            self.file.read_exact(&mut header).map_err(search_io)?;
+            let len = search_key_len(header)?;
+            self.file.read_exact(&mut key[..len]).map_err(search_io)?;
+            match header[0] {
+                SEARCH_TRACK => {
+                    let id = std::str::from_utf8(&key[..len]).map_err(|_| SEARCH_STORAGE)?;
+                    if !valid_id(id) {
+                        return Err(SEARCH_STORAGE);
+                    }
+                    ids.push(id.to_owned());
+                    self.remaining -= 1;
+                }
+                SEARCH_CURSOR | SEARCH_OCCURRENCE => (),
+                _ => return Err(SEARCH_STORAGE),
+            }
+        }
+        Ok(ids)
+    }
+}
+
+struct SearchStaging {
+    domain: &'static str,
+    id: String,
+    progress: ManifestProgress,
+    keys: SearchKeys,
+    permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl SearchStaging {
+    fn open(
+        dir: OwnedFd,
+        domain: &'static str,
+        id: String,
+        permit: tokio::sync::SemaphorePermit<'static>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ApiError> {
+        search_live(&cancelled)?;
+        let records = anonymous_search_file(&dir)?;
+        search_live(&cancelled)?;
+        let slots = SearchSlots::open(&dir, 64)?;
+        Ok(Self {
+            domain,
+            id,
+            progress: ManifestProgress::default(),
+            keys: SearchKeys {
+                dir,
+                records,
+                end: 0,
+                slots,
+                entries: 0,
+                hash: RandomState::new(),
+                cancelled,
+            },
+            permit,
+        })
+    }
+
+    fn append(&mut self, wire: &[u8]) -> Result<Option<String>, ApiError> {
+        self.keys.live()?;
+        let target = match self.domain {
+            "albums" => Target::Album(&self.id),
+            "artists" => Target::Artist(&self.id),
+            _ => return Err(INVALID),
+        };
+        self.progress.append(target, wire, &mut self.keys)
+    }
+
+    fn finish(self) -> Result<SearchSourceSpool, ApiError> {
+        let (_, _, total) = self.progress.finish()?;
+        self.keys.live()?;
+        // Catch delayed allocation errors before handing replay to a writer.
+        self.keys.records.sync_data().map_err(search_io)?;
+        Ok(SearchSourceSpool {
+            total,
+            replay: Some(SearchReplay {
+                file: BufReader::new(self.keys.records),
+                remaining: total,
+                _permit: self.permit,
+            }),
+        })
+    }
+}
+
+fn anonymous_search_file(dir: &OwnedFd) -> Result<File, ApiError> {
+    let flags = OFlags::RDWR | OFlags::CLOEXEC;
+    let fd = match fs::openat(
+        dir,
+        ".",
+        flags | OFlags::TMPFILE | OFlags::EXCL,
+        PRIVATE_FILE,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::OPNOTSUPP | Errno::INVAL) => {
+            // Same fallback as audio_input: unlink the private name before
+            // writing any catalog data.
+            let name = uuid::Uuid::new_v4().to_string();
+            let fd = fs::openat(
+                dir,
+                name.as_str(),
+                flags | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+                PRIVATE_FILE,
+            )
+            .map_err(search_errno)?;
+            fs::unlinkat(dir, name.as_str(), AtFlags::empty()).map_err(search_errno)?;
+            fd
+        }
+        Err(err) => return Err(search_errno(err)),
+    };
+    let stat = fs::fstat(&fd).map_err(search_errno)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_uid != geteuid().as_raw()
+        || stat.st_mode & (0o7777 & !0o600) != 0
+        || stat.st_nlink != 0
+    {
+        return Err(SEARCH_STORAGE);
+    }
+    Ok(File::from(fd))
+}
+
+const SEARCH_TRACK: u8 = 0;
+const SEARCH_CURSOR: u8 = 1;
+const SEARCH_OCCURRENCE: u8 = 2;
+const SEARCH_KEY_CAPACITY: usize = 4096;
+const SEARCH_SLOT_BYTES: u64 = 16;
+
+fn search_errno(err: Errno) -> ApiError {
+    match err {
+        Errno::NOSPC | Errno::DQUOT | Errno::FBIG => SEARCH_NO_SPACE,
+        _ => SEARCH_STORAGE,
+    }
+}
+
+fn search_io(err: std::io::Error) -> ApiError {
+    err.raw_os_error()
+        .map(Errno::from_raw_os_error)
+        .map_or(SEARCH_STORAGE, search_errno)
+}
+
+fn search_key_len(header: [u8; 3]) -> Result<usize, ApiError> {
+    let len = usize::from(u16::from_le_bytes([header[1], header[2]]));
+    (1..=SEARCH_KEY_CAPACITY)
+        .contains(&len)
+        .then_some(len)
+        .ok_or(SEARCH_STORAGE)
+}
+
+/// An append-only key log plus an anonymous, growable open-addressed index.
+/// A slot stores a keyed hash and an exact key's log offset + 1 (zero is
+/// empty). Hash collisions compare original bytes; no RAM set scales with
+/// source size. Growth streams the old index into its replacement.
+struct SearchKeys {
+    dir: OwnedFd,
+    records: File,
+    end: u64,
+    slots: SearchSlots,
+    entries: u64,
+    hash: RandomState,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct SearchSlots {
+    file: File,
+    capacity: u64,
+}
+
+impl SearchSlots {
+    fn open(dir: &OwnedFd, capacity: u64) -> Result<Self, ApiError> {
+        let file = anonymous_search_file(dir)?;
+        file.set_len(
+            capacity
+                .checked_mul(SEARCH_SLOT_BYTES)
+                .ok_or(SEARCH_NO_SPACE)?,
+        )
+        .map_err(search_io)?;
+        Ok(Self { file, capacity })
+    }
+
+    fn find(
+        &self,
+        hash: u64,
+        mut matches: impl FnMut(u64) -> Result<bool, ApiError>,
+        live: impl Fn() -> Result<(), ApiError>,
+    ) -> Result<u64, ApiError> {
+        let mask = self.capacity - 1;
+        let mut index = hash & mask;
+        for _ in 0..self.capacity {
+            live()?;
+            let slot = index * SEARCH_SLOT_BYTES;
+            let mut bytes = [0; SEARCH_SLOT_BYTES as usize];
+            self.file
+                .read_exact_at(&mut bytes, slot)
+                .map_err(search_io)?;
+            let (key, old_hash) = Self::decode(bytes);
+            if key == 0 {
+                return Ok(slot);
+            }
+            if old_hash == hash && matches(key - 1)? {
+                return Err(INVALID);
+            }
+            index = (index + 1) & mask;
+        }
+        Err(SEARCH_STORAGE)
+    }
+
+    fn decode(bytes: [u8; SEARCH_SLOT_BYTES as usize]) -> (u64, u64) {
+        let (key, hash) = bytes.split_at(8);
+        (
+            u64::from_le_bytes(key.try_into().unwrap()),
+            u64::from_le_bytes(hash.try_into().unwrap()),
+        )
+    }
+
+    fn write(&self, slot: u64, key: u64, hash: u64) -> Result<(), ApiError> {
+        let mut bytes = [0; SEARCH_SLOT_BYTES as usize];
+        bytes[..8].copy_from_slice(&key.to_le_bytes());
+        bytes[8..].copy_from_slice(&hash.to_le_bytes());
+        self.file.write_all_at(&bytes, slot).map_err(search_io)
+    }
+}
+
+fn search_live(cancelled: &AtomicBool) -> Result<(), ApiError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(SEARCH_CANCELLED)
+    } else {
+        Ok(())
+    }
+}
+
+impl SearchKeys {
+    fn live(&self) -> Result<(), ApiError> {
+        search_live(&self.cancelled)
+    }
+
+    fn grow(&mut self) -> Result<(), ApiError> {
+        let capacity = self.slots.capacity.checked_mul(2).ok_or(SEARCH_NO_SPACE)?;
+        let next = SearchSlots::open(&self.dir, capacity)?;
+        // Only positional I/O accesses slots, so the old stream starts at 0.
+        let mut old = BufReader::new(&self.slots.file);
+        for _ in 0..self.slots.capacity {
+            self.live()?;
+            let mut bytes = [0; SEARCH_SLOT_BYTES as usize];
+            old.read_exact(&mut bytes).map_err(search_io)?;
+            let (key, hash) = SearchSlots::decode(bytes);
+            if key != 0 {
+                let slot = next.find(hash, |_| Ok(false), || self.live())?;
+                next.write(slot, key, hash)?;
+            }
+        }
+        self.slots = next;
+        Ok(())
+    }
+
+    fn insert(&mut self, tag: u8, value: &str) -> Result<(), ApiError> {
+        if self.entries == self.slots.capacity / 2 {
+            self.grow()?;
+        }
+        let hash = self.hash.hash_one((tag, value));
+        let len = value.len();
+        let slot = self.slots.find(
+            hash,
+            |offset| {
+                let mut header = [0; 3];
+                self.records
+                    .read_exact_at(&mut header, offset)
+                    .map_err(search_io)?;
+                if header[0] != tag || search_key_len(header)? != len {
+                    return Ok(false);
+                }
+                let mut key = [0; SEARCH_KEY_CAPACITY];
+                self.records
+                    .read_exact_at(&mut key[..len], offset + 3)
+                    .map_err(search_io)?;
+                Ok(key[..len] == *value.as_bytes())
+            },
+            || self.live(),
+        )?;
+        let end = self
+            .end
+            .checked_add(3 + len as u64)
+            .ok_or(SEARCH_NO_SPACE)?;
+        let length = u16::try_from(len).map_err(|_| INVALID)?.to_le_bytes();
+        self.records
+            .write_all_at(&[tag, length[0], length[1]], self.end)
+            .map_err(search_io)?;
+        self.records
+            .write_all_at(value.as_bytes(), self.end + 3)
+            .map_err(search_io)?;
+        self.slots.write(slot, self.end + 1, hash)?;
+        self.end = end;
+        self.entries += 1;
+        Ok(())
+    }
+}
+
+impl ManifestSink for SearchKeys {
+    fn counts(&self, total: u64, recorded: u64) -> Result<(), ApiError> {
+        (total == recorded).then_some(()).ok_or(INVALID)
+    }
+
+    fn cursor(&mut self, cursor: &str) -> Result<(), ApiError> {
+        let base64url = |part: &str| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if !cursor
+            .strip_prefix("ofc1_")
+            .and_then(|token| token.split_once('.'))
+            .is_some_and(|(claim, signature)| base64url(claim) && base64url(signature))
+        {
+            return Err(INVALID);
+        }
+        self.insert(SEARCH_CURSOR, cursor)
+    }
+
+    fn occurrence(&mut self, id: String, track: Item) -> Result<(), ApiError> {
+        if !track.has_audio {
+            return Err(INVALID);
+        }
+        self.insert(SEARCH_OCCURRENCE, &id)?;
+        self.insert(SEARCH_TRACK, &track.id)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireManifest {
@@ -743,13 +1205,32 @@ impl WireTrack {
 
 #[derive(Default)]
 struct ManifestState<T = Vec<Item>> {
-    metadata: Option<(Header, String, u64, u64, Kind)>,
+    progress: ManifestProgress,
+    memory: MemoryManifest<T>,
+}
+
+#[derive(Default)]
+struct MemoryManifest<T> {
     tracks: T,
     occurrences: HashSet<String>,
     cursors: HashSet<String>,
+}
+
+#[derive(Default)]
+struct ManifestProgress {
+    metadata: Option<(Header, String, u64, u64, Kind)>,
     position: u64,
     recorded: u64,
 }
+
+trait ManifestSink {
+    fn counts(&self, _total: u64, _recorded: u64) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn cursor(&mut self, cursor: &str) -> Result<(), ApiError>;
+    fn occurrence(&mut self, id: String, track: Item) -> Result<(), ApiError>;
+}
+
 trait ManifestTracks: Default {
     fn push_track(&mut self, item: Item) -> Result<(), ApiError>;
 }
@@ -761,8 +1242,38 @@ impl ManifestTracks for Vec<Item> {
     }
 }
 
+impl<T: ManifestTracks> ManifestSink for MemoryManifest<T> {
+    fn cursor(&mut self, cursor: &str) -> Result<(), ApiError> {
+        self.cursors
+            .insert(cursor.into())
+            .then_some(())
+            .ok_or(INVALID)
+    }
+    fn occurrence(&mut self, id: String, track: Item) -> Result<(), ApiError> {
+        if !self.occurrences.insert(id) {
+            return Err(INVALID);
+        }
+        self.tracks.push_track(track)
+    }
+}
+
 impl<T: ManifestTracks> ManifestState<T> {
     fn append(&mut self, target: Target<'_>, body: &[u8]) -> Result<Option<String>, ApiError> {
+        self.progress.append(target, body, &mut self.memory)
+    }
+    fn finish_parts(self) -> Result<(Header, Kind, T), ApiError> {
+        let (header, kind, _) = self.progress.finish()?;
+        Ok((header, kind, self.memory.tracks))
+    }
+}
+
+impl ManifestProgress {
+    fn append(
+        &mut self,
+        target: Target<'_>,
+        body: &[u8],
+        sink: &mut impl ManifestSink,
+    ) -> Result<Option<String>, ApiError> {
         if body.len() > MAX_PAGE_BYTES {
             return Err(INVALID);
         }
@@ -813,6 +1324,7 @@ impl<T: ManifestTracks> ManifestState<T> {
                 return Err(CHANGED);
             }
         }
+        sink.counts(wire.total, wire.recorded_audio_total)?;
         let offset = self.position;
         let remaining = wire.total.checked_sub(offset).ok_or(INVALID)?;
         let count = wire.items.len() as u64;
@@ -822,20 +1334,18 @@ impl<T: ManifestTracks> ManifestState<T> {
             return Err(INVALID);
         }
         if let Some(next) = &wire.next_cursor {
-            if !next.starts_with(prefix) || !opaque(next) || !self.cursors.insert(next.clone()) {
+            if !next.starts_with(prefix) || !opaque(next) {
                 return Err(INVALID);
             }
+            sink.cursor(next)?;
         }
         for (i, occurrence) in wire.items.into_iter().enumerate() {
-            if occurrence.position != offset + i as u64
-                || !opaque(&occurrence.occurrence_id)
-                || !self.occurrences.insert(occurrence.occurrence_id)
-            {
+            if occurrence.position != offset + i as u64 || !opaque(&occurrence.occurrence_id) {
                 return Err(INVALID);
             }
             let item = occurrence.track.project()?;
             let recorded = u64::from(item.has_audio);
-            self.tracks.push_track(item)?;
+            sink.occurrence(occurrence.occurrence_id, item)?;
             self.position += 1;
             self.recorded += recorded;
         }
@@ -848,12 +1358,12 @@ impl<T: ManifestTracks> ManifestState<T> {
         ));
         Ok(wire.next_cursor)
     }
-    fn finish_parts(self) -> Result<(Header, Kind, T), ApiError> {
+    fn finish(self) -> Result<(Header, Kind, u64), ApiError> {
         let (header, _, total, recorded, kind) = self.metadata.ok_or(INVALID)?;
         if total != self.position || recorded != self.recorded {
             return Err(INVALID);
         }
-        Ok((header, kind, self.tracks))
+        Ok((header, kind, total))
     }
 }
 
@@ -902,7 +1412,7 @@ impl ManifestState<PlaylistTracks> {
         live: impl Fn() -> Result<(), ApiError>,
         open: impl FnOnce() -> Result<OfflineStore, offline::Error> + Send + 'static,
     ) -> Result<Membership, ApiError> {
-        let all_recorded = self.position == self.recorded;
+        let all_recorded = self.progress.position == self.progress.recorded;
         let (
             header,
             _,
@@ -1528,6 +2038,143 @@ mod tests {
         }
     }
 
+    fn search_stage(dir: &Scratch, domain: &'static str, cancel: &Cancellation) -> SearchStaging {
+        static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        SearchStaging::open(
+            local_storage::open_private(&dir.0).unwrap(),
+            domain,
+            "fixture".into(),
+            SLOT.try_acquire().unwrap(),
+            cancel.0.clone(),
+        )
+        .unwrap()
+    }
+
+    fn search_wire(
+        kind: &str,
+        total: usize,
+        range: std::ops::Range<usize>,
+        cursor: Option<&str>,
+    ) -> Value {
+        let mut page = wire_page(kind, total, range.clone(), cursor);
+        for (row, position) in page["items"].as_array_mut().unwrap().iter_mut().zip(range) {
+            row["track"] = track(&format!("song:{position}/音"));
+        }
+        page
+    }
+
+    fn append_search(stage: &mut SearchStaging, page: &Value) -> Result<Option<String>, ApiError> {
+        stage.append(&serde_json::to_vec(page).unwrap())
+    }
+
+    #[tokio::test]
+    async fn search_source_spool_is_anonymous_and_replays_exact_ids_in_bounded_batches() {
+        let dir = Scratch::new();
+        let cancel = Cancellation::new();
+        let total = 1161;
+        let size = PAGE_SIZE as usize;
+        for (kind, domain) in [("artist", "artists"), ("album", "albums")] {
+            let mut stage = search_stage(&dir, domain, &cancel);
+            for start in (0..total).step_by(size) {
+                let end = (start + size).min(total);
+                let cursor = (end < total).then(|| format!("ofc1_next_{end}.signature"));
+                let page = search_wire(kind, total, start..end, cursor.as_deref());
+                assert_eq!(append_search(&mut stage, &page), Ok(cursor));
+            }
+            assert!(stage.keys.slots.capacity > 64);
+            for file in [&stage.keys.records, &stage.keys.slots.file] {
+                let stat = fs::fstat(file).unwrap();
+                assert_eq!(stat.st_nlink, 0);
+                assert_eq!(stat.st_mode & (0o7777 & !0o600), 0);
+            }
+            let mut spool = stage.finish().unwrap();
+            assert_eq!(spool.total(), total as u64);
+            let first = spool.next_batch(1).await.unwrap();
+            assert_eq!(first, ["song:0/音"]);
+            let mut position = first.len();
+            while position != total {
+                let batch = spool.next_batch(usize::MAX).await.unwrap();
+                assert_eq!(batch.len(), size.min(total - position));
+                for id in batch {
+                    assert_eq!(id, format!("song:{position}/音"));
+                    position += 1;
+                }
+            }
+            assert!(spool.next_batch(1).await.unwrap().is_empty());
+        }
+        assert_eq!(stdfs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn search_source_spool_rejects_cross_page_drift_and_repeats() {
+        let dir = Scratch::new();
+        let cancel = Cancellation::new();
+        let size = PAGE_SIZE as usize;
+        let total = size * 2 + 1;
+        let first = search_wire("album", total, 0..size, Some("ofc1_first.signature"));
+        let second = search_wire(
+            "album",
+            total,
+            size..size * 2,
+            Some("ofc1_second.signature"),
+        );
+        let changes = [
+            (json!(format!("f1_{}", "b".repeat(64))), "/fence", CHANGED),
+            (json!("Renamed album"), "/collection/name", CHANGED),
+            (json!(total - 1), "/recordedAudioTotal", CHANGED),
+            (json!("artist"), "/collection/kind", INVALID),
+            (json!("wrong"), "/collection/id", INVALID),
+            (json!(size + 1), "/items/0/position", INVALID),
+            (json!(false), "/items/0/track/hasAudio", INVALID),
+            (
+                first["items"][0]["occurrenceId"].clone(),
+                "/items/0/occurrenceId",
+                INVALID,
+            ),
+            (
+                first["items"][0]["track"]["id"].clone(),
+                "/items/1/track/id",
+                INVALID,
+            ),
+            (first["nextCursor"].clone(), "/nextCursor", INVALID),
+            (json!("ofc1_.signature"), "/nextCursor", INVALID),
+            (json!("ofc1_more..dots"), "/nextCursor", INVALID),
+            (Value::Null, "/nextCursor", INVALID),
+        ];
+        for (value, pointer, expected) in changes {
+            let mut stage = search_stage(&dir, "albums", &cancel);
+            assert!(append_search(&mut stage, &first).unwrap().is_some());
+            let mut bad = second.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            assert_eq!(append_search(&mut stage, &bad), Err(expected), "{pointer}");
+            assert_eq!(stage.finish().err(), Some(INVALID), "{pointer}");
+        }
+        assert_eq!(stdfs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn search_source_checks_recorded_count_final_cursor_and_cancellation() {
+        let dir = Scratch::new();
+        let cancel = Cancellation::new();
+        let mut empty = search_wire("artist", 0, 0..0, None);
+        let mut stage = search_stage(&dir, "artists", &cancel);
+        assert_eq!(append_search(&mut stage, &empty), Ok(None));
+        assert_eq!(stage.finish().unwrap().total(), 0);
+
+        empty.as_object_mut().unwrap().remove("nextCursor");
+        let mut stage = search_stage(&dir, "artists", &cancel);
+        assert_eq!(append_search(&mut stage, &empty), Err(INVALID));
+
+        let mut page = search_wire("artist", 1, 0..1, None);
+        page["recordedAudioTotal"] = json!(0);
+        assert_eq!(append_search(&mut stage, &page), Err(INVALID));
+        page["recordedAudioTotal"] = json!(1);
+        assert_eq!(append_search(&mut stage, &page), Ok(None));
+        drop(cancel);
+        assert_eq!(stage.finish().err(), Some(SEARCH_CANCELLED));
+        assert_eq!(stdfs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
     fn account(origin: &str) -> Access {
         let api = Arc::new(Api::new(Origin::parse(origin).unwrap()).unwrap());
         let session = api.test_session();
@@ -1730,7 +2377,7 @@ mod tests {
                 Ok(next)
             );
         }
-        assert_eq!(state.tracks.unique.len(), 2);
+        assert_eq!(state.memory.tracks.unique.len(), 2);
         let mut milestones = Vec::new();
         let test_store = store.clone();
         let membership = state

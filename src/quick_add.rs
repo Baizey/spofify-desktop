@@ -93,9 +93,63 @@ struct Revalidation {
     exhausted: bool,
 }
 
+pub(crate) const BULK_WINDOW: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BulkTicket {
+    nonce: u64,
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
+    interruption: u64,
+    pub(crate) mode_stamp: u64,
+    pub(crate) target: String,
+    skip: bool,
+}
+
+pub(crate) struct BulkStatus {
+    pub(crate) kind: String,
+    pub(crate) source: String,
+    pub(crate) active: bool,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BulkWrite {
+    Started,
+    Skipped,
+    Wait,
+    Ready,
+    Stop,
+}
+
+struct Bulk {
+    ticket: BulkTicket,
+    status: BulkStatus,
+    started: Vec<String>,
+    // A private marker releases wire work, but the primary projection may
+    // still be catching up. Hold these tracks until both sides agree on the
+    // minimum revision. This is independent of shared membership broadcasts.
+    checkpoint: Option<u64>,
+    first_revision: u64,
+    sent: u64,
+    skipped: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BulkEnd {
+    Done,
+    Cancelled,
+    Source,
+    Connection,
+}
+
 pub(crate) struct View<'a> {
     pub(crate) target: Option<&'a PlaylistSummary>,
-    pub(crate) hide: bool,
+    pub(crate) skip: bool,
+    pub(crate) bulk_ready: bool,
+    pub(crate) bulk: Option<&'a BulkStatus>,
+    uncertain_bulk: &'a [String],
+    bulk_serial: u64,
     pub(crate) at_capacity: bool,
     pub(crate) due: Option<Instant>,
     pub(crate) read_stalled: bool,
@@ -115,7 +169,6 @@ pub(crate) struct Row {
     pub(crate) membership: Membership,
     pub(crate) pending: bool,
     pub(crate) outcome: Option<Outcome>,
-    pub(crate) visible: bool,
     pub(crate) can_add: bool,
 }
 
@@ -132,6 +185,10 @@ impl View<'_> {
         )
     }
 
+    pub(crate) fn bulk_scope(&self, mode_stamp: u64) -> String {
+        format!("{}:{:x}", self.scope(mode_stamp), self.bulk_serial)
+    }
+
     pub(crate) fn row(&self, track_id: &str) -> Row {
         let membership = self
             .target
@@ -143,10 +200,14 @@ impl View<'_> {
             self.target.is_some_and(|target| target.id == ticket.target) && track_id == ticket.track
         };
         let present = membership == Membership::Present;
-        let pending = !present && self.pending.iter().any(|p| matches(&p.ticket));
+        let bulk_active = self.bulk.is_some_and(|bulk| bulk.active);
+        let pending = !present
+            && (self.pending.iter().any(|p| matches(&p.ticket))
+                || bulk_active && self.uncertain_bulk.iter().any(|id| id == track_id));
         let held = self
             .attempted
-            .is_some_and(|tracks| tracks.contains(track_id));
+            .is_some_and(|tracks| tracks.contains(track_id))
+            || self.uncertain_bulk.iter().any(|id| id == track_id);
         let outcome = if present || pending {
             None
         } else if held {
@@ -160,10 +221,10 @@ impl View<'_> {
             membership,
             pending,
             outcome,
-            visible: !self.hide || !present,
             can_add: membership == Membership::Absent
                 && !pending
                 && !held
+                && !bulk_active
                 && !self.at_capacity
                 && !self.session_limit,
         }
@@ -174,8 +235,10 @@ impl View<'_> {
 pub(crate) struct QuickAdd {
     target: Option<PlaylistSummary>,
     authorized: bool,
-    hide: bool,
     searching: bool,
+    allow_bulk_duplicates: bool,
+    bulk: Option<Bulk>,
+    bulk_serial: u64,
     selection_version: u64,
     nonce: u64,
     pending: Vec<Pending>,
@@ -201,9 +264,21 @@ impl QuickAdd {
         status: Status,
     ) -> View<'a> {
         let target = self.target.as_ref().filter(|_| scoped);
+        let bulk = self.bulk.as_ref();
+        let own_bulk = bulk.filter(|bulk| target.is_some_and(|p| p.id == bulk.ticket.target));
         View {
             target,
-            hide: scoped && self.hide,
+            skip: !self.allow_bulk_duplicates,
+            bulk_ready: scoped
+                && target.is_some_and(|p| self.can_begin_bulk(status, replica, &p.id)),
+            bulk: scoped
+                .then_some(
+                    own_bulk.or_else(|| bulk.filter(|b| !b.status.active && !b.started.is_empty())),
+                )
+                .flatten()
+                .map(|b| &b.status),
+            uncertain_bulk: own_bulk.map_or(&[], |b| b.started.as_slice()),
+            bulk_serial: self.bulk_serial,
             at_capacity: scoped && self.at_capacity(),
             due: scoped.then(|| self.due()).flatten(),
             read_stalled: scoped && self.read_unavailable(),
@@ -249,6 +324,7 @@ impl QuickAdd {
             self.reset_read();
             if !searching {
                 self.cancel_unsent();
+                self.abort_bulk(BulkEnd::Cancelled);
             }
         }
     }
@@ -260,7 +336,11 @@ impl QuickAdd {
                 .checked_add(1)
                 .expect("selection version exhausted");
             self.cancel_unsent();
-            self.hide = false;
+            self.abort_bulk(BulkEnd::Cancelled);
+            self.allow_bulk_duplicates = false;
+            if self.bulk.as_ref().is_some_and(|b| b.started.is_empty()) {
+                self.bulk = None;
+            }
             self.reset_read();
             self.revalidation = Revalidation::default();
         }
@@ -268,8 +348,216 @@ impl QuickAdd {
         self.target = target;
     }
 
-    pub(crate) fn filter(&mut self, hide: bool) {
-        self.hide = hide && self.target.is_some();
+    pub(crate) fn bulk_skip(&mut self, skip: bool) {
+        self.allow_bulk_duplicates = !skip && self.selected().is_some();
+    }
+
+    fn bulk_basis(&self, status: Status, replica: &Replica, target: &str) -> Option<u64> {
+        if status.link != Link::Ready || !self.authorized || self.watched() != Some(target) {
+            return None;
+        }
+        replica
+            .playlist()
+            .filter(|p| !p.stale && p.summary.id == target && editable(&p.summary))
+            .map(|p| p.summary.revision)
+    }
+
+    fn can_begin_bulk(&self, status: Status, replica: &Replica, target: &str) -> bool {
+        self.bulk_basis(status, replica, target).is_some()
+            && !self.pending.iter().any(|p| p.ticket.target == target)
+            && self
+                .bulk
+                .as_ref()
+                .is_none_or(|b| !b.status.active && b.started.is_empty())
+    }
+
+    pub(crate) fn begin_bulk(
+        &mut self,
+        status: Status,
+        replica: &Replica,
+        mode_stamp: u64,
+        target: &str,
+        kind: &str,
+        source: &str,
+    ) -> Option<BulkTicket> {
+        if mode_stamp & 1 != 0
+            || !matches!(kind, "album" | "artist")
+            || !self.can_begin_bulk(status, replica, target)
+        {
+            return None;
+        }
+        self.nonce = self
+            .nonce
+            .checked_add(1)
+            .expect("quick add nonce exhausted");
+        let ticket = BulkTicket {
+            nonce: self.nonce,
+            epoch: status.epoch,
+            generation: status.generation,
+            interruption: status.interruption,
+            mode_stamp,
+            target: target.into(),
+            skip: !self.allow_bulk_duplicates,
+        };
+        self.bulk_serial = ticket.nonce;
+        self.bulk = Some(Bulk {
+            ticket: ticket.clone(),
+            status: BulkStatus {
+                kind: kind.into(),
+                source: source.into(),
+                active: true,
+                message: "Preparing tracks…".into(),
+            },
+            started: Vec::with_capacity(BULK_WINDOW),
+            checkpoint: None,
+            first_revision: 0,
+            sent: 0,
+            skipped: 0,
+        });
+        Some(ticket)
+    }
+
+    pub(crate) fn bulk_current(&self, status: Status, ticket: &BulkTicket) -> bool {
+        status.epoch == ticket.epoch
+            && status.generation == ticket.generation
+            && status.interruption == ticket.interruption
+            && status.link == Link::Ready
+            && self.watched() == Some(&ticket.target)
+            && self.authorized
+            && self
+                .bulk
+                .as_ref()
+                .is_some_and(|b| b.status.active && b.ticket == *ticket)
+    }
+
+    pub(crate) fn bulk_revision(
+        &self,
+        status: Status,
+        replica: &Replica,
+        ticket: &BulkTicket,
+    ) -> Option<u64> {
+        self.bulk_current(status, ticket)
+            .then(|| self.bulk_basis(status, replica, &ticket.target))
+            .flatten()
+    }
+
+    pub(crate) fn bulk_start(
+        &mut self,
+        status: Status,
+        replica: &Replica,
+        ticket: &BulkTicket,
+        track: &str,
+        start: impl FnOnce() -> bool,
+    ) -> BulkWrite {
+        if !self.bulk_current(status, ticket) {
+            return BulkWrite::Stop;
+        }
+        let membership = replica.membership(&ticket.target, track);
+        let basis = self.bulk_basis(status, replica, &ticket.target);
+        let bulk = self.bulk.as_mut().expect("active bulk operation");
+        Self::reconcile_bulk(bulk, basis);
+        if ticket.skip && membership == Membership::Present {
+            bulk.skipped += 1;
+            return BulkWrite::Skipped;
+        }
+        let Some(revision) = basis.filter(|_| membership != Membership::Unknown) else {
+            return BulkWrite::Wait;
+        };
+        if bulk.checkpoint.is_some()
+            || bulk.started.len() >= BULK_WINDOW
+            || bulk.started.iter().any(|id| id == track)
+        {
+            return BulkWrite::Stop;
+        }
+        if membership == Membership::Absent
+            && self
+                .attempted
+                .get(ticket.target.as_str())
+                .is_some_and(|ids| ids.contains(track))
+        {
+            // A primary-link add could still arrive (including after a foreign
+            // membership observation). Do not silently overlap that intent.
+            return BulkWrite::Stop;
+        }
+        if !start() {
+            return BulkWrite::Ready;
+        }
+        // Record at actual start_send. Errors at or after that boundary do not
+        // prove that the authenticated server didn't receive the write.
+        if bulk.started.is_empty() {
+            bulk.first_revision = revision;
+        }
+        bulk.started.push(track.into());
+        BulkWrite::Started
+    }
+
+    pub(crate) fn bulk_ack(&mut self, ticket: &BulkTicket, revision: u64) -> bool {
+        let Some(bulk) = self
+            .bulk
+            .as_mut()
+            .filter(|b| b.status.active && b.ticket == *ticket && b.checkpoint.is_none())
+        else {
+            return false;
+        };
+        let n = bulk.started.len() as u64;
+        if n == 0 || revision.saturating_sub(bulk.first_revision) < n {
+            return false;
+        }
+        bulk.sent += n;
+        bulk.checkpoint = Some(revision);
+        bulk.status.message = format!("Sent {}…", bulk.sent);
+        true
+    }
+
+    pub(crate) fn bulk_checkpoint(
+        &mut self,
+        status: Status,
+        replica: &Replica,
+        ticket: &BulkTicket,
+    ) {
+        let revision = self.bulk_basis(status, replica, &ticket.target);
+        if let Some(bulk) = self.bulk.as_mut().filter(|b| b.ticket == *ticket) {
+            Self::reconcile_bulk(bulk, revision);
+        }
+    }
+
+    fn reconcile_bulk(bulk: &mut Bulk, revision: Option<u64>) {
+        if bulk
+            .checkpoint
+            .zip(revision)
+            .is_some_and(|(needed, actual)| actual >= needed)
+        {
+            bulk.started.clear();
+            bulk.checkpoint = None;
+        }
+    }
+
+    pub(crate) fn finish_bulk(&mut self, ticket: &BulkTicket, end: BulkEnd) {
+        if self.bulk.as_ref().is_some_and(|b| b.ticket == *ticket) {
+            self.abort_bulk(end);
+        }
+    }
+
+    pub(crate) fn abort_bulk(&mut self, end: BulkEnd) -> bool {
+        let Some(bulk) = self.bulk.as_mut().filter(|b| b.status.active) else {
+            return false;
+        };
+        bulk.status.active = false;
+        bulk.status.message = if bulk.checkpoint.is_none() && !bulk.started.is_empty() {
+            format!("{} sent · {} unconfirmed", bulk.sent, bulk.started.len())
+        } else {
+            match end {
+                BulkEnd::Done if bulk.sent == 0 && bulk.skipped == 0 => "No playable tracks".into(),
+                BulkEnd::Done if bulk.skipped == 0 => format!("{} sent", bulk.sent),
+                BulkEnd::Done if bulk.sent == 0 => format!("{} already in playlist", bulk.skipped),
+                BulkEnd::Done => format!("{} sent · {} skipped", bulk.sent, bulk.skipped),
+                BulkEnd::Cancelled if bulk.sent == 0 => "Add cancelled".into(),
+                BulkEnd::Source => "Couldn’t read the whole collection".into(),
+                _ if bulk.sent > 0 => format!("Stopped · {} sent", bulk.sent),
+                _ => "No tracks sent".into(),
+            }
+        };
+        true
     }
 
     fn summary(&mut self, summary: &PlaylistSummary) {
@@ -291,6 +579,7 @@ impl QuickAdd {
                     // Keep the exact selection; revalidate it via its next scoped pull.
                     self.authorized = false;
                     self.cancel_unsent();
+                    self.abort_bulk(BulkEnd::Cancelled);
                 }
             }
             AcceptedPlaylist::Summary { summary, .. } => self.summary(summary),
@@ -311,6 +600,13 @@ impl QuickAdd {
         // could be removed before our own delayed command is applied.
         self.pending.retain(|p| !present(&p.ticket));
         self.not_sent.retain(|ticket| !present(ticket));
+        if let Some(bulk) = self.bulk.as_mut().filter(|b| !b.status.active) {
+            let revision = replica
+                .playlist()
+                .filter(|p| !p.stale && p.summary.id == bulk.ticket.target)
+                .map(|p| p.summary.revision);
+            Self::reconcile_bulk(bulk, revision);
+        }
     }
 
     fn at_capacity(&self) -> bool {
@@ -338,6 +634,10 @@ impl QuickAdd {
     ) -> Option<Ticket> {
         self.expire_pending(now);
         if self.selected() != Some(expected_target)
+            || self.bulk.as_ref().is_some_and(|b| {
+                b.ticket.target == expected_target
+                    && (b.status.active || b.started.iter().any(|id| id == track))
+            })
             || !self.writable(status, replica, expected_target, track)
             || self.at_capacity()
             || self.attempt_count >= MAX_ATTEMPTS
@@ -537,6 +837,7 @@ impl QuickAdd {
 
     pub(crate) fn interrupted(&mut self) {
         self.authorized = false;
+        self.abort_bulk(BulkEnd::Connection);
         self.reset_read();
         self.revalidation.exhausted = self.revalidation.links >= MAX_UNVERIFIED_LINKS;
         self.settle_matching(|_| true);

@@ -434,6 +434,29 @@ impl Engine {
         if self.link() != Link::Connected(generation) {
             return;
         }
+        let own_output = match &event.kind {
+            EventKind::Snapshot {
+                connection_id,
+                outputs,
+                ..
+            } => Some((connection_id.as_str(), outputs)),
+            EventKind::Outputs(outputs) => Some((self.online.connection.as_str(), outputs)),
+            _ => None,
+        };
+        if let Some(((connection, outputs), socket)) = own_output.zip(self.socket.as_ref())
+            && let Some(device) = outputs
+                .devices
+                .iter()
+                .find(|d| d.id == connection && d.can_play)
+        {
+            self.personal
+                .set_bulk_device(crate::personal_bridge::BulkDevice {
+                    id: device.device_id.clone(),
+                    name: device.name.clone(),
+                    link: socket.link.clone(),
+                    order: socket.bulk_order(),
+                });
+        }
         if self
             .online
             .local_start

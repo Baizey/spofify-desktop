@@ -13,7 +13,7 @@ from fixture import check
 import wire_ui as base
 
 QUERY = "Night signals"
-HIDDEN_QUERY = "Signal studies"
+STUDIES_QUERY = "Signal studies"
 LONG = "Night Train Studies — Field Recordings and After-Hours Arrangements for the Long Way Home"
 SHORT, EMPTY, READ_ONLY, RULES = "Road mix", "Sunday at the Harbour", "Read-only manual", "Rules only"
 TARGET_ID = "wire-night-train-studies"
@@ -35,7 +35,7 @@ NORMAL = (
     track("ferry", "Between the Last Ferry and the First Morning Train"),
     track("blue", "Blue Hour at Low Tide"),
 ) + tuple(track(i, f"Night Signal at Mile {i:02}") for i in range(8, 34))
-HIDDEN = tuple(track(f"study-{i}", f"Signal Study {i:02}") for i in range(1, 27))
+STUDIES = tuple(track(f"study-{i}", f"Signal Study {i:02}") for i in range(1, 27))
 
 
 def playlist(ident, name, tracks, *, kind="manual", edit=True, description=""):
@@ -61,10 +61,10 @@ class Wire:
         self.events = []
         self.expected_add = None
         self.confirm = Event()
-        self.continue_hidden = Event()
+        self.continue_studies = Event()
         self.playlists = dict((case[0]["id"], case) for case in (
             playlist("wire-road-mix", SHORT, (NORMAL[5],)),
-            playlist(TARGET_ID, LONG, (NORMAL[4], *HIDDEN[:-1]), description=DESCRIPTION),
+            playlist(TARGET_ID, LONG, (NORMAL[4], *STUDIES[:-1]), description=DESCRIPTION),
             playlist("wire-sunday", EMPTY, ()),
             playlist("wire-read-only", READ_ONLY, (NORMAL[0],), edit=False),
             playlist("wire-rules", RULES, (NORMAL[0],), kind="derived", edit=False),
@@ -141,6 +141,10 @@ class Wire:
                 wire.record("membership-sync", playlist=pid, offset=offset, part=has_part,
                             revision=summary["revision"])
 
+            def play(self, _message):
+                wire.record("unexpected-play")
+                check(False, "quick-add state leaked a click to playback")
+
             def message(self):
                 while True:
                     notice = super().message()
@@ -194,18 +198,18 @@ class Wire:
                             if set(args) != {"query", "limit"} or args["limit"] != ["20"] or not query:
                                 wire.record("unexpected-search-shape", keys=sorted(args))
                                 return self.error(400)
-                            rows = {QUERY: NORMAL, HIDDEN_QUERY: HIDDEN}.get(query, ())
+                            rows = {QUERY: NORMAL, STUDIES_QUERY: STUDIES}.get(query, ())
                             wire.record("search", query=query, page=1)
                             value = dict(items=rows[:20], resultCount=len(rows), expiresAt=EXPIRY)
                             if len(rows) > 20:
-                                value["nextCursor"] = "hidden-second" if rows is HIDDEN else "normal-second"
+                                value["nextCursor"] = "studies-second" if rows is STUDIES else "normal-second"
                             return self.reply(value)
-                        if args != {"cursor": [cursor]} or cursor not in ("hidden-second", "normal-second"):
+                        if args != {"cursor": [cursor]} or cursor not in ("studies-second", "normal-second"):
                             wire.record("unexpected-search-shape", keys=sorted(args))
                             return self.error(400)
-                        rows = HIDDEN if cursor == "hidden-second" else NORMAL
-                        wire.record("search", query=HIDDEN_QUERY if rows is HIDDEN else QUERY, page=2)
-                        if rows is HIDDEN and not wire.continue_hidden.wait(6):
+                        rows = STUDIES if cursor == "studies-second" else NORMAL
+                        wire.record("search", query=STUDIES_QUERY if rows is STUDIES else QUERY, page=2)
+                        if rows is STUDIES and not wire.continue_studies.wait(8):
                             wire.record("unexpected-continuation-timeout")
                             return self.error(503)
                         return self.reply(dict(items=rows[20:], resultCount=len(rows), expiresAt=EXPIRY))
@@ -221,6 +225,6 @@ class Wire:
                 yield ready
             finally:
                 self.confirm.set()
-                self.continue_hidden.set()
+                self.continue_studies.set()
         check(not any(e["event"].startswith("unexpected-") for e in self.events),
               "unexpected wire activity; see wire.jsonl")

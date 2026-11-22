@@ -1,4 +1,4 @@
-//! One authenticated account-state.v1 socket. No fallback, command receipts, or replay.
+//! Authenticated account-state.v1 links. No fallback, command receipts, or replay.
 
 #[path = "account_wire.rs"]
 mod wire;
@@ -38,10 +38,10 @@ use tokio_tungstenite::{
 
 use crate::{
     api::{Api, Session},
-    personal::PersonalCommand,
+    personal::{PersonalCommand, PersonalUpdate},
     personal_bridge::PersonalAccess,
     playlist_pin_store::PUBLICATION_GATE,
-    quick_add::Ticket,
+    quick_add::{BULK_WINDOW, Ticket},
 };
 use wire::{Incoming, Outgoing};
 
@@ -168,6 +168,26 @@ pub(crate) struct Socket {
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Primary personal ingress fence. Call while holding the Personal state lock,
+/// as for order admission; the closure must not wait or perform async I/O.
+#[derive(Clone)]
+pub(crate) struct BulkOrder {
+    order_gate: Arc<Mutex<u64>>,
+    applied: watch::Receiver<u64>,
+}
+
+impl BulkOrder {
+    pub(crate) fn when_applied<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let published = self.order_gate.lock().expect("socket order admission gate");
+        let applied = *self.applied.borrow();
+        (applied == *published).then(f)
+    }
+
+    pub(crate) fn changes(&self) -> watch::Receiver<u64> {
+        self.applied.clone()
+    }
 }
 
 pub(crate) fn spawn(
@@ -344,6 +364,13 @@ impl Socket {
 
     pub(crate) fn mark_personal_applied(&self, stamp: u64) {
         self.personal_applied.send_replace(stamp);
+    }
+
+    pub(crate) fn bulk_order(&self) -> BulkOrder {
+        BulkOrder {
+            order_gate: self.order_gate.clone(),
+            applied: self.personal_applied.subscribe(),
+        }
     }
 
     /// The server responds with a fresh player snapshot and personal initial
@@ -758,10 +785,337 @@ impl Pulses {
 
 type AccountWs = WebSocketStream<reqwest::Upgraded>;
 
+// Go's personal FIFO allows up to 15 seconds per job. An eight-write
+// window plus its Initial can therefore need 135 seconds without other
+// clients. Allow bounded headroom, while still limiting ingress separately.
+const BULK_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
+const BULK_SCOPED_TIMEOUT: Duration = Duration::from_secs(45);
+const BULK_REPLY_FRAMES: usize = 256;
+
+/// A single-run, non-playing link. The primary socket alone feeds the shared
+/// replica. This link sees private replies only as FIFO barriers, not receipts.
+pub(crate) struct BulkLink<S = reqwest::Upgraded> {
+    ws: Option<WebSocketStream<S>>,
+    connection_id: String,
+    device_id: String,
+    session: Session,
+    mode_stamp: u64,
+    pending: usize,
+    target: Option<String>,
+}
+
+impl BulkLink {
+    pub(crate) async fn open(
+        api: &Api,
+        session: &Session,
+        mode_stamp: u64,
+        device_id: &str,
+        device_name: &str,
+    ) -> Result<Self, SocketError> {
+        if !wire::text(device_id, 128) || !wire::name(device_name) {
+            return Err(SocketError::Invalid);
+        }
+        // Older Go versions list non-playable sockets too. Reuse the primary
+        // installation identity so its earlier join wins roster deduplication.
+        let device = DeviceIdentity {
+            device_id: device_id.into(),
+            name: device_name.into(),
+            can_play: false,
+        };
+        bulk_scope(session, mode_stamp, async {
+            let (ws, initial) = admit(api, session, &device, Some(mode_stamp)).await?;
+            Self::finish_open(ws, initial, session, mode_stamp, device_id).await
+        })
+        .await
+        .map_err(bulk_error)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> BulkLink<S> {
+    async fn finish_open(
+        mut ws: WebSocketStream<S>,
+        initial: Incoming,
+        session: &Session,
+        mode_stamp: u64,
+        device_id: &str,
+    ) -> Result<Self, End> {
+        let Incoming::Snapshot { connection_id, .. } = initial else {
+            return Err(End::Protocol);
+        };
+        bulk_reply(
+            &mut ws,
+            device_id,
+            &connection_id,
+            "snapshot",
+            SNAPSHOT_TIMEOUT,
+            |update| matches!(update, PersonalUpdate::Snapshot(_)).then_some(()),
+        )
+        .await?;
+        Ok(Self {
+            ws: Some(ws),
+            connection_id,
+            device_id: device_id.into(),
+            session: session.clone(),
+            mode_stamp,
+            pending: 0,
+            target: None,
+        })
+    }
+
+    /// `start_guard` runs under PUBLICATION_GATE after write readiness. Call
+    /// `start` synchronously only while the exact scope and membership permit
+    /// it. A true `start()` is an attempt even if this future then fails or is
+    /// canceled; record it inside the guard, not after awaiting `add`.
+    /// Ok(false) means the guard did not start a write. Ok(true) is only flush.
+    pub(crate) async fn add(
+        &mut self,
+        command: &PersonalCommand,
+        start_guard: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    ) -> Result<bool, SocketError> {
+        let PersonalCommand::AddEntry { playlist_id, .. } = command else {
+            return Err(SocketError::Invalid);
+        };
+        if !command.valid()
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|target| target != playlist_id)
+        {
+            return Err(SocketError::Invalid);
+        }
+        if self.pending >= BULK_WINDOW {
+            return Err(SocketError::Busy);
+        }
+        let raw = encode(&Outgoing::Personal { command })?;
+        // A dropped future (e.g. caller select!) or transport failure retires
+        // this link, including any partial frame; nothing can resume or replay.
+        let mut ws = self.ws.take().ok_or(SocketError::NotConnected)?;
+        let started = bulk_scope(&self.session, self.mode_stamp, async {
+            send_bulk(&mut ws, raw, &self.session, self.mode_stamp, start_guard).await
+        })
+        .await
+        .map_err(bulk_error)?;
+        self.ws = Some(ws);
+        if started {
+            self.pending += 1;
+            self.target.get_or_insert_with(|| playlist_id.clone());
+        }
+        Ok(started)
+    }
+
+    /// Return the target revision after this link's FIFO barrier. In the
+    /// bounded Initial list the target may be absent; a same-link, tokenless
+    /// offset-zero read then supplies its revision, without fetching more rows.
+    pub(crate) async fn checkpoint(&mut self, target: &str) -> Result<u64, SocketError> {
+        let part = PersonalCommand::SyncPlaylist {
+            playlist_id: target.into(),
+            known: None,
+            offset: 0,
+            local_request: Arc::new(()),
+        };
+        if !part.valid() || self.target.as_deref().is_some_and(|id| id != target) {
+            return Err(SocketError::Invalid);
+        }
+        let sync = encode(&Outgoing::<()>::Sync)?;
+        let mut ws = self.ws.take().ok_or(SocketError::NotConnected)?;
+        let revision = bulk_scope(&self.session, self.mode_stamp, async {
+            send_bulk(&mut ws, sync, &self.session, self.mode_stamp, |start| {
+                start()
+            })
+            .await?;
+            // Go replies immediately with a player Snapshot, then queues a
+            // private personal Initial behind our writes. Only the latter can
+            // confirm the FIFO ran; ordinary personal changes are broadcasts.
+            let revision = bulk_reply(
+                &mut ws,
+                &self.device_id,
+                &self.connection_id,
+                "snapshot",
+                BULK_CHECKPOINT_TIMEOUT,
+                |update| {
+                    let PersonalUpdate::Snapshot(snapshot) = update else {
+                        return None;
+                    };
+                    Some(
+                        snapshot
+                            .playlists
+                            .into_iter()
+                            .find(|p| p.id == target)
+                            .map(|p| p.revision),
+                    )
+                },
+            )
+            .await?;
+            if let Some(revision) = revision {
+                return Ok(revision);
+            }
+            let raw = encode(&Outgoing::Personal { command: &part }).map_err(|_| End::Protocol)?;
+            send_bulk(&mut ws, raw, &self.session, self.mode_stamp, |start| {
+                start()
+            })
+            .await?;
+            bulk_reply(
+                &mut ws,
+                &self.device_id,
+                &self.connection_id,
+                "part",
+                BULK_SCOPED_TIMEOUT,
+                |update| match update {
+                    PersonalUpdate::Part(part) if part.summary.id == target && part.offset == 0 => {
+                        Some(part.summary.revision)
+                    }
+                    _ => None,
+                },
+            )
+            .await
+        })
+        .await
+        .map_err(bulk_error)?;
+        self.ws = Some(ws);
+        self.pending = 0;
+        Ok(revision)
+    }
+
+    /// Service control frames while the owner awaits primary replica progress.
+    /// This does not send application frames and is safe to drop and reuse.
+    /// Tungstenite retains partial reads and queued Pongs in the socket; the
+    /// next read or write flushes any Pong interrupted by the caller's select.
+    pub(crate) async fn maintain(&mut self) -> Result<(), SocketError> {
+        let result = bulk_scope(&self.session, self.mode_stamp, async {
+            let ws = self.ws.as_mut().ok_or(End::Closed)?;
+            for _ in 0..BULK_REPLY_FRAMES {
+                match receive(ws, &self.device_id, true).await? {
+                    Incoming::Snapshot { connection_id, .. }
+                        if connection_id != self.connection_id =>
+                    {
+                        return Err(End::Protocol);
+                    }
+                    Incoming::Personal { update }
+                        if update.get("snapshot").is_some() || update.get("part").is_some() =>
+                    {
+                        // No request is outstanding. Never silently leave an
+                        // unsolicited private reply to a future checkpoint.
+                        return Err(End::Protocol);
+                    }
+                    _ => (),
+                }
+                tokio::task::consume_budget().await;
+            }
+            Err(End::Backpressure)
+        })
+        .await;
+        if result.is_err() {
+            self.ws = None;
+        }
+        result.map_err(bulk_error)
+    }
+}
+
+fn bulk_current(session: &Session, mode_stamp: u64) -> Result<(), End> {
+    if mode_stamp & 1 != 0 || *session.network_changes().borrow() != mode_stamp {
+        return Err(End::NetworkChanged);
+    }
+    if session.is_expired() {
+        return Err(End::Expired);
+    }
+    Ok(())
+}
+
+async fn bulk_scope<T>(
+    session: &Session,
+    mode_stamp: u64,
+    work: impl Future<Output = Result<T, End>>,
+) -> Result<T, End> {
+    let mut mode = session.network_changes();
+    bulk_current(session, mode_stamp)?;
+    let result = tokio::select! {
+        biased;
+        _ = mode.changed() => return Err(End::NetworkChanged),
+        _ = local_expiry(session) => return Err(End::Expired),
+        result = work => result?,
+    };
+    bulk_current(session, mode_stamp)?;
+    Ok(result)
+}
+
+async fn send_bulk<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    raw: String,
+    session: &Session,
+    mode_stamp: u64,
+    start_guard: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+) -> Result<bool, End> {
+    wait_write_ready(ws).await?;
+    let mut raw = Some(raw);
+    let mut result = Ok(());
+    {
+        let _publication = PUBLICATION_GATE.lock().expect("account publication gate");
+        bulk_current(session, mode_stamp)?;
+        start_guard(&mut || {
+            // Mode and explicit revocation are serialized by the gate, but
+            // the credential's natural deadline can elapse during the guard.
+            if session.is_expired() {
+                result = Err(End::Expired);
+                return false;
+            }
+            let Some(raw) = raw.take() else {
+                return false;
+            };
+            result = Pin::new(&mut *ws)
+                .start_send(Message::Text(raw.into()))
+                .map_err(|_| End::Transport);
+            true
+        });
+    }
+    result?;
+    let started = raw.is_none();
+    if started {
+        flush_scoped(ws).await?;
+    }
+    Ok(started)
+}
+
+async fn bulk_reply<S: AsyncRead + AsyncWrite + Unpin, T>(
+    ws: &mut WebSocketStream<S>,
+    device_id: &str,
+    connection_id: &str,
+    kind: &str,
+    timeout: Duration,
+    pick: impl Fn(PersonalUpdate) -> Option<T>,
+) -> Result<T, End> {
+    time::timeout(timeout, async {
+        for _ in 0..BULK_REPLY_FRAMES {
+            match receive(ws, device_id, true).await? {
+                Incoming::Snapshot {
+                    connection_id: id, ..
+                } if id != connection_id => {
+                    return Err(End::Protocol);
+                }
+                Incoming::Personal { update } if update.get(kind).is_some() => {
+                    let update = serde_json::from_value(update).map_err(|_| End::Protocol)?;
+                    if let Some(reply) = pick(update) {
+                        return Ok(reply);
+                    }
+                }
+                _ => (),
+            }
+            tokio::task::consume_budget().await;
+        }
+        Err(End::Backpressure)
+    })
+    .await
+    .map_err(|_| End::Transport)?
+}
+
+fn bulk_error(_: End) -> SocketError {
+    SocketError::NotConnected
+}
+
 async fn admit(
     api: &Api,
     session: &Session,
     device: &DeviceIdentity,
+    bulk_mode: Option<u64>,
 ) -> Result<(AccountWs, Incoming), End> {
     let AccountUpgrade { upgraded, ticket } = api.account_upgrade(session).await.map_err(|e| {
         if e.expired {
@@ -782,10 +1136,18 @@ async fn admit(
         device_id: &device.device_id,
         can_play: device.can_play,
     };
-    send(&mut ws, encode(&hello).map_err(|_| End::Protocol)?).await?;
-    let first = time::timeout(SNAPSHOT_TIMEOUT, receive(&mut ws, &device.device_id))
-        .await
-        .map_err(|_| End::Transport)??;
+    let raw = encode(&hello).map_err(|_| End::Protocol)?;
+    if let Some(mode_stamp) = bulk_mode {
+        send_bulk(&mut ws, raw, session, mode_stamp, |start| start()).await?;
+    } else {
+        send(&mut ws, raw).await?;
+    }
+    let first = time::timeout(
+        SNAPSHOT_TIMEOUT,
+        receive(&mut ws, &device.device_id, bulk_mode.is_some()),
+    )
+    .await
+    .map_err(|_| End::Transport)??;
     if !matches!(first, Incoming::Snapshot { .. }) {
         return Err(End::Protocol);
     }
@@ -944,10 +1306,11 @@ async fn send_quick<S: AsyncRead + AsyncWrite + Unpin>(
 async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
     device: &str,
+    bulk: bool,
 ) -> Result<Incoming, End> {
     loop {
         match ws.next().await {
-            Some(Ok(Message::Text(raw))) => return decode(&raw, device),
+            Some(Ok(Message::Text(raw))) => return decode_link(&raw, device, bulk),
             Some(Ok(Message::Ping(_))) => {
                 // Tungstenite schedules the matching Pong itself. Flush now,
                 // including when waiting on the initial snapshot.
@@ -961,18 +1324,40 @@ async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
             Some(Ok(_)) => return Err(End::Protocol),
             Some(Err(err)) => return Err(classify_wire_error(err)),
         }
+        if bulk {
+            tokio::task::consume_budget().await;
+        }
     }
 }
 
 fn decode(raw: &str, device: &str) -> Result<Incoming, End> {
+    decode_link(raw, device, false)
+}
+
+fn decode_link(raw: &str, device: &str, bulk: bool) -> Result<Incoming, End> {
     if raw.len() > MAX_INBOUND {
         return Err(End::Protocol);
     }
     let incoming: Incoming = serde_json::from_str(raw).map_err(|_| End::Protocol)?;
-    incoming
-        .valid(device)
-        .then_some(incoming)
-        .ok_or(End::Protocol)
+    let valid = match &incoming {
+        Incoming::Snapshot {
+            connection_id,
+            outputs,
+            ..
+        } if bulk => {
+            // A non-player may be omitted from the roster. We do not use its
+            // player projection; still require an addressed, non-owner link.
+            wire::text(connection_id, 128)
+                && outputs.owner != *connection_id
+                && outputs.devices.len() <= 32
+                && outputs
+                    .devices
+                    .iter()
+                    .all(|d| d.id != *connection_id || (!d.can_play && d.device_id == device))
+        }
+        _ => incoming.valid(device),
+    };
+    valid.then_some(incoming).ok_or(End::Protocol)
 }
 
 struct Connection {
@@ -1295,6 +1680,10 @@ async fn expiry_aware<T>(
 #[path = "account_socket_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "bulk_socket_tests.rs"]
+mod bulk_tests;
+
 async fn run(
     api: Arc<Api>,
     session: Session,
@@ -1334,7 +1723,7 @@ async fn run(
             _ = &mut expiry => Err(End::Expired),
             _ = mode.changed() => Err(End::NetworkChanged),
             _ = signals.events.closed() => Err(End::Closed),
-            result = expiry_aware(admit(&api, &session, &device), &mut output, &signals) => result,
+            result = expiry_aware(admit(&api, &session, &device, None), &mut output, &signals) => result,
         };
         let ended = match admitted {
             Ok((mut ws, initial)) => match Connection::begin(initial, &mut output, &signals) {

@@ -85,6 +85,185 @@ fn dispatch(hub: &PersonalHub, access: &PersonalAccess, ticket: &Ticket) {
     assert!(access.start_quick_add(ticket, || true));
 }
 
+fn begin_bulk(access: &PersonalAccess, target: &str, kind: &str) -> Option<BulkTicket> {
+    let scope = access.quick_view(EPOCH, |v| v.bulk_scope(2));
+    access.quick_begin_bulk(EPOCH, 2, &scope, target, kind, "source")
+}
+
+#[test]
+fn bulk_add_uses_scoped_absence_off_adds_one_even_when_present() {
+    let (hub, a) = ready();
+    a.quick_select(EPOCH, Some("a"));
+    let current = summary("a", 2, 2);
+    let existing = entry("exists", "song", 0);
+    part(
+        &hub,
+        GENERATION,
+        current.clone(),
+        "full",
+        0,
+        vec![existing.clone()],
+        true,
+    );
+    assert!(begin_bulk(&a, "a", "album").is_none());
+    part(
+        &hub,
+        GENERATION,
+        current,
+        "full",
+        1,
+        vec![entry("last", "tail", 1)],
+        false,
+    );
+    let skip = begin_bulk(&a, "a", "album").unwrap();
+    assert_eq!(
+        a.quick_bulk_send(&skip, "song", || panic!("already present")),
+        BulkWrite::Skipped
+    );
+    assert!(begin_bulk(&a, "a", "artist").is_none());
+    assert!(a.quick_stage(EPOCH, 2, "a", "missing").is_none());
+    a.quick_skip(EPOCH, false);
+    assert_eq!(
+        a.quick_bulk_send(&skip, "tail", || panic!("settings changed operation")),
+        BulkWrite::Skipped
+    );
+    a.quick_finish_bulk(&skip, BulkEnd::Done);
+    a.quick_view(EPOCH, |v| {
+        assert_eq!(v.bulk.unwrap().message, "2 already in playlist")
+    });
+    let allow = begin_bulk(&a, "a", "artist").unwrap();
+    assert_eq!(
+        a.quick_bulk_send(&allow, "song", || true),
+        BulkWrite::Started
+    );
+    a.quick_view(EPOCH, |v| {
+        let row = v.row("song");
+        assert_eq!(row.membership, Membership::Present);
+        assert!(!row.pending && !row.can_add);
+    });
+    assert!(!a.quick_bulk_ack(&allow, 2)); // Cannot be the post-write marker.
+    assert!(a.quick_bulk_ack(&allow, 3));
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change": {
+            "playlist": summary("a", 3, 3),
+            "entries": {"added": entry("added", "song", 2)}
+        }}),
+    );
+    a.quick_bulk_checkpoint(&allow);
+    a.quick_finish_bulk(&allow, BulkEnd::Done);
+    a.quick_select(EPOCH, Some("b"));
+    a.quick_view(EPOCH, |v| assert!(v.skip));
+}
+
+#[test]
+fn bulk_add_shared_membership_never_releases_window_or_resends_started_tracks() {
+    use crate::quick_add::BULK_WINDOW;
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let ticket = begin_bulk(&a, "a", "artist").unwrap();
+    for i in 0..BULK_WINDOW {
+        let track = format!("song-{i}");
+        assert_eq!(
+            a.quick_bulk_send(&ticket, &track, || true),
+            BulkWrite::Started
+        );
+    }
+    receive(
+        &hub,
+        GENERATION,
+        json!({"change": {
+            "playlist": summary("a", 1, 2),
+            "entries": {"added": entry("foreign", "song-0", 0)}
+        }}),
+    );
+    assert_eq!(
+        a.quick_bulk_send(&ticket, "new", || panic!(
+            "window drained by shared broadcast"
+        )),
+        BulkWrite::Stop
+    );
+    assert!(a.quick_stage(EPOCH, 2, "a", "song-0").is_none());
+    a.quick_abort_bulk(EPOCH);
+    assert!(!a.quick_bulk_current(&ticket));
+    assert!(begin_bulk(&a, "a", "album").is_none());
+    a.quick_view(EPOCH, |v| {
+        assert_eq!(v.row("song-0").membership, Membership::Present);
+        assert_eq!(v.row("song-1").outcome, Some(Outcome::Unconfirmed));
+        assert!(v.row("unrelated").can_add);
+    });
+    assert_eq!(
+        a.quick_bulk_send(&ticket, "new", || panic!("cancelled write")),
+        BulkWrite::Stop
+    );
+}
+
+#[test]
+fn bulk_add_stale_launch_cancel_and_old_account_completion_cannot_touch_the_next_bulk() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let before = a.quick_view(EPOCH, |v| v.bulk_scope(2));
+    let first = a
+        .quick_begin_bulk(EPOCH, 2, &before, "a", "album", "some-source")
+        .unwrap();
+    let during = a.quick_view(EPOCH, |v| v.bulk_scope(2));
+    a.quick_abort_bulk_scoped(EPOCH, 2, &before);
+    assert!(a.quick_bulk_current(&first));
+    a.quick_abort_bulk_scoped(EPOCH, 2, &during);
+    assert!(!a.quick_bulk_current(&first));
+    assert!(
+        a.quick_begin_bulk(EPOCH, 2, &before, "a", "album", "some-source")
+            .is_none()
+    );
+
+    let epoch = EPOCH + 1;
+    hub.begin(epoch, GENERATION + 1);
+    let read = |raw| {
+        hub.receive(epoch, GENERATION + 1, serde_json::from_value(raw).unwrap())
+            .unwrap()
+    };
+    read(json!({"snapshot": {"playlists": [summary("a", 0, 1)], "recent": []}}));
+    a.quick_watch(epoch, true, None);
+    a.quick_select(epoch, Some("a"));
+    read(
+        json!({"part": {"summary": summary("a", 0, 1), "token": "again", "offset": 0, "rows": [], "more": false}}),
+    );
+    let scope = a.quick_view(epoch, |v| v.bulk_scope(2));
+    let current = a
+        .quick_begin_bulk(epoch, 2, &scope, "a", "album", "some-source")
+        .unwrap();
+    a.quick_finish_bulk(&first, BulkEnd::Done);
+    assert!(a.quick_bulk_current(&current));
+}
+
+#[test]
+fn bulk_add_published_account_epoch_fences_the_wire_before_hub_retirement() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let ticket = begin_bulk(&a, "a", "album").unwrap();
+    let epoch = AtomicU64::new(EPOCH);
+    {
+        let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+        epoch.store(EPOCH + 1, Ordering::SeqCst);
+    }
+    assert!(
+        a.quick_bulk_current(&ticket),
+        "Engine has not retired the old hub"
+    );
+    let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+    assert_eq!(
+        a.quick_bulk_send_ordered(&ticket, "song", None, &epoch, || {
+            panic!("obsolete account reached start_send")
+        }),
+        BulkWrite::Stop
+    );
+    assert!(
+        !a.quick_bulk_ack(&ticket, 2),
+        "no ambiguous write was started"
+    );
+}
+
 fn elapse(access: &PersonalAccess, seconds: u64) {
     access
         .state
@@ -99,7 +278,6 @@ fn quick_add_partial_large_membership_is_exact_boolean_not_committed_rows() {
     let total = 12_000;
     let s = summary("a", total, 2);
     assert!(a.quick_select(EPOCH, Some("a")).is_some());
-    a.quick_filter(EPOCH, true);
     for offset in (0..total).step_by(500) {
         let end = offset + 500;
         let next = part(
@@ -127,7 +305,7 @@ fn quick_add_partial_large_membership_is_exact_boolean_not_committed_rows() {
         a.quick_view(EPOCH, |v| {
             let known = v.row("duplicate");
             assert_eq!(known.membership, Membership::Present);
-            assert!(!known.visible);
+            assert!(!known.can_add);
             let missing = v.row("missing");
             assert_eq!(
                 missing.membership,
@@ -137,7 +315,6 @@ fn quick_add_partial_large_membership_is_exact_boolean_not_committed_rows() {
                     Membership::Absent
                 }
             );
-            assert!(missing.visible);
             assert_eq!(missing.can_add, end == total);
         });
         a.read(|_, r| {
@@ -161,7 +338,6 @@ fn quick_add_partial_large_membership_is_exact_boolean_not_committed_rows() {
 fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let t = stage(&a, "a", "song");
     dispatch(&hub, &a, &t);
     assert!(a.quick_stage(EPOCH, 2, "a", "song").is_none());
@@ -179,7 +355,7 @@ fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
     hub.refused(EPOCH, GENERATION); // Neither ordinary refusal nor a revision is this ticket.
     a.quick_view(EPOCH, |v| {
         let song = v.row("song");
-        assert!(song.pending && song.visible && !song.can_add);
+        assert!(song.pending && !song.can_add);
         assert_eq!(song.membership, Membership::Absent);
         assert_eq!(song.outcome, None);
     });
@@ -199,7 +375,7 @@ fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
     );
     a.quick_view(EPOCH, |v| {
         let song = v.row("song");
-        assert!(!song.pending && !song.visible && !song.can_add);
+        assert!(!song.pending && !song.can_add);
         assert_eq!(song.membership, Membership::Present);
         assert_eq!(song.outcome, None); // Plain membership; no success/receipt state exists.
     });
@@ -210,7 +386,6 @@ fn quick_add_foreign_same_song_resolves_membership_but_other_facts_do_not() {
 fn quick_add_three_distinct_writes_start_and_observe_out_of_order() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let first = stage(&a, "a", "first");
     dispatch(&hub, &a, &first);
     let second = stage(&a, "a", "second");
@@ -225,7 +400,7 @@ fn quick_add_three_distinct_writes_start_and_observe_out_of_order() {
         for song in ["first", "second", "third"] {
             let row = v.row(song);
             assert_eq!(row.membership, Membership::Absent);
-            assert!(row.pending && row.visible && !row.can_add && row.outcome.is_none());
+            assert!(row.pending && !row.can_add && row.outcome.is_none());
         }
         assert!(v.row("unused").can_add && !v.at_capacity);
     });
@@ -239,7 +414,7 @@ fn quick_add_three_distinct_writes_start_and_observe_out_of_order() {
         a.quick_view(EPOCH, |v| {
             let row = v.row(song);
             assert_eq!(row.membership, Membership::Present);
-            assert!(!row.pending && !row.visible && !row.can_add && row.outcome.is_none());
+            assert!(!row.pending && !row.can_add && row.outcome.is_none());
             assert!(v.row("first").pending);
             assert_eq!(v.row("second").pending, index == 0);
         });
@@ -259,7 +434,7 @@ fn quick_add_three_distinct_writes_start_and_observe_out_of_order() {
     a.quick_view(EPOCH, |v| {
         let row = v.row("first");
         assert_eq!(row.membership, Membership::Present);
-        assert!(!row.pending && !row.visible && !row.can_add && row.outcome.is_none());
+        assert!(!row.pending && !row.can_add && row.outcome.is_none());
     });
 }
 
@@ -356,7 +531,6 @@ fn quick_add_observation_window_begins_at_actual_start_and_deadlines_are_indepen
 fn quick_add_dispatch_rechecks_exact_absence_during_multipart_repair() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let started = stage(&a, "a", "started");
     dispatch(&hub, &a, &started);
     let queued = stage(&a, "a", "queued");
@@ -381,7 +555,7 @@ fn quick_add_dispatch_rechecks_exact_absence_during_multipart_repair() {
         for song in ["started", "queued", "staged"] {
             let row = v.row(song);
             assert_eq!(row.membership, Membership::Unknown);
-            assert!(row.pending && row.visible && !row.can_add);
+            assert!(row.pending && !row.can_add);
         }
     });
     assert!(!hub.admit_quick_add(&staged, || panic!("unknown is not absent at admission")));
@@ -418,7 +592,7 @@ fn quick_add_dropped_no_diff_and_reconnect_never_rearm_old_reader_attempt() {
     assert!(a.quick_stage(EPOCH, 2, "a", "song").is_none());
     a.quick_view(EPOCH, |v| {
         let song = v.row("song");
-        assert!(!song.pending && song.visible && !song.can_add);
+        assert!(!song.pending && !song.can_add);
         assert_eq!(song.outcome, Some(Outcome::Unconfirmed));
         assert_eq!(v.row("another-song").outcome, None);
         assert!(v.row("another-song").can_add);
@@ -534,7 +708,7 @@ fn quick_add_foreign_present_then_removed_does_not_rearm_a_started_add() {
     a.quick_view(EPOCH, |v| {
         let song = v.row("song");
         assert_eq!(song.membership, Membership::Absent);
-        assert!(song.visible && !song.pending && !song.can_add);
+        assert!(!song.pending && !song.can_add);
         assert_eq!(song.outcome, Some(Outcome::Unconfirmed));
         assert!(v.row("another-song").can_add);
     });
@@ -616,7 +790,7 @@ fn quick_add_attempt_budget_does_not_evict_a_hold_or_affect_explicit_add() {
     elapse(&a, 31);
     a.quick_view(EPOCH, |v| {
         let row = v.row("new-song");
-        assert!(v.session_limit && !v.at_capacity && row.visible && !row.can_add);
+        assert!(v.session_limit && !v.at_capacity && !row.can_add);
         assert_eq!(v.row("song-0").outcome, Some(Outcome::Unconfirmed));
     });
     for song in ["song-0", "new-song"] {
@@ -685,38 +859,34 @@ fn quick_add_obsolete_reads_never_refuse_a_normal_write() {
 fn quick_add_held_unsent_target_rights_route_and_account_are_fenced() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let held = stage(&a, "a", "song");
     assert!(hub.admit_quick_add(&held, || true));
     assert!(a.quick_select(EPOCH, Some("b")).is_some());
     assert!(!a.start_quick_add(&held, || panic!("old target reached socket")));
     a.quick_view(EPOCH, |v| {
         assert_eq!(v.target.unwrap().id, "b");
-        assert!(!v.hide);
         assert_eq!(v.row("song").outcome, None); // The unsent ticket was for A.
     });
     part(&hub, GENERATION, summary("b", 0, 1), "b", 0, vec![], false);
-    a.quick_filter(EPOCH, true);
     let rejected = stage(&a, "b", "song");
     let mut no_add = summary("b", 0, 2);
     no_add["capabilities"]["addTracks"] = json!(false);
     receive(&hub, GENERATION, json!({"change":{"playlist":no_add}}));
     assert!(!hub.admit_quick_add(&rejected, || panic!("revoked rights reached socket")));
-    a.quick_view(EPOCH, |v| assert!(v.target.is_none() && !v.hide));
+    a.quick_view(EPOCH, |v| assert!(v.target.is_none()));
     assert!(a.quick_select(EPOCH, Some("b")).is_none());
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let unsent = stage(&a, "a", "song");
     assert!(a.quick_watch(EPOCH, false, Some("b".into())).is_some());
     assert!(!hub.admit_quick_add(&unsent, || panic!("off-Search ticket")));
     assert!(a.quick_watch(EPOCH, true, None).is_some());
-    a.quick_view(EPOCH, |v| assert!(v.hide && v.target.unwrap().id == "a"));
+    a.quick_view(EPOCH, |v| assert_eq!(v.target.unwrap().id, "a"));
     let leaving = stage(&a, "a", "song");
     hub.reset(EPOCH + 1);
     assert!(!hub.admit_quick_add(&leaving, || panic!("old account ticket")));
     for epoch in [EPOCH, EPOCH + 1] {
         a.quick_view(epoch, |v| {
-            assert!(v.target.is_none() && !v.hide && v.row("song").outcome.is_none())
+            assert!(v.target.is_none() && v.row("song").outcome.is_none())
         });
     }
 }
@@ -747,13 +917,11 @@ fn quick_add_selects_current_editable_detail_beyond_the_summary_cap() {
     assert_eq!(a.quick_targets(EPOCH).len(), 101);
     assert!(a.quick_select(EPOCH, Some("z-outside")).is_none()); // Off Search: no second watch.
     assert!(a.quick_watch(EPOCH, true, None).is_none()); // Same exact watched route.
-    a.quick_filter(EPOCH, true);
     hub.disconnect(EPOCH, GENERATION);
     hub.begin(EPOCH, GENERATION + 1);
     assert!(lists(&hub, GENERATION + 1, summaries).is_some());
     a.quick_view(EPOCH, |v| {
         assert_eq!(v.target.unwrap().id, "z-outside");
-        assert!(v.hide);
         assert_eq!(v.row("song").membership, Membership::Unknown);
     });
     part(
@@ -790,7 +958,6 @@ fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
     );
     a.quick_select(EPOCH, Some(target));
     a.quick_watch(EPOCH, true, None);
-    a.quick_filter(EPOCH, true);
     hub.disconnect(EPOCH, GENERATION);
 
     for generation in GENERATION + 1..=GENERATION + 2 {
@@ -834,7 +1001,7 @@ fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
             );
         });
         a.quick_view(EPOCH, |v| {
-            assert!(v.read_stalled && v.hide && v.target.is_some_and(|p| p.id == target));
+            assert!(v.read_stalled && v.target.is_some_and(|p| p.id == target));
             assert_eq!(v.row("song").membership, Membership::Unknown);
             assert!(!v.row("song").can_add);
         });
@@ -864,7 +1031,6 @@ fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
 fn quick_add_stalled_or_invalid_partial_read_never_proves_absence() {
     let (hub, a) = ready();
     assert!(a.quick_select(EPOCH, Some("a")).is_some());
-    a.quick_filter(EPOCH, true);
     let s = summary("a", 3, 2);
     let initial = part(
         &hub,
@@ -899,7 +1065,7 @@ fn quick_add_stalled_or_invalid_partial_read_never_proves_absence() {
     a.quick_view(EPOCH, |v| {
         for track in ["old-positive", "never-proof"] {
             assert_eq!(v.row(track).membership, Membership::Unknown);
-            assert!(v.row(track).visible);
+            assert!(!v.row(track).can_add);
         }
     });
     elapse(&a, 21);
@@ -908,7 +1074,7 @@ fn quick_add_stalled_or_invalid_partial_read_never_proves_absence() {
         hub.authorizes(EPOCH, GENERATION, &repair),
         "a slow read can still repair the scope"
     );
-    a.quick_view(EPOCH, |v| assert!(v.read_stalled && v.hide));
+    a.quick_view(EPOCH, |v| assert!(v.read_stalled));
     elapse(&a, 121);
     assert!(!hub.authorizes(EPOCH, GENERATION, &repair));
     assert!(a.quick_watch(EPOCH, false, Some("b".into())).is_some());
@@ -988,7 +1154,7 @@ fn quick_add_silent_matching_probe_never_marks_presence_or_rearms() {
     assert!(timer(31).is_none());
     a.quick_view(EPOCH, |v| {
         let row = v.row("song");
-        assert!(!row.pending && row.visible && !row.can_add && !v.read_stalled);
+        assert!(!row.pending && !row.can_add && !v.read_stalled);
         assert_eq!(row.outcome, Some(Outcome::Unconfirmed));
         assert!(v.row("elsewhere").can_add);
     });
@@ -1070,7 +1236,6 @@ fn quick_add_hard_read_cutoff_does_not_depend_on_browser_timer_order() {
 fn quick_add_large_repair_ignores_old_continuation_and_accepts_late_final_part() {
     let (hub, a) = ready();
     empty_a(&hub, &a);
-    a.quick_filter(EPOCH, true);
     let ticket = stage(&a, "a", "exact-tail");
     dispatch(&hub, &a, &ticket);
     let first_gen = summary("a", 1501, 2);
@@ -1165,7 +1330,7 @@ fn quick_add_large_repair_ignores_old_continuation_and_accepts_late_final_part()
     elapse(&a, 21);
     a.quick_view(EPOCH, |v| {
         let tail = v.row("exact-tail");
-        assert!(v.read_stalled && tail.pending && tail.visible);
+        assert!(v.read_stalled && tail.pending && !tail.can_add);
         assert_eq!(tail.membership, Membership::Unknown);
     });
     assert!(
@@ -1187,7 +1352,7 @@ fn quick_add_large_repair_ignores_old_continuation_and_accepts_late_final_part()
     a.quick_view(EPOCH, |v| {
         let tail = v.row("exact-tail");
         assert_eq!(tail.membership, Membership::Present);
-        assert!(!tail.pending && !tail.visible && !v.read_stalled);
+        assert!(!tail.pending && !tail.can_add && !v.read_stalled);
         assert!(v.row("not-a-member").can_add);
     });
 }
