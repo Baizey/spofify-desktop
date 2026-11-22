@@ -311,8 +311,9 @@ class Search(View):
         self.window.mcp.call("move_pointer", {"windowHandle": self.window.handle,
             "position": {"x": (x + right) / 2, "y": (y + bottom) / 2}})
 
-    def assert_query(self):
-        self.window.title("Search")
+    def assert_query(self, *, heading=True):
+        if heading:
+            self.window.title("Search")
         field = self.window.find(r"Search.*", roles=("TextInput",))
         check(field.get("accessibleValue") == QUERY, "Search no longer holds the exact mixed query")
 
@@ -518,7 +519,8 @@ def capture_cases(view, wire, mode):
         try:
             wait("wheel moved the actual Search list", moved, 3)
             w.absent(closed, roles=("Button",))
-            view.assert_query()
+            # The Search heading scrolls away; the sticky input stays visible.
+            view.assert_query(heading=False)
             view.frame(tag + "-dismissed")
             print(f"PASS wheel moved Search and dismissed the {item['kind']} menu", flush=True)
         except Failure as error:
