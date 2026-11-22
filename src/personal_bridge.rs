@@ -4,14 +4,15 @@
 use crate::{
     api::library::{PlaylistKind, PlaylistSummary, RuleDefinition},
     desk::Access,
-    personal::{PersonalCommand, PersonalUpdate, Replica},
+    personal::{AcceptedPlaylist, PersonalCommand, PersonalUpdate, Replica},
     playlist_observations::Writer,
+    quick_add::{self, QuickAdd, Ticket},
 };
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, atomic::AtomicU64},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
 #[derive(Clone, Debug)]
 pub struct Mutation {
@@ -108,6 +109,7 @@ struct Observation {
 struct State {
     status: Status,
     replica: Replica,
+    quick: QuickAdd,
     observations: VecDeque<Observation>,
     observation_writer: Option<Writer>,
     observation_mode: Option<u64>,
@@ -126,6 +128,7 @@ impl Default for State {
                 sequence: 0,
             },
             replica: Replica::default(),
+            quick: QuickAdd::default(),
             observations: VecDeque::new(),
             observation_writer: None,
             observation_mode: None,
@@ -135,6 +138,70 @@ impl Default for State {
 impl State {
     fn scoped(&self, epoch: u64, generation: u64) -> bool {
         self.status.epoch == epoch && self.status.generation == generation
+    }
+
+    fn watch(&mut self, id: Option<String>) -> (bool, Option<PersonalCommand>) {
+        let before = self.replica.watched_playlist().map(str::to_owned);
+        let command = self.replica.watch(id);
+        let changed = before.as_deref() != self.replica.watched_playlist();
+        if changed {
+            self.status.playlist_detail = self.status.playlist_detail.wrapping_add(1);
+        }
+        (changed, command)
+    }
+
+    fn quick_watch(&mut self) -> (bool, Option<PersonalCommand>) {
+        let id = self.quick.watched().map(str::to_owned);
+        self.watch(id)
+    }
+
+    fn quick_read(&mut self, command: Option<&PersonalCommand>, progressed: bool, now: Instant) {
+        let complete = self.replica.playlist().is_some_and(|p| !p.stale);
+        self.quick.on_read(command, complete, progressed, now);
+    }
+
+    fn quick_tick(&mut self, now: Instant) {
+        if self.quick.tick(now) {
+            self.quick_watch();
+        }
+    }
+
+    fn interrupt(&mut self) {
+        self.replica.disconnected();
+        self.quick.interrupted();
+        if self.quick.searching() {
+            self.quick_watch();
+        }
+    }
+
+    fn accepts_playlist_sync(
+        &self,
+        epoch: u64,
+        generation: u64,
+        command: &PersonalCommand,
+    ) -> bool {
+        self.scoped(epoch, generation)
+            && self.status.link == Link::Ready
+            && self.replica.accepts_sync(command)
+    }
+
+    fn quick_candidate(&self, id: &str) -> Option<&PlaylistSummary> {
+        if self.status.link != Link::Ready {
+            return None;
+        }
+        self.replica
+            .snapshot()?
+            .playlists
+            .iter()
+            .find(|p| p.id == id)
+            .or_else(|| {
+                self.replica
+                    .playlist()
+                    .filter(|p| !p.stale && p.summary.id == id)
+                    .map(|p| &p.summary)
+            })
+            .or_else(|| self.quick.authorized_target().filter(|p| p.id == id))
+            .filter(|p| quick_add::editable(p))
     }
 }
 
@@ -174,18 +241,221 @@ impl PersonalAccess {
         if state.status.epoch != epoch {
             return None;
         }
-        let previous = state.replica.watched_playlist().map(str::to_owned);
-        let command = state.replica.watch(id);
-        if previous.as_deref() != state.replica.watched_playlist() {
-            state.status.playlist_detail = state.status.playlist_detail.wrapping_add(1);
+        let (changed, command) = state.watch(id);
+        if changed {
             self.signal();
         }
-        if state.status.link == Link::Ready {
-            Some((state.status.generation, command?))
+        if state.status.link != Link::Ready {
+            return None;
+        }
+        Some((state.status.generation, command?))
+    }
+
+    /// A single owner of the scoped pull: Search temporarily watches the quick
+    /// target, while the actual detail route owns it everywhere else.
+    pub(crate) fn quick_watch(
+        &self,
+        epoch: u64,
+        searching: bool,
+        detail: Option<String>,
+    ) -> Option<(u64, PersonalCommand)> {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch != epoch {
+            return None;
+        }
+        let mode_changed = state.quick.searching() != searching;
+        state.quick.set_searching(searching);
+        let (watch_changed, command) = if searching {
+            state.quick_watch()
+        } else {
+            state.watch(detail)
+        };
+        if searching && mode_changed && command.is_none() {
+            // Detail -> Search can inherit the exact in-progress pull.
+            let inherited = state.replica.pending_sync().cloned();
+            state.quick_read(inherited.as_ref(), false, Instant::now());
+        } else {
+            state.quick_read(command.as_ref(), false, Instant::now());
+        }
+        if mode_changed || watch_changed {
+            self.signal();
+        }
+        Some((state.status.generation, command?))
+    }
+
+    pub(crate) fn quick_targets(&self, epoch: u64) -> Vec<PlaylistSummary> {
+        let state = self.state.lock().expect("personal state");
+        if state.status.epoch != epoch || state.status.link != Link::Ready {
+            return Vec::new();
+        }
+        let mut targets: Vec<_> = state
+            .replica
+            .snapshot()
+            .into_iter()
+            .flat_map(|s| &s.playlists)
+            .filter(|p| quick_add::editable(p))
+            .cloned()
+            .collect();
+        for id in [state.replica.watched_playlist(), state.quick.selected()]
+            .into_iter()
+            .flatten()
+        {
+            if !targets.iter().any(|p| p.id == id)
+                && let Some(p) = state.quick_candidate(id)
+            {
+                targets.push(p.clone());
+            }
+        }
+        targets
+    }
+
+    pub(crate) fn quick_select(
+        &self,
+        epoch: u64,
+        id: Option<&str>,
+    ) -> Option<(u64, PersonalCommand)> {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch != epoch || state.quick.selected() == id {
+            return None;
+        }
+        let target = match id {
+            Some(id) => Some(state.quick_candidate(id)?.clone()),
+            None => None,
+        };
+        state.quick.select(target);
+        let command = if state.quick.searching() {
+            state.quick_watch().1
         } else {
             None
+        };
+        state.quick_read(command.as_ref(), false, Instant::now());
+        self.signal();
+        Some((state.status.generation, command?))
+    }
+
+    pub(crate) fn quick_filter(&self, epoch: u64, hide: bool) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch == epoch {
+            state.quick.filter(hide);
+            self.signal();
         }
     }
+
+    pub(crate) fn quick_view<R>(
+        &self,
+        epoch: u64,
+        read: impl FnOnce(quick_add::View<'_>) -> R,
+    ) -> R {
+        let state = self.state.lock().expect("personal state");
+        read(
+            state
+                .quick
+                .view(state.status.epoch == epoch, &state.replica, state.status),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quick_stage(
+        &self,
+        epoch: u64,
+        mode_stamp: u64,
+        expected_target: &str,
+        track_id: &str,
+    ) -> Option<Ticket> {
+        let scope = self.quick_view(epoch, |view| view.scope(mode_stamp));
+        self.quick_stage_scoped(epoch, mode_stamp, &scope, expected_target, track_id)
+    }
+
+    pub(crate) fn quick_stage_scoped(
+        &self,
+        epoch: u64,
+        mode_stamp: u64,
+        expected_scope: &str,
+        expected_target: &str,
+        track_id: &str,
+    ) -> Option<Ticket> {
+        let mut state = self.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        if status.epoch != epoch
+            || quick.view(true, replica, *status).scope(mode_stamp) != expected_scope
+        {
+            return None;
+        }
+        let ticket = quick.stage(
+            *status,
+            replica,
+            mode_stamp,
+            expected_target,
+            track_id,
+            Instant::now(),
+        );
+        self.signal();
+        ticket
+    }
+
+    pub(crate) fn quick_cancel(&self, ticket: &Ticket) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.quick.cancel(ticket) {
+            self.signal();
+        }
+    }
+
+    pub(crate) fn quick_tick(&self, epoch: u64) {
+        let mut state = self.state.lock().expect("personal state");
+        if state.status.epoch == epoch {
+            state.quick_tick(Instant::now());
+            self.signal();
+        }
+    }
+
+    pub(crate) fn inspect_playlist_sync<R>(
+        &self,
+        epoch: u64,
+        generation: u64,
+        command: &PersonalCommand,
+        check: impl FnOnce(bool) -> R,
+    ) -> Option<R> {
+        let state = self.state.lock().expect("personal state");
+        state
+            .accepts_playlist_sync(epoch, generation, command)
+            .then(|| check(state.quick.searching()))
+    }
+
+    pub(crate) fn start_playlist_sync(
+        &self,
+        epoch: u64,
+        generation: u64,
+        command: &PersonalCommand,
+        start: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut state = self.state.lock().expect("personal state");
+        if !state.accepts_playlist_sync(epoch, generation, command) || !start() {
+            return false;
+        }
+        state.quick.started_read(generation, command);
+        true
+    }
+
+    // Socket writer calls this immediately before committing the local send.
+    // No async wait inside this guard; a successful start is still uncertain.
+    pub(crate) fn start_quick_add(&self, ticket: &Ticket, start: impl FnOnce() -> bool) -> bool {
+        let mut state = self.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        let started = quick.start(*status, replica, ticket, Instant::now(), start);
+        self.signal();
+        started
+    }
+
     pub(crate) fn refresh_playlist(&self, epoch: u64) -> Option<(u64, PersonalCommand)> {
         let mut state = self.state.lock().expect("personal state");
         if state.status.epoch != epoch || state.status.link != Link::Ready {
@@ -376,7 +646,7 @@ impl PersonalHub {
             .observation_writer
             .as_ref()
             .and_then(Writer::online_mode);
-        state.replica.disconnected();
+        state.interrupt();
         self.0.signal();
     }
     pub fn disconnect(&self, epoch: u64, generation: u64) {
@@ -393,7 +663,7 @@ impl PersonalHub {
         {
             state.status.link = link;
             state.status.interruption = state.status.interruption.wrapping_add(1);
-            state.replica.disconnected();
+            state.interrupt();
             state.observations.clear();
             self.0.signal();
         }
@@ -409,6 +679,17 @@ impl PersonalHub {
             return Ok(None);
         }
         let snapshot = matches!(&update, PersonalUpdate::Snapshot(_));
+        let part = matches!(&update, PersonalUpdate::Part(_));
+        let now = Instant::now();
+        if snapshot && state.status.link != Link::Ready && state.quick.searching() {
+            // Reappraise a direct target only while its selection has a
+            // revalidation budget. A capped snapshot can't clear that budget.
+            if state.replica.playlist_unavailable() {
+                state.watch(None);
+            }
+            state.quick_watch();
+        }
+        state.quick_tick(now);
         if !snapshot && state.status.link != Link::Ready {
             // A repair snapshot may be queued behind older in-flight updates.
             if state.status.link == Link::Gap {
@@ -416,7 +697,7 @@ impl PersonalHub {
             }
             state.status.link = Link::Gap;
             state.status.interruption = state.status.interruption.wrapping_add(1);
-            state.replica.disconnected();
+            state.interrupt();
             self.0.signal();
             return Err(PersonalGap);
         }
@@ -457,17 +738,30 @@ impl PersonalHub {
             None
         };
         let writer = state.observation_writer.clone().zip(state.observation_mode);
-        let result = match state.replica.receive_observed(update, |event| {
+        let State { replica, quick, .. } = &mut *state;
+        let received = replica.receive_observed(update, |event| {
             if let Some((writer, mode)) = &writer {
                 writer.observe(*mode, event);
             }
-        }) {
-            Ok(command) => {
+            quick.observe(event);
+            if part && let AcceptedPlaylist::Complete(playlist) = event {
+                quick.validated_read(&playlist.summary.id);
+            }
+        });
+        let result = match received {
+            Ok(mut command) => {
+                quick.observe_scoped(replica);
                 if snapshot {
                     state.status.link = Link::Ready;
                 }
-                if matches!(command, Some(PersonalCommand::SyncPlaylist { offset, .. }) if offset > 0)
+                if state.quick.searching()
+                    && state.quick.watched() != state.replica.watched_playlist()
                 {
+                    command = state.quick_watch().1;
+                }
+                let progressed = matches!(command, Some(PersonalCommand::SyncPlaylist { offset, .. }) if offset > 0);
+                state.quick_read(command.as_ref(), progressed, now);
+                if progressed {
                     state.status.playlist_progress = state.status.playlist_progress.wrapping_add(1);
                 }
                 let watched_changed = state.replica.watched_playlist().is_some_and(|id| {
@@ -499,7 +793,7 @@ impl PersonalHub {
             Err(_) => {
                 state.status.link = Link::Gap;
                 state.status.interruption = state.status.interruption.wrapping_add(1);
-                state.replica.disconnected();
+                state.interrupt();
                 state.observations.clear();
                 Err(PersonalGap)
             }
@@ -514,6 +808,39 @@ impl PersonalHub {
             self.0.signal();
         }
     }
+    // An obsolete read is not a mutation refusal. Atomically check the
+    // current scoped request at queue admission, and use the quick read's
+    // own deadline for a local refusal instead of poisoning normal writes.
+    pub(crate) fn send_playlist_sync(
+        &self,
+        epoch: u64,
+        generation: u64,
+        command: &PersonalCommand,
+        send: impl FnOnce() -> bool,
+    ) {
+        let mut state = self.0.state.lock().expect("personal state");
+        if !state.accepts_playlist_sync(epoch, generation, command) {
+            return;
+        }
+        if !send() && !state.quick.searching() {
+            state.status.refused = state.status.refused.wrapping_add(1);
+            self.0.signal();
+        }
+    }
+
+    pub(crate) fn admit_quick_add(&self, ticket: &Ticket, send: impl FnOnce() -> bool) -> bool {
+        let mut state = self.0.state.lock().expect("personal state");
+        let State {
+            quick,
+            replica,
+            status,
+            ..
+        } = &mut *state;
+        let admitted = quick.admit(*status, replica, ticket, Instant::now(), send);
+        self.0.signal();
+        admitted
+    }
+
     // Validate the exact observed detail and occurrence pair all the way to
     // transport admission. The live wire has no expected revision field.
     pub(crate) fn admit_move(
@@ -569,6 +896,10 @@ impl PersonalHub {
             }
     }
 }
+
+#[cfg(test)]
+#[path = "personal_quick_add_tests.rs"]
+mod quick_add_tests;
 
 #[cfg(test)]
 mod tests {

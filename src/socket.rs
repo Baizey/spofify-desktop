@@ -10,8 +10,9 @@ pub(crate) use wire::{
 
 use std::{
     collections::VecDeque,
-    future::{Future, pending},
+    future::{Future, pending, poll_fn},
     io::{self, Write},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -19,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -35,7 +36,13 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::api::{Api, Session};
+use crate::{
+    api::{Api, Session},
+    personal::PersonalCommand,
+    personal_bridge::PersonalAccess,
+    playlist_pin_store::PUBLICATION_GATE,
+    quick_add::Ticket,
+};
 use wire::{Incoming, Outgoing};
 
 pub(crate) const SUBPROTOCOL: &str = "spofify.account-state.v1";
@@ -155,7 +162,7 @@ pub(crate) struct Socket {
     pub(crate) events: mpsc::Receiver<Event>,
     outbound: mpsc::Sender<WriteFrame>,
     resume_sequence: AtomicU64,
-    order_gate: Arc<Mutex<()>>,
+    order_gate: Arc<Mutex<u64>>,
     actual: watch::Sender<ActualSample>,
     session: Session,
     task: tokio::task::JoinHandle<()>,
@@ -175,7 +182,7 @@ pub(crate) fn spawn(
     let (authority_out, authority) = watch::channel(None);
     let (actual, _) = watch::channel(None);
     let direct_start: Arc<DirectStartFence> = Arc::default();
-    let order_gate = Arc::new(Mutex::new(()));
+    let order_gate = Arc::new(Mutex::new(0));
     let signals = Signals {
         order_gate: order_gate.clone(),
         link: link_out,
@@ -272,6 +279,29 @@ impl Socket {
         )
     }
 
+    pub(crate) fn personal_playlist_sync(
+        &self,
+        epoch: u64,
+        generation: Generation,
+        command: &PersonalCommand,
+        personal: PersonalAccess,
+        current_epoch: Arc<AtomicU64>,
+    ) -> Result<(), SocketError> {
+        self.submit_fenced(
+            generation,
+            Class::Choice,
+            &Outgoing::Personal { command },
+            None,
+            None,
+            Some(ScopedWrite::Playlist(PlaylistRead {
+                epoch,
+                personal,
+                current_epoch,
+                command: command.clone(),
+            })),
+        )
+    }
+
     pub(crate) fn personal_order(
         &self,
         generation: Generation,
@@ -279,6 +309,34 @@ impl Socket {
         command: &(impl Serialize + ?Sized),
     ) -> Result<(), SocketError> {
         self.submit_order(generation, mode_stamp, &Outgoing::Personal { command })
+    }
+
+    pub(crate) fn personal_quick_add(
+        &self,
+        personal: PersonalAccess,
+        ticket: Ticket,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<(), SocketError> {
+        let gate = self.order_gate.lock().expect("socket order admission gate");
+        if !self.events.is_empty() || epoch.load(Ordering::SeqCst) != ticket.epoch {
+            return Err(SocketError::Busy);
+        }
+        let command = ticket.command();
+        let (generation, mode_stamp) = (ticket.generation, ticket.mode_stamp);
+        self.submit_fenced(
+            generation,
+            Class::Choice,
+            &Outgoing::Personal { command: &command },
+            None,
+            Some(mode_stamp),
+            Some(ScopedWrite::Quick(QuickWrite {
+                personal,
+                ticket,
+                epoch,
+                wire_stamp: *gate,
+                session: self.session.clone(),
+            })),
+        )
     }
 
     /// The server responds with a fresh player snapshot and personal initial
@@ -313,7 +371,7 @@ impl Socket {
         frame: &(impl Serialize + ?Sized),
         resume: Option<u64>,
     ) -> Result<(), SocketError> {
-        self.submit_fenced(generation, class, frame, resume, None)
+        self.submit_fenced(generation, class, frame, resume, None, None)
     }
 
     fn submit_order(
@@ -328,7 +386,14 @@ impl Socket {
         if !self.events.is_empty() {
             return Err(SocketError::Busy);
         }
-        self.submit_fenced(generation, Class::Choice, frame, None, Some(mode_stamp))
+        self.submit_fenced(
+            generation,
+            Class::Choice,
+            frame,
+            None,
+            Some(mode_stamp),
+            None,
+        )
     }
 
     fn submit_fenced(
@@ -338,6 +403,7 @@ impl Socket {
         frame: &(impl Serialize + ?Sized),
         resume: Option<u64>,
         expected_mode: Option<u64>,
+        scoped: Option<ScopedWrite>,
     ) -> Result<(), SocketError> {
         let raw = encode(frame)?;
         // Hold the lock through bounded admission. The socket's writer also
@@ -362,6 +428,7 @@ impl Socket {
             resume,
             at: Instant::now(),
             raw,
+            scoped: scoped.map(Box::new),
         });
         Ok(())
     }
@@ -434,6 +501,35 @@ struct WriteFrame {
     resume: Option<u64>,
     at: Instant,
     raw: String,
+    // The common playback/write queue stays small; only the two paths with
+    // final personal-state admission allocate local metadata.
+    scoped: Option<Box<ScopedWrite>>,
+}
+
+enum ScopedWrite {
+    Quick(QuickWrite),
+    Playlist(PlaylistRead),
+}
+
+struct PlaylistRead {
+    epoch: u64,
+    personal: PersonalAccess,
+    current_epoch: Arc<AtomicU64>,
+    command: PersonalCommand,
+}
+
+impl PlaylistRead {
+    fn account_current(&self) -> bool {
+        self.current_epoch.load(Ordering::SeqCst) == self.epoch
+    }
+}
+
+struct QuickWrite {
+    personal: PersonalAccess,
+    ticket: Ticket,
+    epoch: Arc<AtomicU64>,
+    wire_stamp: u64,
+    session: Session,
 }
 
 struct Bounded(Vec<u8>);
@@ -469,7 +565,7 @@ enum End {
 }
 
 struct Signals {
-    order_gate: Arc<Mutex<()>>,
+    order_gate: Arc<Mutex<u64>>,
     link: watch::Sender<Link>,
     authority: watch::Sender<Option<OutputAuthority>>,
     direct_start: Arc<DirectStartFence>,
@@ -478,13 +574,16 @@ struct Signals {
 
 impl Signals {
     fn event(&self, generation: Generation, kind: EventKind, first: bool) -> Result<(), End> {
-        let _gate = self.order_gate.lock().expect("socket order admission gate");
+        let mut gate = self.order_gate.lock().expect("socket order admission gate");
         let permit = self.events.try_reserve().map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => End::Backpressure,
             mpsc::error::TrySendError::Closed(_) => End::Closed,
         })?;
         if first {
             self.link.send_replace(Link::Connected(generation));
+        }
+        if matches!(kind, EventKind::Personal(_)) {
+            *gate = gate.wrapping_add(1);
         }
         permit.send(Event { generation, kind });
         Ok(())
@@ -688,6 +787,132 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|_| End::Transport)?
         .map_err(|_| End::Transport)
+}
+
+async fn wait_write_ready<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+) -> Result<(), End> {
+    time::timeout(
+        WRITE_TIMEOUT,
+        poll_fn(|cx| Pin::new(&mut *ws).poll_ready(cx)),
+    )
+    .await
+    .map_err(|_| End::Transport)?
+    .map_err(|_| End::Transport)
+}
+
+async fn flush_scoped<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+) -> Result<(), End> {
+    time::timeout(WRITE_TIMEOUT, ws.flush())
+        .await
+        .map_err(|_| End::Transport)?
+        .map_err(|_| End::Transport)
+}
+
+async fn send_playlist_read<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    raw: String,
+    read: PlaylistRead,
+    generation: Generation,
+    queued: Instant,
+) -> Result<(), End> {
+    // In particular, an obsolete read must not trip the generic queue-age
+    // connection failure before we notice that its exact local scope retired.
+    let allowed =
+        read.personal
+            .inspect_playlist_sync(read.epoch, generation, &read.command, |quick| {
+                if !read.account_current() {
+                    Ok(false)
+                } else if queued.elapsed() <= MAX_QUEUE_AGE {
+                    Ok(true)
+                } else if quick {
+                    Ok(false) // Leave a current quick read to its own bounded timeout.
+                } else {
+                    Err(End::Backpressure)
+                }
+            });
+    if !allowed.unwrap_or(Ok(false))? {
+        return Ok(());
+    }
+    if let Err(error) = wait_write_ready(ws).await {
+        return if read
+            .personal
+            .inspect_playlist_sync(read.epoch, generation, &read.command, |_| {
+                read.account_current()
+            })
+            == Some(true)
+        {
+            Err(error)
+        } else {
+            Ok(()) // Scope retired while waiting for write readiness.
+        };
+    }
+    let mut result = Ok(());
+    let started = {
+        let _publication = PUBLICATION_GATE.lock().expect("account publication gate");
+        read.personal
+            .start_playlist_sync(read.epoch, generation, &read.command, || {
+                if !read.account_current() {
+                    return false;
+                }
+                result = Pin::new(&mut *ws).start_send(Message::Text(raw.into()));
+                true
+            })
+    };
+    if started {
+        result.map_err(|_| End::Transport)?;
+        flush_scoped(ws).await?;
+    }
+    Ok(())
+}
+
+async fn send_quick<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    raw: String,
+    quick: QuickWrite,
+    signals: &Signals,
+) -> Result<(), End> {
+    wait_write_ready(ws).await?;
+    // Reader and writer share this actor. If a newer personal frame was
+    // published after buffering the command, don't assume the engine has
+    // reduced it yet; refuse this exact ticket rather than enqueue it again.
+    if *signals
+        .order_gate
+        .lock()
+        .expect("socket order admission gate")
+        != quick.wire_stamp
+    {
+        quick.personal.quick_cancel(&quick.ticket);
+        return Ok(());
+    }
+    let mut result = Ok(());
+    let started = {
+        // Account epoch changes, explicit mode changes and credential
+        // revocation share this gate. Match the existing publication →
+        // mode → lifetime order. No PersonalHub path acquires publication
+        // while holding its state; queue admission never takes this gate.
+        let _publication = PUBLICATION_GATE.lock().expect("account publication gate");
+        quick.personal.start_quick_add(&quick.ticket, || {
+            let mode = quick.session.network_changes();
+            let mode = mode.borrow();
+            if quick.epoch.load(Ordering::SeqCst) != quick.ticket.epoch
+                || *mode != quick.ticket.mode_stamp
+                || quick.session.is_expired()
+            {
+                return false;
+            }
+            // Linearize local dispatch with selection and publication. No
+            // guard crosses the asynchronous network flush below.
+            result = Pin::new(&mut *ws).start_send(Message::Text(raw.into()));
+            true // A transport error at/after start_send is not proof of no write.
+        })
+    };
+    if started {
+        result.map_err(|_| End::Transport)?;
+        flush_scoped(ws).await?;
+    }
+    Ok(())
 }
 
 async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
@@ -933,6 +1158,21 @@ impl Connection {
                     Drive::Write(Some(frame)) => {
                         if frame.generation != self.generation { continue; }
                         let now = Instant::now();
+                        if let Some(scoped) = frame.scoped {
+                            match *scoped {
+                                ScopedWrite::Quick(quick) => {
+                                    if now.duration_since(frame.at) > MAX_QUEUE_AGE {
+                                        quick.personal.quick_cancel(&quick.ticket);
+                                    } else {
+                                        send_quick(ws, frame.raw, quick, signals).await?;
+                                    }
+                                }
+                                ScopedWrite::Playlist(read) => {
+                                    send_playlist_read(ws, frame.raw, read, self.generation, frame.at).await?;
+                                }
+                            }
+                            continue;
+                        }
                         if frame.class == Class::Fact && !output.lease.as_ref().is_some_and(|l| l.generation == self.generation && l.detached.is_none() && now < l.deadline) { continue; }
                         if now.duration_since(frame.at) > MAX_QUEUE_AGE { return Err(End::Backpressure); }
                         if frame.class == Class::Release { self.release(output, signals); }

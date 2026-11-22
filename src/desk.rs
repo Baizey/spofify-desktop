@@ -2,18 +2,19 @@
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
     AppWindow, ArtistCredit, BrowseRow, PlaylistActions, PlaylistOfflineState,
-    PlaylistSourceRestore, ReorderRow, actions,
-    api::{Api, ApiError, Session},
+    PlaylistSourceRestore, ReorderRow, SearchAddChoice, SearchAddSelection, actions,
+    api::{Api, ApiError, Session, library::PlaylistKind},
     engine::Command,
     pages::{self, Page, Route, RowKey},
+    personal::PersonalCommand,
     personal_bridge::{Effect, Link, Mutation, PersonalAccess, Status},
-    player, playlist_browser, playlist_pins,
+    player, playlist_browser, playlist_pins, quick_add,
     replica::{Replica, Trail},
     saved,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{BuildHasher, RandomState},
     sync::{
         Arc,
@@ -63,6 +64,20 @@ enum Intent {
     Search(String),
     Row(String, usize),
     Page(String, String),
+    ChooseQuickTarget {
+        scope: String,
+        id: String,
+    },
+    ToggleQuickFilter {
+        scope: String,
+        id: String,
+    },
+    QuickAdd {
+        scope: String,
+        target: String,
+        track: String,
+        index: usize,
+    },
     PlaylistOrderDrop {
         scope: String,
         grabbed: String,
@@ -239,6 +254,116 @@ struct CatalogContinuation {
     status: String,
 }
 
+#[derive(Default)]
+struct QuickProjection {
+    selection: SearchAddSelection,
+    choices: Vec<SearchAddChoice>,
+    scope: slint::SharedString,
+    status: slint::SharedString,
+    blocked: slint::SharedString,
+    hide: bool,
+    states: Vec<slint::SharedString>,
+    visible: Vec<i32>,
+}
+
+fn focus_search(ui: &AppWindow) {
+    ui.set_search_add_open_serial(ui.get_search_add_open_serial().wrapping_add(1));
+}
+
+impl QuickProjection {
+    fn publish(self, ui: &AppWindow, preserve_position: bool) {
+        let previous = ui.get_search_add_visible_indices();
+        let was_filtered = ui.get_search_add_hide();
+        let indices_changed = !previous.iter().eq(self.visible.iter().copied());
+        let filtered_changed = was_filtered != self.hide;
+        let position = (preserve_position
+            && (indices_changed || filtered_changed)
+            && (was_filtered || self.hide))
+            .then(|| {
+                let focused = ui.get_search_focus_owner();
+                let before = if was_filtered {
+                    previous.iter().position(|i| i == focused)
+                } else {
+                    usize::try_from(focused).ok()
+                };
+                let after = if self.hide {
+                    self.visible.binary_search(&focused).ok()
+                } else {
+                    usize::try_from(focused).ok()
+                };
+                if before != after && before.is_some() {
+                    focus_search(ui);
+                    ui.set_catalog_focused_row(-1);
+                    ui.set_search_focus_owner(-1);
+                }
+                let y = ui.get_catalog_scroll_y();
+                let old_anchor = ui.get_catalog_anchor_row();
+                let offset = ui.get_catalog_anchor_y() + y;
+                let anchor = if y >= 0.0 || old_anchor < 0 || offset > 0.0 {
+                    -1
+                } else if !self.hide {
+                    old_anchor
+                } else {
+                    match self.visible.binary_search(&old_anchor) {
+                        Ok(i) => self.visible[i],
+                        Err(i) => self
+                            .visible
+                            .get(i)
+                            .or_else(|| self.visible.last())
+                            .copied()
+                            .unwrap_or(-1),
+                    }
+                };
+                (y, anchor, offset)
+            });
+        if indices_changed {
+            ui.set_search_add_visible_indices(ModelRc::new(VecModel::from(self.visible)));
+        }
+        if filtered_changed {
+            ui.set_search_add_hide(self.hide);
+        }
+        if ui.get_search_add_scope() != self.scope {
+            ui.set_search_add_scope(self.scope);
+        }
+        if ui.get_search_add_selection() != self.selection {
+            ui.set_search_add_selection(self.selection);
+        }
+        if !ui
+            .get_search_add_choices()
+            .iter()
+            .eq(self.choices.iter().cloned())
+        {
+            ui.set_search_add_choices(ModelRc::new(VecModel::from(self.choices)));
+        }
+        let states = ui.get_search_add_row_states();
+        if !states.iter().eq(self.states.iter().cloned()) {
+            if let Some(model) = states
+                .as_any()
+                .downcast_ref::<VecModel<slint::SharedString>>()
+                && model.row_count() == self.states.len()
+            {
+                for (index, state) in self.states.into_iter().enumerate() {
+                    if model.row_data(index).as_ref() != Some(&state) {
+                        model.set_row_data(index, state);
+                    }
+                }
+            } else {
+                ui.set_search_add_row_states(ModelRc::new(VecModel::from(self.states)));
+            }
+        }
+        ui.set_search_add_status(self.status);
+        ui.set_search_add_blocked(self.blocked);
+        if let Some((y, anchor, offset)) = position.filter(|(y, _, _)| *y < 0.0) {
+            ui.set_catalog_return_key(ui.get_page_key());
+            ui.set_catalog_return_y(y);
+            ui.set_catalog_return_anchor(anchor);
+            ui.set_catalog_return_offset(offset);
+            ui.set_catalog_return_row(-1);
+            ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
+        }
+    }
+}
+
 struct CatalogVisit {
     page: Option<Arc<Page>>,
     position: CatalogPosition,
@@ -329,6 +454,46 @@ impl Desk {
         ui.on_search_edited(move || {
             if let Some(ui) = w.upgrade() {
                 d.submit(&ui, Intent::Search(ui.get_query().to_string()));
+            }
+        });
+        let (d, w) = (self.clone(), ui.as_weak());
+        ui.on_choose_search_add_destination(move |id| {
+            if let Some(ui) = w.upgrade() {
+                d.submit(
+                    &ui,
+                    Intent::ChooseQuickTarget {
+                        scope: ui.get_search_add_scope().into(),
+                        id: id.into(),
+                    },
+                );
+            }
+        });
+        let (d, w) = (self.clone(), ui.as_weak());
+        ui.on_toggle_search_add_hide(move |id| {
+            if let Some(ui) = w.upgrade() {
+                d.submit(
+                    &ui,
+                    Intent::ToggleQuickFilter {
+                        scope: ui.get_search_add_scope().into(),
+                        id: id.into(),
+                    },
+                );
+            }
+        });
+        let (d, w) = (self.clone(), ui.as_weak());
+        ui.on_quick_add_search_track(move |target, track, index| {
+            if let Some(ui) = w.upgrade()
+                && let Ok(index) = usize::try_from(index)
+            {
+                d.submit(
+                    &ui,
+                    Intent::QuickAdd {
+                        scope: ui.get_search_add_scope().into(),
+                        target: target.into(),
+                        track: track.into(),
+                        index,
+                    },
+                );
             }
         });
         let (d, w) = (self.clone(), ui.as_weak());
@@ -463,6 +628,9 @@ struct Browser {
     catalog_restore: Option<CatalogPosition>,
     title_visits: HashMap<u64, TitleOrigin>,
     title_restore: Option<TitleOrigin>,
+    add_songs_visits: HashSet<u64>,
+    add_songs_restore: bool,
+    add_songs_open: bool,
     continuation: CatalogContinuation,
     generation: u64,
     serial: u64,
@@ -517,6 +685,7 @@ fn label(route: &Route) -> &'static str {
 enum Navigation {
     Section(Route),
     Follow(Route),
+    AddSongs,
     Untracked(Route), // Refresh or land after a mutation without adding a Back entry.
     Back,
 }
@@ -566,6 +735,11 @@ impl Navigation {
                 }
                 Some(next)
             }
+            Self::AddSongs => {
+                let next = Route::Search(String::new());
+                trail.visit_from_title(current, &next);
+                Some(next)
+            }
             Self::Untracked(next) => Some(next),
             Self::Back => trail.pop(),
         }
@@ -612,6 +786,18 @@ fn track_album(row: &pages::Row) -> (&str, &str) {
 fn search_track_unavailable(route: &Route, row: &pages::Row) -> bool {
     // Search's catalog row uses hasAudio; local search only projects verified recordings.
     matches!(route, Route::Search(_)) && row.kind == "track" && !row.playable
+}
+
+fn quick_track(row: &pages::Row) -> bool {
+    row.kind == "track"
+        && row.playable
+        && matches!(&row.key, RowKey::Track(id) if !id.is_empty() && *id == row.id)
+}
+
+fn add_songs_eligible(route: &Route, page: &Page) -> bool {
+    matches!(route, Route::Playlist(id) if page.playlist.as_ref().is_some_and(|playlist|
+        playlist.id == *id && playlist.kind == PlaylistKind::Manual
+        && playlist.capabilities.edit_entries && playlist.capabilities.add_tracks))
 }
 
 fn playlist_occurrence_key<'a>(row: &'a pages::Row, route: &Route) -> std::borrow::Cow<'a, str> {
@@ -1079,6 +1265,119 @@ impl Browser {
         Some(PlaylistOrderPublication { scope, rows })
     }
 
+    fn quick_request(&mut self, a: &Access, request: Option<(u64, PersonalCommand)>) {
+        if let Some((generation, command)) = request
+            && !a.local()
+        {
+            // Bounded by the shared scoped-read deadline. A busy/disconnected
+            // transport never authorizes absence or automatically retries an add.
+            let _ = self.engine.try_send(Command::Personal {
+                epoch: a.epoch,
+                generation,
+                command,
+            });
+        }
+    }
+
+    fn quick_projection(&self) -> QuickProjection {
+        let Some(a) = self.access.as_ref().filter(|a| a.usable()) else {
+            return QuickProjection::default();
+        };
+        if !matches!(self.route, Route::Search(_)) {
+            return QuickProjection::default();
+        }
+        let offline = a.local();
+        let mode = *a.session.network_changes().borrow();
+        let targets = if offline {
+            Vec::new()
+        } else {
+            a.personal.quick_targets(a.epoch)
+        };
+        let mut labels = HashMap::new();
+        for target in &targets {
+            *labels.entry(&target.name).or_insert(0) += 1;
+        }
+        let choices: Vec<_> = targets
+            .iter()
+            .map(|target| SearchAddChoice {
+                id: target.id.as_str().into(),
+                name: target.name.as_str().into(),
+                detail: if labels[&target.name] > 1 {
+                    target.description.as_str().into()
+                } else {
+                    Default::default()
+                },
+            })
+            .collect();
+        a.personal.quick_view(a.epoch, |view| {
+            let selection = view
+                .target
+                .map(|target| {
+                    let index = choices
+                        .iter()
+                        .position(|choice| choice.id.as_str() == target.id);
+                    SearchAddSelection {
+                        id: target.id.as_str().into(),
+                        name: target.name.as_str().into(),
+                        detail: index.map(|i| choices[i].detail.clone()).unwrap_or_default(),
+                        option_index: index.and_then(|i| i32::try_from(i + 1).ok()).unwrap_or(0),
+                    }
+                })
+                .unwrap_or_default();
+            let hide = !offline && view.hide;
+            let mut visible = Vec::new();
+            let mut states = Vec::new();
+            if view.target.is_some() && !offline {
+                states.reserve(self.page.rows.len());
+                for (index, row) in self.page.rows.iter().enumerate() {
+                    let state = (row.kind == "track").then(|| view.row(&row.id));
+                    if hide && state.is_none_or(|s| s.visible) {
+                        visible.push(index as i32);
+                    }
+                    states.push(
+                        match state.filter(|_| quick_track(row)) {
+                            Some(s) if s.pending => "pending",
+                            Some(s) if s.membership == quick_add::Membership::Present => "member",
+                            Some(s) if s.can_add => "ready",
+                            Some(_) => "unavailable",
+                            None => "",
+                        }
+                        .into(),
+                    );
+                }
+            }
+            let status = match view.notice {
+                _ if view.read_stalled && !offline => {
+                    "Couldn’t load the playlist to check which songs are already in it."
+                }
+                Some(quick_add::Outcome::NotSent) => "The song was not sent to the playlist.",
+                Some(quick_add::Outcome::Unconfirmed) => {
+                    "Couldn’t verify that the song is in the playlist."
+                }
+                None if view.session_limit && view.target.is_some() => {
+                    "Quick add is unavailable for the rest of this session. Use ⋯ to add songs."
+                }
+                None => "",
+            };
+            QuickProjection {
+                scope: view.scope(mode).into(),
+                selection,
+                choices,
+                hide,
+                visible,
+                states,
+                status: status.into(),
+                blocked: if offline {
+                    "Offline".into()
+                } else if view.read_stalled && view.target.is_some() {
+                    "Unavailable".into()
+                } else {
+                    Default::default()
+                },
+            }
+        })
+    }
+
     fn render(&mut self, models: bool) {
         self.render_rows(models, None);
     }
@@ -1105,6 +1404,14 @@ impl Browser {
             self.generation += 1;
         }
         let order = self.refresh_playlist_order();
+        let quick = self.quick_projection();
+        let playlist_add_songs = self.personal_ready
+            && !self.writing
+            && self.access.as_ref().is_some_and(|a| !a.local())
+            && add_songs_eligible(&self.route, &self.page);
+        let add_songs_open = std::mem::take(&mut self.add_songs_open);
+        let add_songs_return = (!self.busy || self.page.playlist.is_some())
+            && std::mem::take(&mut self.add_songs_restore);
         let catalog_request_key = self.catalog_request_key();
         let catalog_status = self.continuation.status.clone();
         let catalog_loading = self.continuation.loading;
@@ -1382,6 +1689,16 @@ impl Browser {
                 }
                 ui.set_playlist_order_scope(order.scope.into());
             }
+            let same_query =
+                matches!(&route, Route::Search(query) if ui.get_query().trim() == query);
+            quick.publish(&ui, same_query && !models && catalog_restore.is_none());
+            ui.set_playlist_add_songs(playlist_add_songs);
+            if add_songs_open {
+                focus_search(&ui);
+            }
+            if add_songs_return {
+                ui.set_search_add_return_serial(ui.get_search_add_return_serial().wrapping_add(1));
+            }
             // Keep the preview until the confirmed rows and scope are published,
             // not until a separate form-completion callback clears form-busy.
             ui.set_playlist_order_pending(order_pending);
@@ -1505,6 +1822,9 @@ impl Browser {
         self.catalog_visits.clear();
         self.catalog_restore = None;
         self.title_visits.clear();
+        self.add_songs_visits.clear();
+        self.add_songs_restore = false;
+        self.add_songs_open = false;
         self.title_restore = None;
         self.continuation = CatalogContinuation::default();
         self.trail = Trail::default();
@@ -1685,6 +2005,9 @@ impl Browser {
 
     fn personal_changed(&mut self, visiting: bool) {
         if !self.route.personal() {
+            if matches!(self.route, Route::Search(_)) {
+                self.render(false);
+            }
             return;
         }
         let Some(a) = self.access.clone().filter(Access::usable) else {
@@ -1848,6 +2171,15 @@ impl Browser {
 
     fn personal_timeout(&mut self) {
         let now = tokio::time::Instant::now();
+        if let Some(a) = &self.access
+            && a.personal
+                .quick_view(a.epoch, |view| view.due.is_some_and(|due| due <= now))
+        {
+            a.personal.quick_tick(a.epoch);
+            if matches!(self.route, Route::Search(_)) {
+                self.render(false);
+            }
+        }
         if self
             .pending
             .as_ref()
@@ -1964,6 +2296,7 @@ impl Browser {
         }
         let back = matches!(navigation, Navigation::Back);
         let follow = matches!(navigation, Navigation::Follow(_));
+        let add_songs = matches!(navigation, Navigation::AddSongs);
         let previous_top = self.trail.top_id();
         let search_title = matches!((&self.route, &navigation), (Route::Search(_), Navigation::Follow(Route::Album(id)))
         if self.catalog_position.as_ref().is_some_and(|position| {
@@ -1998,6 +2331,9 @@ impl Browser {
             if let Some(origin) = title_origin {
                 self.title_visits.insert(entry, origin);
             }
+            if add_songs {
+                self.add_songs_visits.insert(entry);
+            }
             if self.route.catalog_continuity()
                 && !self.page.rows.is_empty()
                 && let Some(position) = self.catalog_position.take()
@@ -2021,9 +2357,15 @@ impl Browser {
         };
         if returning {
             self.title_restore = previous_top.and_then(|id| self.title_visits.remove(&id));
+            self.add_songs_restore =
+                previous_top.is_some_and(|id| self.add_songs_visits.remove(&id));
         } else if changed {
             self.title_restore = None;
+            self.add_songs_restore = false;
         }
+        self.add_songs_open = add_songs;
+        self.add_songs_visits
+            .retain(|id| self.trail.contains_id(*id));
         self.catalog_visits
             .retain(|id, _| self.trail.contains_id(*id));
         self.title_visits
@@ -2037,7 +2379,9 @@ impl Browser {
             visit.page.map(|page| (page, visit.continuation))
         });
         let retry_personal = !changed && self.error && matches!(next, Route::Playlist(_));
-        if back && let Route::Search(q) = &next {
+        if (back || add_songs)
+            && let Route::Search(q) = &next
+        {
             let q = q.clone();
             self.scoped_ui(move |ui| ui.set_query(q.into()));
         } else if changed
@@ -2061,8 +2405,11 @@ impl Browser {
             if retry_personal {
                 a.personal.watch_playlist(a.epoch, None);
             }
-            if let Some((generation, command)) = a.personal.watch_playlist(a.epoch, wanted)
-                && !a.offline
+            if let Some((generation, command)) = a.personal.quick_watch(
+                a.epoch,
+                matches!(next, Route::Search(_)) && !a.local(),
+                wanted,
+            ) && !a.offline
                 && !a.session.is_offline()
                 && self
                     .engine
@@ -2357,6 +2704,7 @@ impl Browser {
         if self.writing {
             return;
         }
+        let offline = a.local();
         let (op, idx, val) = match i.intent {
             Intent::Navigate(s) => {
                 if let Some(navigation) = Navigation::named(&s) {
@@ -2367,6 +2715,65 @@ impl Browser {
             Intent::Search(q) => {
                 if q.len() <= 1000 {
                     self.visit(Navigation::Follow(Route::Search(q.trim().into())));
+                }
+                return;
+            }
+            Intent::ChooseQuickTarget { scope, id }
+                if i.generation == self.generation && matches!(self.route, Route::Search(_)) =>
+            {
+                let mode = *a.session.network_changes().borrow();
+                if (id.is_empty() || !offline)
+                    && a.personal
+                        .quick_view(a.epoch, |view| view.scope(mode) == scope)
+                {
+                    let request = a
+                        .personal
+                        .quick_select(a.epoch, (!id.is_empty()).then_some(id.as_str()));
+                    self.quick_request(&a, request);
+                    self.render(false);
+                }
+                return;
+            }
+            Intent::ToggleQuickFilter { scope, id }
+                if i.generation == self.generation && matches!(self.route, Route::Search(_)) =>
+            {
+                let mode = *a.session.network_changes().borrow();
+                let hide = a.personal.quick_view(a.epoch, |view| {
+                    view.target
+                        .filter(|target| target.id == id && view.scope(mode) == scope)
+                        .map(|_| !view.hide)
+                });
+                if let Some(hide) = hide {
+                    a.personal.quick_filter(a.epoch, hide);
+                    self.render(false);
+                }
+                return;
+            }
+            Intent::QuickAdd {
+                scope,
+                target,
+                track,
+                index,
+            } if i.generation == self.generation && !offline => {
+                if matches!(self.route, Route::Search(_))
+                    && self
+                        .page
+                        .rows
+                        .get(index)
+                        .is_some_and(|row| quick_track(row) && row.id == track)
+                {
+                    let mode = *a.session.network_changes().borrow();
+                    if let Some(ticket) = a
+                        .personal
+                        .quick_stage_scoped(a.epoch, mode, &scope, &target, &track)
+                        && self
+                            .engine
+                            .try_send(Command::QuickAdd(ticket.clone()))
+                            .is_err()
+                    {
+                        a.personal.quick_cancel(&ticket);
+                    }
+                    self.render(false);
                 }
                 return;
             }
@@ -2391,7 +2798,23 @@ impl Browser {
         let route = self.route.clone();
         let page = self.page.clone();
         // Work offline closes the session gate before the access watch arrives.
-        let offline = a.offline || a.session.is_offline();
+        if op == "add-songs" {
+            if !offline
+                && self.personal_ready
+                && idx.is_none()
+                && let Route::Playlist(id) = &route
+                && add_songs_eligible(&route, &page)
+            {
+                let request = a.personal.quick_select(a.epoch, Some(id));
+                self.quick_request(&a, request);
+                if a.personal.quick_view(a.epoch, |view| {
+                    view.target.is_some_and(|target| target.id == *id)
+                }) {
+                    self.visit(Navigation::AddSongs);
+                }
+            }
+            return;
+        }
         if let Some(mode) = op.strip_prefix("edit-") {
             if !offline && self.personal_ready && PLAYLIST_EDITS.contains(&mode) {
                 match (&route, row.as_ref()) {
@@ -3393,6 +3816,33 @@ mod tests {
     }
 
     #[test]
+    fn add_songs_enters_regular_search_and_keeps_the_initiating_manual_route() {
+        let mut route = Route::Playlists;
+        let mut trail = Trail::default();
+        let detail = Route::Playlist("list".into());
+        let search = Route::Search(String::new());
+        step(&mut route, &mut trail, Navigation::Follow(detail.clone()));
+        step(&mut route, &mut trail, Navigation::AddSongs);
+        assert_eq!(route, search);
+        let shortcut = trail.top_id();
+        step(
+            &mut route,
+            &mut trail,
+            Navigation::Follow(Route::Search("night train".into())),
+        );
+        assert_eq!(trail.top_id(), shortcut);
+        let album = Route::Album("night-train".into());
+        step(&mut route, &mut trail, Navigation::Follow(album));
+        step(&mut route, &mut trail, Navigation::Back);
+        assert_eq!(route, Route::Search("night train".into()));
+        step(&mut route, &mut trail, Navigation::Back);
+        assert_eq!(route, detail);
+        step(&mut route, &mut trail, Navigation::Back);
+        assert_eq!(route, Route::Playlists);
+        assert!(!trail.can_back());
+    }
+
+    #[test]
     fn page_keys_do_not_expose_query_or_entity_identity() {
         let keys = RandomState::new();
         let private = "synthetic private query/id";
@@ -3768,12 +4218,13 @@ pub fn start(
             .expect("browser runtime");
         runtime.block_on(async move {
             let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),catalog_visits:HashMap::new(),catalog_position:None,catalog_restore:None,title_visits:HashMap::new(),title_restore:None,continuation:CatalogContinuation::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),catalog_visits:HashMap::new(),catalog_position:None,catalog_restore:None,title_visits:HashMap::new(),title_restore:None,add_songs_visits:HashSet::new(),add_songs_restore:false,add_songs_open:false,continuation:CatalogContinuation::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);
             loop {
-                let due=b.personal_due.into_iter().chain(b.pending.as_ref().map(|p| p.due)).min();
+                let quick_due = b.access.as_ref().and_then(|a| a.personal.quick_view(a.epoch, |view| view.due));
+                let due=b.personal_due.into_iter().chain(b.pending.as_ref().map(|p| p.due)).chain(quick_due).min();
                 tokio::select! { biased;
                     change=access.changed()=>{
                         if change.is_err(){break;}

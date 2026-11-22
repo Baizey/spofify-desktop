@@ -45,6 +45,206 @@ fn signals() -> (
     )
 }
 
+fn quick_playlist(id: &str) -> Value {
+    json!({"id":id, "name":"Mix", "description":"", "kind":"manual", "countState":"exact",
+        "trackCount":0, "availableCount":0, "revision":1,
+        "createdAt":"2026-08-03T00:00:00Z", "updatedAt":"2026-08-03T00:00:00Z",
+        "capabilities":{"editMetadata":true,"editEntries":true,"editDefinition":false,
+            "play":true,"copyToManual":false,"delete":true,"addTracks":true}})
+}
+
+#[tokio::test]
+async fn quick_add_writer_discards_stale_scoped_reads_before_age_and_keeps_account_socket() {
+    use crate::personal_bridge::PersonalHub;
+
+    let (signals, _, _, _events) = signals();
+    let (actual, _) = watch::channel(None);
+    let mut output = OutputState {
+        lease: None,
+        actual,
+    };
+    let mut connection = begin(NEW, "", &mut output, &signals);
+    let generation = connection.generation;
+    let epoch = Arc::new(AtomicU64::new(7));
+    let api = Api::new(crate::api::Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
+    let (socket, mut peer) = Socket::test_peer(api.test_session(), generation);
+    let hub = PersonalHub::default();
+    let personal = hub.access();
+    hub.begin(7, generation);
+    hub.receive(
+        7,
+        generation,
+        serde_json::from_value(
+            json!({"snapshot":{"playlists":[quick_playlist("a"),quick_playlist("b")],"recent":[]}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    personal.quick_watch(7, true, None);
+    let (_, retired) = personal.quick_select(7, Some("a")).unwrap();
+    let stage = |command| {
+        socket
+            .personal_playlist_sync(7, generation, command, personal.clone(), epoch.clone())
+            .is_ok()
+    };
+    for _ in 0..2 {
+        hub.send_playlist_sync(7, generation, &retired, || stage(&retired));
+    }
+    let mut aged = peer.outbound.try_recv().unwrap();
+    aged.at -= MAX_QUEUE_AGE + Duration::from_millis(1);
+    let fresh = peer.outbound.try_recv().unwrap();
+    personal.quick_select(7, Some("b"));
+    let (_, replacement) = personal.quick_select(7, Some("a")).unwrap();
+    assert!(
+        socket
+            .personal(generation, &PersonalCommand::ClearHistory)
+            .is_ok()
+    );
+    hub.send_playlist_sync(7, generation, &replacement, || stage(&replacement));
+    let normal = peer.outbound.try_recv().unwrap();
+    let latest = peer.outbound.try_recv().unwrap();
+    assert_eq!(
+        fresh.raw, latest.raw,
+        "local identity must not change the wire"
+    );
+    let (queue, mut input) = mpsc::channel(OUTBOUND_CAPACITY);
+    for frame in [aged, fresh, normal, latest] {
+        queue.try_send(frame).ok().unwrap();
+    }
+
+    let (client, server) = tokio::io::duplex(4096);
+    let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+    let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+    let script = async move {
+        assert_eq!(read_json(&mut server).await["type"], "presence");
+        assert_eq!(
+            read_json(&mut server).await,
+            json!({"type":"personal","command":{"type":"clearHistory"}})
+        );
+        assert_eq!(
+            read_json(&mut server).await,
+            json!({"type":"personal","command":{"type":"syncPlaylist","playlistId":"a"}})
+        );
+    };
+    let (ended, ()) = time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            connection.drive(&mut ws, DEVICE, &mut input, &mut output, &signals),
+            script
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended, Err(End::Transport)); // Fixture peer closed after both actual frames.
+}
+
+#[tokio::test]
+async fn quick_add_writer_fences_buffered_ticket_before_start_send() {
+    use crate::{personal_bridge::PersonalHub, quick_add::Outcome};
+
+    for blocked_by in ["selection", "account", "mode", "expiry", "wire", ""] {
+        let (signals, link, authority, events) = signals();
+        let (outbound, mut written) = mpsc::channel(2);
+        let (actual, _) = watch::channel(None);
+        let api = Api::new(crate::api::Origin::parse("http://127.0.0.1:1").unwrap()).unwrap();
+        let session = api.test_session();
+        let socket = Socket {
+            link,
+            authority,
+            direct_start: signals.direct_start.clone(),
+            events,
+            outbound,
+            actual,
+            resume_sequence: AtomicU64::new(0),
+            order_gate: signals.order_gate.clone(),
+            session: session.clone(),
+            task: tokio::spawn(pending()),
+        };
+        signals.link.send_replace(Link::Connected(13));
+        let epoch = Arc::new(AtomicU64::new(7));
+        let hub = PersonalHub::default();
+        let a = hub.access();
+        let list = quick_playlist("target");
+        hub.begin(7, 13);
+        hub.receive(
+            7,
+            13,
+            serde_json::from_value(json!({"snapshot":{"playlists":[list.clone()],"recent":[]}}))
+                .unwrap(),
+        )
+        .unwrap();
+        a.quick_watch(7, true, None);
+        a.quick_select(7, Some("target"));
+        hub.receive(
+            7,
+            13,
+            serde_json::from_value(
+                json!({"part":{"summary":list,"token":"t","offset":0,"rows":[],"more":false}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mode_stamp = *session.network_changes().borrow();
+        let ticket = a.quick_stage(7, mode_stamp, "target", "song").unwrap();
+        assert!(hub.admit_quick_add(&ticket, || {
+            socket
+                .personal_quick_add(a.clone(), ticket.clone(), epoch.clone())
+                .is_ok()
+        }));
+        let frame = written.try_recv().unwrap();
+        match blocked_by {
+            "selection" => {
+                a.quick_select(7, None);
+            }
+            "account" => {
+                let _publication = PUBLICATION_GATE.lock().unwrap();
+                epoch.store(8, Ordering::SeqCst);
+            }
+            "mode" => {
+                session.set_offline(true);
+            }
+            "expiry" => {
+                session.retire_local_grant();
+            }
+            "wire" => {
+                signals
+                    .event(13, EventKind::Personal(json!({"change":{}})), false)
+                    .unwrap();
+            }
+            "" => {}
+            _ => unreachable!(),
+        }
+        let (client, server) = tokio::io::duplex(4096);
+        let mut ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let ScopedWrite::Quick(quick) = *frame.scoped.unwrap() else {
+            panic!("quick write retains its guard")
+        };
+        send_quick(&mut ws, frame.raw, quick, &signals)
+            .await
+            .unwrap();
+        drop(ws);
+        if blocked_by.is_empty() {
+            assert_eq!(
+                read_json(&mut server).await,
+                json!({"type":"personal","command":{"type":"addEntry","playlistId":"target","trackId":"song"}})
+            );
+            hub.disconnect(7, 13);
+            a.quick_view(7, |v| assert_eq!(v.notice, Some(Outcome::Unconfirmed)));
+        } else {
+            assert!(
+                !matches!(server.next().await, Some(Ok(Message::Text(_)))),
+                "stale ticket sent: {blocked_by}"
+            );
+            a.quick_view(7, |v| {
+                assert_eq!(
+                    v.notice,
+                    (blocked_by != "selection").then_some(Outcome::NotSent)
+                );
+            });
+        }
+    }
+}
+
 #[tokio::test]
 async fn order_admission_rejects_published_updates_and_retired_mode() {
     let (signals, link, authority, events) = signals();
@@ -464,6 +664,7 @@ async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices()
             resume: None,
             at: Instant::now(),
             raw: encode(&Command::Next).unwrap(),
+            scoped: None,
         })
         .ok()
         .unwrap();
@@ -512,6 +713,7 @@ async fn framed_reconnect_imports_latest_samples_but_never_replays_old_choices()
                 resume: None,
                 at: Instant::now(),
                 raw: encode(&Command::Pause).unwrap(),
+                scoped: None,
             })
             .ok()
             .unwrap();

@@ -1,0 +1,335 @@
+import { ScrollView } from "std-widgets.slint";
+import { Action, Caption, Divider, Theme } from "theme.slint";
+import { Glyph } from "icon.slint";
+
+export struct SearchAddChoice { id: string, name: string, detail: string }
+
+global DestinationGuides {
+    // The title is in the shell; the rows and tools are inside its 1px border.
+    out property <length> text-inset: 32px;
+    out property <length> icon-center: 18px;
+    out property <length> tool-inset: 6px;
+}
+
+component DestinationCheck inherits Path {
+    width: 12px; height: 12px;
+    viewbox-width: 12; viewbox-height: 12;
+    commands: "M1,6 L4.5,9.5 L11,3";
+    stroke: Theme.primary; stroke-width: 2px;
+    accessible-role: none;
+}
+
+component DestinationRow inherits Action {
+    in property <string> row-label;
+    in property <string> detail;
+    in property <bool> separated;
+    in property <bool> highlighted;
+    in property <bool> keyboard-mode;
+    in property <length> focus-gutter: 5px;
+    callback reveal(length, length);
+    out property <length> row-height: max(42px, label.height + (root.detail == "" ? 0px : byline.height + 2px) + 18px);
+    changed highlighted => { if self.highlighted { self.reveal(self.y, self.height); } }
+    in property <length> shell-height;
+    in property <length> shell-row-top;
+
+    min-width: 0px;
+    quiet: true;
+    keyboard-focusable: false;
+    border-radius: 0px;
+    background: transparent;
+    accessible-role: list-item;
+    accessible-label: root.row-label + (root.detail == "" ? "" : ", " + root.detail);
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+
+    // Slice a rounded shell-sized fill: selected/hovered rows share flat edges
+    // inside the panel, while the first and last corners stay rounded.
+    if root.selected || root.has-hover: Rectangle {
+        width: parent.width; height: parent.height; clip: true;
+        Rectangle {
+            x: 0px; y: -root.shell-row-top; width: parent.width; height: root.shell-height;
+            border-radius: Theme.container-radius - 1px;
+            background: root.selected ? Theme.primary.with-alpha(root.has-hover ? 0.19 : 0.12) : Theme.raised;
+        }
+    }
+    label := Caption {
+        x: DestinationGuides.text-inset; width: parent.width - self.x - 26px;
+        y: (parent.height - self.height - (root.detail == "" ? 0px : byline.height + 2px)) / 2;
+        height: min(self.preferred-height, 51px * Theme.density);
+        text: root.row-label; color: root.selected ? Theme.primary : Theme.text;
+        font-size: 13px * Theme.density; font-weight: 600; wrap: word-wrap;
+        accessible-role: none;
+    }
+    byline := Caption {
+        x: label.x; y: label.y + label.height + 2px; width: label.width; height: self.preferred-height;
+        text: root.detail; visible: self.text != ""; accessible-role: none;
+    }
+    if root.selected: DestinationCheck {
+        x: DestinationGuides.icon-center - self.width / 2; y: (parent.height - self.height) / 2;
+    }
+    if root.separated: Divider { y: parent.height - 1px; }
+    if root.highlighted && root.keyboard-mode: Rectangle {
+        x: 5px; y: 4px; width: parent.width - self.x - root.focus-gutter; height: parent.height - 8px;
+        border-radius: 0px; border-width: 2px; border-color: Theme.tertiary;
+        accessible-role: none;
+    }
+}
+
+// The destination actions are controls in the popup header, not list entries.
+component DestinationTool inherits Action {
+    in property <string> title;
+    in property <bool> filter;
+    in property <bool> keyboard-highlight;
+    out property <length> natural-width: tool-label.x + tool-label.preferred-width + 12px;
+    property <color> ink: !root.enabled ? Theme.muted : root.selected ? Theme.primary : root.filter ? Theme.text : Theme.muted;
+
+    height: 32px;
+    quiet: true;
+    keyboard-focusable: false;
+    accessible-label: root.title;
+    accessible-checkable: root.filter;
+    accessible-checked: root.selected;
+    border-radius: 6px;
+    border-width: root.keyboard-highlight ? 2px : root.filter ? 1px : 0px;
+    border-color: root.keyboard-highlight ? Theme.tertiary
+        : root.selected && root.enabled ? Theme.primary.with-alpha(0.42) : Theme.line;
+    background: root.selected ? (root.enabled ? Theme.primary.with-alpha(0.16) : Theme.raised)
+        : root.has-hover ? Theme.raised : root.filter ? Theme.rail : transparent;
+
+    if root.filter: Path {
+        x: DestinationGuides.icon-center - DestinationGuides.tool-inset - self.width / 2;
+        y: (parent.height - self.height) / 2;
+        width: 14px; height: 14px; viewbox-width: 16; viewbox-height: 16;
+        commands: "M2,3 H14 L9.5,8.5 V13 L6.5,11.5 V8.5 Z";
+        stroke: root.ink; stroke-width: 1.5px; accessible-role: none;
+    }
+    if !root.filter: Glyph {
+        x: 8px; y: (parent.height - self.height) / 2;
+        width: 15px; height: 15px; name: "×"; ink: root.ink;
+    }
+    tool-label := Caption {
+        x: root.filter ? DestinationGuides.text-inset - DestinationGuides.tool-inset : 28px;
+        width: parent.width - self.x - 7px; height: parent.height;
+        text: root.title; color: root.ink; accessible-role: none;
+    }
+}
+
+export component SearchAddPicker inherits Rectangle {
+    // Only eligible manual playlists; the optional detail disambiguates names.
+    in property <[SearchAddChoice]> choices;
+    in property <string> destination;
+    in property <string> destination-name;
+    in property <string> destination-detail;
+    // One-based index in choices, or zero for no current eligible selection.
+    in property <int> destination-index;
+    in property <string> blocked;
+    in property <string> scope;
+    in property <bool> show-label;
+    in property <bool> hide-added;
+    in property <length> available-width: root.width;
+    callback choose(string);
+    callback toggle-hide();
+    callback focus-fallback();
+
+    height: 39px;
+    property <bool> has-destination: root.destination != "";
+    property <bool> offline: root.blocked == "Offline";
+    property <bool> filter-checked: root.has-destination && root.hide-added;
+    property <bool> filter-active: root.filter-checked && !root.offline;
+    changed scope => { if picker.is-open { picker.close(); } }
+    changed blocked => {
+        let had-focus = trigger.has-focus || picker.is-open;
+        if picker.is-open { picker.close(); }
+        if !trigger.enabled && had-focus { root.focus-fallback(); }
+    }
+    changed choices => { if picker.is-open { picker.close(); } }
+
+    trigger := Action {
+        width: root.width; height: root.height;
+        enabled: !root.offline || root.has-destination;
+        quiet: true;
+        selected: picker.is-open || (root.has-destination && root.blocked == "");
+        click-scope: root.scope;
+        pointer-focus-visible: false;
+        accessible-label: "Add to playlist: " + (root.has-destination ? root.destination-name : "No destination")
+            + (root.has-destination && root.destination-detail != "" ? ", " + root.destination-detail : "");
+        accessible-description: root.blocked + (root.filter-checked
+            ? (root.blocked == "" ? "" : " · ") + (root.offline ? "Hide already added paused" : "Hide already added on") : "");
+        accessible-expandable: true;
+        accessible-expanded: picker.is-open;
+        clicked => {
+            if picker.is-open { picker.close(); }
+            else {
+                if self.pointer-focused { self.take-pointer-focus(); }
+                else { self.take-focus(); }
+                picker.show();
+            }
+        }
+        glyph := Glyph {
+            x: 10px; y: (parent.height - self.height) / 2;
+            width: 19px; height: self.width;
+            name: "queue-add"; ink: trigger.selected ? Theme.primary : Theme.muted;
+        }
+        if root.filter-active: Rectangle {
+            x: glyph.x + glyph.width - 1px; y: glyph.y - 2px;
+            width: 5px; height: 5px; border-radius: 3px; background: Theme.primary;
+            accessible-role: none;
+        }
+        if root.show-label: Caption {
+            x: 36px; y: 0px; width: parent.width - self.x - 10px; height: parent.height;
+            text: root.destination-name; color: glyph.ink; font-weight: 600;
+            accessible-role: none;
+        }
+    }
+
+    picker := PopupWindow {
+        x: root.width - self.width; y: root.height + 6px;
+        width: min(428px, root.available-width);
+        height: self.heading-height + self.actions-height + self.list-height + 2px;
+        close-policy: close-on-click-outside;
+        forward-focus: panel;
+        property <int> highlight: 0;
+        property <bool> keyboard-mode;
+        property <bool> blocked-destination: root.has-destination && root.blocked != "";
+        property <length> title-height: 42px;
+        property <length> heading-height: self.title-height + (self.blocked-destination ? 23px : 0px);
+        property <int> choice-count: root.offline ? 0 : root.choices.length;
+        property <bool> show-empty: !root.offline && self.choice-count == 0;
+        property <length> list-height: self.show-empty ? 42px : min(rows.preferred-height, 276px);
+        // Clearing the local destination does not require a connection.
+        property <bool> can-clear: root.has-destination;
+        property <int> filter-index: 0;
+        property <int> clear-index: 1;
+        property <int> choice-start: (root.has-destination ? 1 : 0) + (self.can-clear ? 1 : 0);
+        // Keep accessibility indices stable even when the first tool is disabled.
+        property <int> first-index: root.offline && self.can-clear ? self.clear-index : 0;
+        property <int> last-index: self.choice-start + self.choice-count - 1;
+        property <length> actions-height: root.has-destination ? 48px : 0px;
+        function select(index: int) {
+            if !root.offline && root.has-destination && index == self.filter-index {
+                root.toggle-hide();
+            } else if self.can-clear && index == self.clear-index {
+                self.close();
+                // An offline picker without a selection is disabled.
+                if root.offline { root.focus-fallback(); }
+                root.choose("");
+            } else if index >= self.choice-start && index <= self.last-index {
+                let id = root.choices[index - self.choice-start].id;
+                self.close();
+                root.choose(id);
+            }
+        }
+        function reveal(top: length, height: length) {
+            list.content-y = clamp(min(list.content-y, list.visible-height - top - height), -top, 0px);
+        }
+        init => {
+            self.keyboard-mode = !trigger.pointer-focused;
+            self.highlight = self.last-index < self.first-index ? -1
+                : self.choice-count == 0 ? self.first-index
+                : self.choice-start + clamp(root.destination-index - 1, 0, self.choice-count - 1);
+            panel.focus();
+        }
+        panel := FocusScope {
+            width: parent.width; height: parent.height;
+            focus-on-click: false;
+            accessible-role: AccessibleRole.list;
+            accessible-label: "Add to playlist";
+            accessible-description: root.destination-name + (root.blocked == "" ? "" : " " + root.blocked);
+            accessible-item-count: picker.last-index + 1;
+            accessible-delegate-focus: picker.highlight;
+            Rectangle {
+                width: parent.width; height: parent.height;
+                background: Theme.panel; border-radius: Theme.container-radius; border-color: Theme.line; border-width: 1px;
+            }
+            Caption {
+                x: 1px + DestinationGuides.text-inset; y: 1px; width: parent.width - self.x - 80px; height: picker.title-height;
+                text: "Add to playlist"; color: Theme.text; font-size: 14px * Theme.density; font-weight: 700;
+                accessible-role: none;
+            }
+            if root.blocked != "": Caption {
+                x: parent.width - self.width - 14px; y: 1px; height: picker.title-height;
+                text: root.blocked; color: Theme.tertiary; accessible-role: none;
+            }
+            if picker.blocked-destination: Caption {
+                x: 1px + DestinationGuides.text-inset; y: picker.title-height - 2px; width: parent.width - self.x - 14px; height: 22px;
+                text: root.destination-name; accessible-role: none;
+            }
+            if root.has-destination: tools := Rectangle {
+                x: 1px; y: picker.heading-height;
+                width: panel.width - 2px; height: picker.actions-height;
+                filter-tool := DestinationTool {
+                    x: DestinationGuides.tool-inset; y: (parent.height - self.height) / 2;
+                    width: min(self.natural-width, (parent.width - 32px) * 0.58);
+                    title: "Hide already added"; filter: true; accessible-role: checkbox;
+                    enabled: !root.offline; selected: root.filter-checked; click-scope: root.scope;
+                    accessible-description: root.offline ? "Unavailable offline" : "";
+                    keyboard-highlight: picker.highlight == picker.filter-index && panel.has-focus && picker.keyboard-mode;
+                    clicked => { picker.keyboard-mode = false; picker.highlight = picker.filter-index; picker.select(picker.filter-index); }
+                }
+                if picker.can-clear: DestinationTool {
+                    x: filter-tool.x + filter-tool.width + 8px; y: filter-tool.y;
+                    width: min(self.natural-width, parent.width - self.x - 12px);
+                    title: "Clear selection"; click-scope: root.scope;
+                    keyboard-highlight: picker.highlight == picker.clear-index && panel.has-focus && picker.keyboard-mode;
+                    clicked => { picker.select(picker.clear-index); }
+                }
+            }
+            if picker.choice-count > 0 || picker.show-empty: Divider {
+                x: 1px; y: picker.heading-height + picker.actions-height; width: parent.width - 2px;
+            }
+            if picker.show-empty: Caption {
+                x: 1px + DestinationGuides.text-inset; y: 1px + picker.heading-height + picker.actions-height;
+                width: parent.width - self.x - 14px; height: picker.list-height;
+                text: "No editable manual playlists";
+                accessible-role: text; accessible-label: self.text;
+            }
+            list := ScrollView {
+                x: 1px; y: 1px + picker.heading-height + picker.actions-height; width: parent.width - 2px;
+                height: parent.height - self.y - 1px;
+                horizontal-scrollbar-policy: always-off;
+                content-width: self.visible-width; content-height: rows.preferred-height;
+                rows := VerticalLayout {
+                    // Keep this width independent of scrollbar visibility; row text
+                    // measurement also supplies the popup's preferred height.
+                    width: list.width;
+                    for choice[i] in (root.offline ? [] : root.choices): DestinationRow {
+                        height: self.row-height;
+                        row-label: choice.name; detail: choice.detail;
+                        click-scope: choice.id;
+                        selected: root.destination == choice.id;
+                        separated: i < picker.choice-count - 1;
+                        highlighted: picker.highlight == picker.choice-start + i;
+                        keyboard-mode: panel.has-focus && picker.keyboard-mode;
+                        focus-gutter: rows.preferred-height > list.visible-height ? 18px : 5px;
+                        shell-height: panel.height - 2px;
+                        shell-row-top: list.y - 1px + list.content-y + self.y;
+                        reveal(top, height) => { picker.reveal(top, height); }
+                        clicked => { picker.select(picker.choice-start + i); }
+                    }
+                }
+            }
+            key-pressed(event) => {
+                if event.text == Key.Escape { picker.close(); return accept; }
+                if event.text == Key.Tab || event.text == Key.Backtab { picker.close(); return reject; }
+                if !root.offline && picker.can-clear && picker.highlight < picker.choice-start
+                    && (event.text == Key.LeftArrow || event.text == Key.RightArrow) {
+                    picker.keyboard-mode = true;
+                    picker.highlight = event.text == Key.LeftArrow ? picker.filter-index : picker.clear-index;
+                    return accept;
+                }
+                if event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.Home || event.text == Key.End {
+                    if picker.last-index < picker.first-index { return accept; }
+                    picker.keyboard-mode = true;
+                    picker.highlight = event.text == Key.Home ? picker.first-index : event.text == Key.End ? picker.last-index
+                        : clamp(picker.highlight + (event.text == Key.DownArrow ? 1 : -1), picker.first-index, picker.last-index);
+                    return accept;
+                }
+                if event.text == Key.Return || event.text == Key.Space {
+                    if !event.repeat { picker.select(picker.highlight); }
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+}

@@ -296,7 +296,21 @@ impl Engine {
         {
             return;
         }
-        if !self.personal.authorizes(epoch, generation, command)
+        if matches!(command, PersonalCommand::SyncPlaylist { .. }) {
+            self.personal
+                .send_playlist_sync(epoch, generation, command, || {
+                    self.socket.as_ref().is_some_and(|s| {
+                        s.personal_playlist_sync(
+                            epoch,
+                            generation,
+                            command,
+                            self.personal.access(),
+                            self.shared_epoch.clone(),
+                        )
+                        .is_ok()
+                    })
+                });
+        } else if !self.personal.authorizes(epoch, generation, command)
             || !self
                 .socket
                 .as_ref()
@@ -305,6 +319,28 @@ impl Engine {
             self.personal.refused(epoch, generation);
         }
     }
+    pub(super) fn send_quick_add(&self, ticket: super::QuickAddTicket) {
+        let access = self.personal.access();
+        if !self.current()
+            || self.epoch != ticket.epoch
+            || self.online_generation() != Some(ticket.generation)
+            || self.online.personal_generation != Some(ticket.generation)
+            || !self.socket.as_ref().is_some_and(|socket| {
+                self.personal.admit_quick_add(&ticket, || {
+                    socket
+                        .personal_quick_add(
+                            access.clone(),
+                            ticket.clone(),
+                            self.shared_epoch.clone(),
+                        )
+                        .is_ok()
+                })
+            })
+        {
+            access.quick_cancel(&ticket);
+        }
+    }
+
     pub(super) fn send_playlist_order(
         &self,
         observed: super::PersonalStatus,

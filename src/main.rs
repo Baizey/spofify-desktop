@@ -28,6 +28,7 @@ mod playlist_pins;
 mod playlist_view;
 use api::preferences;
 mod presentation;
+mod quick_add;
 mod replica;
 mod saved;
 mod socket;

@@ -59,6 +59,8 @@ mod playlist_pins;
 mod playlist_view;
 #[path = "../src/presentation.rs"]
 mod presentation;
+#[path = "../src/quick_add.rs"]
+mod quick_add;
 #[path = "../src/replica.rs"]
 mod replica;
 #[path = "../src/saved.rs"]

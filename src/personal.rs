@@ -3,7 +3,7 @@
 //! epochs before reducing a frame and dispatches the returned sync immediately.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     mem::size_of,
     sync::Arc,
 };
@@ -40,6 +40,11 @@ pub enum Command {
         known: Option<String>,
         #[serde(skip_serializing_if = "is_zero")]
         offset: usize,
+        // A local request identity, never an on-the-wire token. Command
+        // value equality still compares the wire fields; accepts_sync also
+        // compares this allocation so an A → B → A watch can't reuse old A.
+        #[serde(skip)]
+        local_request: Arc<()>,
     },
     CreatePlaylist {
         name: String,
@@ -111,6 +116,7 @@ impl Command {
                 playlist_id,
                 known,
                 offset,
+                ..
             } => {
                 id_ok(playlist_id)
                     && known.as_deref().is_none_or(token_ok)
@@ -238,6 +244,7 @@ pub use Command as PersonalCommand;
 pub use Update as PersonalUpdate;
 
 /// Exact successful reducer commits; never an input frame or staged rows.
+#[derive(Clone, Copy)]
 pub(crate) enum AcceptedPlaylist<'a> {
     Summaries(&'a [PlaylistSummary]),
     Summary {
@@ -404,9 +411,41 @@ enum Pull {
     Required,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Membership {
+    Unknown,
+    Present,
+    Absent,
+}
+
 struct Retained {
     playlist: Playlist,
     bytes: usize,
+    // Track membership is boolean to the caller, but we must keep occurrence
+    // counts so removing one copy of a song cannot remove another's evidence.
+    tracks: HashMap<Box<str>, usize>,
+    // Only retained while building a part set. Check each new part before any
+    // of its track IDs become available as positive evidence.
+    staged_entries: HashSet<Box<str>>,
+}
+
+impl Retained {
+    fn add_track(&mut self, id: &str) {
+        if let Some(count) = self.tracks.get_mut(id) {
+            *count += 1;
+        } else {
+            self.tracks.insert(id.into(), 1);
+        }
+    }
+
+    fn remove_track(&mut self, id: &str) {
+        if let Some(count) = self.tracks.get_mut(id) {
+            *count -= 1;
+            if *count == 0 {
+                self.tracks.remove(id);
+            }
+        }
+    }
 }
 
 /// Account-owned state. Keep it across reconnects, call `disconnected` on
@@ -432,6 +471,10 @@ impl Replica {
         self.snapshot.as_ref()
     }
 
+    pub(crate) fn summaries_capped(list: &[PlaylistSummary]) -> bool {
+        list.len() == MAX_PLAYLISTS
+    }
+
     pub fn playlist(&self) -> Option<&Playlist> {
         self.cached(self.desired.as_deref()?).map(|d| &d.playlist)
     }
@@ -444,7 +487,22 @@ impl Replica {
     /// Recheck a queued sync at the transport boundary: navigation, repair,
     /// or a newer continuation may already have superseded it.
     pub fn accepts_sync(&self, command: &Command) -> bool {
-        self.ready && self.expected_sync.as_ref() == Some(command)
+        let Some(
+            expected @ Command::SyncPlaylist {
+                local_request: pending,
+                ..
+            },
+        ) = self.expected_sync.as_ref()
+        else {
+            return false;
+        };
+        self.ready
+            && expected == command
+            && matches!(command, Command::SyncPlaylist { local_request, .. } if Arc::ptr_eq(pending, local_request))
+    }
+
+    pub(crate) fn pending_sync(&self) -> Option<&Command> {
+        self.expected_sync.as_ref()
     }
 
     /// The watched playlist was deleted, or the transport ended while an
@@ -461,6 +519,37 @@ impl Replica {
 
     pub(crate) fn watched_playlist(&self) -> Option<&str> {
         self.desired.as_deref()
+    }
+
+    pub(crate) fn scoped_summary(&self) -> Option<&PlaylistSummary> {
+        let id = self.desired.as_deref()?;
+        self.staged
+            .as_ref()
+            .or_else(|| self.cached(id).filter(|d| !d.playlist.stale))
+            .map(|d| &d.playlist.summary)
+    }
+
+    pub(crate) fn membership(&self, playlist_id: &str, track_id: &str) -> Membership {
+        if !self.ready || self.desired.as_deref() != Some(playlist_id) {
+            return Membership::Unknown;
+        }
+        if let Some(stage) = &self.staged {
+            return if stage.playlist.summary.kind == PlaylistKind::Manual
+                && stage.tracks.contains_key(track_id)
+            {
+                Membership::Present
+            } else {
+                Membership::Unknown
+            };
+        }
+        match self
+            .cached(playlist_id)
+            .filter(|d| !d.playlist.stale && d.playlist.summary.kind == PlaylistKind::Manual)
+        {
+            Some(detail) if detail.tracks.contains_key(track_id) => Membership::Present,
+            Some(_) => Membership::Absent,
+            None => Membership::Unknown,
+        }
     }
 
     pub(crate) fn refresh_playlist(&mut self) -> Option<Command> {
@@ -566,6 +655,7 @@ impl Replica {
             playlist_id,
             known,
             offset,
+            local_request: Arc::new(()),
         };
         self.expected_sync = Some(command.clone());
         command
@@ -626,7 +716,7 @@ impl Replica {
         if self.ready {
             self.invalidate_details();
         }
-        let capped = s.playlists.len() == MAX_PLAYLISTS;
+        let capped = Self::summaries_capped(&s.playlists);
         if let Some(id) = self.desired.as_deref() {
             let listed = s.playlists.iter().any(|p| p.id == id);
             self.unavailable = !listed
@@ -702,6 +792,8 @@ impl Replica {
             }
             Retained {
                 bytes: 0,
+                tracks: HashMap::new(),
+                staged_entries: HashSet::new(),
                 playlist: Playlist {
                     summary: p.summary,
                     definition: p.definition,
@@ -746,11 +838,15 @@ impl Replica {
         {
             return self.repair_part(id);
         }
-        stage.bytes = p
-            .rows
-            .iter()
-            .map(row_bytes)
-            .fold(stage.bytes, usize::saturating_add);
+        for row in &p.rows {
+            if row.id.is_empty() || !stage.staged_entries.insert(row.id.as_str().into()) {
+                return self.repair_part(id);
+            }
+            if stage.playlist.summary.kind == PlaylistKind::Manual {
+                stage.add_track(&row.track.id);
+            }
+            stage.bytes = stage.bytes.saturating_add(row_bytes(row));
+        }
         Arc::make_mut(&mut stage.playlist.rows).extend(p.rows);
         if p.more {
             let next_offset = stage.playlist.rows.len();
@@ -761,11 +857,10 @@ impl Replica {
             self.staged = Some(stage);
             return Ok(Some(self.sync(id, Some(token), next_offset)));
         }
-        if !unique_ids(stage.playlist.rows.iter().map(|r| r.id.as_str()))
-            || !visible_count_matches(&stage.playlist.summary, stage.playlist.rows.len())
-        {
+        if !visible_count_matches(&stage.playlist.summary, stage.playlist.rows.len()) {
             return self.repair_part(id);
         }
+        stage.staged_entries = HashSet::new();
         self.reset_pull();
         self.observed = Some(stage.playlist.summary.clone());
         let snapshot = self.snapshot.as_mut().expect("ready snapshot");
@@ -992,6 +1087,7 @@ fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange
                 return false;
             }
             d.bytes = d.bytes.saturating_add(row_bytes(&row));
+            d.add_track(&row.track.id);
             Arc::make_mut(&mut d.playlist.rows).push(row);
         }
         (None, Some(id), None, None) => {
@@ -1002,10 +1098,12 @@ fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange
                 return false;
             }
             let rows = Arc::make_mut(&mut d.playlist.rows);
-            d.bytes = d.bytes.saturating_sub(row_bytes(&rows.remove(i)));
+            let row = rows.remove(i);
             if rows.capacity() > rows.len().saturating_mul(2) {
                 rows.shrink_to_fit();
             }
+            d.bytes = d.bytes.saturating_sub(row_bytes(&row));
+            d.remove_track(&row.track.id);
         }
         (None, None, Some(id), after) => {
             let Some(from) = rows.iter().position(|r| r.id == id) else {
@@ -1047,7 +1145,8 @@ fn row_bytes(row: &ManualEntry) -> usize {
     [
         size_of::<ManualEntry>().saturating_mul(2),
         row.id.capacity(),
-        t.id.capacity(),
+        t.id.capacity().saturating_mul(2), // includes index key
+        size_of::<(Box<str>, usize)>().saturating_mul(2), // index headroom
         t.name.capacity(),
         t.album_id.capacity(),
         t.album_name.capacity(),

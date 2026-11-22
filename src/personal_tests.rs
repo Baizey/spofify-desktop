@@ -63,6 +63,7 @@ fn sync(id: &str, known: Option<&str>, offset: usize) -> Option<Command> {
         playlist_id: id.into(),
         known: known.map(str::to_owned),
         offset,
+        local_request: Arc::new(()),
     })
 }
 

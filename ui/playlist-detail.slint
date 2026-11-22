@@ -50,6 +50,9 @@ export component PlaylistDetailHeader inherits Rectangle {
     in property <bool> queue;
     in property <bool> queue-enabled: true;
     in property <bool> rename;
+    in property <bool> add-songs;
+    property <int> add-songs-focus;
+    public function focus-add-songs() { if root.add-songs && root.active { root.add-songs-focus += 1; } }
     in property <bool> rules;
     in property <bool> edit-order;
     in property <bool> sticky-order;
@@ -72,7 +75,7 @@ export component PlaylistDetailHeader inherits Rectangle {
 
     property <string> save-command: offline-action != "" ? offline-action : remove-action == "unpin-playlist" || remove-action == "remove" ? remove-action : "";
     property <string> save-name: save-command == "remove" ? "Remove from Saved" : save-command == "unpin-playlist" ? "Remove offline save" : "Save offline";
-    property <bool> listening: play || queue || save-command != "";
+    property <bool> listening: play || queue || save-command != "" || add-songs;
     property <bool> editing: rename || rules || edit-order || remove-action == "delete";
     property <bool> tight: self.width < 315px * Theme.density;
     property <length> title-size: (self.compact ? 29px : 35px) * Theme.density;
@@ -139,6 +142,17 @@ export component PlaylistDetailHeader inherits Rectangle {
                         click-scope: root.click-scope;
                         changed has-focus => { if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); } }
                         clicked => { root.command("play"); }
+                    }
+                    if root.add-songs: DetailCommand {
+                        enabled: root.active;
+                        text: "Add songs"; icon: "+"; height: 42px;
+                        click-scope: root.click-scope;
+                        property <int> resume-add-songs: root.add-songs-focus;
+                        changed resume-add-songs => { if self.enabled { self.take-focus(); } }
+                        changed has-focus => {
+                            if self.has-focus { root.focused(stack.y + toolbar.y + cluster.y + listens.y + self.y, self.height); }
+                        }
+                        clicked => { root.command("add-songs"); }
                     }
                     if root.queue: DetailCommand {
                         enabled: root.queue-enabled;

@@ -10,8 +10,10 @@ import { DeviceRow } from "output-picker.slint";
 import { NowPlaying, TimedLyricLine } from "now-playing.slint";
 import { Settings } from "settings.slint";
 import { WorkspaceRail } from "workspace-parts.slint";
+import { SearchAddChoice, SearchAddPicker } from "search-add.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { ArtistCredit, DeviceRow, ReorderRow }
+export { ArtistCredit, DeviceRow, ReorderRow, SearchAddChoice }
+export struct SearchAddSelection { id: string, name: string, detail: string, option-index: int }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
@@ -100,6 +102,21 @@ export component AppWindow inherits Window {
     callback server-edited();
     callback username-edited();
     callback search-edited();
+    in property <SearchAddSelection> search-add-selection;
+    in property <[SearchAddChoice]> search-add-choices;
+    in property <bool> search-add-hide;
+    in property <string> search-add-blocked;
+    in property <string> search-add-scope;
+    in property <string> search-add-status;
+    in property <[string]> search-add-row-states;
+    in property <[int]> search-add-visible-indices;
+    in property <bool> playlist-add-songs;
+    in property <int> search-add-open-serial;
+    in property <int> search-add-return-serial;
+    in-out property <int> search-focus-owner: -1;
+    callback choose-search-add-destination(string);
+    callback toggle-search-add-hide(string);
+    callback quick-add-search-track(string, string, int);
     callback toggle-play();
     callback previous();
     callback next();
@@ -248,6 +265,9 @@ export component AppWindow inherits Window {
     property <bool> queue-shown: root.wide ? root.wide-queue-open : root.compact-queue-open;
     property <bool> editor-open: form-mode != "" && form-mode != "closed";
     property <bool> is-search: page-kind == "search";
+    property <bool> show-search-add: root.signed-in && root.is-search && !root.editor-open;
+    property <bool> filter-search-add: root.is-search && root.search-add-hide;
+    property <int> catalog-result-count: root.filter-search-add ? root.search-add-visible-indices.length : root.browse-rows.length;
     property <bool> is-history: page-kind == "history" || page-kind == "recent";
     property <bool> is-playlist: page-kind == "playlist" || page-kind == "playlist-manual" || page-kind == "playlist-rules";
     property <bool> playlist-detail: self.is-playlist || self.page-kind == "saved-collection";
@@ -425,6 +445,26 @@ export component AppWindow inherits Window {
                 self.remember-scroll(index, op == "open" ? "" : "menu");
             }
             root.row-action(op, index);
+        }
+        property <int> search-add-open: root.search-add-open-serial;
+        changed search-add-open => { if root.is-search { search.take-focus(); } }
+        property <int> search-add-return: root.search-add-return-serial;
+        property <bool> restore-add-songs;
+        changed search-add-return => { self.restore-add-songs = true; }
+        Timer {
+            interval: 1ms; running: shell.restore-add-songs && !root.page-busy;
+            triggered => {
+                shell.restore-add-songs = false;
+                if playlist-header.add-songs { playlist-header.focus-add-songs(); }
+                else { history-pane.focus(); }
+            }
+        }
+        function open-add-songs() {
+            self.leave-orders();
+            self.returning = false;
+            self.restoring-key = "";
+            self.remember-scroll(-1, "");
+            root.page-action("add-songs", "");
         }
         function edited-search() {
             self.leave-orders();
@@ -643,17 +683,32 @@ export component AppWindow inherits Window {
                 property <bool> narrow: self.width < 640px;
                 toolbar := Rectangle {
                     x: 0px; y: 0px; width: parent.width; height: root.toolbar-height;
+                    property <length> tools-width: parent.width - 2 * main.inset;
+                    property <bool> picker-label: root.search-add-selection.id != "" && self.tools-width >= 510px;
+                    property <length> picker-width: self.picker-label ? 122px : 39px;
                     background: Theme.rail;
                     Divider { x: 0px; y: parent.height - 1px; }
                     search := Field {
                         x: main.inset; y: (parent.height - self.height) / 2;
-                        width: parent.width - 2 * self.x; height: 39px;
+                        width: toolbar.tools-width - (root.show-search-add ? toolbar.picker-width + 8px : 0px); height: 39px;
                         text <=> root.query; prefix: "⌕"; clearable: true; enabled: !root.editor-open;
                         field-label: "Search tracks, albums or artists";
-                        placeholder-text: main.width < 420px ? "Search music" : "Search tracks, albums or artists";
+                        placeholder-text: main.width < 420px || (root.show-search-add && self.width < 360px)
+                            ? "Search music" : "Search tracks, albums or artists";
                         cleared => { shell.edited-search(); }
                         edited => { shell.edited-search(); }
                         accepted => { shell.edited-search(); }
+                    }
+                    if root.show-search-add: SearchAddPicker {
+                        width: toolbar.picker-width; x: parent.width - main.inset - self.width; y: search.y;
+                        show-label: toolbar.picker-label; hide-added: root.search-add-hide;
+                        choices: root.search-add-choices; destination: root.search-add-selection.id;
+                        destination-name: root.search-add-selection.name; destination-detail: root.search-add-selection.detail;
+                        destination-index: root.search-add-selection.option-index;
+                        scope: root.search-add-scope; blocked: root.search-add-blocked; available-width: toolbar.tools-width;
+                        choose(id) => { root.choose-search-add-destination(id); }
+                        toggle-hide => { root.toggle-search-add-hide(root.search-add-selection.id); }
+                        focus-fallback => { search.take-focus(); }
                     }
                 }
                 property <bool> can-edit-order: root.is-playlist && root.playlist-order-scope != "";
@@ -742,6 +797,7 @@ export component AppWindow inherits Window {
                         changed scroll-key => {
                             root.catalog-focused-row = -1;
                             root.catalog-anchor-row = -1;
+                            root.search-focus-owner = -1;
                             shell.destination-scrolled();
                         }
                         property <int> return-serial: root.catalog-return-serial;
@@ -772,15 +828,15 @@ export component AppWindow inherits Window {
                             running: catalog-scroll.visible && catalog-scroll.catalog-results-route
                                 && !root.editor-open && !root.compact-queue-open && !catalog-scroll.restore-catalog
                                 && root.catalog-request-key != "" && root.catalog-request-key != catalog-scroll.issued-request
-                                && catalog.y + catalog-results.y + catalog-results.height + catalog-scroll.content-y
-                                    <= catalog-scroll.visible-height + min(280px, catalog-scroll.visible-height / 2);
+                                && (root.catalog-result-count == 0 || catalog.y + catalog-results.y + catalog-results.height + catalog-scroll.content-y
+                                    <= catalog-scroll.visible-height + min(280px, catalog-scroll.visible-height / 2));
                             triggered => {
                                 catalog-scroll.issued-request = root.catalog-request-key;
                                 root.catalog-demand(catalog-scroll.issued-request);
                             }
                         }
                         changed content-height => {
-                            if root.playlist-detail { self.set-scroll(self.content-y); }
+                            if root.playlist-detail || root.filter-search-add { self.set-scroll(self.content-y); }
                             shell.apply-return-scroll();
                         }
                         property <bool> loading: root.page-busy;
@@ -813,6 +869,7 @@ export component AppWindow inherits Window {
                                         Hero {
                                             title: root.is-settings ? "Settings" : root.catalog-title;
                                             subtitle: root.is-settings ? "" : root.page-kind == "offline" ? "Music saved on this device" + (root.page-subtitle == "" ? "" : " · " + root.page-subtitle) : root.page-subtitle;
+                                            hide-subtitle: root.filter-search-add;
                                             section: root.saved-view ? "ON THIS DEVICE" : root.page-kind == "album" ? "ALBUM" : root.page-kind == "artist" ? "ARTIST" : "";
                                             glyph: Copy.mark(root.page-kind);
                                             artwork: root.page-artwork; compact: main.narrow; show-art: detail-hero.with-art;
@@ -831,6 +888,7 @@ export component AppWindow inherits Window {
                                     play: self.visible && root.playlist-actions.play;
                                     queue: self.visible && root.playlist-actions.queue;
                                     queue-enabled: !root.saved-view || root.saved-queue-enabled;
+                                    add-songs: self.visible && root.playlist-add-songs;
                                     rename: self.visible && root.playlist-actions.rename;
                                     rules: self.visible && root.playlist-actions.rules;
                                     edit-order: main.can-edit-order; sticky-order: main.sticky-order;
@@ -844,6 +902,7 @@ export component AppWindow inherits Window {
                                     focused(y, h) => { catalog-scroll.reveal(catalog.y + header-slot.y + y, h); }
                                     command(op) => {
                                         if op == "order" { main.begin-playlist-order(); }
+                                        else if op == "add-songs" { shell.open-add-songs(); }
                                         else if op == "remove" || op == "unpin-playlist" { root.confirm-saved-removal(op); }
                                         else { root.page-action(op, ""); }
                                     }
@@ -884,6 +943,10 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
+                            if root.filter-search-add && root.browse-rows.length > 0 && root.catalog-result-count == 0
+                                && root.catalog-request-key == "" && root.catalog-continuation-status == ""
+                                && !root.catalog-loading && !root.page-busy && !root.page-error:
+                                EmptyState { glyph: Copy.mark(root.page-kind); title: "Matching tracks are already in this playlist"; }
                             if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
@@ -903,7 +966,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.query = root.catalog-title; shell.edited-search(); search.take-focus(); }
                                 }
                             }
-                            if root.browse-rows.length > 0 && root.page-kind != "playlists" && !root.playlist-detail: Eyebrow {
+                            if root.catalog-result-count > 0 && root.page-kind != "playlists" && !root.playlist-detail: Eyebrow {
                                 height: 30px; color: Theme.muted;
                                 text: root.is-search ? "RESULTS" : root.is-history ? "RECENTLY PLAYED" : root.page-kind == "artist" ? "DISCOGRAPHY"
                                     : root.page-kind == "album" ? "TRACKS" : root.page-kind == "picker" ? "MANUAL PLAYLISTS"
@@ -1112,29 +1175,29 @@ export component AppWindow inherits Window {
                                 }
                             }
                             catalog-results := VerticalLayout {
-                                visible: catalog-scroll.catalog-results-route && root.browse-rows.length > 0;
+                                visible: catalog-scroll.catalog-results-route && root.catalog-result-count > 0;
                                 accessible-role: list;
                                 accessible-label: root.catalog-title;
-                                accessible-item-count: root.browse-rows.length;
+                                accessible-item-count: root.catalog-result-count;
                                 accessible-orientation: vertical;
                                 spacing: 2px;
                                 // Layout slots give the one scroll surface exact geometry. Only
                                 // mount rich row controls around the viewport and keyboard focus.
-                                for entry[index] in (catalog-scroll.catalog-results-route ? root.browse-rows : []): slot := Rectangle {
-                                    property <int> absolute-index: index;
-                                    property <BrowseRow> browse-entry: entry;
-                                    property <bool> album-line: Copy.show-browse-album(root.page-kind, entry.kind, entry.album-name);
-                                    height: Copy.row-height(entry.credits.length > 0 || entry.subtitle != "", self.album-line);
+                                for i in (catalog-scroll.catalog-results-route ? root.catalog-result-count : 0): slot := Rectangle {
+                                    property <int> absolute-index: root.filter-search-add ? root.search-add-visible-indices[i] : i;
+                                    property <BrowseRow> browse-entry: root.browse-rows[self.absolute-index];
+                                    property <bool> album-line: Copy.show-browse-album(root.page-kind, browse-entry.kind, browse-entry.album-name);
+                                    height: Copy.row-height(browse-entry.credits.length > 0 || browse-entry.subtitle != "", self.album-line);
                                     property <length> row-y: catalog.y + catalog-results.y + self.y;
                                     property <length> visible-y: self.row-y + catalog-scroll.content-y;
                                     property <bool> near-viewport: self.visible-y + self.height >= -catalog-scroll.visible-height
                                         && self.visible-y <= 2 * catalog-scroll.visible-height;
-                                    property <bool> near-focus: root.catalog-focused-row >= 0 && abs(index - root.catalog-focused-row) <= 2;
-                                    property <bool> restoring: catalog-scroll.restore-catalog && index == root.catalog-return-row;
+                                    property <bool> near-focus: root.catalog-focused-row >= 0 && abs(self.absolute-index - root.catalog-focused-row) <= 2;
+                                    property <bool> restoring: catalog-scroll.restore-catalog && self.absolute-index == root.catalog-return-row;
                                     property <bool> is-anchor: self.visible-y <= 0px && self.visible-y + self.height + catalog-results.spacing > 0px;
                                     function publish-anchor() {
                                         if self.is-anchor {
-                                            root.catalog-anchor-row = index;
+                                            root.catalog-anchor-row = self.absolute-index;
                                             root.catalog-anchor-y = self.row-y / 1px;
                                         }
                                     }
@@ -1142,7 +1205,7 @@ export component AppWindow inherits Window {
                                     changed row-y => { self.publish-anchor(); }
                                     property <int> restore-anchor: catalog-scroll.return-anchor-serial;
                                     changed restore-anchor => {
-                                        if index == root.catalog-return-anchor {
+                                        if self.absolute-index == root.catalog-return-anchor {
                                             catalog-scroll.set-scroll(clamp(root.catalog-return-offset * 1px, -self.height, 0px) - self.row-y);
                                         }
                                     }
@@ -1151,12 +1214,30 @@ export component AppWindow inherits Window {
                                         entry: slot.browse-entry; index: slot.absolute-index; page-kind: root.page-kind;
                                         align-credit-fallback: true;
                                         paint-left: main.inset; paint-right: main.inset;
-                                        artwork: index < root.browse-artwork.length ? root.browse-artwork[index] : root.no-artwork;
-                                        current-track: entry.track-id != "" && entry.track-id == root.now-track-id;
+                                        artwork: self.index < root.browse-artwork.length ? root.browse-artwork[self.index] : root.no-artwork;
+                                        current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
                                         playing-track: self.current-track && root.playing;
                                         compact: main.width < 435px;
                                         window-height: root.height;
-                                        menu-key: root.page-key + "|" + root.browse-model-key + "|" + index;
+                                        menu-key: root.page-key + "|" + root.browse-model-key + "|" + self.index;
+                                        quick-add-visible: root.show-search-add && root.search-add-selection.id != "" && !root.local-mode;
+                                        quick-add-state: self.index < root.search-add-row-states.length ? root.search-add-row-states[self.index] : "";
+                                        quick-add-target: root.search-add-selection.name + (root.search-add-selection.detail == "" ? "" : ", " + root.search-add-selection.detail);
+                                        quick-add-scope: root.search-add-scope + "|" + self.menu-key + "|" + self.entry.track-id;
+                                        quick-add-focus-evicted(unavailable) => {
+                                            if unavailable { search.take-focus(); }
+                                            else { history-pane.focus(); }
+                                            root.catalog-focused-row = -1;
+                                            root.catalog-focused-part = "";
+                                            root.search-focus-owner = -1;
+                                        }
+                                        quick-add => { root.quick-add-search-track(root.search-add-selection.id, self.entry.track-id, self.index); }
+                                        keyboard-focus-changed(owns, on-body) => {
+                                            if root.is-search {
+                                                if owns { root.search-focus-owner = self.index; }
+                                                else if root.search-focus-owner == self.index { root.search-focus-owner = -1; }
+                                            }
+                                        }
                                         title-focus-key: root.page-key + "/" + self.entry.track-id;
                                         menu-scroll-window-width: root.is-search ? root.width : 0px;
                                         menu-scrolled(delta) => { catalog-scroll.set-scroll(catalog-scroll.content-y + delta); }
@@ -1170,7 +1251,7 @@ export component AppWindow inherits Window {
                                             let title-link = root.is-search && root.catalog-return-part == "album" && self.album-id == root.catalog-return-credit;
                                             if slot.restoring && (title-link || (slot.visible-y + slot.height > 0px && slot.visible-y < catalog-scroll.visible-height)) {
                                                 if title-link { catalog-scroll.reveal(slot.row-y, slot.height); }
-                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-row = self.index;
                                                 root.catalog-focused-part = root.catalog-return-part;
                                                 root.catalog-focused-credit = root.catalog-return-credit;
                                                 self.restore-focus(root.catalog-return-part, root.catalog-return-credit);
@@ -1178,7 +1259,7 @@ export component AppWindow inherits Window {
                                         }
                                         focused => {
                                             if !catalog-scroll.restore-catalog {
-                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-row = self.index;
                                                 root.catalog-focused-part = "";
                                                 root.catalog-focused-credit = "";
                                                 catalog-scroll.reveal(slot.row-y, slot.height);
@@ -1186,20 +1267,20 @@ export component AppWindow inherits Window {
                                         }
                                         action(op) => {
                                             if op == "open" || op == "add" || op == "open-album" || op == "open-artist" {
-                                                root.catalog-focused-row = index;
+                                                root.catalog-focused-row = self.index;
                                                 root.catalog-focused-part = op == "open" ? "" : "menu";
                                                 root.catalog-focused-credit = "";
                                                 root.catalog-row-navigation = true;
                                             }
-                                            shell.browse(op, index);
+                                            shell.browse(op, self.index);
                                             root.catalog-row-navigation = false;
                                         }
                                         page-action(op, id) => {
-                                            root.catalog-focused-row = index;
+                                            root.catalog-focused-row = self.index;
                                             root.catalog-focused-part = op;
                                             root.catalog-focused-credit = id;
                                             root.catalog-row-navigation = true;
-                                            shell.entity(op, id, index);
+                                            shell.entity(op, id, self.index);
                                             root.catalog-row-navigation = false;
                                         }
                                     }
@@ -1211,6 +1292,13 @@ export component AppWindow inherits Window {
                                 error: true;
                             }
                         }
+                    }
+                    if root.is-search && root.search-add-status != "" && !root.compact-queue-open: Notice {
+                        width: min(460px, parent.width - 2 * main.inset);
+                        x: parent.width - main.inset - self.width;
+                        y: parent.height - main.inset - self.height;
+                        height: self.min-height;
+                        text: root.search-add-status; error: true;
                     }
                     playlist-order-pane := VerticalLayout {
                         x: main.inset; y: 0px; width: parent.width - 2 * main.inset; height: parent.height;

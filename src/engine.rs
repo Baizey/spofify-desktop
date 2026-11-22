@@ -19,6 +19,7 @@ use crate::{
     personal::Command as PersonalCommand,
     personal_bridge::{PersonalHub, Status as PersonalStatus},
     player::{self, Action, Authority, Change, LocalQueue, LocalTrack, Status},
+    quick_add::Ticket as QuickAddTicket,
     socket::{self, Link},
 };
 use online::Online;
@@ -60,6 +61,7 @@ pub enum Command {
         generation: u64,
         command: PersonalCommand,
     },
+    QuickAdd(QuickAddTicket),
     ReorderPlaylist {
         observed: PersonalStatus,
         mode_stamp: u64,
@@ -862,6 +864,13 @@ impl Engine {
             } => {
                 self.apply_mode();
                 self.send_personal(epoch, generation, &command);
+            }
+            Command::QuickAdd(ticket) => {
+                self.apply_mode();
+                if !self.offline && self.current() {
+                    self.drain_online_events(None);
+                }
+                self.send_quick_add(ticket);
             }
             Command::ReorderPlaylist {
                 observed,
