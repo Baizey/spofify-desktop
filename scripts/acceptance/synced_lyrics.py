@@ -321,8 +321,8 @@ def capture(win, image_module):
         return png.convert("RGB")
 
 
-def paint(image, scale, pane, band, *, multiline=False):
-    """Probe the left margin and the blank right half, away from the fixture's short text."""
+def paint(image, scale, pane, band, *, multiline=False, near_text=False):
+    """Probe the leading marker and either the tint above the text or the blank far edge."""
     left, _, right, _ = bounds(pane)
     _, top, _, bottom = bounds(band)
     width = right - left
@@ -348,6 +348,9 @@ def paint(image, scale, pane, band, *, multiline=False):
         return False
 
     stripe = any(stripe_at(x) for x in range(x0, x1))
+    if near_text:
+        x2, x3 = round((left + 20) * scale), round((left + 55) * scale)
+        y0, y1 = round((top + 1) * scale), round((top + 3) * scale)
     colors = image.crop((x2, y0, x3, y1)).getcolors((x3 - x2) * (y1 - y0))
     count, fill = max(colors)
     check(count >= 0.95 * (x3 - x2) * (y1 - y0), "lyric background sample was not a solid fill")
@@ -438,9 +441,11 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
         check(boxes == row_boxes, "playback moved the timed lyrics within the reader")
         check(handles == row_handles, "playback remounted the timed lyric rows")
         for i, row in enumerate(rows):
-            stripe, fill = paint(image, scale, pane, row)
+            stripe, fill = paint(image, scale, pane, row, near_text=True)
+            _, far_fill = paint(image, scale, pane, row)
             if background is None:
-                background = fill  # The pre-first-line frame is all inactive.
+                background = far_fill  # The pre-first-line frame is all inactive.
+            check(far_fill == background, f"{name}: line {i + 1} tinted the empty reading lane")
             check(stripe == (i == active) and (fill != background) == (i == active),
                   f"{name}: line {i + 1} expected {'stripe and tint' if i == active else 'plain background'}; "
                   f"got stripe={stripe}, fill={fill}, inactive={background}")
