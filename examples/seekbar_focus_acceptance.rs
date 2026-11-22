@@ -9,7 +9,8 @@ use std::{path::Path, time::Duration};
 slint::include_modules!();
 
 type Crop = [u32; 4]; // left, top, right, bottom (exclusive)
-const NOW: Crop = [398, 564, 772, 597];
+// Now Playing fits its artwork and main timeline above the persistent dock.
+const NOW: Crop = [398, 455, 772, 486];
 const DOCK: Crop = [391, 637, 939, 665];
 const VOLUME: Crop = [1146, 605, 1258, 641];
 const MUTE_BUTTON: Crop = [1107, 606, 1145, 645];
@@ -170,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     Timer::single_shot(Duration::from_millis(300), move || {
         let ui = weak.unwrap();
-        check_timeline(&ui, &frames, "now-waveform", NOW, 551.0, 580.0);
+        check_timeline(&ui, &frames, "now-waveform", NOW, 551.0, 472.0);
         ui.set_page_kind("history".into());
         check_timeline(&ui, &frames, "dock", DOCK, 613.0, 649.0);
         let unmuted = focus(&ui, &frames, "volume", VOLUME, PRIMARY, false);

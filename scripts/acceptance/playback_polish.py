@@ -130,7 +130,7 @@ def queue_pixels(window):
             continue
         content = window.subtree(row)
         label = next((e["accessibleLabel"] for e in content
-                      if window.matches(e, r"(?:Play )?Queue recording [012]")), None)
+                      if window.matches(e, r"(?:Play track: )?Queue recording [012]")), None)
         check(label, "missing accessible queue row label")
         if label == "Queue recording 1":
             cover = element_type(content, "Cover")
@@ -146,11 +146,13 @@ def queue_pixels(window):
             starts.append(min(ink))
         check(max(starts) - min(starts) <= 1, f"queue title/artist/album paint misaligned: {starts}")
         columns[label] = starts
-    expected = {"Queue recording 1", "Play Queue recording 2"}
+    expected = {"Queue recording 1", "Play track: Queue recording 2"}
     if window.dimensions()[0] == ULTRAWIDE[0]:
         expected.add("Queue recording 0")
-    check(expected <= columns.keys() and all(starts == columns["Queue recording 1"] for starts in columns.values()),
-          f"current and compact row paint misaligned: {columns}")
+    check(expected <= columns.keys(), f"expected visible Queue rows, got {columns}")
+    artless = [starts[0] for label, starts in columns.items() if label != "Queue recording 1"]
+    check(max(artless) - min(artless) <= 1 and columns["Queue recording 1"][0] > max(artless),
+          f"expected a shared text edge for artless rows, with only current artwork inset: {columns}")
     print(f"PASS queue painted title/artist/album starts: {columns} at {window.dimensions()[0]:g}px", flush=True)
 
 

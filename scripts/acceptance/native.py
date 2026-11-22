@@ -401,17 +401,27 @@ def assert_queue_columns(window):
     elements = window.subtree(pane, max_elements=1000)
     scroll = element_id(elements, "queue-scroll")
     check(scroll, "missing queue viewport")
-    columns = []
+    artless = []
+    covers = []
     for row in elements:
         if not element_type([row], "MediaLine") or not contains(scroll, row):
             continue
-        words = element_id(window.subtree(row), "words")
+        content = window.subtree(row)
+        words = element_id(content, "words")
         check(words and contains(row, words) and bounds(words)[2] - bounds(words)[0] >= 72,
               f"visible queue row has no usable metadata column: {bounds(row)}")
-        columns.append(bounds(words)[0])
-    check(len(columns) >= 2, "fixture did not show at least two queue rows")
-    check(max(columns) - min(columns) <= 1, f"queue metadata columns don't align: {columns}")
-    print(f"PASS queue columns: {len(columns)} visible rows share a metadata start", flush=True)
+        start = bounds(words)[0]
+        cover = element_type(content, "Cover")
+        if cover:
+            check(contains(row, cover) and bounds(cover)[2] < start,
+                  "Queue artwork must sit to the left of the current track’s metadata")
+            covers.append(bounds(cover)[0])
+        else:
+            artless.append(start)
+    check(artless and len(artless) + len(covers) >= 2, "fixture did not show at least two queue rows")
+    check(len(covers) <= 1 and max(artless + covers) - min(artless + covers) <= 1,
+          f"artless Queue metadata or leading artwork has an empty gutter: {artless}, {covers}")
+    print("PASS Queue columns: artless rows start at the leading cover edge", flush=True)
 
 
 def full_player(window, title, name, width, failures):
