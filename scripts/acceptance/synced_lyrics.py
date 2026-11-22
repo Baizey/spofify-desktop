@@ -33,7 +33,7 @@ sys.dont_write_bytecode = True
 from audio_smoke import admission
 from audio_smoke_wire import Peer
 from fixture import Failure, check, private_env
-from native import DESKTOP, bounds, desktop, element_id, element_type, wait
+from native import DESKTOP, bounds, desktop, dock_identity, element_id, element_type, player_bar, wait
 from playback import CONNECT, PROTOCOL, SOCKET, WS_GUID
 
 
@@ -364,7 +364,8 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
     win.click("Sign in")
     peer = admission(admitted, requests, "lyrics sign-in")
     peer.open_remote()
-    win.click("Lyrics")
+    dock = dock_identity(win)
+    win.click("Lyrics", within=player_bar(win))
     win.absent("Username|Password", roles=("TextInput",))
     win.title(TIMED[1])
     scale = win.window_properties()["scaleFactor"]
@@ -386,9 +387,12 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
         wait(f"GET {path} responses {statuses}", arrived, 6)
 
+    def now_page():
+        return wait("Now Playing", lambda: element_type(win.elements(), "NowPlaying"))
+
     def next_track(track, **cursor):
         exact_gets()
-        win.click("Next track")
+        win.click("Next track", within=now_page())
         peer.command("next")
         peer.cursor(key=TRACKS.index(track) + 1, **cursor)
         now_playing_title(track)
@@ -398,6 +402,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
             page = element_type(win.elements(), "NowPlaying")
             return page and text(win, win.subtree(page), re.escape(track[1]))
         wait("Now Playing: " + track[1], title)
+        check(dock_identity(win) == dock, "changing tracks or reopening Lyrics moved or replaced the dock")
 
     def save(image, name):
         if captures:
@@ -466,15 +471,15 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     peer.cursor(observed=True, elapsed=16.25)
     win.find(r"Elapsed 0:(16|17)", roles=("Text",))
-    win.click("Pause")
+    win.click("Pause", within=now_page())
     peer.command("pause")
     peer.cursor(run=4, elapsed=16.25, playing=False, desired=False)
-    win.find("Play", roles=("Button",))
+    win.find("Play", roles=("Button",), within=now_page())
     sleep(2.2)  # A still-advancing cursor would cross the next line's 18s boundary.
     win.title("Elapsed 0:16", timeout=2)
     timed("05-paused-second-line", 1)
 
-    win.drag_slider(0.56)
+    win.drag_slider(0.56, within=now_page())
     seek = peer.command("seek")["value"]
     check(abs(seek - 0.56 * DURATION) < 0.6, f"unexpected native seek target: {seek!r}")
     peer.cursor(run=5, elapsed=seek)
@@ -483,7 +488,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     # Start after all old authored starts: a leaked timed model could still be active.
     next_track(PLAIN, run=6, visit=3, elapsed=22.0, playing=True, desired=True)
-    win.find("Pause", roles=("Button",))
+    win.find("Pause", roles=("Button",), within=now_page())
     fetched(PLAIN, 200)
 
     def plain():
@@ -538,7 +543,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
         win.click("Back")
         wait("Now Playing closed", lambda: not element_type(win.elements(), "NowPlaying"))
         exact_gets()
-        win.click("Now playing: " + re.escape(track[1]))
+        win.click("Now playing: " + re.escape(track[1]), within=player_bar(win))
         now_playing_title(track)
 
     next_track(STALE, run=7, visit=4, elapsed=0, playing=False, desired=False)

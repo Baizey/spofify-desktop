@@ -1,79 +1,5 @@
-import { Action, Caption, Divider, Eyebrow, Notice, Theme } from "theme.slint";
-import { DeviceRow, OutputPicker } from "output-picker.slint";
-
-component PlaybackStatus inherits Action {
-    in property <string> message;
-    in property <string> context-key;
-    text: "Status";
-    accessible-label: "Playback status";
-    accessible-description: root.message;
-    accessible-expanded: details.is-open;
-    selected: details.is-open;
-    changed message => { if details.is-open { details.close(); } }
-    changed context-key => { if details.is-open { details.close(); } }
-    changed enabled => { if !self.enabled && details.is-open { details.close(); } }
-    clicked => {
-        if details.is-open { details.close(); }
-        else { self.take-focus(); details.show(); }
-    }
-    details := PopupWindow {
-        x: root.width - self.width; y: root.height + 6px;
-        width: 264px; height: message-panel.min-height;
-        close-policy: close-on-click-outside;
-        forward-focus: keys;
-        init => { keys.focus(); }
-        message-panel := Notice { width: 100%; height: 100%; text: root.message; }
-        keys := FocusScope {
-            focus-on-click: false;
-            key-pressed(event) => {
-                if event.text == Key.Escape || event.text == Key.Return || event.text == Key.Space {
-                    details.close(); return accept;
-                }
-                if event.text == Key.Tab || event.text == Key.Backtab { details.close(); }
-                return reject;
-            }
-        }
-    }
-}
-
-// Surface playback tools here only when there is no playback dock.
-export component PlaybackTools inherits Rectangle {
-    in property <bool> labeled;
-    in property <bool> enabled;
-    in property <bool> queue-open;
-    in property <string> status;
-    in property <string> context-key;
-    in property <[DeviceRow]> devices;
-    in property <string> output;
-    in property <string> device-status;
-    in property <bool> offline;
-    in property <length> window-width;
-    in property <length> window-height;
-    callback navigate(string);
-    callback device-action(string, string, string);
-    public function focus-queue() { queue-trigger.take-focus(); }
-    preferred-width: tools.preferred-width;
-    horizontal-stretch: 0;
-    tools := HorizontalLayout {
-        spacing: 6px;
-        queue-trigger := Action {
-            text: root.labeled ? "Queue" : ""; icon: "≡"; selected: root.queue-open;
-            accessible-label: "Play queue"; accessible-expanded: root.queue-open;
-            enabled: root.enabled; clicked => { root.navigate("queue"); }
-        }
-        OutputPicker {
-            text: root.labeled ? "Devices" : ""; below: true;
-            window-width: root.window-width; window-height: root.window-height;
-            devices: root.devices; output: root.output; status: root.device-status;
-            enabled: root.enabled; context-key: root.context-key; offline: root.offline;
-            device-action(op, id, name) => { root.device-action(op, id, name); }
-        }
-        if root.status != "": PlaybackStatus {
-            message: root.status; context-key: root.context-key;
-            enabled: root.enabled;
-        }
-    }
-}
+import { ScrollView } from "std-widgets.slint";
+import { Action, Caption, Divider, Eyebrow, Theme } from "theme.slint";
 
 export component WorkspaceRail inherits Rectangle {
     in property <string> kind;
@@ -88,48 +14,69 @@ export component WorkspaceRail inherits Rectangle {
         else { history.take-focus(); }
     }
     background: Theme.rail;
+    property <bool> short: root.height < 370px;
+    property <length> left-inset: root.compact ? 7px : 14px;
+    property <length> right-inset: root.compact ? 7px : 15px;
     Divider { x: parent.width - 1px; y: 0px; width: 1px; height: parent.height; }
-    VerticalLayout {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
-        padding-left: root.compact ? 7px : 14px;
-        padding-right: root.compact ? 7px : 15px;
-        padding-top: 12px; padding-bottom: 12px; spacing: 5px;
-        HorizontalLayout {
-            height: 40px; spacing: root.compact ? 7px : 10px;
-            Rectangle {
-                width: root.compact ? 22px : 30px;
-                Image { x: 2px; y: (parent.height - self.height) / 2; width: parent.width - 2px; height: self.width; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
-            }
-            Text {
-                text: "Spofify"; font-size: root.compact ? 19px : 23px; font-weight: 750; color: Theme.text;
-                vertical-alignment: center; horizontal-stretch: 1; min-width: 0px; overflow: elide;
+    // Keep account and Settings above the dock even if banners reduce the rail viewport.
+    scroll := ScrollView {
+        x: 0px; y: 0px; width: parent.width; height: max(0px, footer.y);
+        horizontal-scrollbar-policy: always-off;
+        content-width: self.visible-width; content-height: nav.preferred-height;
+        function reveal(y: length, h: length) {
+            if y < -self.content-y { self.content-y = -y; }
+            else if y + h > -self.content-y + self.visible-height {
+                self.content-y = min(0px, self.visible-height - y - h);
             }
         }
-        Rectangle { height: 13px; }
-        Eyebrow { text: "YOUR LIBRARY"; color: Theme.muted; height: 22px; }
-        history := Action {
-            text: "History"; icon: "◷"; leading: true; quiet: true; min-width: 0px;
-            selected: root.kind == "history" || root.kind == "recent";
-            accessible-description: self.selected ? "Current section" : "Listening history";
-            enabled: !root.locked; clicked => { root.navigate("history"); }
+        nav := VerticalLayout {
+            x: 0px; y: 0px; width: scroll.visible-width; height: self.preferred-height;
+            padding-left: root.left-inset; padding-right: root.right-inset;
+            padding-top: root.short ? 4px : 12px; spacing: root.short ? 2px : 5px;
+            HorizontalLayout {
+                height: root.short ? 34px : 40px; spacing: root.compact ? 7px : 10px;
+                Rectangle {
+                    width: root.compact ? 22px : 30px;
+                    Image { x: 2px; y: (parent.height - self.height) / 2; width: parent.width - 2px; height: self.width; source: @image-url("../assets/spofify-logo.svg"); accessible-role: none; }
+                }
+                Text {
+                    text: "Spofify"; font-size: root.compact ? 19px : 23px; font-weight: 750; color: Theme.text;
+                    vertical-alignment: center; horizontal-stretch: 1; min-width: 0px; overflow: elide;
+                }
+            }
+            Rectangle { height: root.short ? 3px : 13px; }
+            Eyebrow { text: "YOUR LIBRARY"; color: Theme.muted; height: root.short ? 18px : 22px; }
+            history := Action {
+                text: "History"; icon: "◷"; leading: true; quiet: true; min-width: 0px;
+                selected: root.kind == "history" || root.kind == "recent";
+                accessible-description: self.selected ? "Current section" : "Listening history";
+                enabled: !root.locked; clicked => { root.navigate("history"); }
+                changed has-focus => { if self.has-focus { scroll.reveal(self.y, self.height); } }
+            }
+            playlists := Action {
+                text: "Playlists"; icon: "playlists"; leading: true; quiet: true; min-width: 0px;
+                selected: root.kind == "playlists" || root.kind == "playlist" || root.kind == "playlist-manual" || root.kind == "playlist-rules" || root.kind == "picker";
+                accessible-description: self.selected ? "Current section" : "Your playlists";
+                enabled: !root.locked; clicked => { root.navigate("playlists"); }
+                changed has-focus => { if self.has-focus { scroll.reveal(self.y, self.height); } }
+            }
+            Rectangle { height: root.short ? 3px : 13px; }
+            Divider { }
+            Eyebrow { text: "ON THIS DEVICE"; color: Theme.muted; height: root.short ? 19px : 25px; letter-spacing: root.compact ? 0.6px : 1.2px; }
+            saved := Action {
+                text: "Saved offline"; icon: root.compact && Theme.density > 1.05 ? "" : "↓"; leading: true; quiet: true; min-width: 0px;
+                selected: root.kind == "offline" || root.kind == "saved-collection";
+                accessible-description: self.selected ? "Current section" : "Music saved on this device";
+                enabled: !root.locked; clicked => { root.navigate("offline"); }
+                changed has-focus => { if self.has-focus { scroll.reveal(self.y, self.height); } }
+            }
         }
-        playlists := Action {
-            text: "Playlists"; icon: "playlists"; leading: true; quiet: true; min-width: 0px;
-            selected: root.kind == "playlists" || root.kind == "playlist" || root.kind == "playlist-manual" || root.kind == "playlist-rules" || root.kind == "picker";
-            accessible-description: self.selected ? "Current section" : "Your playlists";
-            enabled: !root.locked; clicked => { root.navigate("playlists"); }
-        }
-        Rectangle { height: 13px; }
-        Divider { }
-        Eyebrow { text: "ON THIS DEVICE"; color: Theme.muted; height: 25px; letter-spacing: root.compact ? 0.6px : 1.2px; }
-        saved := Action {
-            text: "Saved offline"; icon: root.compact && Theme.density > 1.05 ? "" : "↓"; leading: true; quiet: true; min-width: 0px;
-            selected: root.kind == "offline" || root.kind == "saved-collection";
-            accessible-description: self.selected ? "Current section" : "Music saved on this device";
-            enabled: !root.locked; clicked => { root.navigate("offline"); }
-        }
-        Rectangle { vertical-stretch: 1; }
-        if root.account != "": Caption { text: root.account; height: 22px; }
+    }
+    footer := VerticalLayout {
+        x: 0px; y: root.height - self.height; width: parent.width; height: self.preferred-height;
+        padding-left: root.left-inset; padding-right: root.right-inset;
+        padding-bottom: root.short ? 4px : 12px; spacing: root.short ? 2px : 5px;
+        if root.account != "": Caption { text: root.account; height: root.short ? 18px : 22px; }
         settings := Action {
             text: "Settings"; icon: "⚙"; leading: true; quiet: true; min-width: 0px;
             selected: root.kind == "settings" || root.kind == "appearance" || root.kind == "account";

@@ -65,6 +65,7 @@ fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
     });
 
     let control = journal_path.with_extension("control");
+    let loaded_queue = ui.get_queue_rows();
     let timer = Timer::default();
     let weak = ui.as_weak();
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -74,8 +75,23 @@ fn picker_fixture(ui: &AppWindow) -> Option<(Rc<File>, Timer)> {
         let ui = weak.unwrap();
         match command.trim() {
             "change-page-key" => ui.set_page_key("fixture-new-history-context".into()),
-            "drop-dock" => ui.set_now_track_id("".into()),
-            "restore-dock" => ui.set_now_track_id("one".into()),
+            "clear-track" => {
+                // Clear the real cursor and queue; the dock must hide stale descriptive fields and timing.
+                ui.set_now_track_id("".into());
+                ui.set_playing(false);
+                ui.set_queue_rows(ModelRc::default());
+            }
+            "play-track" => {
+                ui.set_now_track_id("one".into());
+                ui.set_playing(true);
+                ui.set_queue_rows(loaded_queue.clone());
+            }
+            "modes-set" => {
+                ui.set_shuffle(true);
+                ui.set_repeat_mode("one".into());
+            }
+            "open-editor" => ui.set_form_mode("rename".into()),
+            "close-editor" => ui.set_form_mode("".into()),
             "now" => {
                 ui.set_page_kind("now".into());
                 ui.set_can_back(true);
@@ -188,12 +204,18 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(events) = &picker_journal {
             writeln!(&**events, "navigate\t{route}").expect("record navigation");
         }
-        ui.set_can_back(route == "now");
-        ui.set_page_kind(if route == "back" {
-            "history".into()
+        if route == "back" {
+            // Like the engine, publish the returned route after the callback has completed.
+            let weak = ui.as_weak();
+            Timer::single_shot(Duration::from_millis(75), move || {
+                let ui = weak.unwrap();
+                ui.set_can_back(false);
+                ui.set_page_kind("history".into());
+            });
         } else {
-            route
-        });
+            ui.set_can_back(route == "now");
+            ui.set_page_kind(route);
+        }
     });
     let weak = ui.as_weak();
     ui.on_seek(move |elapsed| weak.unwrap().set_elapsed(elapsed.round()));
@@ -202,6 +224,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui = weak.unwrap();
         ui.set_local_volume(volume);
         ui.set_local_muted(false);
+    });
+    let weak = ui.as_weak();
+    ui.on_local_mute_toggle(move || {
+        let ui = weak.unwrap();
+        ui.set_local_muted(!ui.get_local_muted());
     });
     let weak = ui.as_weak();
     ui.on_previous(move || weak.unwrap().set_duration(0.0));

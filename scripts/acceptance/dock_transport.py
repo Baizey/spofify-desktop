@@ -19,7 +19,7 @@ from PIL import Image, ImageChops
 sys.dont_write_bytecode = True
 from fixture import Failure, check, private_env
 from native import (COMPACT, MINIMUM, WIDE, assert_disjoint, bounds, contains, desktop, element_id,
-                    element_type, named, verify, wait)
+                    element_type, named, player_bar, verify, wait)
 from playback_polish import TAB, frame, has_ring, move_off
 
 
@@ -32,6 +32,7 @@ METADATA = ("track title", "artist credits", "album title")
 
 @dataclass
 class Sample:
+    dock_handle: dict
     layout: dict
     paint: dict
     image: Image.Image
@@ -89,13 +90,13 @@ def capture(window, phase, pictures, *, status="", playing=False, ticked=False, 
     label = "Pause" if playing else "Play"
     clock = window.title("1:01" if ticked else "0:46") if known else None
     caption = window.title(status) if status else None
-    window.find(label, roles=("Button",))
+    window.find(label, roles=("Button",), within=player_bar(window))
     if not status:
         window.absent(f"{REQUEST}|{BUFFERING}", roles=("Text",))
     elements = window.elements()
-    dock = element_type(elements, "PlayerBar")
+    dock = player_bar(window, elements)
     catalog = element_id(elements, "catalog-scroll")
-    check(dock and catalog, "missing dock or catalog viewport")
+    check(catalog, "missing catalog viewport")
     children = window.subtree(dock, max_elements=1000)
     title = named(window, children, "Now playing: Synthetic Tone 001")
     check(title and title.get("accessibleEnabled", True), "retained track lost its title action")
@@ -180,10 +181,11 @@ def capture(window, phase, pictures, *, status="", playing=False, ticked=False, 
     print(f"{phase}: dock={layout['dock']}, {label}={bounds(button)}, "
           f"ink-center={paint['Play|Pause'][1]}, seek-end={end}, status={status!r}, status-box={status_box}",
           flush=True)
-    return Sample(layout, paint, image, status_box, clock_box, end)
+    return Sample(dock["handle"], layout, paint, image, status_box, clock_box, end)
 
 
 def compare(before, after, *, icon_changes=False):
+    check(after.dock_handle == before.dock_handle, "playback phase replaced the dock")
     shifted = [name for name, old in before.layout.items()
                if name in after.layout and any(abs(a - b) > 0.25 for a, b in zip(old, after.layout[name]))]
     check(not shifted, "layout moved: " + ", ".join(shifted))
@@ -228,7 +230,7 @@ def transition(window, root, pictures, failures, width, *, keyboard=False, unkno
     if keyboard:
         window.key(" ")
     else:
-        window.click("Play")  # Native center press/release, not an accessible default action.
+        window.click("Play", within=player_bar(window))  # Native press/release, not an accessible action.
         move_off(window)
     request = read("request", status=REQUEST, focus=play_focus, known=not unknown)
     release("buffer")
@@ -241,7 +243,7 @@ def transition(window, root, pictures, failures, width, *, keyboard=False, unkno
     playing = read("playing", playing=True, focus=pause_focus)
     release("tick")
     advanced = read("advanced", playing=True, ticked=True, focus=pause_focus)
-    window.click("Pause")
+    window.click("Pause", within=player_bar(window))
     move_off(window)
     restored = read("restored")
 

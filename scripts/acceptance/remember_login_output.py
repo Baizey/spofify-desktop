@@ -11,10 +11,10 @@ import wave
 
 from audio_smoke import child, heard_tone, silence
 from fixture import Failure, check
-from native import Window, mcp_class, wait
+from native import Window, mcp_class, player_bar, wait
 from playback import Peer
 from remember_login_wire import admitted, event, no_writes, settle, state, vacant_output
-from workspace_checks import open_manual, open_playlists
+from workspace_checks import open_manual, open_playlists, play_manual
 
 
 @contextmanager
@@ -194,7 +194,7 @@ def output_relaunches(binary, root, env, receipt, pcm, mark, *, on_restore, remo
             open_playlists(window)
             open_manual(window)
             play_mark, start = len(receipt.events()), pcm.stat().st_size
-            window.click("Play")
+            play_manual(window)
             wait("canonical playlist selection", lambda: ("owned-playlist-selection",) in receipt.events(play_mark))
             wait("220 Hz on private null sink", lambda: heard_tone(pcm, hz=220, start=start), 5)
             _, _, _, active = wait("nonzero canonical playing cursor", lambda: state(
@@ -228,7 +228,7 @@ def output_relaunches(binary, root, env, receipt, pcm, mark, *, on_restore, remo
         no_writes(receipt, mark, playing=True)
         print("PASS playing window closed gracefully; same device/new connection kept the Go lease and canonical cursor, with PCM and no replay", flush=True)
         pause_mark = len(receipt.events())
-        window.click("Pause")
+        window.click("Pause", within=player_bar(window))
         _, _, _, paused = wait("Go paused cursor", lambda: state(
             receipt, pause_mark, connection=new, owner=new,
             cursor=lambda c: not c["desired"] and not c["playing"] and c["key"] == initial["cursor"]["key"]))

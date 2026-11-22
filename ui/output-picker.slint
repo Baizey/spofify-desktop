@@ -9,14 +9,12 @@ export component OutputPicker inherits Action {
     in property <string> status;
     in property <string> context-key;
     in property <bool> offline;
-    in property <bool> below;
     in property <length> window-width;
-    in property <length> window-height;
     property <bool> open: picker.is-open;
     callback device-action(string, string, string);
 
     icon: "◫";
-    quiet: self.text == "";
+    quiet: true;
     pointer-focus-visible: false;
     accessible-label: "Playback devices";
     accessible-description: root.offline ? root.message : root.output;
@@ -30,7 +28,7 @@ export component OutputPicker inherits Action {
         : root.devices.length == 0 ? "No outputs available" : "";
     changed context-key => { root.dismiss(); }
     changed enabled => { if !self.enabled { root.dismiss(); } }
-    function dismiss() { if root.open { picker.close(); } }
+    public function dismiss() { if root.open { picker.close(); } }
     clicked => {
         if root.open { picker.close(); }
         else {
@@ -43,11 +41,11 @@ export component OutputPicker inherits Action {
 
     picker := PopupWindow {
         width: min(326px, root.window-width - 16px);
-        height: min(286px, max(42px, root.below ? root.window-height - root.anchor-y - root.height - 14px : root.anchor-y - 14px),
+        height: min(286px, max(42px, root.anchor-y - 14px),
             header.height + selected-row.preferred-height + rows.preferred-height + 2px);
-        x: clamp(root.below ? root.width - self.width : (root.width - self.width) / 2, 8px - root.anchor-x,
+        x: clamp((root.width - self.width) / 2, 8px - root.anchor-x,
             root.window-width - root.anchor-x - self.width - 8px);
-        y: root.below ? root.height + 6px : -self.height - 6px;
+        y: -self.height - 6px;
         close-policy: close-on-click-outside;
         init => {
             if root.pointer-focused { close-button.take-pointer-focus(); }
