@@ -120,14 +120,11 @@ component TrackState inherits Rectangle {
 component TrackCover inherits Cover {
     in property <bool> current-track;
     in property <bool> playing-track;
-    in property <bool> artist-mark;
     width: 39px; height: self.width;
-    Rectangle {
-        visible: root.current-track || root.artist-mark;
+    if root.current-track: Rectangle {
         x: parent.width - self.width; y: parent.height - self.height;
-        width: root.artist-mark ? 17px : 20px; height: self.width; border-radius: 5px; background: Theme.bg;
-        if root.current-track: TrackState { x: 2px; y: 2px; playing: root.playing-track; }
-        if root.artist-mark: Glyph { x: 2px; y: 2px; width: 13px; height: self.width; name: "◉"; ink: Theme.text; }
+        width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
+        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
     }
 }
 
@@ -148,7 +145,8 @@ export component MediaLine inherits Rectangle {
     in property <bool> queue-row;
     property <bool> leading-cover: root.sequence == 0 && (root.queue-row ? root.artwork.width > 0 : !root.compact);
     property <bool> leading-state: root.queue-row && root.current-track && !root.leading-cover;
-    property <bool> leading-marker: root.sequence == 0 && root.compact && root.kind == "track" && !root.queue-row;
+    property <bool> leading-marker: root.sequence == 0 && root.compact && !root.queue-row
+        && (root.kind == "track" || root.type-mark != "");
     property <length> leading-slot: root.sequence > 0 ? (root.compact ? 26px : 33px)
         : root.leading-cover || root.leading-state ? 39px : root.leading-marker ? 16px : 0px;
     property <length> word-gap: !root.queue-row && root.compact && root.kind == "track" ? 6px : 8px;
@@ -183,7 +181,15 @@ export component MediaLine inherits Rectangle {
     in property <bool> title-opens-album;
     in property <bool> show-separate-album: true;
     in property <bool> availability-status;
-    in property <bool> mark-artist-art;
+    in property <string> type-mark;
+    in property <length> menu-scroll-window-width;
+    callback menu-scrolled(length);
+    property <bool> menu-focused;
+    property <length> menu-top: (root.height - 38px) / 2;
+    property <bool> menu-scrolled-out: root.menu-scroll-window-width > 0px && root.menu-focused && root.play-viewport-height > 0px
+        && (root.row-viewport-y + root.menu-top + 38px <= 0px
+            || root.row-viewport-y + root.menu-top >= root.play-viewport-height);
+    changed menu-scrolled-out => { if root.menu-scrolled-out { root.play-focus-evicted(); } }
     in property <string> current-album-id;
     in property <bool> align-credit-fallback;
     in property <bool> selected;
@@ -363,7 +369,6 @@ export component MediaLine inherits Rectangle {
                 TrackCover {
                     y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
-                    artist-mark: root.kind == "artist" && root.mark-artist-art && root.artwork.width > 0;
                     current-track: root.current-track; playing-track: root.playing-track;
                 }
             }
@@ -377,6 +382,11 @@ export component MediaLine inherits Rectangle {
             if root.leading-marker: Rectangle {
                 width: 16px;
                 TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
+                if root.type-mark != "": Glyph {
+                    width: 14px; height: self.width;
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    name: root.type-mark; ink: Theme.muted;
+                }
             }
             words := VerticalLayout {
                 min-width: 0px; horizontal-stretch: 1; alignment: center;
@@ -471,14 +481,28 @@ export component MediaLine inherits Rectangle {
             }
             clicked => { root.action("play"); }
         }
+        // Real art gets a type mark in its corner; fallback art already
+        // communicates the type. Keep the mark visible next to hover Play.
+        if root.type-mark != "" && root.leading-cover && root.artwork.width > 0: Rectangle {
+            width: 17px; height: self.width;
+            x: -row-face.x + 39px - self.width; y: (root.height + 39px) / 2 - self.height;
+            border-radius: 5px; background: Theme.bg;
+            Glyph { x: 2px; y: 2px; width: 13px; height: self.width; name: root.type-mark; ink: Theme.text; }
+        }
         if root.actions.length > 0: OverflowMenu {
-            x: parent.width - 37px; y: (parent.height - self.height) / 2;
+            x: parent.width - 37px; y: root.menu-top;
             actions: root.actions; label: "Show actions for " + root.title; open-label: "Hide actions for " + root.title;
             item-context: root.title; context-key: root.menu-key; window-height: root.window-height;
+            scroll-window-width: root.menu-scroll-window-width;
+            scroll-position: root.menu-scroll-window-width > 0px ? root.row-viewport-y : 0px;
+            scrolled(delta) => { root.menu-scrolled(delta); }
             restore-focus: root.restore-control == "menu";
             property <int> resume: root.resume-part == "menu" ? root.resume-serial : 0;
             changed resume => { if self.resume != 0 { self.take-focus(); } }
-            trigger-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
+            trigger-focus-changed(owns) => {
+                root.menu-focused = owns;
+                root.keyboard-focus-changed(owns, false);
+            }
             action(op) => { root.action(op); }
             focused => { root.focused(); }
         }

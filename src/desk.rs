@@ -715,6 +715,37 @@ impl RowEditor {
     }
 }
 
+fn search_entity_actions(
+    page: &Page,
+    row: &pages::Row,
+    offline: bool,
+) -> Option<&'static [&'static str]> {
+    let (details, id): (&[_], _) = match (row.kind.as_str(), &row.route) {
+        ("album", Some(Route::Album(id))) if id == &row.id => (&["open-album"], id),
+        ("artist", Some(Route::Artist(id))) if id == &row.id => (&["open-artist"], id),
+        _ => return None,
+    };
+    if !crate::api::catalog::segment_id(id) {
+        return None;
+    }
+    // Online rows carry the same canonical collection selection as their
+    // detail pages. Offline rows deliberately have no wire selection; their
+    // playable flag comes from the verified local catalog instead.
+    let playable = row.playable
+        && if offline {
+            page.local_audio
+        } else {
+            !page.local_audio
+                && matches!(&row.playback, Some(pages::PlaybackSelection::Collection { context })
+                    if context.kind.as_str() == row.kind && &context.id == id)
+        };
+    Some(if playable {
+        &["play", "queue"]
+    } else {
+        details
+    })
+}
+
 fn row_actions(
     p: &Page,
     r: &pages::Row,
@@ -725,6 +756,11 @@ fn row_actions(
     let mut v = Vec::new();
     if p.kind == "picker" {
         return v;
+    }
+    if p.kind == "search" && matches!(r.kind.as_str(), "album" | "artist") {
+        return search_entity_actions(p, r, offline)
+            .unwrap_or_default()
+            .to_vec();
     }
     if offline && p.local_audio && r.playable {
         v.push("queue");
@@ -2466,7 +2502,19 @@ impl Browser {
             return;
         }
         let saved_page = saved_route(&route);
-        if op == "open" && !matches!(route, Route::Picker(_)) {
+        let entity_details = matches!(op.as_str(), "open-album" | "open-artist");
+        match (&route, row.as_ref()) {
+            (Route::Search(_), Some(r)) if matches!(r.kind.as_str(), "album" | "artist") => {
+                if !search_entity_actions(&page, r, offline)
+                    .is_some_and(|actions| op == "open" || actions.contains(&op.as_str()))
+                {
+                    return;
+                }
+            }
+            _ if entity_details => return,
+            _ => {}
+        }
+        if (op == "open" || entity_details) && !matches!(route, Route::Picker(_)) {
             if let Some(target) = row.as_ref().and_then(|r| row_open_target(&route, r)) {
                 self.visit(Navigation::Follow(target.clone()));
             }
@@ -3465,6 +3513,39 @@ mod tests {
                 delete: true,
                 add_tracks: false,
             },
+        }
+    }
+
+    #[test]
+    fn search_entity_menu_uses_only_addressable_and_playable_catalog_targets() {
+        let mut page = Page {
+            kind: "search".into(),
+            ..Page::default()
+        };
+        for (kind, route, open) in [
+            ("album", Route::Album("same".into()), "open-album"),
+            ("artist", Route::Artist("same".into()), "open-artist"),
+        ] {
+            let mut row = pages::Row {
+                id: "same".into(),
+                route: Some(route),
+                kind: kind.into(),
+                playable: true,
+                ..pages::Row::default()
+            };
+            assert_eq!(row_actions(&page, &row, false, true, false), [open]);
+            assert_eq!(row_actions(&page, &row, true, false, false), [open]);
+            page.local_audio = true;
+            assert_eq!(
+                row_actions(&page, &row, true, false, false),
+                ["play", "queue"]
+            );
+            assert_eq!(row_actions(&page, &row, false, true, false), [open]);
+            row.playable = false;
+            assert_eq!(row_actions(&page, &row, true, false, false), [open]);
+            row.route = Some(Route::Album("unrelated".into()));
+            assert!(row_actions(&page, &row, true, false, false).is_empty());
+            page.local_audio = false;
         }
     }
 

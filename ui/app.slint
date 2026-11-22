@@ -39,9 +39,9 @@ component BrowseLine inherits MediaLine {
     in property <bool> is-playlist;
     title: entry.title; subtitle: entry.subtitle; kind: entry.kind;
     availability-status: page-kind == "search" && entry.kind == "track" && entry.track-unavailable;
-    detail: page-kind == "search" && entry.kind == "track" ? (self.availability-status ? "Unavailable" : "") : entry.detail;
+    detail: page-kind == "search" ? (self.availability-status ? "Unavailable" : "") : entry.detail;
     title-opens-album: entry.kind == "track" && (page-kind == "search" || is-playlist);
-    mark-artist-art: page-kind == "search";
+    type-mark: page-kind == "search" && (entry.kind == "album" || entry.kind == "artist") ? Copy.mark(entry.kind) : "";
     sequence: page-kind == "album" || is-playlist ? index + 1 : 0;
     occurrence-description: is-playlist || page-kind == "saved-collection" ? "Song " + (index + 1) : "";
     credits: entry.credits; metadata-enabled: page-kind != "picker";
@@ -425,7 +425,9 @@ export component AppWindow inherits Window {
             }
         }
         function browse(op: string, index: int) {
-            if op == "open" || op == "add" { self.remember-scroll(index, op == "add" ? "menu" : ""); }
+            if op == "open" || op == "add" || op == "open-album" || op == "open-artist" {
+                self.remember-scroll(index, op == "open" ? "" : "menu");
+            }
             root.row-action(op, index);
         }
         function edited-search() {
@@ -1166,6 +1168,8 @@ export component AppWindow inherits Window {
                                         window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + index;
                                         title-focus-key: root.page-key + "/" + self.entry.track-id;
+                                        menu-scroll-window-width: root.is-search ? root.width : 0px;
+                                        menu-scrolled(delta) => { catalog-scroll.set-scroll(catalog-scroll.content-y + delta); }
                                         // A retained Back anchor must not keep a clipped Play action active.
                                         row-viewport-y: slot.visible-y;
                                         play-viewport-height: history-pane.visible && catalog-scroll.visible && !catalog-scroll.restore-catalog
@@ -1191,9 +1195,9 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                         action(op) => {
-                                            if op == "open" || op == "add" {
+                                            if op == "open" || op == "add" || op == "open-album" || op == "open-artist" {
                                                 root.catalog-focused-row = index;
-                                                root.catalog-focused-part = op == "add" ? "menu" : "";
+                                                root.catalog-focused-part = op == "open" ? "" : "menu";
                                                 root.catalog-focused-credit = "";
                                                 root.catalog-row-navigation = true;
                                             }
