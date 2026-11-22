@@ -2,7 +2,7 @@
 //! Installing a new image never restarts the player.
 use crate::{
     api_transport::{is_transient_error, is_transient_status},
-    desk::Access,
+    mode::UpdateNetwork,
     playlist_pin_store::PUBLICATION_GATE,
 };
 use futures_util::{Stream, StreamExt};
@@ -18,20 +18,17 @@ use rustix::{
 use serde::Deserialize;
 use slint::ComponentHandle;
 use std::{
-    fmt,
     fs::{self, File, OpenOptions},
     future::Future,
     io::{self, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::watch,
     time::{Instant, timeout_at},
 };
 use uuid::Uuid;
@@ -66,13 +63,6 @@ impl Version {
             *n = p.parse().ok()?;
         }
         parts.next().is_none().then_some(Self(parsed))
-    }
-}
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [major, minor, patch] = self.0;
-        write!(f, "{major}.{minor}.{patch}")
     }
 }
 
@@ -261,10 +251,9 @@ where
 
 /// The managed package opts in by placing the executable in its dedicated
 /// directory. Refuse symlinks, unowned/writable directories and stale processes.
-fn current_image(path: &Path) -> io::Result<bool> {
+fn current_image(path: &Path, running: &fs::Metadata) -> io::Result<bool> {
     let parent = fs::symlink_metadata(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     let installed = fs::symlink_metadata(path)?;
-    let running = fs::metadata("/proc/self/exe")?;
     let uid = geteuid().as_raw();
     Ok(parent.is_dir()
         && parent.uid() == uid
@@ -294,8 +283,55 @@ impl Drop for Staged {
     }
 }
 
+// The scheduler and installer work with replayable reads. Production has only
+// these anonymous HTTPS transports; the tests supply private byte streams.
+trait ReleaseSource {
+    async fn metadata(&self) -> Result<Vec<u8>, ReadFailure>;
+    async fn stage(&self, update: &Update, target: &Path) -> Result<(Staged, File), ReadFailure>;
+}
+
+struct GitHub {
+    api: Client,
+    assets: Client,
+}
+
+impl GitHub {
+    fn new() -> Option<Self> {
+        Some(Self {
+            api: client().redirect(Policy::none()).build().ok()?,
+            assets: asset_client().ok()?,
+        })
+    }
+}
+
+impl ReleaseSource for GitHub {
+    async fn metadata(&self) -> Result<Vec<u8>, ReadFailure> {
+        let response = fetch(release_request(&self.api)).await?;
+        bounded_metadata(
+            response.content_length(),
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(Into::into)),
+        )
+        .await
+    }
+
+    async fn stage(&self, update: &Update, target: &Path) -> Result<(Staged, File), ReadFailure> {
+        let response = fetch(self.assets.get(&update.url)).await?;
+        stage_download(
+            response.content_length(),
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(Into::into)),
+            update,
+            target,
+        )
+        .await
+    }
+}
+
 async fn check(
-    http: &Client,
+    source: &impl ReleaseSource,
     running: Version,
     online: impl Fn() -> bool,
 ) -> Result<Option<Update>, ReadFailure> {
@@ -306,14 +342,7 @@ async fn check(
             if !online() {
                 return Err(ReadFailure::Permanent);
             }
-            let response = fetch(release_request(http)).await?;
-            bounded_metadata(
-                response.content_length(),
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(Into::into)),
-            )
-            .await
+            source.metadata().await
         },
         tokio::time::sleep,
     )
@@ -348,43 +377,37 @@ async fn bounded_metadata<T: AsRef<[u8]>>(
 }
 
 async fn download(
-    http: &Client,
+    source: &impl ReleaseSource,
     update: &Update,
     target: &Path,
+    running_image: &fs::Metadata,
     online: impl Fn() -> bool,
-) -> Option<()> {
+) -> Result<(), ReadFailure> {
+    use ReadFailure::{Permanent, Transient};
     let deadline = Instant::now() + READ_BUDGET;
-    if !online() || !current_image(target).ok()? {
-        return None;
+    let eligible = || online() && current_image(target, running_image).ok() == Some(true);
+    if !eligible() {
+        return Err(Permanent);
     }
-    let lock = File::open(target.parent()?).ok()?;
-    flock(&lock, FlockOperation::NonBlockingLockExclusive).ok()?;
+    // Use the same interprocess directory lock as the managed installer. An
+    // older process may have passed the initial check before a competing
+    // updater ran; recheck the running inode under the lock and before rename.
+    let lock = File::open(target.parent().ok_or(Permanent)?).map_err(|_| Permanent)?;
+    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|_| Transient)?;
     let (stage, file) = retry_read(
         deadline,
         || async {
-            if !online() || current_image(target).ok() != Some(true) {
-                return Err(ReadFailure::Permanent);
+            if !eligible() {
+                return Err(Permanent);
             }
-            let response = fetch(http.get(&update.url)).await?;
-            stage_download(
-                response.content_length(),
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(Into::into)),
-                update,
-                target,
-            )
-            .await
+            source.stage(update, target).await
         },
         tokio::time::sleep,
     )
-    .await
-    .ok()?;
-    install_staged(stage, file, target, deadline, || {
-        current_image(target).ok() == Some(true) && online()
-    })?;
+    .await?;
+    install_staged(stage, file, target, deadline, eligible).ok_or(Permanent)?;
     let _ = lock.sync_all();
-    Some(())
+    Ok(())
 }
 
 async fn stage_download<T: AsRef<[u8]>>(
@@ -445,7 +468,7 @@ fn install_staged(
     file.set_permissions(fs::Permissions::from_mode(0o755))
         .ok()?;
     file.sync_all().ok()?;
-    // Serialize final admission and rename with epoch and network-mode changes.
+    // Serialize final admission and rename with explicit network-mode changes.
     // A blocking sync or a wait for this gate must not extend the deadline.
     let _publication = PUBLICATION_GATE.lock().ok()?;
     if !may_replace() || Instant::now() >= deadline {
@@ -454,120 +477,32 @@ fn install_staged(
     fs::rename(&stage.0, target).ok()
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Notice {
-    Hidden,
-    Available(Version, Uuid),
-    Downloading,
-    Failed,
-    Ready,
-}
-
-impl Notice {
-    fn banner(self) -> (String, &'static str, Option<Uuid>) {
-        match self {
-            Self::Hidden => (String::new(), "", None),
-            Self::Available(v, id) => (format!("Spofify {v} is available"), "Update", Some(id)),
-            Self::Downloading => ("Downloading update…".into(), "", None),
-            Self::Failed => ("Couldn’t install update".into(), "", None),
-            Self::Ready => ("Update ready. Reopen Spofify to apply it.".into(), "", None),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Offers {
-    pending: Option<(Update, Uuid)>,
-    failed: Option<Version>,
-}
-
-impl Offers {
-    fn notice(&self) -> Notice {
-        if let Some((update, id)) = &self.pending {
-            Notice::Available(update.version, *id)
-        } else if self.failed.is_some() {
-            Notice::Failed
-        } else {
-            Notice::Hidden
-        }
-    }
-
-    fn refresh(&mut self, found: Option<Update>) -> Option<Notice> {
-        // Periodic checks and reconnects must not re-offer a failed version,
-        // even if its metadata changes. A newer version can ask for consent.
-        let found = found.filter(|update| self.failed.is_none_or(|v| update.version > v));
-        if found.as_ref() == self.pending.as_ref().map(|(update, _)| update) {
-            return None;
-        }
-        self.pending = found.map(|update| (update, Uuid::new_v4()));
-        Some(self.notice())
-    }
-
-    fn approve(&mut self, request: Uuid) -> Option<Update> {
-        self.pending.as_ref().filter(|(_, id)| *id == request)?;
-        self.pending.take().map(|(update, _)| update)
-    }
-
-    fn reset_offer(&mut self) -> Notice {
-        self.pending = None;
-        self.notice()
-    }
-
-    fn fail(&mut self, update: Update) -> Notice {
-        self.failed = Some(update.version);
-        self.notice()
-    }
-}
-
-fn show(ui: &slint::Weak<crate::AppWindow>, notice: Notice) {
-    let (message, button, action) = notice.banner();
-    let _ = ui.upgrade_in_event_loop(move |ui| {
-        ui.set_update_notice(message.into());
-        ui.set_update_action(action.map_or_else(String::new, |id| id.to_string()).into());
-        ui.set_update_button(button.into());
-    });
-}
-
-fn bind_action(ui: &crate::AppWindow, request: mpsc::Sender<Uuid>) {
-    let weak = ui.as_weak();
-    ui.on_download_update(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if let Ok(id) = Uuid::parse_str(&ui.get_update_action())
-            && request.try_send(id).is_ok()
-        {
-            // Consume the offer before another input event can replay the click.
-            ui.set_update_action(Default::default());
-        }
-    });
-}
+const READY_NOTICE: &str = "Update ready. Restart Spofify to use it.";
 
 pub fn start(
     ui: &crate::AppWindow,
-    access: watch::Receiver<Option<Access>>,
-    shared_epoch: Arc<AtomicU64>,
-) {
-    if cfg!(debug_assertions) || !cfg!(target_arch = "x86_64") {
-        return;
+    network: watch::Receiver<UpdateNetwork>,
+) -> Option<mpsc::Receiver<()>> {
+    if cfg!(debug_assertions) {
+        return None;
     }
-    let Some(running) = Version::parse(env!("CARGO_PKG_VERSION")) else {
-        return;
-    };
-    let Some(home) = std::env::var_os("HOME")
+    let running = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-    else {
-        return;
-    };
+        .filter(|p| p.is_absolute())?;
     let target = home.join(".local/lib/spofify-desktop/spofify-desktop");
-    if current_image(&target).ok() != Some(true) {
-        return;
-    }
-    let (request, requests) = mpsc::channel(1);
     let weak = ui.as_weak();
-    bind_action(ui, request);
-    let _ = std::thread::Builder::new()
+    let (lifetime, stopped) = mpsc::channel();
+    thread::Builder::new()
         .name("spofify-updates".into())
         .spawn(move || {
+            let _lifetime = lifetime;
+            let Ok(running_image) = fs::metadata("/proc/self/exe") else {
+                return;
+            };
+            if current_image(&target, &running_image).ok() != Some(true) {
+                return;
+            }
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -576,238 +511,126 @@ pub fn start(
             };
             runtime.block_on(run_updates(
                 running,
-                target,
-                weak,
-                access,
-                requests,
-                shared_epoch,
+                &target,
+                &running_image,
+                network,
+                GitHub::new,
+                || {
+                    let _ =
+                        weak.upgrade_in_event_loop(|ui| ui.set_update_notice(READY_NOTICE.into()));
+                },
             ));
-        });
+            // Do not keep a closing app waiting on a cancelled DNS lookup.
+            runtime.shutdown_background();
+        })
+        .ok()?;
+    Some(stopped)
 }
 
-async fn run_updates(
+#[derive(Debug, PartialEq, Eq)]
+enum Cycle {
+    Stale,
+    Unchanged,
+    Installed,
+    TransientFailure,
+    Rejected(Version),
+}
+
+async fn update_once(
+    source: &impl ReleaseSource,
     running: Version,
-    target: PathBuf,
-    ui: slint::Weak<crate::AppWindow>,
-    mut access: watch::Receiver<Option<Access>>,
-    mut requests: mpsc::Receiver<Uuid>,
-    shared_epoch: Arc<AtomicU64>,
-) {
-    let mut clients = None;
-    let live_access = access.clone();
-    let mut offers = Offers::default();
-    'connection: loop {
-        show(&ui, offers.reset_offer());
-        if access.has_changed().is_err() {
-            return;
-        }
-        let (epoch, session) = match access
-            .wait_for(|a| {
-                a.as_ref().is_some_and(|a| {
-                    a.epoch == shared_epoch.load(Ordering::SeqCst)
-                        && !a.offline
-                        && !a.session.is_offline()
-                        && !a.session.is_expired()
-                })
-            })
-            .await
-        {
-            Ok(access) => {
-                let a = access.as_ref().expect("online access");
-                (a.epoch, a.session.clone())
-            }
-            Err(_) => return,
-        };
-        let mut mode = session.network_changes();
-        let generation = *mode.borrow_and_update();
-        let current = session.network_changes();
-        // Recent-list updates also publish Access; they must not restart the updater.
-        let disconnected =
-            |a: &Option<Access>| a.as_ref().is_none_or(|a| a.epoch != epoch || a.offline);
-        let online = || {
-            current_connection(&shared_epoch, epoch, &current, generation)
-                && !session.is_expired()
-                && live_access.has_changed().is_ok()
-                && !disconnected(&live_access.borrow())
-        };
-        if !online() {
-            continue;
-        }
-        // A cold local session must not construct updater transports either.
-        if clients.is_none() {
-            let Ok(api) = client().redirect(Policy::none()).build() else {
-                return;
-            };
-            let Ok(assets) = asset_client() else { return };
-            clients = Some((api, assets));
-        }
-        let (api, assets) = clients.as_ref().unwrap();
-        let mut delay = Duration::ZERO;
-        loop {
-            // Refresh the offer without making the visible action unresponsive.
-            let wait = delay;
-            let refresh = async {
-                tokio::time::sleep(wait).await;
-                if online() && current_image(&target).ok() == Some(true) {
-                    check(api, running, online).await
-                } else {
-                    Ok(None)
-                }
-            };
-            tokio::pin!(refresh);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = mode.changed() => continue 'connection,
-                    _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
-                    request = requests.recv() => {
-                        let Some(request) = request else { return };
-                        let Some(update) = offers.approve(request) else {
-                            continue;
-                        };
-                        show(&ui, Notice::Downloading);
-                        let installed = tokio::select! {
-                            biased;
-                            _ = mode.changed() => continue 'connection,
-                            _ = async { let _ = access.wait_for(disconnected).await; } => continue 'connection,
-                            installed = download(assets, &update, &target, online) => installed,
-                        };
-                        if installed.is_some() {
-                            show(&ui, Notice::Ready);
-                            return;
-                        }
-                        // An epoch change can precede the Access notification.
-                        // A cancelled download must not suppress a future offer.
-                        if !online() {
-                            continue 'connection;
-                        }
-                        show(&ui, offers.fail(update));
-                        if current_image(&target).ok() != Some(true) {
-                            return;
-                        }
-                        delay = CHECK_INTERVAL;
-                    }
-                    found = &mut refresh => {
-                        if current_image(&target).ok() != Some(true) {
-                            show(&ui, offers.reset_offer());
-                            return;
-                        }
-                        if !online() {
-                            continue 'connection;
-                        }
-                        delay = if found == Err(ReadFailure::Transient) {
-                            CHECK_FAILURE_INTERVAL
-                        } else {
-                            CHECK_INTERVAL
-                        };
-                        if let Some(notice) = offers.refresh(found.ok().flatten()) {
-                            show(&ui, notice);
-                        }
-                    }
-                }
-                break;
+    target: &Path,
+    running_image: &fs::Metadata,
+    rejected: Option<Version>,
+    online: impl Fn() -> bool,
+) -> Cycle {
+    if current_image(target, running_image).ok() != Some(true) {
+        return Cycle::Stale;
+    }
+    match check(source, running, &online).await {
+        Ok(Some(update)) if rejected.is_none_or(|version| update.version > version) => {
+            match download(source, &update, target, running_image, online).await {
+                Ok(()) => Cycle::Installed,
+                Err(ReadFailure::Transient) => Cycle::TransientFailure,
+                Err(ReadFailure::Permanent) => Cycle::Rejected(update.version),
             }
         }
+        Err(ReadFailure::Transient) => Cycle::TransientFailure,
+        _ => Cycle::Unchanged,
     }
 }
 
-fn current_connection(
-    shared_epoch: &AtomicU64,
-    epoch: u64,
-    network: &watch::Receiver<u64>,
-    generation: u64,
-) -> bool {
-    shared_epoch.load(Ordering::SeqCst) == epoch
-        && generation & 1 == 0
-        && *network.borrow() == generation
+async fn run_updates<T: ReleaseSource>(
+    running: Version,
+    target: &Path,
+    running_image: &fs::Metadata,
+    mut network: watch::Receiver<UpdateNetwork>,
+    build_source: impl FnOnce() -> Option<T>,
+    show_ready: impl FnOnce(),
+) {
+    let mut build_source = Some(build_source);
+    let mut source = None;
+    let mut rejected = None;
+    let mut next_check = Instant::now();
+    loop {
+        match network
+            .wait_for(|state| matches!(state, UpdateNetwork::Online | UpdateNetwork::Closed))
+            .await
+        {
+            Ok(state) if *state == UpdateNetwork::Online => (),
+            _ => return,
+        }
+        // wait_for marked the online version seen. Even an offline→online
+        // round trip invalidates all work admitted by that old version.
+        let current = network.clone();
+        let online = || matches!(current.has_changed(), Ok(false));
+        if !online() {
+            continue;
+        }
+        if source.is_none() {
+            source = build_source.take().and_then(|build| build());
+        }
+        let Some(source) = &source else { return };
+        let outcome = tokio::select! {
+            biased;
+            _ = network.changed() => continue,
+            outcome = async {
+                tokio::time::sleep_until(next_check).await;
+                update_once(source, running, target, running_image, rejected, online).await
+            } => outcome,
+        };
+        match outcome {
+            Cycle::Installed => {
+                // Installation won its publication race. Do not hide ready
+                // on a later offline change or sign-out.
+                show_ready();
+                return;
+            }
+            Cycle::Stale => return,
+            _ if !online() => continue,
+            Cycle::Rejected(version) => rejected = Some(version),
+            _ => (),
+        }
+        // Neither a transient retry budget nor the periodic cadence is reset
+        // by account activity or by toggling mode after a completed check.
+        next_check = Instant::now()
+            + if outcome == Cycle::TransientFailure {
+                CHECK_FAILURE_INTERVAL
+            } else {
+                CHECK_INTERVAL
+            };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::ModeControl;
     use futures_util::stream;
     use serde_json::{Value, json};
-    use std::{cell::Cell, future::ready, os::unix::fs::DirBuilderExt};
+    use std::{cell::Cell, future::ready, os::unix::fs::DirBuilderExt, sync::atomic::AtomicU64};
 
-    #[test]
-    fn banner_only_accepts_a_current_update_click() {
-        use slint::{
-            LogicalPosition, PhysicalSize, PlatformError,
-            platform::{
-                Platform, PointerEventButton, WindowAdapter, WindowEvent,
-                software_renderer::{MinimalSoftwareWindow, Rgb565Pixel},
-            },
-        };
-        use std::rc::Rc;
-
-        struct TestWindow(Rc<MinimalSoftwareWindow>);
-        impl Platform for TestWindow {
-            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-                Ok(self.0.clone())
-            }
-        }
-        let window = MinimalSoftwareWindow::new(Default::default());
-        slint::platform::set_platform(Box::new(TestWindow(window.clone()))).unwrap();
-        let ui = crate::AppWindow::new().unwrap();
-        ui.set_signed_in(true);
-        ui.set_playing(true);
-        ui.set_now_track_id("test-track".into());
-        ui.show().unwrap();
-        ui.window().set_size(PhysicalSize::new(480, 440));
-        let mut pixels = vec![Rgb565Pixel::default(); 480 * 440];
-        let mut render = || {
-            window.draw_if_needed(|renderer| {
-                renderer.render(&mut pixels, 480);
-            });
-        };
-        let position = LogicalPosition::new(448.0, 20.0);
-        let button = PointerEventButton::Left;
-        let press = || {
-            ui.window()
-                .dispatch_event(WindowEvent::PointerPressed { position, button })
-        };
-        let release = || {
-            ui.window()
-                .dispatch_event(WindowEvent::PointerReleased { position, button })
-        };
-        let click = || {
-            press();
-            release();
-        };
-        let (sender, mut requests) = mpsc::channel(1);
-        bind_action(&ui, sender);
-        let set_banner = |notice: Notice| {
-            let (message, button, action) = notice.banner();
-            ui.set_update_notice(message.into());
-            ui.set_update_button(button.into());
-            ui.set_update_action(action.map(|id| id.to_string()).unwrap_or_default().into());
-        };
-        let offer = Uuid::new_v4();
-        set_banner(Notice::Available(Version([1, 0, 1]), offer));
-        render();
-        assert!(requests.try_recv().is_err());
-        press();
-        let refreshed = Uuid::new_v4();
-        set_banner(Notice::Available(Version([1, 0, 2]), refreshed));
-        render();
-        release();
-        assert!(requests.try_recv().is_err());
-        click();
-        assert_eq!(requests.try_recv().unwrap(), refreshed);
-        click();
-        assert!(requests.try_recv().is_err());
-        for notice in [Notice::Downloading, Notice::Failed, Notice::Ready] {
-            set_banner(notice);
-            render();
-            click();
-            assert!(requests.try_recv().is_err());
-            assert!(!ui.get_update_notice().is_empty());
-            assert!(ui.get_update_button().is_empty());
-            assert!(ui.get_update_action().is_empty());
-        }
-        assert!(ui.get_playing());
-        assert_eq!(ui.get_now_track_id(), "test-track");
-    }
+    const EPOCH: u64 = 1;
 
     fn fixture_release(tag: &str, binary: &[u8]) -> Value {
         let sha256: String = digest::digest(&digest::SHA256, binary)
@@ -832,54 +655,6 @@ mod tests {
 
     fn parse_fixture(release: &Value) -> Option<Update> {
         available_update(&serde_json::to_vec(release).unwrap(), Version([1, 0, 0]))
-    }
-
-    #[test]
-    fn approval_is_single_use_and_failure_survives_periodic_checks_and_reconnects() {
-        let update = || parse_fixture(&fixture_release("v1.9.0", b"update")).unwrap();
-        let mut offers = Offers::default();
-        assert_eq!(offers.notice(), Notice::Hidden);
-        assert!(offers.approve(Uuid::nil()).is_none());
-        let Some(Notice::Available(version, id)) = offers.refresh(Some(update())) else {
-            panic!("expected an update offer");
-        };
-        assert_eq!(offers.refresh(Some(update())), None);
-        assert!(offers.approve(Uuid::nil()).is_none());
-        assert_eq!(offers.notice(), Notice::Available(version, id));
-        let approved = offers.approve(id).unwrap();
-        assert_eq!(approved, update());
-        assert!(offers.approve(id).is_none());
-
-        assert_eq!(offers.fail(approved), Notice::Failed);
-        // No response, the same version, a changed digest, or an older
-        // release cannot clear the failure or add another consent action.
-        for found in [
-            None,
-            Some(update()),
-            parse_fixture(&fixture_release("v1.9.0", b"changed")),
-            parse_fixture(&fixture_release("v1.8.0", b"older")),
-        ] {
-            assert_eq!(offers.refresh(found), None);
-            assert_eq!(offers.notice(), Notice::Failed);
-        }
-        assert_eq!(offers.reset_offer(), Notice::Failed);
-        let newer = || parse_fixture(&fixture_release("v1.10.0", b"newer")).unwrap();
-        let Some(Notice::Available(_, new_id)) = offers.refresh(Some(newer())) else {
-            panic!("expected a fresh offer for a newer version");
-        };
-        assert_eq!(offers.reset_offer(), Notice::Failed);
-        let Some(Notice::Available(_, reconnected_id)) = offers.refresh(Some(newer())) else {
-            panic!("expected fresh consent after reconnecting");
-        };
-        assert!(offers.approve(id).is_none());
-        assert!(offers.approve(new_id).is_none());
-        assert_eq!(offers.approve(reconnected_id), Some(newer()));
-        // Cancellation consumes the click, but not the release.
-        assert_eq!(offers.reset_offer(), Notice::Failed);
-        assert!(matches!(
-            offers.refresh(Some(newer())),
-            Some(Notice::Available(_, _))
-        ));
     }
 
     #[test]
@@ -1124,6 +899,316 @@ mod tests {
         header
     }
 
+    // A private standalone ELF fixture: the only thing it does is exit with
+    // the supplied code. Never runs the installed Desktop or loads app state.
+    fn runnable_fixture(code: u8) -> Vec<u8> {
+        const BASE: u64 = 0x0040_0000;
+        const PH_SIZE: u64 = 56;
+        let entry = ELF_HEADER_LEN as u64 + PH_SIZE;
+        let image_len = entry + 12;
+        let mut elf = fixture_elf().to_vec();
+        elf.resize(entry as usize, 0);
+        elf[16] = 2; // ET_EXEC
+        elf[24..32].copy_from_slice(&(BASE + entry).to_le_bytes());
+        elf[32..40].copy_from_slice(&(ELF_HEADER_LEN as u64).to_le_bytes());
+        elf[54..58].copy_from_slice(&[PH_SIZE as u8, 0, 1, 0]);
+        elf[64..72].copy_from_slice(&[1, 0, 0, 0, 5, 0, 0, 0]); // PT_LOAD, R+X
+        elf[80..88].copy_from_slice(&BASE.to_le_bytes());
+        elf[88..96].copy_from_slice(&BASE.to_le_bytes());
+        elf[96..104].copy_from_slice(&image_len.to_le_bytes());
+        elf[104..112].copy_from_slice(&image_len.to_le_bytes());
+        elf[112..120].copy_from_slice(&4096u64.to_le_bytes());
+        elf.extend([0xb8, 60, 0, 0, 0, 0xbf, code, 0, 0, 0, 0x0f, 0x05]);
+        elf
+    }
+
+    #[derive(Clone, Copy)]
+    enum Body {
+        Complete,
+        WrongDigest,
+        Interrupted,
+        Pending,
+    }
+
+    struct FixtureSource<'a> {
+        payload: &'a [u8],
+        body: Cell<Body>,
+        checks: Cell<usize>,
+        downloads: Cell<usize>,
+        stage_polled: tokio::sync::Notify,
+    }
+
+    impl<'a> FixtureSource<'a> {
+        fn new(payload: &'a [u8], body: Body) -> Self {
+            Self {
+                payload,
+                body: Cell::new(body),
+                checks: Cell::new(0),
+                downloads: Cell::new(0),
+                stage_polled: Default::default(),
+            }
+        }
+    }
+
+    impl ReleaseSource for &FixtureSource<'_> {
+        async fn metadata(&self) -> Result<Vec<u8>, ReadFailure> {
+            self.checks.set(self.checks.get() + 1);
+            Ok(serde_json::to_vec(&fixture_release("v1.0.1", self.payload)).unwrap())
+        }
+
+        async fn stage(
+            &self,
+            update: &Update,
+            target: &Path,
+        ) -> Result<(Staged, File), ReadFailure> {
+            let attempt = self.downloads.get() + 1;
+            self.downloads.set(attempt);
+            let body = self.body.get();
+            let mut data = self.payload.to_vec();
+            if matches!(body, Body::WrongDigest) {
+                *data.last_mut().unwrap() ^= 1;
+            }
+            let result = match body {
+                Body::Pending => {
+                    let tail = stream::poll_fn(|_| {
+                        self.stage_polled.notify_one();
+                        std::task::Poll::Pending
+                    });
+                    stage_download(
+                        None,
+                        stream::iter([Ok(&data[..3])]).chain(tail),
+                        update,
+                        target,
+                    )
+                    .await
+                }
+                Body::Interrupted => {
+                    stage_download(
+                        None,
+                        stream::iter([Ok(&data[..3]), Err(ReadFailure::Transient)]),
+                        update,
+                        target,
+                    )
+                    .await
+                }
+                _ => stage_download(None, stream::iter([Ok(data)]), update, target).await,
+            };
+            if !matches!(body, Body::Interrupted) || attempt == READ_BACKOFF.len() + 1 {
+                self.stage_polled.notify_one();
+            }
+            result
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_policy_then_updates_without_sign_in_or_restarting() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let previous = runnable_fixture(21);
+        fs::write(&target, &previous).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let manual_reopen = || std::process::Command::new(&target).status().unwrap().code();
+        assert_eq!(manual_reopen(), Some(21));
+        let running_image = fs::metadata(&target).unwrap();
+        let mode = ModeControl::default();
+        let next = runnable_fixture(32);
+        let source = FixtureSource::new(&next, Body::Complete);
+        let ready_count = Cell::new(0);
+        let built = Cell::new(false);
+        let updater = run_updates(
+            Version([1, 0, 0]),
+            &target,
+            &running_image,
+            mode.update_network(),
+            || {
+                built.set(true);
+                Some(&source)
+            },
+            || ready_count.set(ready_count.get() + 1),
+        );
+        tokio::pin!(updater);
+        assert!(futures_util::poll!(&mut updater).is_pending());
+        assert!(!built.get()); // Preferences have not loaded; no transport exists yet.
+        dir.assert_clean(&previous);
+        assert_eq!(ready_count.get(), 0);
+
+        mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH)); // No saved credentials or account exists.
+        tokio::time::timeout(Duration::from_secs(2), &mut updater)
+            .await
+            .unwrap();
+        assert!(built.get());
+        assert_eq!((source.checks.get(), source.downloads.get()), (1, 1));
+        assert_eq!(ready_count.get(), 1);
+        dir.assert_clean(&next);
+        assert!(!current_image(&target, &running_image).unwrap());
+        mode.block_updates();
+        assert_eq!(ready_count.get(), 1); // Subsequent mode changes cannot clear verified ready.
+        assert_eq!(manual_reopen(), Some(32)); // Only this explicit fixture reopen runs v2.
+    }
+
+    #[tokio::test]
+    async fn cold_offline_and_unresolved_startup_never_build_transport() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let running_image = fs::metadata(&target).unwrap();
+        let mode = ModeControl::default();
+        let updater = run_updates::<&FixtureSource<'_>>(
+            Version([1, 0, 0]),
+            &target,
+            &running_image,
+            mode.update_network(),
+            || panic!("constructed transport without online permission"),
+            || panic!("unexpected notice"),
+        );
+        tokio::pin!(updater);
+        assert!(futures_util::poll!(&mut updater).is_pending());
+        mode.block_updates(); // Admission of the loaded cold grant.
+        mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH)); // Cannot supersede Work offline.
+        assert!(futures_util::poll!(&mut updater).is_pending());
+        mode.close_updates();
+        updater.await;
+        dir.assert_clean(b"old image");
+    }
+
+    #[tokio::test]
+    async fn runtime_offline_cancels_a_partial_download_and_explicit_online_can_resume() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let running_image = fs::metadata(&target).unwrap();
+        let next = fixture_elf();
+        let source = FixtureSource::new(&next, Body::Pending);
+        let mode = ModeControl::default();
+        mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH));
+        let ready = Cell::new(false);
+        let updater = run_updates(
+            Version([1, 0, 0]),
+            &target,
+            &running_image,
+            mode.update_network(),
+            || Some(&source),
+            || ready.set(true),
+        );
+        tokio::pin!(updater);
+        tokio::select! {
+            _ = &mut updater => panic!("returned while a partial asset was still pending"),
+            _ = source.stage_polled.notified() => (),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("download did not start"),
+        }
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+        mode.block_updates();
+        assert!(futures_util::poll!(&mut updater).is_pending());
+        dir.assert_clean(b"old image");
+        assert!(!ready.get());
+        assert_eq!((source.checks.get(), source.downloads.get()), (1, 1));
+        source.body.set(Body::Complete);
+        mode.allow_updates(EPOCH, &AtomicU64::new(EPOCH));
+        tokio::time::timeout(Duration::from_secs(2), &mut updater)
+            .await
+            .unwrap();
+        assert_eq!((source.checks.get(), source.downloads.get()), (2, 2));
+        assert!(ready.get());
+        dir.assert_clean(&next);
+    }
+
+    #[tokio::test]
+    async fn closing_cancels_an_active_download_and_cleans_the_partial_stage() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let running_image = fs::metadata(&target).unwrap();
+        let next = fixture_elf();
+        let source = FixtureSource::new(&next, Body::Pending);
+        let mode = ModeControl::default();
+        mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH));
+        let updater = run_updates(
+            Version([1, 0, 0]),
+            &target,
+            &running_image,
+            mode.update_network(),
+            || Some(&source),
+            || panic!("partial stage appeared ready"),
+        );
+        tokio::pin!(updater);
+        tokio::select! {
+            _ = &mut updater => panic!("returned while a partial asset was still pending"),
+            _ = source.stage_polled.notified() => (),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("download did not start"),
+        }
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+        mode.close_updates();
+        tokio::time::timeout(Duration::from_secs(2), &mut updater)
+            .await
+            .unwrap();
+        dir.assert_clean(b"old image");
+    }
+
+    #[tokio::test]
+    async fn failed_checksum_or_transport_never_publishes_a_notice() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let running_image = fs::metadata(&target).unwrap();
+        let next = fixture_elf();
+        for (body, tries) in [(Body::WrongDigest, 1), (Body::Interrupted, 3)] {
+            let source = FixtureSource::new(&next, body);
+            let mode = ModeControl::default();
+            mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH));
+            let updater = run_updates(
+                Version([1, 0, 0]),
+                &target,
+                &running_image,
+                mode.update_network(),
+                || Some(&source),
+                || panic!("failed update appeared ready"),
+            );
+            tokio::pin!(updater);
+            tokio::select! {
+                _ = &mut updater => panic!("returned instead of waiting for next check"),
+                _ = source.stage_polled.notified() => (),
+                _ = tokio::time::sleep(Duration::from_secs(4)) => panic!("attempts did not finish"),
+            }
+            assert!(futures_util::poll!(&mut updater).is_pending());
+            assert_eq!((source.checks.get(), source.downloads.get()), (1, tries));
+            // A toggle after a completed failure must preserve the next check
+            // deadline, not immediately retry the same release.
+            mode.block_updates();
+            mode.allow_updates(EPOCH, &AtomicU64::new(EPOCH));
+            assert!(futures_util::poll!(&mut updater).is_pending());
+            assert_eq!((source.checks.get(), source.downloads.get()), (1, tries));
+            dir.assert_clean(b"old image");
+            mode.close_updates();
+            updater.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn competing_lock_and_stale_running_inode_prevent_replacement() {
+        let dir = Fixture::new();
+        let target = dir.target();
+        let running_image = fs::metadata(&target).unwrap();
+        let next = fixture_elf();
+        let fixture_source = FixtureSource::new(&next, Body::Complete);
+        let source = &fixture_source;
+        let run = || {
+            update_once(
+                &source,
+                Version([1, 0, 0]),
+                &target,
+                &running_image,
+                None,
+                || true,
+            )
+        };
+        let lock = File::open(&dir.0).unwrap();
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert_eq!(run().await, Cycle::TransientFailure);
+        assert_eq!((source.checks.get(), source.downloads.get()), (1, 0));
+        dir.assert_clean(b"old image");
+        drop(lock);
+        assert_eq!(run().await, Cycle::Installed);
+        assert_eq!(run().await, Cycle::Stale);
+        assert_eq!((source.checks.get(), source.downloads.get()), (2, 1));
+        dir.assert_clean(&next);
+    }
+
     #[test]
     fn executable_header_requires_linux_architecture_and_executable_type() {
         let mut header = fixture_elf();
@@ -1268,31 +1353,37 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn publication_fences_stale_epoch_network_and_deadline_under_the_gate() {
+    async fn publication_fences_offline_round_trips_and_deadline_under_the_gate() {
         let dir = Fixture::new();
         let target = dir.target();
         let next = fixture_elf();
         let update = parse_fixture(&fixture_release("v1.0.1", &next)).unwrap();
         let now = Instant::now();
-        for (actual_epoch, actual_generation, deadline) in [
-            (2, 10, now + READ_BUDGET), // logout before Access is republished
-            (1, 11, now + READ_BUDGET), // offline
-            (1, 12, now + READ_BUDGET), // back online, but different generation
-            (1, 10, now),               // expired despite an otherwise live session
+        for (offline, resume, deadline) in [
+            (true, false, now + READ_BUDGET),
+            (true, true, now + READ_BUDGET),
+            (false, false, now),
         ] {
-            let epoch = AtomicU64::new(actual_epoch);
-            let (_changes, network) = watch::channel(actual_generation);
+            let mode = ModeControl::default();
+            mode.resolve_update_startup(EPOCH, &AtomicU64::new(EPOCH));
+            let network = mode.update_network();
             let chunks = stream::iter([Ok(next)]);
             let (stage, file) = stage_download(None, chunks, &update, &target)
                 .await
                 .unwrap();
+            if offline {
+                mode.block_updates();
+            }
+            if resume {
+                mode.allow_updates(EPOCH, &AtomicU64::new(EPOCH));
+            }
             assert_eq!(
                 install_staged(stage, file, &target, deadline, || {
                     assert!(matches!(
                         PUBLICATION_GATE.try_lock(),
                         Err(std::sync::TryLockError::WouldBlock)
                     ));
-                    current_connection(&epoch, 1, &network, 10)
+                    matches!(network.has_changed(), Ok(false))
                 }),
                 None
             );

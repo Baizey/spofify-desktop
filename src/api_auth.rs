@@ -267,6 +267,7 @@ impl Api {
 
     /// A saved cookie by itself grants no local or network session.
     /// The caller owns cancellation and fences the result against newer sign-in intents.
+    #[cfg(test)]
     pub async fn resume(&self, credential: &RememberedCredential) -> Result<Session, ApiError> {
         self.resume_if(credential, || true).await
     }

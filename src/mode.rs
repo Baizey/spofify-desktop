@@ -1,7 +1,20 @@
 //! Latest explicit mode choice. Independent of the bounded playback command
 //! mailbox: a superseded Go online cannot reopen the socket after Work offline.
-use crate::desk::Access;
-use std::sync::{Arc, Mutex};
+use crate::{desk::Access, playlist_pin_store::PUBLICATION_GATE};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::sync::watch;
+
+/// Permission for anonymous update reads, not an account or session state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateNetwork {
+    Pending,
+    Offline,
+    Online,
+    Closed,
+}
 
 #[derive(Default)]
 struct Choice {
@@ -13,17 +26,61 @@ struct Choice {
 #[derive(Clone)]
 pub struct ModeControl {
     choice: Arc<Mutex<Choice>>,
-    changed: tokio::sync::watch::Sender<u64>,
+    changed: watch::Sender<u64>,
+    updates: watch::Sender<UpdateNetwork>,
 }
 impl Default for ModeControl {
     fn default() -> Self {
         Self {
             choice: Arc::default(),
-            changed: tokio::sync::watch::channel(0).0,
+            changed: watch::channel(0).0,
+            updates: watch::channel(UpdateNetwork::Pending).0,
         }
     }
 }
 impl ModeControl {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn update_network(&self) -> watch::Receiver<UpdateNetwork> {
+        self.updates.subscribe()
+    }
+
+    pub(crate) fn resolve_update_startup(&self, epoch: u64, current: &AtomicU64) {
+        self.publish_update_network(UpdateNetwork::Online, |state| {
+            state == UpdateNetwork::Pending && current.load(Ordering::SeqCst) == epoch
+        });
+    }
+
+    pub(crate) fn allow_updates(&self, epoch: u64, current: &AtomicU64) {
+        self.publish_update_network(UpdateNetwork::Online, |_| {
+            current.load(Ordering::SeqCst) == epoch
+        });
+    }
+
+    pub(crate) fn block_updates(&self) {
+        self.publish_update_network(UpdateNetwork::Offline, |_| true);
+    }
+
+    pub(crate) fn close_updates(&self) {
+        self.publish_update_network(UpdateNetwork::Closed, |_| true);
+    }
+
+    fn publish_update_network(
+        &self,
+        next: UpdateNetwork,
+        permitted: impl FnOnce(UpdateNetwork) -> bool,
+    ) {
+        // Serialize authorization with account-epoch changes and the updater's
+        // final rename, but never hold this across network reads or fsync.
+        let _publication = PUBLICATION_GATE.lock().unwrap();
+        self.updates.send_if_modified(|state| {
+            if *state == next || *state == UpdateNetwork::Closed || !permitted(*state) {
+                return false;
+            }
+            *state = next;
+            true
+        });
+    }
+
     pub fn request_current(
         &self,
         access: &tokio::sync::watch::Receiver<Option<Access>>,
@@ -45,6 +102,7 @@ impl ModeControl {
         let mut s = self.choice.lock().unwrap_or_else(|e| e.into_inner());
         let Some(access) = access() else { return false };
         if offline {
+            self.block_updates();
             access.session.set_offline(true);
         }
         *s = Choice {
@@ -94,6 +152,27 @@ impl ModeControl {
 mod tests {
     use super::*;
     use crate::api::{Api, Origin};
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn superseded_auth_cannot_open_anonymous_networking() {
+        let epoch = AtomicU64::new(2);
+        let mode = ModeControl::default();
+        let network = mode.update_network();
+        mode.resolve_update_startup(1, &epoch);
+        assert!(matches!(*network.borrow(), UpdateNetwork::Pending));
+        mode.block_updates();
+        mode.allow_updates(1, &epoch);
+        assert!(matches!(*network.borrow(), UpdateNetwork::Offline));
+        mode.allow_updates(2, &epoch);
+        assert!(matches!(*network.borrow(), UpdateNetwork::Online));
+        let next = crate::advance_account_epoch(&epoch);
+        assert!(matches!(*network.borrow(), UpdateNetwork::Online));
+        mode.close_updates();
+        mode.allow_updates(next, &epoch);
+        assert!(matches!(*network.borrow(), UpdateNetwork::Closed));
+    }
+
     #[test]
     fn a_late_work_offline_click_fences_the_replacement_session() {
         let api = Arc::new(Api::new(Origin::parse("https://music.invalid").unwrap()).unwrap());

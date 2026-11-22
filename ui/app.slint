@@ -86,9 +86,6 @@ export component AppWindow inherits Window {
     in property <string> now-detail: "Find a track to begin";
     in property <string> player-status;
     in property <string> update-notice;
-    in property <string> update-action;
-    in property <string> update-button;
-    callback download-update();
     in property <bool> playing;
     in property <bool> can-control;
     in property <bool> remote-controls;
@@ -341,8 +338,21 @@ export component AppWindow inherits Window {
         else { root.page-action(action, ""); }
     }
 
+    update-banner := Rectangle {
+        x: 0px; y: 0px; width: parent.width;
+        visible: root.update-notice != "";
+        height: self.visible ? update-message.preferred-height + 17px : 0px;
+        background: Theme.rail;
+        update-message := Text {
+            x: 12px; y: 8px; width: parent.width - 24px;
+            text: root.update-notice; wrap: word-wrap;
+            color: Theme.muted; font-size: 12px * Theme.density;
+            accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
+        }
+        Divider { y: parent.height - 1px; }
+    }
     if !root.signed-in: SignInView {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        x: 0px; y: update-banner.height; width: parent.width; height: parent.height - self.y;
         origin <=> root.origin; username <=> root.username; password <=> root.password;
         keep-signed-in <=> root.keep-signed-in;
         status: root.status; error: root.error; busy: root.busy;
@@ -351,7 +361,7 @@ export component AppWindow inherits Window {
         sign-in => { root.sign-in(); } cancel => { root.cancel-sign-in(); }
     }
     if root.signed-in: shell := FocusScope {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        x: 0px; y: update-banner.height; width: parent.width; height: parent.height - self.y;
         focus-on-tab-navigation: false; focus-on-click: false;
         property <string> destination: root.page-kind;
         property <bool> editing: root.editor-open;
@@ -645,31 +655,8 @@ export component AppWindow inherits Window {
             visible: root.auth-notice != "";
             text: root.auth-notice;
         }
-        update-banner := Rectangle {
-            x: 0px; y: session-notice.height; width: parent.width;
-            visible: root.update-notice != "";
-            height: self.visible ? update-content.preferred-height : 0px;
-            background: Theme.rail;
-            update-content := HorizontalLayout {
-                padding-left: 12px; padding-right: 12px; padding-top: 3px; padding-bottom: 3px;
-                spacing: 8px;
-                Caption {
-                    text: root.update-notice; wrap: word-wrap; horizontal-stretch: 1;
-                    accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
-                }
-                if root.update-button != "": Action {
-                    text: root.update-button; enabled: !root.editor-open && root.update-action != "";
-                    click-scope: root.update-action;
-                    clicked => {
-                        if self.has-focus { shell.focus(); }
-                        root.download-update();
-                    }
-                }
-            }
-            Divider { y: parent.height - 1px; }
-        }
         work := Rectangle {
-            x: 0px; y: update-banner.y + update-banner.height; width: parent.width; height: parent.height - self.y - root.player-height;
+            x: 0px; y: session-notice.height; width: parent.width; height: parent.height - self.y - root.player-height;
             rail := WorkspaceRail {
                 x: 0px; y: 0px; width: root.rail-width; height: parent.height;
                 kind: root.page-kind; account: root.account-label; compact: root.compact;

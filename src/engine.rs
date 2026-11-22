@@ -681,8 +681,11 @@ impl Engine {
         }
         // Going offline fences all credential clones before any old task can
         // resume. Going online retires the local decoder before lifting it.
-        if offline && let Some(a) = &self.account {
-            a.session.set_offline(true);
+        if offline {
+            self.mode.block_updates();
+            if let Some(a) = &self.account {
+                a.session.set_offline(true);
+            }
         }
         self.cancel_login();
         self.retire_pending(false);
@@ -711,6 +714,7 @@ impl Engine {
                 return;
             }
             a.session.set_offline(false);
+            self.mode.allow_updates(self.epoch, &self.shared_epoch);
             self.connect();
         }
         self.publish_access();
@@ -780,13 +784,19 @@ impl Engine {
         let (epoch, current, results) =
             (self.epoch, self.shared_epoch.clone(), self.results.clone());
         let store = self.login_store.clone();
+        let mode = self.mode.clone();
         self.login = Some(tokio::spawn(async move {
             let prefill = results.clone();
-            let outcome =
-                auth::restore(store, epoch, &current, move |origin, username| async move {
+            let outcome = auth::restore(
+                store,
+                epoch,
+                &current,
+                || mode.resolve_update_startup(epoch, &current),
+                move |origin, username| async move {
                     let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
-                })
-                .await;
+                },
+            )
+            .await;
             let _ = results.send(Reply::Login(epoch, outcome)).await;
         }));
     }
@@ -1320,6 +1330,9 @@ impl Engine {
             // No socket, output selection, or resumed playback on admission.
             self.set_offline(true);
         } else {
+            // An accepted explicit sign-in can resolve a denied or unknown
+            // startup preference. A later sign-out is not a mode change.
+            self.mode.allow_updates(epoch, &self.shared_epoch);
             self.publish_access();
             self.connect();
         }

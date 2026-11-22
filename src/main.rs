@@ -143,10 +143,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let (art, pages) = watch::channel(None);
     let _covers = artwork::install(&ui, access.clone(), pages);
     let (desk, browser) = desk::start(&ui, epoch.clone(), access.clone(), tx.clone(), art);
-    desk.bind(&ui, mode, access.clone());
+    desk.bind(&ui, mode.clone(), access.clone());
     let _media = presentation::install(&ui, access.clone(), epoch.clone());
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    update::start(&ui, access, epoch.clone());
+    let updates = update::start(&ui, mode.update_network());
     bind_auth(&ui, &auth_tx, &epoch);
     for op in ["previous", "next", "toggle"] {
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
@@ -286,6 +286,7 @@ fn main() -> Result<(), slint::PlatformError> {
         send(&tx, command, ui);
     });
     let result = ui.run();
+    mode.close_updates();
     let _ = auth_tx.send(AuthCommand::Shutdown);
     if worker.join().is_err() {
         eprintln!("Audio worker closed unexpectedly.");
@@ -293,6 +294,12 @@ fn main() -> Result<(), slint::PlatformError> {
     drop(desk);
     if browser.join().is_err() {
         eprintln!("Library worker closed unexpectedly.");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(updates) = updates {
+        // Let a cancelled partial download drop its stage, but never hang
+        // exit waiting for updater filesystem I/O.
+        let _ = updates.recv_timeout(std::time::Duration::from_millis(250));
     }
     result
 }

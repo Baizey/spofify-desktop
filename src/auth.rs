@@ -81,7 +81,30 @@ pub(crate) async fn restore<F>(
     store: Result<Arc<LoginStore>, StoreError>,
     epoch: u64,
     current: &AtomicU64,
+    online_preference_known: impl Fn(),
     prefill: impl FnOnce(String, String) -> F,
+) -> Outcome
+where
+    F: Future<Output = ()>,
+{
+    restore_with(
+        store,
+        epoch,
+        current,
+        online_preference_known,
+        prefill,
+        async |store, profile| store.restore(profile).await,
+    )
+    .await
+}
+
+pub(crate) async fn restore_with<F>(
+    store: Result<Arc<LoginStore>, StoreError>,
+    epoch: u64,
+    current: &AtomicU64,
+    online_preference_known: impl Fn(),
+    prefill: impl FnOnce(String, String) -> F,
+    lookup: impl AsyncFn(&LoginStore, &LoginProfile) -> Result<Option<RememberedLogin>, StoreError>,
 ) -> Outcome
 where
     F: Future<Output = ()>,
@@ -101,6 +124,11 @@ where
         }
     })?;
     let profile = store.profile().map_err(unreadable)?;
+    // Disk prefill alone never records Work offline. If a slot is active,
+    // only its typed keyring record can resolve the startup preference.
+    if profile.as_ref().is_none_or(|profile| !profile.remembered) {
+        online_preference_known();
+    }
     let Some(profile) = profile else {
         return Err(Fallback::default());
     };
@@ -109,7 +137,13 @@ where
         return Err(Fallback::default());
     }
     let (api, session) = with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
-        restore_once(&store, &profile, epoch, current)
+        restore_once(
+            lookup(&store, &profile),
+            &profile,
+            epoch,
+            current,
+            &online_preference_known,
+        )
     })
     .await?;
     Ok(Success {
@@ -126,14 +160,15 @@ enum RestoreFailure {
 }
 
 async fn restore_once(
-    store: &LoginStore,
+    lookup: impl Future<Output = Result<Option<RememberedLogin>, StoreError>>,
     profile: &LoginProfile,
     epoch: u64,
     current: &AtomicU64,
+    online_preference_known: &impl Fn(),
 ) -> Result<(Arc<Api>, Session), RestoreFailure> {
     // Re-check the original login slot on each attempt. A changed profile
     // can neither substitute its credential nor reuse the old one here.
-    let credential = match store.restore(profile).await {
+    let credential = match lookup.await {
         Ok(Some(credential)) => credential,
         Ok(None) | Err(StoreError::InvalidCredential) => {
             return Err(RestoreFailure::Final(stale(profile.clone())));
@@ -163,7 +198,15 @@ async fn restore_once(
     let api = Arc::new(
         Api::new(profile.origin.clone()).map_err(|_| RestoreFailure::Final(restore_failed()))?,
     );
-    match api.resume(&credential).await {
+    match api
+        .resume_if(&credential, || {
+            // Local origin/cookie validation is complete; the updater does not
+            // need to wait for server revalidation or account admission.
+            online_preference_known();
+            current.load(Ordering::SeqCst) == epoch
+        })
+        .await
+    {
         Ok(session) if session.username == profile.username => Ok((api, session)),
         // A renamed or mismatched account still needs explicit sign-in.
         Ok(_) => Err(RestoreFailure::Final(stale(profile.clone()))),

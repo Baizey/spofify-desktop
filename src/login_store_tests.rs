@@ -364,6 +364,78 @@ async fn rejects_aliases_and_insecure_or_invalid_metadata_before_keyring_access(
 const ONLINE_LOGIN: &[u8] = br#"{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}"#;
 const LOCAL_LOGIN: &[u8] = br#"{"format":"local-v1","username":"listener","role":"user","credential":{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}}"#;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn startup_update_permission_uses_the_saved_mode_before_account_admission() {
+    use crate::{
+        auth,
+        mode::{ModeControl, UpdateNetwork},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    let wrong_origin = br#"{"origin":"https://wrong.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}"#;
+    let invalid_cookie = br#"{"origin":"https://music.example","accountId":"synthetic-account","cookie":"unrecognized=synthetic-cookie"}"#;
+    for (saved_record, unavailable, expected_online) in [
+        (None, false, true),
+        (Some(ONLINE_LOGIN), false, true),
+        (Some(LOCAL_LOGIN), false, false),
+        (Some(LOCAL_LOGIN), true, false),
+        (Some(wrong_origin.as_slice()), false, false),
+        (Some(invalid_cookie.as_slice()), false, false),
+    ] {
+        let fixture = Fixture::new();
+        let store = &fixture.store;
+        let keyring = FakeKeyring::default();
+        if let Some(blob) = saved_record {
+            store
+                .record_with(&keyring, &origin(), "listener", Some(blob))
+                .await
+                .unwrap();
+        }
+        if unavailable {
+            keyring.behavior.set(Behavior::Unavailable);
+        }
+        let mode = ModeControl::default();
+        let network = mode.update_network();
+        let current = AtomicU64::new(1);
+        let outcome = auth::restore_with(
+            Ok(Arc::new(fixture.reopen())),
+            1,
+            &current,
+            || {
+                mode.resolve_update_startup(1, &current);
+                // Cancel account restoration at this point. The gate must
+                // already be open with no HTTP call or account admission.
+                current.store(2, Ordering::SeqCst);
+            },
+            |_, _| std::future::ready(()),
+            async |store, profile| {
+                store
+                    .restore_with(&keyring, profile)
+                    .await?
+                    .map(|bytes| {
+                        serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidCredential)
+                    })
+                    .transpose()
+            },
+        )
+        .await;
+        if saved_record == Some(LOCAL_LOGIN) && !unavailable {
+            assert!(outcome.ok().unwrap().session.is_local_only());
+        } else {
+            assert!(outcome.is_err());
+        }
+        assert_eq!(keyring.calls.get().0, usize::from(saved_record.is_some()));
+        assert_eq!(
+            matches!(*network.borrow(), UpdateNetwork::Online),
+            expected_online
+        );
+    }
+}
+
 #[tokio::test]
 async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_authoritative() {
     let fixture = Fixture::new();
