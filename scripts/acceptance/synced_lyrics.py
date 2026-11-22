@@ -523,17 +523,17 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
         check(not any(win.matches(e, "Retry lyrics") for e in elements), "unexpected Retry lyrics control")
         return elements
 
-    def shows(label):
+    def shows(*labels):
         elements = current_elements()
-        return elements and text(win, elements, re.escape(label))
+        return elements and all(text(win, elements, re.escape(label)) for label in labels)
 
-    def stays_quiet(scenario, label):
+    def stays_quiet(scenario, *labels):
         peer.ping(scenario)  # Keep the same account socket alive across the quiet windows.
         until = monotonic() + RETRY_WINDOW
 
         def unchanged():
             exact_gets()
-            check(shows(label), f"{scenario}: Lyrics reader did not stay at {label!r}")
+            check(shows(*labels), f"{scenario}: Lyrics reader did not stay at {labels!r}")
             return monotonic() >= until
 
         wait(scenario + ": no further lyrics GETs", unchanged, RETRY_WINDOW + 2)
@@ -570,10 +570,10 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
 
     next_track(RECOVERY, run=9, visit=6)
     fetched(RECOVERY, 503, None, 200)
-    recovered = RECOVERED_TEXT + "\n\nLyrics source: " + RECOVERED_SOURCE
-    wait("automatic same-track recovery renders alternate generation and attribution", lambda: shows(recovered), 6)
+    recovered = (RECOVERED_TEXT, "Lyrics source: " + RECOVERED_SOURCE)
+    wait("automatic same-track recovery renders alternate generation and attribution", lambda: shows(*recovered), 6)
     now_playing_title(RECOVERY)
-    stays_quiet("lyrics-recovered", recovered)
+    stays_quiet("lyrics-recovered", *recovered)
     if captures:
         save(capture(win, image_module), "08-recovered-track")
     print("PASS automatic recovery on the same track after exactly three GETs, with no retry control", flush=True)
