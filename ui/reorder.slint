@@ -98,11 +98,14 @@ export component ReorderList inherits Rectangle {
     accessible-item-count: root.rows.length;
     // AccessKit resolves the index among instantiated descendants, not rows
     // preceding the current virtualized window.
-    accessible-delegate-focus: root.selection >= root.index-at-or-after(0px)
-            && root.row-top(root.selection) + scroll.content-y < scroll.visible-height
-        ? root.selection - root.index-at-or-after(0px) : -1;
+    accessible-delegate-focus: root.accessible-index >= root.index-at-or-after(0px)
+            && root.row-top(root.accessible-index) + scroll.content-y < scroll.visible-height
+        ? root.accessible-index - root.index-at-or-after(0px) : -1;
 
     private property <int> selection: -1;
+    // With keyboard placement, the source delegate can scroll out of the
+    // virtual window. Keep the destination and its description reachable.
+    private property <int> accessible-index: root.queue-style && root.grab == Grab.keyboard ? root.slot : root.selection;
     private property <string> selected-key;
     private property <string> observed-scope;
     private property <int> expected-index: -1;
@@ -245,6 +248,16 @@ export component ReorderList inherits Rectangle {
 
     function scroll-to(y: length) {
         scroll.content-y = clamp(y, min(0px, scroll.visible-height - root.content-height), 0px);
+    }
+
+    function scroll-lifted(delta: length) {
+        let y = scroll.content-y;
+        let limit = delta > 0px ? -root.row-top(root.first-slot)
+            : min(0px, scroll.visible-height - root.row-bottom(root.last-slot));
+        // A wheel can arrive while fixed lanes are already on screen. Never
+        // jump farther in the opposite direction just to meet the bound.
+        root.scroll-to(delta > 0px ? min(max(y, limit), y + delta) : max(min(y, limit), y + delta));
+        root.track-pointer(root.pointer-y);
     }
 
     function reveal(index: int) {
@@ -448,11 +461,7 @@ export component ReorderList inherits Rectangle {
             if !root.source-is-current() || !pointer.pressed || !keys.has-focus {
                 root.refresh-selection(); return;
             }
-            let limit = root.auto-delta > 0px ? min(0px, -root.row-top(root.first-slot))
-                : min(0px, scroll.visible-height - root.row-bottom(root.last-slot));
-            let proposal = scroll.content-y + root.auto-delta;
-            root.scroll-to(root.auto-delta > 0px ? min(limit, proposal) : max(limit, proposal));
-            root.track-pointer(root.pointer-y);
+            root.scroll-lifted(root.auto-delta);
         }
     }
 
@@ -534,7 +543,8 @@ export component ReorderList inherits Rectangle {
                         accessible-item-index: self.index;
                         accessible-label: (self.entry.section == "" ? "" : self.entry.section + ": ") + self.entry.title
                             + (self.entry.subtitle == "" ? "" : ", " + self.entry.subtitle);
-                        accessible-description: !root.lifted || self.index != root.source ? ""
+                        accessible-description: !root.lifted || self.index != (root.queue-style && root.grab == Grab.keyboard
+                            ? root.slot : root.source) ? ""
                             : root.preceding-index() < 0 ? "Lifted, at start"
                             : "Lifted, after " + root.rows[root.preceding-index()].title;
                         accessible-action-default => { root.activate-row(self.index); }
@@ -591,7 +601,9 @@ export component ReorderList inherits Rectangle {
         }
         if root.preview: carried-card := ReorderCard {
             x: root.card-left + (root.queue-style ? 0px : root.line-variant ? 5px : 8px);
-            y: root.queue-style && root.grab == Grab.pointer ? root.carried-top + scroll.content-y
+            // Queue grip and settle share one coordinate space, including at
+            // a clipped viewport edge; only the viewport clips the motion.
+            y: root.queue-style ? root.carried-top + scroll.content-y
                 : clamp(root.carried-top + scroll.content-y, 1px, max(1px, scroll.visible-height - self.height - 1px));
             visible: root.grab == Grab.pointer || root.slot-in-view;
             width: max(0px, root.card-width - (root.queue-style ? 0px : root.line-variant ? 29px : 39px));
@@ -623,8 +635,11 @@ export component ReorderList inherits Rectangle {
                 scroll-event(event) => {
                     if root.grab != Grab.pointer && root.grab != Grab.pending { return reject; }
                     if root.grab == Grab.pending { root.cancel-grab(); }
-                    root.scroll-to(scroll.content-y + event.delta-y);
-                    if root.grab == Grab.pointer { root.track-pointer(root.pointer-y); }
+                    if root.queue-style && root.grab == Grab.pointer { root.scroll-lifted(event.delta-y); }
+                    else {
+                        root.scroll-to(scroll.content-y + event.delta-y);
+                        if root.grab == Grab.pointer { root.track-pointer(root.pointer-y); }
+                    }
                     return accept;
                 }
                 pointer-event(event) => {
@@ -669,7 +684,10 @@ export component ReorderList inherits Rectangle {
                                 && self.mouse-y >= 0px && self.mouse-y < self.height;
                             if inside && root.grab == Grab.pointer {
                                 if !root.queue-style || self.mouse-y != root.pointer-y { root.track-pointer(self.mouse-y); }
-                                root.place();
+                                // A wheel can scroll entirely past Up Next into
+                                // Played. Do not drop into an invisible slot.
+                                if root.queue-style && !root.slot-in-view { root.cancel-grab(); }
+                                else { root.place(); }
                                 return;
                             } else if inside && root.grab == Grab.pending && root.source-is-current()
                                 && root.index-at(self.mouse-y) == root.source {
