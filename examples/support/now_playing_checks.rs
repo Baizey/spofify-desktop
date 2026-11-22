@@ -464,11 +464,11 @@ fn reading(ui: &AppWindow, base: &Path) {
 
 pub(super) fn run(ui: &AppWindow, evidence: PathBuf, finish: impl FnOnce(RgbaImage) + 'static) {
     close_queue(ui);
-    click(ui, 120.0, 1101.0); // Dock title, ordinary entry from History.
+    click(ui, 48.0, 1121.0); // Dock cover: “Open Now Playing” from History.
     assert_eq!(
         ui.get_page_kind().as_str(),
         "now",
-        "dock title did not open Now Playing"
+        "dock cover did not open Now Playing"
     );
     assert!(ui.get_can_back());
     let opened = frame(ui);
@@ -516,7 +516,7 @@ pub(super) fn run(ui: &AppWindow, evidence: PathBuf, finish: impl FnOnce(RgbaIma
                     "Back failed to restore keyboard focus to dock Lyrics"
                 );
                 println!(
-                    "PASS dock title entry, Queue toggle, Lyrics focus, Ctrl+L and Back to History"
+                    "PASS dock Open Now Playing, Queue toggle, Lyrics focus, Ctrl+L and Back to History"
                 );
                 finish(opened);
             });
