@@ -14,7 +14,42 @@ component PlayerTime inherits Caption {
 
 export struct TimedLyricLine { start-ms: int, text: string }
 
-// In the split view lyrics scroll independently; in the stack they run down the page.
+// The standard scrollbar is too faint when idle. Keep the proportional thumb
+// visible and draggable in a lane that never covers the last row of lyrics.
+component LyricPanBar inherits Rectangle {
+    in property <length> limit;
+    in property <length> viewport-width;
+    in-out property <length> content-x;
+    callback take-reading-focus();
+    accessible-role: none;
+    property <length> thumb-width: min(self.width, max(28px, self.width * viewport-width / max(1px, viewport-width + limit)));
+    property <length> travel: max(1px, self.width - self.thumb-width);
+    Rectangle {
+        width: parent.width; y: (parent.height - self.height) / 2; height: 4px;
+        border-radius: 2px; background: Theme.line;
+    }
+    thumb := Rectangle {
+        x: root.travel * (-root.content-x / max(1px, root.limit));
+        y: (parent.height - self.height) / 2; width: root.thumb-width; height: 7px;
+        border-radius: 3.5px;
+        background: pointer.pressed || pointer.has-hover ? Theme.muted : Theme.subtle.with-alpha(0.7);
+    }
+    pointer := TouchArea {
+        property <length> grab;
+        function position() { root.content-x = -root.limit * clamp((self.mouse-x - self.grab) / root.travel, 0, 1); }
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                self.grab = self.mouse-x >= thumb.x && self.mouse-x <= thumb.x + thumb.width
+                    ? self.mouse-x - thumb.x : thumb.width / 2;
+                root.take-reading-focus();
+                self.position();
+            }
+        }
+        moved => { if self.pressed { self.position(); } }
+    }
+}
+
+// The reading viewport owns both scroll axes. Its width is independent from the authored text.
 component LyricsReader inherits Rectangle {
     in property <string> lyrics;
     in property <[TimedLyricLine]> lines;
@@ -22,31 +57,30 @@ component LyricsReader inherits Rectangle {
     in property <int> active-line: -1;
     in property <string> status;
     in property <string> track-id;
-    in property <bool> split;
     in property <length> reading-height;
     in property <bool> active;
-    callback move-page(string);
     callback reveal();
     out property <bool> has-reading-focus: reading-focus.has-focus;
     public function take-focus() { reading-focus.focus(); }
+    function pan(step: length) { reader.content-x = clamp(reader.content-x + step, -root.horizontal-limit, 0px); }
 
-    property <length> inset: root.split ? 28px : 0px;
-    property <length> heading-height: root.split ? 52px : 46px;
-    property <bool> overflow: reader.content-height > reader.visible-height;
+    property <length> heading-y: 14px;
+    out property <length> heading-height: 53px;
+    property <length> pan-height: root.horizontal-limit > 0px ? 22px : 0px;
     property <bool> has-lyrics: root.lyrics != "" || root.lines.length > 0;
-    property <length> verse-size: (root.split ? 19px : 17px) * Theme.density;
-    preferred-height: root.heading-height + (!root.has-lyrics ? 42px
-        : root.split ? root.reading-height : verses.height + 10px);
-    changed track-id => { reader.content-y = 0px; }
-    changed split => { reader.content-y = 0px; }
+    property <length> verse-size: 19px * Theme.density;
+    property <length> horizontal-limit: max(0px, reader.content-width - reader.visible-width);
+    property <length> vertical-limit: max(0px, reader.content-height - reader.visible-height);
+    property <length> edge: 12px;
+    preferred-height: root.heading-height + (root.has-lyrics ? root.reading-height : 50px);
+    changed track-id => { reader.content-x = 0px; reader.content-y = 0px; }
+    changed horizontal-limit => { reader.content-x = clamp(reader.content-x, -root.horizontal-limit, 0px); }
+    changed vertical-limit => { reader.content-y = clamp(reader.content-y, -root.vertical-limit, 0px); }
 
-    if root.split: Divider {
-        x: 0px; y: 0px; width: 1px; height: parent.height;
-    }
-    if !root.split: Divider { y: 0px; }
+    Divider { y: 0px; }
 
-    Text {
-        x: root.inset; y: root.split ? 0px : 11px;
+    heading := Text {
+        x: root.edge; y: root.heading-y;
         height: 33px;
         text: "Lyrics";
         color: Theme.text;
@@ -54,85 +88,119 @@ component LyricsReader inherits Rectangle {
         font-weight: 700;
         vertical-alignment: center;
     }
-    if !root.has-lyrics: Caption {
-        x: root.inset; y: root.heading-height;
-        width: parent.width - self.x;
-        text: root.status;
-        font-size: 14px * Theme.density;
-        wrap: word-wrap;
-        accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
-    }
     reading-focus := FocusScope {
-        x: root.inset; y: 0px;
-        width: parent.width - self.x; height: parent.height;
+        width: parent.width; height: parent.height;
         enabled: root.active;
         accessible-role: groupbox; accessible-label: "Lyrics";
+        accessible-description: !root.has-lyrics ? root.status
+            : root.horizontal-limit > 0px ? "Use Left and Right arrows to read long lines" : "";
         focus-on-click: false;
         changed has-focus => { if self.has-focus { root.reveal(); } }
         key-pressed(event) => {
             if event.modifiers.control || event.modifiers.alt || event.modifiers.meta { return reject; }
-            if event.text != Key.UpArrow && event.text != Key.DownArrow && event.text != Key.PageUp
-                && event.text != Key.PageDown && event.text != Key.Home && event.text != Key.End { return reject; }
+            if event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                if root.horizontal-limit <= 0px { return reject; }
+                root.pan(event.text == Key.LeftArrow ? 80px : -80px);
+                root.reveal();
+                return accept;
+            }
+            if event.text == Key.Home && (root.horizontal-limit > 0px || root.vertical-limit > 0px) {
+                reader.content-x = 0px; reader.content-y = 0px;
+                root.reveal();
+                return accept;
+            }
+            if root.vertical-limit <= 0px || (event.text != Key.UpArrow && event.text != Key.DownArrow
+                && event.text != Key.PageUp && event.text != Key.PageDown && event.text != Key.End) { return reject; }
             let step = event.text == Key.UpArrow ? 28px : event.text == Key.DownArrow ? -28px
                 : event.text == Key.PageUp ? max(32px, reader.visible-height - 28px)
                 : event.text == Key.PageDown ? -max(32px, reader.visible-height - 28px) : 0px;
-            if root.split {
-                if !root.overflow { return reject; }
-                let end = min(0px, reader.visible-height - reader.content-height);
-                reader.content-y = event.text == Key.Home ? 0px : event.text == Key.End ? end
-                    : clamp(reader.content-y + step, end, 0px);
-            } else {
-                root.move-page(event.text);
-            }
+            reader.content-y = event.text == Key.End ? -root.vertical-limit
+                : clamp(reader.content-y + step, -root.vertical-limit, 0px);
+            root.reveal();
             return accept;
         }
+        if !root.has-lyrics: Caption {
+            x: root.edge; y: root.heading-height;
+            width: parent.width - self.x;
+            text: root.status;
+            font-size: 14px * Theme.density;
+            wrap: word-wrap;
+            accessible-role: text; accessible-label: self.text; accessible-live-region: polite;
+        }
         reader := ScrollView {
-            y: root.heading-height; width: parent.width; height: parent.height - self.y;
+            y: root.heading-height; width: parent.width; height: parent.height - self.y - root.pan-height;
             visible: root.has-lyrics;
             horizontal-scrollbar-policy: always-off;
-            vertical-scrollbar-policy: root.split ? as-needed : always-off;
-            content-width: self.visible-width;
-            content-height: max(self.visible-height, verses.height + 10px);
+            vertical-scrollbar-policy: as-needed;
+            // Reserve a little space at the far edge for the desktop scrollbars.
+            content-width: max(self.visible-width, verses.preferred-width + 16px);
+            content-height: max(self.visible-height, credit.y + credit.height + 8px);
             verses := VerticalLayout {
-                x: 2px; y: 3px;
-                width: min(560px, max(0px, reader.visible-width - (root.split ? 24px : 7px)));
+                x: 0px; y: 3px;
+                width: max(0px, reader.content-width - 16px);
                 height: self.preferred-height;
                 alignment: start;
-                if root.lyrics != "": Text {
-                    text: root.lyrics; color: Theme.text;
-                    font-size: root.verse-size; font-weight: 500; wrap: word-wrap;
-                    accessible-role: text; accessible-label: self.text;
-                }
-                for line[index] in root.lines: Rectangle {
-                    property <bool> current: index == root.active-line;
-                    height: max(root.verse-size, words.preferred-height) + 6px;
-                    background: self.current ? Theme.primary.with-alpha(0.14) : transparent;
-                    border-radius: 4px;
-                    accessible-role: text; accessible-label: line.text;
-                    accessible-description: self.current ? "Current line" : "";
-                    if self.current: Rectangle {
-                        x: 0px; y: 3px; width: 3px; height: parent.height - 6px;
-                        border-radius: 1.5px; background: Theme.primary;
-                    }
-                    words := Text {
-                        x: 10px; width: max(0px, parent.width - 17px);
-                        height: parent.height; vertical-alignment: center;
-                        text: line.text; color: Theme.text;
-                        font-size: root.verse-size; font-weight: 500; wrap: word-wrap;
-                        accessible-role: none;
-                    }
-                }
-                if root.attribution != "": VerticalLayout {
-                    padding-top: 10px;
-                    Caption {
-                        text: root.attribution; font-size: 13px * Theme.density; wrap: word-wrap;
+                if root.lyrics != "": VerticalLayout {
+                    padding-left: root.edge;
+                    Text {
+                        text: root.lyrics; color: Theme.text;
+                        font-size: root.verse-size; font-weight: 500; wrap: no-wrap;
                         accessible-role: text; accessible-label: self.text;
                     }
                 }
+                for line[index] in root.lines: lyric-row := Rectangle {
+                    property <bool> current: index == root.active-line && line.text != "";
+                    preferred-width: root.edge + words.preferred-width;
+                    height: max(root.verse-size, words.preferred-height) + 6px;
+                    accessible-role: text; accessible-label: line.text;
+                    accessible-description: self.current ? "Current line" : "";
+                    if self.current: Rectangle {
+                        x: 0px; y: 0px; width: min(parent.width, words.preferred-width + 2 * root.edge); height: parent.height;
+                        border-radius: 4px; background: Theme.primary.with-alpha(0.11);
+                    }
+                    words := Text {
+                        x: root.edge; width: max(0px, parent.width - self.x);
+                        height: parent.height; vertical-alignment: center;
+                        text: line.text; color: Theme.text;
+                        font-size: root.verse-size; font-weight: 500; wrap: no-wrap;
+                        accessible-role: none;
+                    }
+                    // Keep the leading marker and the text gutter fixed while
+                    // the measured lyric line and its tint pan beneath them.
+                    if self.current || reader.content-x != 0px: Rectangle {
+                        x: -reader.content-x; y: 0px; width: root.edge - 1px; height: parent.height;
+                        background: Theme.bg;
+                        if lyric-row.current: Rectangle {
+                            x: 1px; y: 3px; width: 3px; height: parent.height - 6px;
+                            border-radius: 1.5px; background: Theme.primary;
+                        }
+                    }
+                }
+            }
+            if reader.content-x != 0px && root.lyrics != "": Rectangle {
+                x: -reader.content-x; y: verses.y; width: root.edge; height: verses.height;
+                background: Theme.bg;
+            }
+            credit := VerticalLayout {
+                x: root.edge - reader.content-x; y: verses.y + verses.height;
+                width: max(0px, reader.visible-width - root.edge - 16px);
+                padding-top: root.attribution == "" ? 0px : 14px;
+                height: self.preferred-height;
+                if root.attribution != "": Caption {
+                    text: root.attribution; font-size: 13px * Theme.density; wrap: word-wrap;
+                    accessible-role: text; accessible-label: self.text;
+                }
             }
         }
+        if root.pan-height > 0px: LyricPanBar {
+            x: root.edge; y: parent.height - self.height;
+            width: max(0px, parent.width - self.x - 16px); height: root.pan-height;
+            limit: root.horizontal-limit; viewport-width: reader.visible-width;
+            content-x <=> reader.content-x;
+            take-reading-focus => { root.take-focus(); }
+        }
         if reading-focus.has-focus: Rectangle {
-            x: -5px; y: root.split ? 0px : 9px; width: parent.width + 5px; height: 35px;
+            x: 0px; y: root.heading-y; width: heading.preferred-width + 2 * root.edge; height: 34px;
             border-width: 2px; border-color: Theme.tertiary; border-radius: 5px;
         }
     }
@@ -183,18 +251,16 @@ export component NowPlaying inherits Rectangle {
     background: Theme.bg;
 
     property <bool> has-track: root.track-id != "";
-    property <bool> split: scroll.visible-width >= 830px;
-    property <bool> short: scroll.visible-height < (root.split ? 400px : 490px);
-    property <length> gutter: root.split ? clamp(scroll.visible-width * 0.052, 36px, 76px) : clamp(scroll.visible-width * 0.048, 16px, 30px);
-    property <length> stage-width: max(0px, min(root.split ? 1152px : 520px, scroll.visible-width - 2 * root.gutter));
-    property <length> deck-lane: root.split ? root.stage-width * 0.46 : root.stage-width;
-    property <length> lane-gap: root.split ? clamp(root.stage-width * 0.065, 44px, 76px) : 0px;
-    // Fit the deck transport in the usual single-column viewport above the dock.
-    property <length> deck-reserve: 286px + 36px * max(0, Theme.density - 1);
-    property <length> art-size: min(root.deck-lane, root.short ? clamp(scroll.visible-height - 260px, 44px, 164px)
-        : root.split ? clamp(scroll.visible-height - 307px, 164px, 450px) : clamp(scroll.visible-height - root.deck-reserve, 145px, 342px));
-    property <length> record-width: min(root.deck-lane, max(root.split ? 334px : 370px, root.art-size));
-    property <length> deck-top: root.short ? 47px : root.split ? 65px : 55px;
+    property <bool> header: root.stage-width >= 555px;
+    property <bool> header-wide: root.stage-width >= 1120px;
+    property <bool> short: scroll.visible-height < 640px;
+    property <length> gutter: clamp(scroll.visible-width * 0.038, 18px, 66px);
+    property <length> stage-width: max(0px, min(1440px, scroll.visible-width - 2 * root.gutter));
+    property <length> deck-lane: root.header ? root.stage-width : min(root.stage-width, 460px);
+    property <length> art-size: min(root.deck-lane,
+        root.header-wide ? 138px : root.header ? 112px : clamp(scroll.visible-height - 350px, 100px, 248px));
+    property <length> header-controls-width: min(390px, root.stage-width * 0.27);
+    property <length> deck-top: 44px;
     property <bool> has-context: root.context-id != "" && root.context-name != "" &&
         (root.context-kind == "album" || root.context-kind == "artist" || root.context-kind == "playlist" || root.context-kind == "derived" || root.context-kind == "saved");
     property <bool> context-is-album: root.has-context && root.context-kind == "album" && root.context-id == root.album-id;
@@ -208,7 +274,6 @@ export component NowPlaying inherits Rectangle {
     }
 
     changed track-id => { root.reset-position(); }
-    changed split => { root.reset-position(); }
     property <bool> has-lyrics: !root.offline && (root.lyrics-text != "" || root.lyrics-lines.length > 0);
     changed has-lyrics => {
         // Align after initial delivery only; playback must never drive scrolling.
@@ -216,8 +281,7 @@ export component NowPlaying inherits Rectangle {
     }
 
     function align-lyrics() {
-        if !root.split { root.scroll-to(12px - stage.y - lyrics.y); }
-        else { root.reveal(stage.y + lyrics.y, min(92px, scroll.visible-height)); }
+        root.reveal(stage.y + lyrics.y, min(lyrics.height, scroll.visible-height - 18px));
     }
     function reset-position() {
         scroll.content-y = 0px;
@@ -240,7 +304,7 @@ export component NowPlaying inherits Rectangle {
         stage := Rectangle {
             width: root.stage-width;
             x: (scroll.visible-width - self.width) / 2;
-            y: root.short ? 8px : root.split ? 23px : 14px;
+            y: root.short ? 8px : 16px;
             height: !root.has-track ? 176px : max(deck.y + deck.height, lyrics.y + lyrics.height);
 
             HorizontalLayout {
@@ -250,7 +314,7 @@ export component NowPlaying inherits Rectangle {
                 if root.next-title != "": Caption {
                     text: "Up next · " + root.next-title + (root.next-subtitle == "" ? "" : " · " + root.next-subtitle);
                     horizontal-alignment: right;
-                    min-width: 0px; max-width: root.split ? 320px : 170px;
+                    min-width: 0px; max-width: root.header ? 420px : 210px;
                     horizontal-stretch: 2;
                 }
             }
@@ -265,111 +329,127 @@ export component NowPlaying inherits Rectangle {
                 Caption { text: "Play a track from your library to get started."; font-size: 14px * Theme.density; wrap: word-wrap; }
             }
 
-            deck := VerticalLayout {
+            deck := Rectangle {
                 visible: root.has-track;
-                x: (root.deck-lane - self.width) / 2; y: root.deck-top;
-                width: root.record-width; height: self.preferred-height;
-                alignment: start;
+                x: (stage.width - self.width) / 2; y: root.deck-top;
+                width: root.deck-lane;
+                property <length> stack-identity-y: root.art-size + (root.short ? 10px : 16px);
+                property <length> identity-row-height: max(root.art-size, identity.height, root.header-wide ? controls.height : 0px);
+                property <length> stack-controls-y: (root.header ? self.identity-row-height : self.stack-identity-y + identity.height) + 10px;
+                height: root.header-wide ? self.identity-row-height : self.stack-controls-y + controls.height;
 
-                HorizontalLayout {
-                    alignment: center;
-                    Cover { artwork: root.artwork; width: root.art-size; height: root.art-size; }
+                Cover {
+                    x: root.header ? 0px : (parent.width - self.width) / 2;
+                    y: root.header ? (deck.identity-row-height - self.height) / 2 : 0px;
+                    artwork: root.artwork; width: root.art-size; height: root.art-size;
                 }
-                Rectangle { height: root.short ? 8px : 16px; }
-                Text {
-                    text: root.track;
-                    horizontal-alignment: center;
-                    color: Theme.text;
-                    font-size: (root.short ? 24px : root.split ? 34px : 28px) * Theme.density;
-                    font-weight: 750;
-                    letter-spacing: -0.45px;
-                    overflow: elide;
-                    accessible-label: root.track;
-                }
-                if root.subtitle != "" || root.credits.length > 0: artist-line := WrappingCredits {
-                    credits: root.credits; fallback: root.subtitle; centered: true;
-                    interactive: root.metadata-interactive;
-                    font-size: 15px * Theme.density;
-                    focused(y, h) => { root.reveal(stage.y + deck.y + artist-line.y + y, h); }
-                    activated(id) => { root.page-action("artist", id); }
-                }
-                Rectangle { height: root.short ? 4px : 10px; }
-                if root.duration > 0: SeekBar {
-                    height: 30px;
-                    elapsed: root.elapsed; duration: root.duration;
-                    enabled: root.has-track && root.can-seek;
-                    waveform: root.waveform;
-                    seek(value) => { root.seek(value); }
-                }
-                if root.duration > 0: HorizontalLayout {
-                    height: 19px; padding-left: 2px; padding-right: 2px;
-                    PlayerTime { seconds: min(root.elapsed, root.duration); accessible-label: "Elapsed " + self.text; }
-                    Rectangle { horizontal-stretch: 1; }
-                    PlayerTime { seconds: root.duration; accessible-label: "Duration " + self.text; }
-                }
-                Rectangle { height: root.short ? 3px : 9px; }
-                playback-row := HorizontalLayout {
-                    height: 44px; alignment: center;
-                    Transport {
-                        playing: root.playing; available: root.has-track && root.can-toggle; skip-enabled: root.has-track && root.can-skip;
-                        shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.has-track && root.can-change-modes;
-                        previous => { root.previous(); }
-                        toggle => { root.toggle(); }
-                        next => { root.next(); }
-                        focused => { root.reveal(stage.y + deck.y + playback-row.y, playback-row.height); }
-                        queue-action(op, key) => { root.queue-action(op, key); }
+                identity := VerticalLayout {
+                    x: root.header ? root.art-size + 26px : 0px;
+                    y: root.header ? (deck.identity-row-height - self.height) / 2 : deck.stack-identity-y;
+                    width: max(0px, parent.width - self.x - (root.header-wide ? root.header-controls-width + 36px : 0px));
+                    height: self.preferred-height; alignment: start; spacing: 3px;
+                    Text {
+                        text: root.track;
+                        horizontal-alignment: root.header ? left : center;
+                        color: Theme.text;
+                        font-size: (root.short ? 24px : root.header-wide ? 35px : 30px) * Theme.density;
+                        font-weight: 750;
+                        letter-spacing: -0.45px;
+                        wrap: word-wrap;
+                        accessible-label: root.track;
+                    }
+                    if root.subtitle != "" || root.credits.length > 0: artist-line := WrappingCredits {
+                        credits: root.credits; fallback: root.subtitle; centered: !root.header;
+                        interactive: root.metadata-interactive;
+                        font-size: 15px * Theme.density;
+                        focused(y, h) => { root.reveal(stage.y + deck.y + identity.y + artist-line.y + y, h); }
+                        activated(id) => { root.page-action("artist", id); }
+                    }
+                    if root.show-album || root.show-context: source-line := HorizontalLayout {
+                        height: 34px; spacing: 8px;
+                        if root.link-album: Rectangle {
+                            width: min(album.min-width, parent.width * (root.show-context ? 0.49 : 1));
+                            album := Action {
+                                width: parent.width; height: parent.height;
+                                text: root.album-label == "" ? "Album" : root.album-label;
+                                icon: "◎"; quiet: true; leading: true;
+                                accessible-label: root.album-label == "" ? "Open album" : "Open album: " + root.album-label;
+                                changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + identity.y + source-line.y, source-line.height); } }
+                                clicked => { root.page-action("album", root.album-id); }
+                            }
+                        }
+                        if root.show-album && !root.link-album: Caption {
+                            min-width: 0px;
+                            max-width: root.show-context ? parent.width * 0.49 : parent.width;
+                            text: root.album-label;
+                        }
+                        if root.show-context: Action {
+                            min-width: 0px; height: 34px; horizontal-stretch: 1;
+                            text: "From " + root.context-name; icon: "↗"; quiet: true; leading: true;
+                            accessible-label: "Open playback source: " + root.context-name;
+                            changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + identity.y + source-line.y, source-line.height); } }
+                            clicked => { root.page-action("context-" + root.context-kind, root.context-id); }
+                        }
+                        if !root.show-context: Rectangle { horizontal-stretch: 1; }
                     }
                 }
-                if root.show-album || root.show-context: Rectangle { height: root.short ? 4px : 11px; }
-                if root.show-album || root.show-context: source-line := HorizontalLayout {
-                    height: 34px; spacing: 8px;
-                    if root.link-album: Rectangle {
-                        width: min(album.min-width, parent.width * (root.show-context ? 0.49 : 1));
-                        album := Action {
-                            width: parent.width; height: parent.height;
-                            text: root.album-label == "" ? "Album" : root.album-label;
-                            icon: "◎"; quiet: true; leading: true;
-                            accessible-label: root.album-label == "" ? "Open album" : "Open album: " + root.album-label;
-                            changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + source-line.y, source-line.height); } }
-                            clicked => { root.page-action("album", root.album-id); }
+                controls := Rectangle {
+                    property <bool> side-by-side: root.header && !root.header-wide && root.duration > 0;
+                    property <length> seek-height: root.duration > 0 ? 49px : 0px;
+                    property <length> transport-gap: root.duration > 0 ? (root.short ? 3px : 9px) : 0px;
+                    x: root.header-wide ? parent.width - self.width : 0px;
+                    y: root.header-wide ? (deck.identity-row-height - self.height) / 2 : deck.stack-controls-y;
+                    width: root.header-wide ? root.header-controls-width : parent.width;
+                    height: self.side-by-side ? max(self.seek-height, playback-row.height) : self.seek-height + self.transport-gap + playback-row.height;
+                    VerticalLayout {
+                        x: 0px; y: 0px;
+                        width: controls.side-by-side ? max(0px, parent.width - playback-row.width - 20px) : parent.width;
+                        height: controls.seek-height;
+                        if root.duration > 0: SeekBar {
+                            height: 30px;
+                            elapsed: root.elapsed; duration: root.duration;
+                            enabled: root.has-track && root.can-seek;
+                            waveform: root.waveform;
+                            seek(value) => { root.seek(value); }
+                        }
+                        if root.duration > 0: HorizontalLayout {
+                            height: 19px; padding-left: 2px; padding-right: 2px;
+                            PlayerTime { seconds: min(root.elapsed, root.duration); accessible-label: "Elapsed " + self.text; }
+                            Rectangle { horizontal-stretch: 1; }
+                            PlayerTime { seconds: root.duration; accessible-label: "Duration " + self.text; }
                         }
                     }
-                    if root.show-album && !root.link-album: Caption {
-                        min-width: 0px;
-                        max-width: root.show-context ? parent.width * 0.49 : parent.width;
-                        text: root.album-label;
+                    playback-row := HorizontalLayout {
+                        x: controls.side-by-side ? parent.width - self.width : 0px;
+                        y: controls.side-by-side ? (controls.seek-height - self.height) / 2 : controls.seek-height + controls.transport-gap;
+                        width: controls.side-by-side ? self.preferred-width : parent.width;
+                        height: 44px; alignment: center;
+                        Transport {
+                            playing: root.playing; available: root.has-track && root.can-toggle; skip-enabled: root.has-track && root.can-skip;
+                            shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.has-track && root.can-change-modes;
+                            previous => { root.previous(); }
+                            toggle => { root.toggle(); }
+                            next => { root.next(); }
+                            focused => { root.reveal(stage.y + deck.y + controls.y + playback-row.y, playback-row.height); }
+                            queue-action(op, key) => { root.queue-action(op, key); }
+                        }
                     }
-                    if root.show-context: Action {
-                        min-width: 0px; height: 34px; horizontal-stretch: 1;
-                        text: "From " + root.context-name; icon: "↗"; quiet: true; leading: true;
-                        accessible-label: "Open playback source: " + root.context-name;
-                        changed has-focus => { if self.has-focus { root.reveal(stage.y + deck.y + source-line.y, source-line.height); } }
-                        clicked => { root.page-action("context-" + root.context-kind, root.context-id); }
-                    }
-                    if !root.show-context: Rectangle { horizontal-stretch: 1; }
                 }
             }
 
             lyrics := LyricsReader {
                 visible: root.has-track;
-                x: root.split ? root.deck-lane + root.lane-gap : deck.x;
-                y: root.split ? deck.y : deck.y + deck.height + 26px;
-                width: root.split ? stage.width - self.x : deck.width;
+                width: stage.width;
+                y: deck.y + deck.height + 22px;
                 height: self.preferred-height;
-                reading-height: max(142px, scroll.visible-height - stage.y - self.y - 78px);
-                split: root.split; active: root.has-track;
+                reading-height: max(112px, scroll.visible-height - stage.y - self.y - self.heading-height - 26px);
+                active: root.has-track;
                 track-id: root.track-id; lyrics: root.offline ? "" : root.lyrics-text;
                 lines: root.offline ? [] : root.lyrics-lines;
                 attribution: root.offline ? "" : root.lyrics-attribution;
                 active-line: root.active-lyric-line;
                 status: root.offline ? "Lyrics unavailable offline." : root.lyrics-status != "" ? root.lyrics-status : "Loading lyrics…";
-                reveal => { root.reveal(stage.y + self.y, root.split ? min(self.height, scroll.visible-height - 30px) : 92px); }
-                move-page(key) => {
-                    let page = max(32px, scroll.visible-height - 32px);
-                    let step = key == Key.UpArrow ? 28px : key == Key.DownArrow ? -28px : key == Key.PageUp ? page : -page;
-                    root.scroll-to(key == Key.Home ? -stage.y - self.y + 8px : key == Key.End ? scroll.visible-height - scroll.content-height
-                        : scroll.content-y + step);
-                }
+                reveal => { root.align-lyrics(); }
             }
         }
     }

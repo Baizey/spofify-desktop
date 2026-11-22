@@ -423,21 +423,35 @@ fn project_lyrics(result: Result<media::Lyrics, ApiError>) -> LyricProjection {
     if let Ok(lyrics) = result {
         match lyrics.state {
             Timed => projected.lines = lyrics.lines,
-            Plain => projected.text = lyrics.plain_text,
+            Plain => projected.text = lyrics.plain_text.map(lyric_display_text),
             Instrumental => projected.text = Some("Instrumental".into()),
             _ => return projected,
         }
         if let Some(attribution) = lyrics.attribution {
-            let credit = format!("Lyrics source: {}", attribution.name);
-            if let Some(text) = &mut projected.text {
-                text.push_str("\n\n");
-                text.push_str(&credit);
-            } else {
-                projected.attribution = credit;
-            }
+            projected.attribution = format!("Lyrics source: {}", attribution.name);
         }
     }
     projected
+}
+
+// Unpainted trailing spaces must not widen the viewport or erase hard breaks.
+fn lyric_display_text(text: String) -> String {
+    fn trim_padding(line: &str) -> &str {
+        line.trim_end_matches(|ch: char| {
+            ch.is_whitespace() && !matches!(ch, '\u{85}' | '\u{2028}' | '\u{2029}')
+        })
+    }
+    if text
+        .split('\n')
+        .any(|line| trim_padding(line).len() != line.len())
+    {
+        text.split('\n')
+            .map(trim_padding)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text
+    }
 }
 
 fn lyric_model(lines: Vec<media::LyricLine>) -> ModelRc<TimedLyricLine> {
@@ -445,7 +459,7 @@ fn lyric_model(lines: Vec<media::LyricLine>) -> ModelRc<TimedLyricLine> {
         .into_iter()
         .map(|line| TimedLyricLine {
             start_ms: line.start_ms as i32, // bounded by parse_lyrics
-            text: line.text.into(),
+            text: lyric_display_text(line.text).into(),
         })
         .collect::<Vec<_>>();
     ModelRc::new(VecModel::from(lines))
@@ -454,13 +468,25 @@ fn lyric_model(lines: Vec<media::LyricLine>) -> ModelRc<TimedLyricLine> {
 // Called from the reader's binding with the same projection as the seek bar.
 // The immutable row model is constructed only on delivery, not on clock ticks.
 fn displayed_lyric_line(lines: ModelRc<TimedLyricLine>, elapsed: f32, duration: f32) -> i32 {
-    media::active_lyric_line(
+    let Some(last) = media::active_lyric_line(
         lines.row_count(),
         |i| u64::try_from(lines.row_data(i)?.start_ms).ok(),
         elapsed,
         duration,
-    )
-    .map_or(-1, |i| i as i32)
+    ) else {
+        return -1;
+    };
+    let Some(latest) = lines.row_data(last) else {
+        return -1;
+    };
+    // A stanza break still ends the previous timestamp, but is never sung.
+    // Preserve a genuine lyric if the same timestamp also has an empty row.
+    let timestamp = latest.start_ms;
+    std::iter::once(latest)
+        .chain((0..last).rev().map_while(|i| lines.row_data(i)))
+        .take_while(|line| line.start_ms == timestamp)
+        .position(|line| !line.text.trim().is_empty())
+        .map_or(-1, |offset| (last - offset) as i32)
 }
 
 async fn run_lyrics(
@@ -816,9 +842,9 @@ mod tests {
             source_generation: "local-v1".into(),
             state: media::LyricsState::Timed,
             plain_text: Some("Alternate transcription".into()),
-            lines: ["First", "Second"]
+            lines: ["First   ", " \t", "Second", ""]
                 .into_iter()
-                .zip([500, 1500])
+                .zip([500, 1000, 1500, 1500])
                 .map(|(text, start_ms)| media::LyricLine {
                     start_ms,
                     text: text.into(),
@@ -839,24 +865,27 @@ mod tests {
         for (position, active) in [
             (0.0, -1),
             (0.5, 0),
-            (1.5, 1),
-            (1.5, 1),
+            (1.0, -1),
+            (1.25, -1),
+            (1.5, 2),
             (0.75, 0),
             (0.0, -1),
         ] {
             assert_eq!(displayed_lyric_line(rows.clone(), position, 2.0), active);
         }
-        assert_eq!(rows.row_data(1).unwrap().text, "Second");
+        assert_eq!(rows.row_data(0).unwrap().text, "First");
+        assert_eq!(rows.row_data(1).unwrap().text, "");
+        assert_eq!(rows.row_data(2).unwrap().text, "Second");
 
         lyrics.state = media::LyricsState::Plain;
         lyrics.lines.clear();
-        lyrics.plain_text = Some("Plain verse".into());
+        lyrics.plain_text = Some("Plain verse\t \n \n  Second stanza\n".into());
         let plain = project_lyrics(Ok(lyrics));
         assert_eq!(
             plain.text.as_deref(),
-            Some("Plain verse\n\nLyrics source: Fixture")
+            Some("Plain verse\n\n  Second stanza\n")
         );
-        assert!(plain.attribution.is_empty());
+        assert_eq!(plain.attribution, "Lyrics source: Fixture");
         assert_eq!(displayed_lyric_line(lyric_model(plain.lines), 1.5, 2.0), -1);
     }
 
