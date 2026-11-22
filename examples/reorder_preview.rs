@@ -2,7 +2,12 @@
 //! dispatch on an owned display, but no network, audio, login or user data.
 use slint::platform::{Key, PointerEventButton::Left, WindowEvent};
 use slint::{ComponentHandle, LogicalPosition, Model, ModelRc, SharedString, Timer};
-use std::{cell::RefCell, path::PathBuf, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
+};
 slint::include_modules!();
 
 #[path = "../src/playlist_view.rs"]
@@ -18,6 +23,50 @@ fn song(index: usize) -> SharedString {
     } else {
         format!("Track {index:03}").into()
     }
+}
+
+fn queue_song(index: usize) -> SharedString {
+    match index {
+        0 => "Current song".into(),
+        1 | 3 => "The Last Train Out of the City Before the First Snow Came".into(),
+        _ => song(index),
+    }
+}
+
+fn save_frame(ui: &AppWindow, output: &Path, name: &str, probe_y: Option<u32>) -> bool {
+    let buffer = ui.window().take_snapshot().expect("native frame");
+    assert_eq!((buffer.width(), buffer.height()), (1280, 720));
+    image::save_buffer(
+        output.join(format!("{name}.png")),
+        buffer.as_bytes(),
+        buffer.width(),
+        buffer.height(),
+        image::ColorType::Rgba8,
+    )
+    .expect("save frame");
+    // At this fixture size the Queue occupies x=976..1280. The carried
+    // card paints a continuous mint outline around the pressed row. Its
+    // two saturated horizontal edges distinguish it from the insertion
+    // cue alone, focus, and the old, fainter pending-press treatment.
+    probe_y.is_some_and(|y| {
+        let bytes = buffer.as_bytes();
+        let mut edges = (y.saturating_sub(36)..(y + 37).min(buffer.height())).filter(|&row| {
+            let mut run = 0;
+            let start = (row as usize * 1280 + 1000) * 4;
+            bytes[start..start + 244 * 4].chunks_exact(4).any(|pixel| {
+                let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
+                run = if g >= 175 && g.saturating_sub(r) >= 70 && g.saturating_sub(b) >= 26 {
+                    run + 1
+                } else {
+                    0
+                };
+                run >= 32
+            })
+        });
+        edges
+            .next()
+            .is_some_and(|top| edges.any(|bottom| bottom - top >= 30))
+    })
 }
 
 fn commit(rows: ModelRc<ReorderRow>, key: &str, after: &str) -> ModelRc<ReorderRow> {
@@ -93,11 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (0..13)
             .map(|i| QueueRow {
                 key: format!("queue-{i:03}").into(),
-                title: if i == 0 {
-                    "Current song".into()
-                } else {
-                    song(i)
-                },
+                title: queue_song(i),
                 subtitle: "Fixture artist".into(),
                 track_id: if i == 0 {
                     "current".into()
@@ -114,11 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (0..13)
             .map(|i| ReorderRow {
                 key: format!("queue-{i:03}").into(),
-                title: if i == 0 {
-                    "Current song".into()
-                } else {
-                    song(i)
-                },
+                title: queue_song(i),
                 subtitle: "Fixture artist".into(),
                 reorderable: i > 0,
                 section: match i {
@@ -130,9 +171,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect(),
     ));
+    let queue_drop = Rc::new(RefCell::new(Vec::new()));
+    let playlist_drops = Rc::new(Cell::new(0));
+    let queue_writes = queue_drop.clone();
     let window = ui.as_weak();
     ui.on_queue_order_drop(move |scope, key, after| {
         println!("drop queue {scope} {key} {after:?}");
+        queue_writes.borrow_mut().push((key.clone(), after.clone()));
         window.unwrap().set_queue_order_writable(false);
         let window = window.clone();
         Timer::single_shot(Duration::from_millis(140), move || {
@@ -150,9 +195,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_queue_order_writable(true);
         });
     });
+    let playlist_writes = playlist_drops.clone();
     let window = ui.as_weak();
     ui.on_playlist_order_drop(move |scope, key, after| {
         println!("drop playlist {scope} {key} {after:?}");
+        playlist_writes.set(playlist_writes.get() + 1);
         window.unwrap().set_form_busy(true);
         let window = window.clone();
         Timer::single_shot(Duration::from_millis(140), move || {
@@ -209,12 +256,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("event {line}");
         let mut fields = line.split_whitespace();
         match fields.next().unwrap() {
-            verb @ ("down" | "move" | "up" | "scroll") => {
+            verb @ ("down" | "press-frame" | "move" | "up" | "scroll") => {
                 let x = fields.next().unwrap().parse().unwrap();
                 let y = fields.next().unwrap().parse().unwrap();
                 let position = LogicalPosition::new(x, y);
                 let event = match verb {
-                    "down" => WindowEvent::PointerPressed {
+                    "down" | "press-frame" => WindowEvent::PointerPressed {
                         position,
                         button: Left,
                     },
@@ -230,6 +277,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => WindowEvent::PointerMoved { position },
                 };
                 ui.window().dispatch_event(event);
+                if verb == "press-frame" {
+                    // No time for a hold timer or intervening move: capture
+                    // the very first rendering of this press, on this stack.
+                    let name = fields.next().expect("press-frame name");
+                    let expected = match fields.next().expect("press-frame state") {
+                        "lifted" => true,
+                        "idle" => false,
+                        state => panic!("unknown press-frame state {state}"),
+                    };
+                    assert_eq!(
+                        save_frame(&ui, &output, name, Some(y as u32)),
+                        expected,
+                        "unexpected visible lift on the first stationary press frame ({name})",
+                    );
+                }
             }
             "key" => {
                 let text: SharedString = match fields.next().unwrap() {
@@ -249,17 +311,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .dispatch_event(WindowEvent::KeyReleased { text });
             }
             "frame" => {
-                let buffer = ui.window().take_snapshot().expect("native frame");
-                image::save_buffer(
-                    output.join(format!("{}.png", fields.next().unwrap())),
-                    buffer.as_bytes(),
-                    buffer.width(),
-                    buffer.height(),
-                    image::ColorType::Rgba8,
-                )
-                .expect("save frame");
+                save_frame(&ui, &output, fields.next().expect("frame name"), None);
+            }
+            "queue-drops" => {
+                let count: usize = fields.next().expect("drop count").parse().unwrap();
+                let drops = queue_drop.borrow();
+                assert_eq!(drops.len(), count, "unexpected Queue moves: {drops:?}");
+                if let Some(key) = fields.next() {
+                    let after = fields.next().unwrap_or("");
+                    let (actual_key, actual_after) = drops.last().expect("expected Queue move");
+                    assert_eq!((actual_key.as_str(), actual_after.as_str()), (key, after));
+                }
+            }
+            "playlist-drops" => {
+                let count: usize = fields.next().expect("drop count").parse().unwrap();
+                assert_eq!(
+                    playlist_drops.get(),
+                    count,
+                    "unexpected playlist move count"
+                );
             }
             "revise" => ui.set_playlist_order_scope("external-r2".into()),
+            "queue-revise" => ui.set_queue_order_token("external-queue-r2".into()),
+            "deactivate" | "activate" => ui
+                .window()
+                .dispatch_event(WindowEvent::WindowActiveChanged(line == "activate")),
             "progress" => {
                 ui.set_elapsed(10.0);
                 ui.set_now_detail("Updated playback facts".into());

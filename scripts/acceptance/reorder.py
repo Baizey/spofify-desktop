@@ -76,7 +76,9 @@ def account(output, readback_delay=READBACK_DELAY):
     summary = dict(wire_ui.SUMMARY, id=PLAYLIST_ID, name=PLAYLIST, description="",
                    trackCount=COUNT, availableCount=COUNT)
     entries = [dict(id=entry_id(i), position=i, addedAt=wire_ui.DATE, track=track(i)) for i in range(COUNT)]
-    queue = [dict(id=t["id"], name=t["name"], artists=t["artists"], albumId=t["albumId"],
+    queue = [dict(id=t["id"], name=(t["name"] + " — The Last Train Out of the City Before the First Snow Came"
+                                   if i in (DUPLICATE, 5) else t["name"]),
+                  artists=t["artists"], albumId=t["albumId"],
                   albumName=t["albumName"], duration=60, key=queue_key(i), order=i + 1, intent="low")
              for i in range(COUNT) for t in (track(i),)]
     cursor = dict(key=queue_key(CURRENT), chain="fixture-paused", visit=1, run=1,
@@ -288,18 +290,13 @@ class Review:
         return wait(id_, find)
 
     def control(self, label):
-        def find():
-            if label == "Edit order" and self.surface == "playlist":
-                # At this wide display size both surfaces may advertise Edit order.
-                handle = self.handle("edit-playlist-order")
-                e = self.window.mcp.value("get_element_properties", {"elementHandle": handle})
-                return e | {"handle": handle} if e.get("accessibleEnabled") else None
-            if self.surface == "queue":
-                return next((e for e in self.tree(self.handle("queue-pane"))
-                             if self.window.matches(e, label) and e.get("accessibleRole") == "Button"
-                             and e.get("accessibleEnabled")), None)
-            return self.window.find(label, roles=("Button",), timeout=1)
-        return wait(f"enabled {self.surface} {label}", find)
+        # The playlist header and its sticky strip show alternate Edit order
+        # buttons. Search the content pane, not the queue's identically named button.
+        pane = self.handle("queue-pane" if self.surface == "queue" else "main")
+        return wait(f"enabled {self.surface} {label}", lambda: next(
+            (e for e in self.tree(pane) if self.window.matches(e, label)
+             and e.get("accessibleRole") == "Button" and e.get("visible", True)
+             and e.get("accessibleEnabled")), None))
 
     def open(self, surface):
         self.surface = surface
@@ -307,6 +304,8 @@ class Review:
             self.window.click("Playlists")
             self.window.click(f"Open {PLAYLIST}")
         # At 1280 px AppWindow opens the wide queue by default.
+        if surface == "queue":
+            self.frame("00-normal")
         self.window.click_element(self.control("Edit order"))
         self.editor = self.handle(f"{surface}-order")
         self.frame("01-editor-open", self.layout())
@@ -399,6 +398,31 @@ class Review:
         # Drag from a centered grip to a final slot, allowing for up to one
         # autoscroll tick between sampling the anchor and leaving the edge.
         self.device.move(x, center(row)[1])
+
+    def stationary_no_write(self):
+        # The offline fixture asserts the first *synchronous* pressed frame.
+        # This pass proves the same hit targets, real stationary events, and
+        # absence of any wire mutations both on a quick click and a held release.
+        for site, held in (("title", False), ("left-edge", True)):
+            start = self.row(DUPLICATE, 1)
+            left, top, right, bottom = bounds(start)
+            point = ((left + right) / 2, (top + bottom) / 2 - 9) if site == "title" else (
+                left + 4, (top + bottom) / 2)
+            before = len(self.commands())
+            name = f"01c-stationary-{site}"
+            with recording(self.window, self.output, f"{self.surface}-{name}") as events:
+                with self.hold(point):
+                    if held:
+                        lifted = wait("stationary Queue row lift", lambda: self.lifted(), timeout=1)
+                        check(len(lifted) == 1 and bounds(lifted[0]) == bounds(start),
+                              "wrong native occurrence lifted from the left edge")
+                        self.frame(name + "-held")
+                        check(len(self.commands()) == before, "stationary lift emitted a mutation")
+                self.expect(before)
+                check(not self.lifted(), "stationary release left the Queue row lifted")
+                self.expect_adjacent(DUPLICATE, 4, occurrence=1)
+                self.frame(name + "-released", self.layout())
+            pointer_trace(events, point, stationary=True)
 
     def fixed_current(self):
         before = len(self.commands())
@@ -564,13 +588,16 @@ def number(row):
     return int(ROW.search(row["accessibleLabel"])[1])
 
 
-def pointer_trace(events, point):
-    positions = [e["pointerPressed"]["position"] for e in events if "pointerPressed" in e]
-    check(len(positions) == 1 and all(abs(positions[0][axis] - expected) <= 2
-                                      for axis, expected in zip(("x", "y"), point)),
-          f"recorded native press missed the grip: {positions!r} vs {point!r}")
-    check(any("pointerMoved" in e for e in events), "missing native pointer movement")
-    check(sum("pointerReleased" in e for e in events) == 1, "expected one native pointer release")
+def pointer_trace(events, point, *, stationary=False):
+    presses = [i for i, e in enumerate(events) if "pointerPressed" in e]
+    releases = [i for i, e in enumerate(events) if "pointerReleased" in e]
+    check(len(presses) == len(releases) == 1 and presses[0] < releases[0],
+          "expected one native pointer press followed by one release")
+    position = events[presses[0]]["pointerPressed"]["position"]
+    check(all(abs(position[axis] - expected) <= 2 for axis, expected in zip(("x", "y"), point)),
+          f"recorded native press missed the target: {position!r} vs {point!r}")
+    motion = any("pointerMoved" in e for e in events[presses[0] + 1:releases[0]])
+    check(motion != stationary, "unexpected native pointer motion between press and release")
 
 
 def key_trace(events, key):
@@ -582,7 +609,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("desktop", type=Path, help="prebuilt debug binary with the reorder editor and Slint MCP")
     parser.add_argument("--output", default="reorder-review", help="new directory name under worktree .tmp/")
-    parser.add_argument("--delayed-echo", action="store_true", help="only verify slow readback on queue and playlist")
+    parser.add_argument("--delayed-echo", action="store_true", help="only verify slow readback")
+    parser.add_argument("--surface", choices=("queue", "playlist"), help="only verify this named surface")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     check(Path.cwd() == repo, "run this script from the desktop worktree root")
@@ -596,7 +624,7 @@ def main():
     print(f"Native evidence: {output}", flush=True)
     failures = []
     for variant in (("soft-slot",) if args.delayed_echo else ("soft-slot", "line-cue")):
-        for surface in ("queue", "playlist"):
+        for surface in ((args.surface,) if args.surface else ("queue", "playlist")):
             captures = output / variant / surface
             captures.mkdir(mode=0o700, parents=True)
             try:
@@ -630,6 +658,7 @@ def main():
                                 else:
                                     if surface == "queue":
                                         review.fixed_current()
+                                        review.stationary_no_write()
                                     review.pointer_gesture(cancel=True)
                                     review.pointer_gesture()
                                     review.keyboard()

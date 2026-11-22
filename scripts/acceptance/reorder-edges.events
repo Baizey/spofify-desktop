@@ -1,26 +1,56 @@
-# Native AppWindow fixture at 1280 × 685 client pixels (1280 × 720 Cage output).
-# Normal playback, quick and same-slot holds, immutable current, and cancel.
-0 down 1201 295
-15 up 1201 295
-100 down 1164 27
+# Native AppWindow fixture at 1280 × 720 client pixels on a private Cage output.
+0 down 1164 27
 15 up 1164 27
-100 down 1145 95
-285 move 1145 260
-30 up 1145 260
-100 down 1120 145
-15 up 1120 145
-100 down 1120 145
-280 up 1120 145
-100 down 1120 248
-280 move 1120 145
+# The fixed current row must not lift, even when held and moved into Up Next.
+100 press-frame 1100 121 queue-current-first-press idle
+285 move 1100 250
+30 up 1100 250
+# A quick title press never writes; neither does a stationary held release.
+100 down 1115 294
+15 up 1115 294
+100 press-frame 998 304 queue-left-edge-first-press lifted
+280 up 998 304
+230 queue-drops 0
+# Both Escape and an authoritative Queue scope change cancel a displaced
+# pointer lift even while the button remains down.
+100 down 1115 294
+35 move 1115 460
 50 key escape
-40 up 1120 145
-130 frame queue-cancelled
-# Keyboard last, first, and stale-scope cancellation.
+40 up 1115 460
+130 frame queue-escape-cancelled
+0 queue-drops 0
+100 down 1115 294
+35 move 1115 460
+50 queue-revise
+100 up 1115 460
+130 frame queue-revision-cancelled
+0 queue-drops 0
+# Losing window activation cancels the displaced lift before a late release.
+100 press-frame 1115 294 queue-before-deactivate lifted
+35 move 1115 460
+50 deactivate
+100 up 1115 460
+130 frame queue-deactivated-cancelled
+0 queue-drops 0
+20 activate
+# Scrolling a held row must stop at the movable band rather than exposing
+# the fixed current lane. Only release places it after the visible anchor.
+100 press-frame 1115 294 queue-wheel-press lifted
+25 scroll 1115 294 -10000
+140 frame queue-wheel-held-bottom
+0 queue-drops 0
+25 scroll 1115 294 10000
+140 frame queue-wheel-held-top
+0 queue-drops 0
+15 up 1115 294
+35 frame queue-wheel-release
+200 frame queue-wheel-settled
+0 queue-drops 1 queue-003 queue-005
+# Playlists retain keyboard last, first, and stale-scope cancellation.
 20 down 1188 28
 15 up 1188 28
-100 down 900 92
-15 up 900 92
+100 down 895 211
+15 up 895 211
 130 key space
 30 key end
 140 frame keyboard-last
@@ -31,26 +61,29 @@
 140 frame keyboard-first
 25 key enter
 200 frame keyboard-first-settled
+0 playlist-drops 2
 25 key space
 30 key down
 100 revise
 20 key escape
 140 frame revision-cancelled
-100 down 923 93
-15 up 923 93
-100 down 900 92
-15 up 900 92
+0 playlist-drops 2
+100 down 917 138
+15 up 917 138
+100 down 895 211
+15 up 895 211
 140 key home
 # Select track 98 solely to start a pointer drag just before the old page edge.
 4 repeat 98 key down
 130 frame 098-visible
-25 down 507 558
+25 down 507 584
 280 frame 098-lifted
-15 move 507 582
+15 move 507 611
 120 frame crossing-100
 570 frame after-100
 1300 frame edge-end
-15 up 507 582
+15 up 507 611
 35 frame settling-at-end
 210 frame settled-at-end
+0 playlist-drops 3
 0 quit
