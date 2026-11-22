@@ -5,13 +5,16 @@ export global ActionCopy {
         return action == "play" ? "Play" : action == "queue" ? "Add to queue" : action == "add" ? "Add to playlist"
             : action == "save" || action == "pin-playlist" ? "Save offline" : action == "unpin-playlist" ? "Remove offline save"
             : action == "remove" ? "Remove"
+            : action == "open-album" ? "Open album" : action == "open-artist" ? "Open artist"
             : action == "album" ? "Album" : action == "artist" ? "Artist" : action == "rename" ? "Rename"
             : action == "rules" ? "Edit rules" : action == "delete" ? "Delete" : action == "new-manual" ? "New playlist"
             : action == "new-rules" ? "New rules playlist" : action;
     }
     public pure function mark(action: string) -> string {
         return action == "play" ? "▶" : action == "queue" ? "≡" : action == "add" ? "+" : action == "save" || self.offline-toggle(action) ? "↓"
-            : action == "remove" || action == "delete" ? "−" : action == "album" ? "◎" : action == "artist" ? "◉" : "";
+            : action == "remove" || action == "delete" ? "−"
+            : action == "album" || action == "open-album" ? "◎"
+            : action == "artist" || action == "open-artist" ? "◉" : "";
     }
     public pure function offline-toggle(action: string) -> bool {
         return action == "pin-playlist" || action == "unpin-playlist";
@@ -29,10 +32,16 @@ export component OverflowMenu inherits Rectangle {
     in property <string> item-context;
     in property <string> context-key;
     in property <length> window-height;
+    // On Search the popup owns wheel input while open. A nonzero width opts
+    // into a transparent window-sized input surface so wheel input outside
+    // the panel can dismiss it and scroll the originating results.
+    in property <length> scroll-window-width;
+    in property <length> scroll-position;
     in property <bool> restore-focus;
     init => { if self.restore-focus { self.take-focus(); } }
     changed restore-focus => { if self.restore-focus { self.take-focus(); } }
     callback action(string);
+    callback scrolled(length);
     callback focused();
     callback trigger-focus-changed(bool);
     public function take-focus() { if root.visible && root.actions.length > 0 { trigger.take-focus(); } }
@@ -45,9 +54,11 @@ export component OverflowMenu inherits Rectangle {
     property <length> menu-width: 244px + max(0, Theme.density - 1) * 80px;
     property <length> item-height: max(37px, 34px * Theme.density);
     property <length> anchor-y: self.absolute-position.y;
+    property <bool> wheel-scroll: scroll-window-width > 0px && window-height > 0px;
 
     changed actions => { if menu.is-open { menu.close(); } }
     changed context-key => { if menu.is-open { menu.close(); } }
+    changed scroll-position => { if menu.is-open { menu.close(); } }
 
     trigger := Action {
         width: parent.width; height: parent.height;
@@ -72,12 +83,14 @@ export component OverflowMenu inherits Rectangle {
     }
 
     menu := PopupWindow {
-        x: root.width - root.menu-width;
-        y: self.open-above ? -self.height - 4px : root.height + 4px;
-        width: root.menu-width;
-        height: items.preferred-height;
+        x: root.wheel-scroll ? -root.absolute-position.x : panel-x;
+        y: root.wheel-scroll ? -root.anchor-y : panel-y;
+        width: root.wheel-scroll ? root.scroll-window-width : root.menu-width;
+        height: root.wheel-scroll ? root.window-height : items.preferred-height;
+        property <length> panel-x: root.width - root.menu-width;
+        property <length> panel-y: self.open-above ? -items.preferred-height - 4px : root.height + 4px;
         property <bool> open-above: root.window-height > 0px
-            && root.anchor-y + root.height + 4px + self.height > root.window-height
+            && root.anchor-y + root.height + 4px + items.preferred-height > root.window-height
             && root.anchor-y > root.window-height - root.anchor-y - root.height;
         close-policy: close-on-click-outside;
         forward-focus: keys;
@@ -88,8 +101,23 @@ export component OverflowMenu inherits Rectangle {
         }
         init => { keys.focus(); }
 
-        Rectangle {
+        if root.wheel-scroll: TouchArea {
             width: 100%; height: 100%;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down && (self.mouse-x < panel.x || self.mouse-x >= panel.x + panel.width
+                    || self.mouse-y < panel.y || self.mouse-y >= panel.y + panel.height) { menu.close(); }
+            }
+            scroll-event(event) => {
+                if event.delta-y == 0px { return reject; }
+                menu.close();
+                root.scrolled(event.delta-y);
+                return accept;
+            }
+        }
+        panel := Rectangle {
+            x: root.wheel-scroll ? root.absolute-position.x + menu.panel-x : 0px;
+            y: root.wheel-scroll ? root.anchor-y + menu.panel-y : 0px;
+            width: root.menu-width; height: items.preferred-height;
             background: Theme.panel;
             border-color: Theme.line; border-width: 1px; border-radius: Theme.container-radius;
             accessible-role: list;
