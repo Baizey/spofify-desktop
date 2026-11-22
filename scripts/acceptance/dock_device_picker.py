@@ -178,7 +178,9 @@ def assert_view(window, entry):
         if entry == "empty":
             assert_empty_dock(window)
         else:
-            window.find("Now playing: Synthetic Tone 001", roles=BUTTON, within=player_bar(window))
+            dock = player_bar(window)
+            window.find("Open Now Playing", roles=BUTTON, within=dock)
+            window.find("(Open album for )?Synthetic Tone 001", roles=("Button", "Text"), within=dock)
 
 
 def queue_state(window):

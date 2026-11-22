@@ -260,7 +260,7 @@ def run(win, ready, admitted, media, requests, pcm):
     for label, mode, forward in (("wide", WIDE, 0.60), ("compact", COMPACT, 0.65)):
         if mode == COMPACT:  # Cage already starts in WIDE.
             win.resize(mode)
-        assert_dock_layout(win, "Now playing: " + TITLE)
+        assert_dock_layout(win, "Open album for " + TITLE)
         win.pixels("player-controls-" + label, mode[0])
         for direction, fraction, marker in (("forward", forward, 600), ("backward", 0.25, 360)):
             peer.ping(f"before-{label}-{direction}-seek")

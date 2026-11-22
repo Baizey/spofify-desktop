@@ -543,7 +543,7 @@ def run(win, ready, admitted, requests, lyrics_gets, release_media, release_stal
         win.click("Back")
         wait("Now Playing closed", lambda: not element_type(win.elements(), "NowPlaying"))
         exact_gets()
-        win.click("Now playing: " + re.escape(track[1]), within=player_bar(win))
+        win.click("Open Now Playing", within=player_bar(win))
         now_playing_title(track)
 
     next_track(STALE, run=7, visit=4, elapsed=0, playing=False, desired=False)

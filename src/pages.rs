@@ -1246,6 +1246,21 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_track_keeps_its_album_and_artist_metadata() {
+        let mut item = track();
+        item.has_audio = false;
+        let row = catalog_row(item, None);
+        assert!(!row.playable);
+        assert!(row.playback.is_none());
+        assert_eq!(row.detail, "Unavailable");
+        assert_eq!(row.subtitle, "Name only, Artist, Guest");
+        assert_eq!(
+            row.music.album.unwrap().target,
+            Some(Route::Album("album%2F1".into()))
+        );
+    }
+
+    #[test]
     fn detail_links_do_not_guess_from_names_or_unsupported_path_ids() {
         let mut item = track();
         item.id = "track/音".into();

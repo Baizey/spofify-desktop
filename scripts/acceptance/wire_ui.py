@@ -45,8 +45,13 @@ TRACK = catalog_item("track", "wire-track-01", TRACK_NAME, durationMs=1000, arti
                      albumId=ALBUM["id"], albumName=ALBUM_NAME, discNumber=1, trackNumber=1)
 SINGLE_TRACK = catalog_item("track", "wire-track-02", "Synthetic Uncredited Wire Recording", durationMs=1000,
                             artists=ID_ONLY_RELEASE["artists"], albumId=ID_ONLY_RELEASE["id"],
-                            albumName=ID_ONLY_RELEASE["name"], discNumber=1, trackNumber=1)
-ITEMS = (ARTIST, GUEST, ALBUM, TRACK, ID_ONLY_RELEASE, SINGLE_TRACK)
+                            albumName=ALBUM_NAME, discNumber=1, trackNumber=1)
+# A familiar display name does not establish an identity. SINGLE_TRACK has
+# the same display album name but must open ID_ONLY_RELEASE, not ALBUM.
+UNKNOWN_ALBUM_TRACK = catalog_item("track", "wire-track-no-album", "Synthetic Album Unknown",
+                                   durationMs=59000, artists=CREDITS,
+                                   albumName=ALBUM_NAME)
+ITEMS = (ARTIST, GUEST, ALBUM, TRACK, ID_ONLY_RELEASE, SINGLE_TRACK, UNKNOWN_ALBUM_TRACK)
 DETAILS = {f"/api/library/{item['kind']}s/{item['id']}": item for item in ITEMS if item['kind'] != 'track'}
 SUMMARY = {"id": "wire-playlist-01", "name": PLAYLIST, "description": "Two synthetic occurrences",
            "kind": "manual", "countState": "exact", "trackCount": 2, "availableCount": 2,

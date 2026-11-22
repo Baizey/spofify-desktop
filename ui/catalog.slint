@@ -1,4 +1,4 @@
-import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, Theme } from "theme.slint";
+import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, Theme, TrackTitle } from "theme.slint";
 import { ArtistCredit, CreditLine, WrappingCredits } from "credits.slint";
 import { ActionCopy, OverflowMenu } from "overflow-menu.slint";
 import { Glyph } from "icon.slint";
@@ -21,27 +21,21 @@ export global Copy {
             : kind == "playlist" || kind == "playlists" || kind == "playlist-manual" || kind == "playlist-rules" || kind == "picker" ? "playlists"
             : kind == "queue" ? "≡" : kind == "saved-collection" ? "↓" : "♫";
     }
-    // Catalog sizing corresponds to MediaLine's title, optional type, credits,
-    // album link, and 6px padding on both sides. It remains available without
-    // mounting any of those controls for an offscreen row.
-    public pure function result-height(typed: bool, credits: bool, album: bool) -> length {
+    // Shared by the live row and its virtual layout slot. Fixed-pitch
+    // playlists reserve room for credits even when one song has none.
+    public pure function row-height(credits: bool, album: bool) -> length {
         return max(max(48px, 56px * Theme.density), 12px + max(20px, 15px * Theme.density + 7px)
-            + (typed ? max(18px, 16px * Theme.density) : 0px)
             + (credits ? max(20px, 13px * Theme.density + 6px) : 0px)
             + (album ? max(20px, 12px * Theme.density + 7px) : 0px));
+    }
+    public pure function show-browse-album(page: string, kind: string, album: string) -> bool {
+        return kind == "track" && page != "album" && page != "picker" && page != "search" && album != "";
     }
     public pure function action-label(action: string) -> string {
         return ActionCopy.label(action);
     }
     public pure function action-mark(action: string) -> string {
         return ActionCopy.mark(action);
-    }
-    // Fixed playlist rows fit the same title, credits and album lines as MediaLine.
-    public pure function track-row-height(with-album: bool) -> length {
-        return max(max(48px, 56px * Theme.density), 12px
-            + max(20px, 15px * Theme.density + 7px)
-            + max(20px, 13px * Theme.density + 6px)
-            + (with-album ? max(20px, 12px * Theme.density + 7px) : 0px));
     }
 }
 
@@ -126,12 +120,14 @@ component TrackState inherits Rectangle {
 component TrackCover inherits Cover {
     in property <bool> current-track;
     in property <bool> playing-track;
+    in property <bool> artist-mark;
     width: 39px; height: self.width;
     Rectangle {
-        visible: root.current-track;
+        visible: root.current-track || root.artist-mark;
         x: parent.width - self.width; y: parent.height - self.height;
-        width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
-        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
+        width: root.artist-mark ? 17px : 20px; height: self.width; border-radius: 5px; background: Theme.bg;
+        if root.current-track: TrackState { x: 2px; y: 2px; playing: root.playing-track; }
+        if root.artist-mark: Glyph { x: 2px; y: 2px; width: 13px; height: self.width; name: "◉"; ink: Theme.text; }
     }
 }
 
@@ -184,7 +180,11 @@ export component MediaLine inherits Rectangle {
             root.keyboard-focus-changed(false, false);
         }
     }
-    in property <bool> search-result;
+    in property <bool> title-opens-album;
+    in property <bool> show-separate-album: true;
+    in property <bool> availability-status;
+    in property <bool> mark-artist-art;
+    in property <string> current-album-id;
     in property <bool> align-credit-fallback;
     in property <bool> selected;
     in property <length> paint-left;
@@ -203,10 +203,20 @@ export component MediaLine inherits Rectangle {
     callback action(string);
     callback focused();
     callback keyboard-focus-changed(bool /* owns */, bool /* body */);
-    property <string> result-type: !search-result ? ""
-        : kind == "artist" ? "Artist" : kind == "album" ? "Album" : kind == "track" ? "Track" : "";
+    property <bool> has-credits: root.credits.length > 0 || root.subtitle != "";
+    property <bool> show-album-line: root.show-separate-album && !root.title-opens-album && root.album-name != "";
+    out property <bool> title-focused;
+    in property <string> title-focus-key: root.menu-key;
+    property <string> focused-title-key;
+    // Album IDs are validated path segments; the final slash separates them
+    // from any occurrence identifier without a delimiter collision.
+    property <string> title-identity: root.title-focus-key + "/" + root.album-id;
+    property <bool> title-unavailable: root.title-focused && (!song-title.interactive || root.focused-title-key != root.title-identity ||
+        (root.play-viewport-height > 0px && (root.row-viewport-y + words.y + song-title.y + song-title.height <= 0px
+            || root.row-viewport-y + words.y + song-title.y >= root.play-viewport-height)));
+    changed title-unavailable => { if root.title-unavailable { root.title-focused = false; root.play-focus-evicted(); } }
     min-width: 0px;
-    min-height: max(max(48px, 56px * Theme.density), words.min-height + 12px);
+    min-height: Copy.row-height(root.has-credits, root.show-album-line);
     vertical-stretch: 0;
     property <bool> play-on-activate: root.selectable && root.playable && !root.can-open;
     property <bool> body-actionable: root.can-open || root.play-on-activate;
@@ -228,7 +238,7 @@ export component MediaLine inherits Rectangle {
     property <int> resume-serial;
     public function restore-focus(part: string, credit: string) {
         if ((part == "artist" || part == "album") && !root.metadata-enabled)
-            || (part == "album" && (root.album-id == "" || root.album-name == ""))
+            || (part == "album" && (credit != root.album-id || (root.title-opens-album ? !song-title.interactive : !root.show-album-line)))
             || (part == "menu" && root.actions.length == 0) {
             if root.body-focusable { root.take-row-focus(); }
         } else if part == "artist" || part == "album" || part == "menu" {
@@ -353,6 +363,7 @@ export component MediaLine inherits Rectangle {
                 TrackCover {
                     y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
+                    artist-mark: root.kind == "artist" && root.mark-artist-art && root.artwork.width > 0;
                     current-track: root.current-track; playing-track: root.playing-track;
                 }
             }
@@ -369,31 +380,26 @@ export component MediaLine inherits Rectangle {
             }
             words := VerticalLayout {
                 min-width: 0px; horizontal-stretch: 1; alignment: center;
-                Rectangle {
-                    property <length> font-size: 15px * Theme.density;
-                    height: max(20px, font-size + 7px);
-                    Text {
-                        x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-                        text: root.title; color: root.current-track || root.selected ? Theme.primary : Theme.text;
-                        font-size: parent.font-size; font-weight: 600;
-                        vertical-alignment: center; overflow: elide;
-                        accessible-role: none;
-                    }
-                    if !root.body-actionable: Rectangle {
-                        width: parent.width; height: parent.height;
-                        accessible-role: text;
-                        accessible-label: root.title;
-                        accessible-description: root.track-state-label;
-                    }
-                }
-                if root.result-type != "": Rectangle {
-                    height: max(18px, 16px * Theme.density);
-                    Caption {
-                        x: 4px; width: max(0px, parent.width - 8px); height: parent.height;
-                        text: root.result-type + (root.detail == "" ? "" : " · " + root.detail);
+                song-title := TrackTitle {
+                    text: root.title; album-id: root.album-id; album-name: root.album-name;
+                    current-album-id: root.current-album-id;
+                    links-enabled: root.title-opens-album && root.metadata-enabled;
+                    ink: root.current-track || root.selected ? Theme.primary : Theme.text;
+                    plain-accessible: !root.body-actionable;
+                    track-description: root.track-state-label + (root.availability-status
+                        ? (root.track-state-label == "" ? "" : ", ") + root.detail : "");
+                    click-scope: root.title-identity;
+                    restore-focus: root.title-opens-album && root.restore-control == "album:" + root.album-id;
+                    focus-serial: root.resume-part == "album" && root.resume-credit == root.album-id ? root.resume-serial : 0;
+                    activated => { if !root.title-unavailable { root.page-action("album", root.album-id); } }
+                    focused => { root.focused(); }
+                    keyboard-focus-changed(owns) => {
+                        if owns { root.focused-title-key = root.title-identity; }
+                        root.title-focused = owns;
+                        root.keyboard-focus-changed(owns, false);
                     }
                 }
-                if root.credits.length > 0 || root.subtitle != "": Rectangle {
+                if root.has-credits: Rectangle {
                     min-width: 0px; horizontal-stretch: 1;
                     height: artist-line.preferred-height;
                     artist-line := CreditLine {
@@ -414,7 +420,7 @@ export component MediaLine inherits Rectangle {
                         keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                     }
                 }
-                if root.album-name != "": AlbumLine {
+                if root.show-album-line: AlbumLine {
                     text: root.album-name; album-id: root.album-id; links-enabled: root.metadata-enabled;
                     fit-link: true;
                     restore-focus: root.restore-control == "album:" + root.album-id;
@@ -424,10 +430,11 @@ export component MediaLine inherits Rectangle {
                     keyboard-focus-changed(owns) => { root.keyboard-focus-changed(owns, false); }
                 }
             }
-            if root.result-type == "" && (!root.compact || root.sequence > 0) && root.detail != "": Caption {
+            if (root.availability-status || !root.compact || root.sequence > 0) && root.detail != "": Caption {
                 property <length> column-width: root.sequence > 0 ? (root.compact ? 42px : 64px) : 126px;
-                width: root.playlist-track-row && !root.playable ? max(self.column-width, min(180px, self.preferred-width)) : self.column-width;
-                text: root.detail; horizontal-alignment: root.sequence > 0 ? right : left;
+                width: root.availability-status ? self.preferred-width : root.playlist-track-row && !root.playable
+                    ? max(self.column-width, min(180px, self.preferred-width)) : self.column-width;
+                text: root.detail; horizontal-alignment: root.availability-status || root.sequence > 0 ? right : left;
             }
         }
         // Keep Play out of layout flow and after metadata links in Tab order.

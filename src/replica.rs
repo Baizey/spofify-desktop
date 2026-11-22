@@ -79,13 +79,24 @@ impl Trail {
     /// Follow a link from the actual current route. A rail selection clears
     /// the trail instead of calling this.
     pub fn visit(&mut self, old: &Route, new: &Route) {
+        self.visit_with_source(old, new, false);
+    }
+
+    /// A title launch preserves its source for exact control focus on Back,
+    /// even when the destination album is already in the trail.
+    pub fn visit_from_title(&mut self, old: &Route, new: &Route) {
+        self.visit_with_source(old, new, true);
+    }
+
+    fn visit_with_source(&mut self, old: &Route, new: &Route, preserve_title_source: bool) {
         if old == new || matches!((old, new), (Route::Search(_), Route::Search(_))) {
             return;
         }
-        if self.top_route() == Some(new) {
+        let empty_search = matches!(old, Route::Search(q) if q.is_empty());
+        if self.top_route() == Some(new) && !preserve_title_source {
             self.0.pop_back(); // Directly returning to the previous screen.
         } else if !matches!(old, Route::Picker(_))
-            && !matches!(old, Route::Search(q) if q.is_empty())
+            && (!empty_search || preserve_title_source)
             && self.top_route() != Some(old)
         {
             if self.0.len() >= MAX_HISTORY {
@@ -135,6 +146,26 @@ mod tests {
         assert!(!fresh);
         assert!(r.get(&Route::Album("a".into())).unwrap().1);
     }
+    #[test]
+    fn title_navigation_retains_source_even_if_the_album_was_the_previous_route() {
+        let album = Route::Album("release".into());
+        for source in [
+            Route::Search(String::new()),
+            Route::Search("song".into()),
+            Route::Playlist("list".into()),
+        ] {
+            let mut trail = Trail::default();
+            trail.visit(&album, &source);
+            trail.visit(&source, &album);
+            assert!(!trail.can_back());
+
+            trail.visit(&album, &source);
+            trail.visit_from_title(&source, &album);
+            assert_eq!(trail.pop(), Some(source));
+            assert_eq!(trail.pop(), Some(album.clone()));
+        }
+    }
+
     #[test]
     fn bounded_trail_and_search_edits() {
         let mut t = Trail::default();

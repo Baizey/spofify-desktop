@@ -9,7 +9,6 @@ import argparse
 from base64 import b64decode
 from io import BytesIO
 from pathlib import Path
-import re
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -129,31 +128,33 @@ def queue_pixels(window):
         if not element_type([row], "MediaLine") or not contains(scroll, row):
             continue
         content = window.subtree(row)
-        label = next((e["accessibleLabel"] for e in content
-                      if window.matches(e, r"(?:Play track: )?Queue recording [012]")), None)
+        label = next((e["accessibleLabel"].removeprefix("Play track: ").removeprefix("Open album for ")
+                      for e in content if window.matches(e, r"(?:Play track: |Open album for )?Queue recording [012]")), None)
         check(label, "missing accessible queue row label")
         if label == "Queue recording 1":
             cover = element_type(content, "Cover")
             check(cover and any(rgb == (75, 53, 94) for _, _, rgb in rect_pixels(image, cover)),
                   "fixture's current queue row did not paint artwork")
         words = element_id(content, "words")
-        lines = [e for e in window.subtree(words) if element_type([e], "Text")]
-        check(len(lines) == 3, f"expected title/artist/album in a visible queue row: {bounds(words)}")
+        text = window.subtree(words)
+        lines = [element_type(text, "TrackTitle"), element_type(text, "CreditLine")]
+        check(all(lines) and not element_type(text, "AlbumLine"),
+              f"expected only title and artist in a visible queue row: {bounds(words)}")
         starts = []
         for line in lines:
             ink = [x for x, _, color in rect_pixels(image, line) if max(color) >= 170]
             check(ink, f"no legible queue text at {bounds(line)}")
             starts.append(min(ink))
-        check(max(starts) - min(starts) <= 1, f"queue title/artist/album paint misaligned: {starts}")
+        check(max(starts) - min(starts) <= 1, f"queue title and artist paint misaligned: {starts}")
         columns[label] = starts
-    expected = {"Queue recording 1", "Play track: Queue recording 2"}
+    expected = {"Queue recording 1", "Queue recording 2"}
     if window.dimensions()[0] == ULTRAWIDE[0]:
         expected.add("Queue recording 0")
     check(expected <= columns.keys(), f"expected visible Queue rows, got {columns}")
     artless = [starts[0] for label, starts in columns.items() if label != "Queue recording 1"]
     check(max(artless) - min(artless) <= 1 and columns["Queue recording 1"][0] > max(artless),
           f"expected a shared text edge for artless rows, with only current artwork inset: {columns}")
-    print(f"PASS queue painted title/artist/album starts: {columns} at {window.dimensions()[0]:g}px", flush=True)
+    print(f"PASS queue painted title and artist starts: {columns} at {window.dimensions()[0]:g}px", flush=True)
 
 
 def live_sliders(window):
@@ -178,7 +179,7 @@ def wide_now_transport(window):
     check(window.dimensions() == WIDE, f"expected the exact {WIDE} Now Playing client")
     check(element_id(window.elements(), "queue-pane"), "wide fixture must start with Queue open")
     dock = player_bar(window)
-    window.click("Now playing: Synthetic Tone 001", within=dock)
+    window.click("Open Now Playing", within=dock)
     page = wait("wide Now Playing", lambda: element_type(window.elements(), "NowPlaying"))
     elements = window.subtree(page, max_elements=1000)
     viewport = element_id(elements, "scroll")
@@ -220,7 +221,7 @@ def run(window):
           "dock shows a seek control for a track of unknown duration")
     check(dock_identity(window) == before, "unknown duration moved or replaced the dock")
     window.click("Next track", within=dock_transport)
-    title = "Now playing: Synthetic Tone 002"
+    title = "Open album for Synthetic Tone 002"
     button(window, title, within=dock)
     assert_dock_layout(window)
     window.click("Next track", within=dock_transport)
@@ -243,10 +244,12 @@ def run(window):
     painted_transport(window, dock_transport, "compact dock (play)")
     check(dock_identity(window) == before, "skip or play/pause moved or replaced the dock")
 
-    window.click(title, within=dock)
+    window.click("Open Now Playing", within=dock)
     page = wait("Now Playing after pointer activation", lambda: element_type(window.elements(), "NowPlaying"))
     check(dock_identity(window) == before, "entering Now Playing moved or replaced the dock")
-    check(not named(window, window.subtree(dock), re.escape(title)), "dock title repeats the active Now Playing route")
+    now = named(window, window.subtree(dock), "Open Now Playing")
+    check(not now or not now.get("accessibleEnabled"), "dock repeats the active Now Playing route")
+    button(window, title, within=dock)
     window.scroll_catalog(-150, within=page)
     transport = element_type(window.subtree(page, max_elements=1000), "Transport")
     move_off(window)

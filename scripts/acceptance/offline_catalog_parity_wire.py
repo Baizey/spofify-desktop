@@ -259,6 +259,14 @@ class Wire:
                                     return
                             wire.bad("unexpected offline transfer request")
                             return self.error(404)
+                        if path == "/api/library" and args.get("albumId") == [ALBUM["id"]]:
+                            if not (self.trusted() and self.owned()):
+                                return
+                            check(args.get("kind") == ["tracks"], "album route requested the wrong catalog kind")
+                            offset = int(args.get("offset", ["0"])[0])
+                            limit = int(args.get("limit", ["40"])[0])
+                            return self.reply(dict(items=TRACKS[offset:offset + limit], total=len(TRACKS),
+                                                   offset=offset, limit=limit, revision=base.REVISION))
                         return super().do_GET()
 
                 check(address == ("127.0.0.1", 0), "fixture listeners must be worker-local only")

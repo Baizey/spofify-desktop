@@ -7,8 +7,8 @@ mod local_start;
 #[path = "engine_online_pcm_tests.rs"]
 mod pcm_tests;
 use super::{
-    CreditView, Engine, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply, artist_subtitle,
-    context_kind, credit_views, crossfade, metadata_id, output,
+    CreditView, Engine, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply, album_route_id,
+    artist_subtitle, context_kind, credit_views, crossfade, output,
 };
 use crate::{
     DeviceRow,
@@ -1460,7 +1460,7 @@ impl Engine {
             p.credits = credit_views(&track.artists);
             p.detail = artist_subtitle(&p.credits);
             p.track = track.id.clone();
-            p.album = metadata_id(&track.album_id).into();
+            p.album = album_route_id(&track.album_id).into();
             p.album_name = track.album_name.clone();
             p.duration = track.duration;
             // The credit links already reach this page; don't repeat it as a source link.
@@ -1510,7 +1510,7 @@ impl Engine {
                     title: t.name.clone(),
                     subtitle: artist_subtitle(&credits),
                     credits,
-                    album_id: metadata_id(&t.album_id).into(),
+                    album_id: album_route_id(&t.album_id).into(),
                     album_name: t.album_name.clone(),
                     current: position == Some(i),
                     upcoming: position.is_some_and(|pos| i > pos),

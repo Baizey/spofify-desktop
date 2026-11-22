@@ -74,15 +74,162 @@ struct Input {
     generation: u64,
     intent: Intent,
     catalog_position: Option<CatalogPosition>,
+    title_origin: Option<TitleOrigin>,
 }
 
 struct CatalogPosition {
     y: f32,
     anchor: i32,
+    anchor_key: Option<RowKey>,
     anchor_offset: f32,
     row: i32,
+    row_key: Option<RowKey>,
     part: String,
     credit: String,
+}
+
+impl CatalogPosition {
+    fn capture_keys(&mut self, rows: &[pages::Row]) {
+        let key = |index| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| rows.get(i))
+                .filter(|row| row.key != RowKey::None)
+                .map(|row| row.key.clone())
+        };
+        self.anchor_key = key(self.anchor);
+        self.row_key = key(self.row);
+    }
+
+    fn resolve_keys(&mut self, rows: &[pages::Row]) {
+        let index = |key: &Option<RowKey>| {
+            key.as_ref()
+                .and_then(|key| unique_row_index(rows.iter().map(|row| &row.key == key)))
+                .unwrap_or(-1)
+        };
+        self.anchor = index(&self.anchor_key);
+        self.row = index(&self.row_key);
+    }
+}
+
+fn matching_title_control(control: &str, album: &str) -> bool {
+    !album.is_empty() && control.strip_prefix("album:") == Some(album)
+}
+
+fn playlist_focus_destination(rows: &[BrowseRow], occurrence: &str, control: &str) -> Option<i32> {
+    if occurrence.is_empty() {
+        return None;
+    }
+    let index = unique_row_index(rows.iter().map(|row| row.occurrence_key == occurrence))?;
+    // Enter on a title navigates, whereas Enter on the track body may play.
+    // If the control changed identity, hand focus to the list, not the body.
+    (control.is_empty() || matching_title_control(control, &rows[index as usize].album_id))
+        .then_some(index)
+}
+
+fn unique_row_index(matches: impl Iterator<Item = bool>) -> Option<i32> {
+    let mut indices = matches
+        .enumerate()
+        .filter_map(|(i, matches)| matches.then_some(i));
+    let first = indices.next()?;
+    if indices.next().is_some() {
+        return None;
+    }
+    i32::try_from(first).ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TitleSource {
+    Queue { room: String, track: String },
+    Dock,
+    Playlist,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TitleOrigin {
+    source: TitleSource,
+    key: String,
+    album: String,
+}
+
+impl TitleOrigin {
+    fn capture(ui: &AppWindow, album: &str) -> Option<Self> {
+        let key = ui.get_title_source_key();
+        if key.is_empty() || !crate::api::catalog::segment_id(album) {
+            return None;
+        }
+        let source = match ui.get_title_source().as_str() {
+            "queue" => {
+                let room = ui.get_queue_room_key();
+                if room.is_empty() {
+                    return None;
+                }
+                let track = ui
+                    .get_queue_rows()
+                    .iter()
+                    .find(|row| row.key == key && row.album_id == album)?
+                    .track_id;
+                TitleSource::Queue {
+                    room: room.into(),
+                    track: track.into(),
+                }
+            }
+            "dock" if ui.get_now_track_id() == key && ui.get_now_album_id() == album => {
+                TitleSource::Dock
+            }
+            "playlist" => TitleSource::Playlist,
+            _ => return None,
+        };
+        Some(Self {
+            source,
+            key: key.into(),
+            album: album.into(),
+        })
+    }
+
+    fn playlist_index(&self, rows: &[pages::Row], route: &Route) -> Option<i32> {
+        if !matches!(route, Route::Playlist(_) | Route::SavedCollection(_)) {
+            return None;
+        }
+        let index = unique_row_index(
+            rows.iter()
+                .map(|row| playlist_occurrence_key(row, route).as_ref() == self.key),
+        )?;
+        (track_album(&rows[index as usize]).0 == self.album).then_some(index)
+    }
+
+    fn publish(self, ui: &AppWindow, playlist_row: i32) {
+        let (source, room, track) = match &self.source {
+            TitleSource::Queue { room, track } => {
+                if ui.get_queue_room_key() != room.as_str()
+                    || !ui.get_queue_rows().iter().any(|row| {
+                        row.key == self.key.as_str()
+                            && row.track_id == track.as_str()
+                            && row.album_id == self.album.as_str()
+                    })
+                {
+                    return;
+                }
+                ("queue", room.as_str(), track.as_str())
+            }
+            TitleSource::Dock => {
+                if ui.get_now_track_id() != self.key.as_str()
+                    || ui.get_now_album_id() != self.album.as_str()
+                {
+                    return;
+                }
+                ("dock", "", "")
+            }
+            TitleSource::Playlist => ("playlist", "", ""),
+        };
+        ui.set_title_return_source(source.into());
+        ui.set_title_return_room(room.into());
+        ui.set_title_return_track(track.into());
+        ui.set_title_return_key(self.key.into());
+        ui.set_title_return_album(self.album.into());
+        ui.set_title_return_row(playlist_row);
+        ui.set_title_return_serial(ui.get_title_return_serial().wrapping_add(1));
+    }
 }
 
 #[derive(Default)]
@@ -93,9 +240,17 @@ struct CatalogContinuation {
 }
 
 struct CatalogVisit {
-    page: Arc<Page>,
+    page: Option<Arc<Page>>,
     position: CatalogPosition,
     continuation: CatalogContinuation,
+}
+
+impl CatalogVisit {
+    fn retire_snapshot(&mut self) {
+        // Positions are route-scoped typed identities, not remote rows.
+        self.page = None;
+        self.continuation = CatalogContinuation::default();
+    }
 }
 
 #[derive(Clone)]
@@ -131,19 +286,26 @@ impl Desk {
                     } else {
                         -1
                     },
+                    anchor_key: None,
                     anchor_offset,
                     row: row.unwrap_or(-1),
+                    row_key: None,
                     part: row.map_or_else(String::new, |_| ui.get_catalog_focused_part().into()),
                     credit: row
                         .map_or_else(String::new, |_| ui.get_catalog_focused_credit().into()),
                 }
             });
+        let title_origin = match &intent {
+            Intent::Page(op, album) if op == "album" => TitleOrigin::capture(ui, album),
+            _ => None,
+        };
         if self
             .tx
             .try_send(Input {
                 epoch: self.stamp.epoch.load(Ordering::SeqCst),
                 generation: self.stamp.shown.load(Ordering::SeqCst),
                 catalog_position: position,
+                title_origin,
                 intent,
             })
             .is_err()
@@ -219,7 +381,7 @@ enum Update {
     Read(Result<Page, ApiError>, bool), // true when the task will retry
     ReadGap,
     CatalogAppend(u64, Option<Result<pages::CatalogBatch, ApiError>>),
-    LocalRead(u64, Result<Page, ApiError>, Option<CatalogPosition>),
+    LocalRead(u64, Result<Page, ApiError>),
     Storage(Result<String, ApiError>),
     Changed(Result<Option<Route>, ApiError>),
     Local(Result<Command, ApiError>),
@@ -299,6 +461,8 @@ struct Browser {
     catalog_visits: HashMap<u64, CatalogVisit>,
     catalog_position: Option<CatalogPosition>,
     catalog_restore: Option<CatalogPosition>,
+    title_visits: HashMap<u64, TitleOrigin>,
+    title_restore: Option<TitleOrigin>,
     continuation: CatalogContinuation,
     generation: u64,
     serial: u64,
@@ -378,6 +542,7 @@ impl Navigation {
         trail: &mut Trail,
         reading: bool,
         failed: bool,
+        preserve_title_source: bool,
     ) -> Option<Route> {
         match self {
             Self::Section(next) => {
@@ -394,7 +559,11 @@ impl Navigation {
                 if repeat_navigation(current, &next, reading, failed) {
                     return None;
                 }
-                trail.visit(current, &next);
+                if preserve_title_source {
+                    trail.visit_from_title(current, &next);
+                } else {
+                    trail.visit(current, &next);
+                }
                 Some(next)
             }
             Self::Untracked(next) => Some(next),
@@ -423,10 +592,39 @@ fn projected_music(credit: Option<&pages::Credit>, artist: bool) -> (&str, &str)
         return ("", "");
     };
     let id = match (&credit.target, artist) {
-        (Some(Route::Artist(id)), true) | (Some(Route::Album(id)), false) => id,
+        (Some(Route::Artist(id)), true) | (Some(Route::Album(id)), false)
+            if crate::api::catalog::segment_id(id) =>
+        {
+            id
+        }
         _ => "",
     };
     (id, &credit.name)
+}
+
+fn track_album(row: &pages::Row) -> (&str, &str) {
+    if row.kind != "track" {
+        return ("", "");
+    }
+    projected_music(row.music.album.as_ref(), false)
+}
+
+fn search_track_unavailable(route: &Route, row: &pages::Row) -> bool {
+    // Search's catalog row uses hasAudio; local search only projects verified recordings.
+    matches!(route, Route::Search(_)) && row.kind == "track" && !row.playable
+}
+
+fn playlist_occurrence_key<'a>(row: &'a pages::Row, route: &Route) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    match &row.key {
+        RowKey::ManualEntry { entry_id, .. } => Cow::Borrowed(entry_id),
+        RowKey::DerivedOccurrence { occurrence_id, .. } => Cow::Borrowed(occurrence_id),
+        RowKey::Track(_) if matches!(route, Route::Playlist(_) | Route::SavedCollection(_)) => row
+            .position
+            .map(|pos| format!("saved:{pos}:{}", row.id))
+            .map_or(Cow::Borrowed(""), Cow::Owned),
+        _ => Cow::Borrowed(""),
+    }
 }
 
 fn artist_credits(music: &pages::MusicMetadata) -> ModelRc<ArtistCredit> {
@@ -874,7 +1072,36 @@ impl Browser {
         let catalog_request_key = self.catalog_request_key();
         let catalog_status = self.continuation.status.clone();
         let catalog_loading = self.continuation.loading;
-        let catalog_restore = self.catalog_restore.take();
+        // After a mode change only the position survived. Wait for the
+        // projected local/online model rather than resolving a loading shell.
+        let catalog_restore = if self.busy {
+            None
+        } else {
+            self.catalog_restore.take().map(|mut position| {
+                position.resolve_keys(&self.page.rows);
+                position
+            })
+        };
+        // The playlist route can publish a loading shell before it publishes
+        // the current membership. Resolve the occurrence against that membership.
+        let title_restore = if self
+            .title_restore
+            .as_ref()
+            .is_some_and(|origin| origin.source != TitleSource::Playlist || !self.busy)
+        {
+            self.title_restore.take().map(|origin| {
+                let row = if origin.source == TitleSource::Playlist {
+                    origin
+                        .playlist_index(&self.page.rows, &self.route)
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+                (origin, row)
+            })
+        } else {
+            None
+        };
         let token = self.generation;
         let shown = self.shown.clone();
         let p = self.page.clone();
@@ -935,18 +1162,40 @@ impl Browser {
             page: p.clone(),
         });
         self.scoped_ui(move |ui| {
-            let switching_playlist_source = models
+            let replacing_playlist = models
+                && matches!(route, Route::Playlist(_) | Route::SavedCollection(_))
+                && ui.get_page_key().as_str() == key;
+            let switching_playlist_source = replacing_playlist
                 && matches!(route, Route::Playlist(_))
-                && ui.get_page_key().as_str() == key
                 && ui.get_browse_local_audio() != p.local_audio;
-            let position = switching_playlist_source.then(|| {
-                let focused = ui.get_playlist_focus_index();
-                let occurrence = usize::try_from(focused)
-                    .ok()
-                    .and_then(|i| ui.get_browse_rows().row_data(i))
-                    .map(|row| row.occurrence_key)
-                    .filter(|key| !key.is_empty());
-                (ui.get_catalog_scroll_y(), focused, occurrence)
+            let control = ui.get_playlist_focus_control();
+            let title_occurrence = ui.get_playlist_focus_occurrence();
+            let restoring_title =
+                replacing_playlist && !title_occurrence.is_empty() && control.starts_with("album:");
+            let position = (switching_playlist_source || restoring_title).then(|| {
+                let mut focused = ui.get_playlist_focus_index();
+                let displayed = ui.get_browse_rows();
+                let occurrence = if restoring_title {
+                    let existing = unique_row_index(
+                        displayed
+                            .iter()
+                            .map(|row| row.occurrence_key == title_occurrence),
+                    );
+                    if let Some(index) = existing {
+                        focused = index;
+                    }
+                    existing
+                        .and_then(|i| displayed.row_data(i as usize))
+                        .filter(|row| matching_title_control(&control, &row.album_id))
+                        .map(|row| row.occurrence_key)
+                } else {
+                    usize::try_from(focused)
+                        .ok()
+                        .and_then(|i| displayed.row_data(i))
+                        .map(|row| row.occurrence_key)
+                        .filter(|key| !key.is_empty())
+                };
+                (ui.get_catalog_scroll_y(), focused, occurrence, control)
             });
             // Invalidate a captured gesture before changing its view, then publish the
             // new scope after both row models and the shown generation are installed.
@@ -959,6 +1208,10 @@ impl Browser {
                 // Record reopening with the route, before the media observer runs.
                 ui.set_lyrics_open_generation(ui.get_lyrics_open_generation().wrapping_add(1));
             }
+            ui.set_page_album_id(match &route {
+                Route::Album(id) => id.as_str().into(),
+                _ => Default::default(),
+            });
             ui.set_page_kind(kind.clone().into());
             ui.set_page_key(key.into());
             ui.set_page_title(title.into());
@@ -982,7 +1235,7 @@ impl Browser {
                     .iter()
                     .skip(append_from.unwrap_or(0))
                     .map(|r| {
-                        let (album_id, album_name) = projected_music(r.music.album.as_ref(), false);
+                        let (album_id, album_name) = track_album(r);
                         let status = if matches!(kind.as_str(), "playlists" | "offline") {
                             pin.row(r)
                         } else {
@@ -999,23 +1252,7 @@ impl Browser {
                             )),
                             kind: r.kind.as_str().into(),
                             track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
-                            occurrence_key: match &r.key {
-                                RowKey::ManualEntry { entry_id, .. } => entry_id.as_str().into(),
-                                RowKey::DerivedOccurrence { occurrence_id, .. } => {
-                                    occurrence_id.as_str().into()
-                                }
-                                RowKey::Track(_)
-                                    if matches!(
-                                        route,
-                                        Route::Playlist(_) | Route::SavedCollection(_)
-                                    ) =>
-                                {
-                                    r.position
-                                        .map(|pos| format!("saved:{pos}:{}", r.id).into())
-                                        .unwrap_or_default()
-                                }
-                                _ => Default::default(),
-                            },
+                            occurrence_key: playlist_occurrence_key(r, &route).as_ref().into(),
                             title: r.title.as_str().into(),
                             subtitle: pin_subtitle(r, status),
                             playlist_pinned: status.is_some(),
@@ -1026,6 +1263,7 @@ impl Browser {
                                 row_open_target(&route, r).is_some()
                             },
                             playable: r.playable && can_play_rows,
+                            track_unavailable: search_track_unavailable(&route, r),
                             credits: artist_credits(&r.music),
                             album_id: album_id.into(),
                             album_name: album_name.into(),
@@ -1041,22 +1279,23 @@ impl Browser {
                         model.extend(rows);
                     }
                 } else {
-                    let restore = position.map(|(y, before, occurrence)| {
-                        let after = occurrence
-                            .and_then(|key| rows.iter().position(|r| r.occurrence_key == key))
-                            .and_then(|i| i32::try_from(i).ok())
-                            .unwrap_or(-1);
-                        (y, before, after)
+                    let restore = position.map(|(y, before, occurrence, control)| {
+                        let occurrence = occurrence.unwrap_or_default();
+                        let after = playlist_focus_destination(&rows, &occurrence, &control);
+                        let control = after.map_or_else(Default::default, |_| control);
+                        (y, before, after.unwrap_or(-1), control, occurrence)
                     });
                     ui.set_browse_model_key(token.to_string().into());
                     ui.set_browse_local_audio(p.local_audio);
                     ui.set_page_credits(artist_credits(&p.music));
                     ui.set_browse_rows(ModelRc::new(VecModel::from(rows)));
-                    if let Some((y, before, after)) = restore {
+                    if let Some((y, before, after, control, occurrence)) = restore {
                         ui.set_playlist_source_restore(PlaylistSourceRestore {
                             y,
                             before,
                             after,
+                            control,
+                            occurrence,
                             serial: ui.get_playlist_source_restore().serial.wrapping_add(1),
                         });
                     }
@@ -1119,6 +1358,9 @@ impl Browser {
                 ui.set_catalog_return_part(position.part.into());
                 ui.set_catalog_return_credit(position.credit.into());
                 ui.set_catalog_return_serial(ui.get_catalog_return_serial().wrapping_add(1));
+            }
+            if let Some((origin, row)) = title_restore {
+                origin.publish(&ui, row);
             }
         });
     }
@@ -1225,6 +1467,9 @@ impl Browser {
         self.row_editor = None;
         self.cache = Replica::default();
         self.catalog_visits.clear();
+        self.catalog_restore = None;
+        self.title_visits.clear();
+        self.title_restore = None;
         self.continuation = CatalogContinuation::default();
         self.trail = Trail::default();
         self.page_keys = RandomState::new();
@@ -1257,7 +1502,9 @@ impl Browser {
         let a = self.access.as_ref().unwrap();
         let offline = a.offline;
         if old.offline != offline {
-            self.catalog_visits.clear();
+            for visit in self.catalog_visits.values_mut() {
+                visit.retire_snapshot();
+            }
             if self.unpinning {
                 // Durable unpin needs the same local account grant, not the
                 // previous online connection. Finish before refreshing Saved.
@@ -1672,17 +1919,27 @@ impl Browser {
     }
 
     fn visit(&mut self, navigation: Navigation) {
+        self.visit_from(navigation, None);
+    }
+
+    fn visit_from(&mut self, navigation: Navigation, title_origin: Option<TitleOrigin>) {
         if self.writing {
             return;
         }
         let back = matches!(navigation, Navigation::Back);
         let follow = matches!(navigation, Navigation::Follow(_));
         let previous_top = self.trail.top_id();
+        let search_title = matches!((&self.route, &navigation), (Route::Search(_), Navigation::Follow(Route::Album(id)))
+        if self.catalog_position.as_ref().is_some_and(|position| {
+            position.part == "album" && position.credit == *id
+                && matches!(position.row_key, Some(RowKey::Track(_)))
+        }));
         let Some(next) = navigation.resolve(
             &self.route,
             &mut self.trail,
             self.task.is_some(),
             self.error,
+            title_origin.is_some() || search_title,
         ) else {
             return;
         };
@@ -1701,28 +1958,48 @@ impl Browser {
             .trail
             .top_id()
             .filter(|id| previous_top.is_none_or(|previous| *id > previous))
-            && self.route.catalog_continuity()
-            && !self.page.rows.is_empty()
-            && let Some(position) = self.catalog_position.take()
         {
-            self.catalog_visits.insert(
-                entry,
-                CatalogVisit {
-                    page: self.page.clone(),
-                    position,
-                    continuation: std::mem::take(&mut self.continuation),
-                },
-            );
+            if let Some(origin) = title_origin {
+                self.title_visits.insert(entry, origin);
+            }
+            if self.route.catalog_continuity()
+                && !self.page.rows.is_empty()
+                && let Some(position) = self.catalog_position.take()
+            {
+                self.catalog_visits.insert(
+                    entry,
+                    CatalogVisit {
+                        page: Some(self.page.clone()),
+                        position,
+                        continuation: std::mem::take(&mut self.continuation),
+                    },
+                );
+            }
         }
-        let returned =
-            if back || (follow && previous_top.is_some_and(|id| !self.trail.contains_id(id))) {
-                previous_top.and_then(|id| self.catalog_visits.remove(&id))
-            } else {
-                None
-            };
+        let returning =
+            back || (follow && previous_top.is_some_and(|id| !self.trail.contains_id(id)));
+        let returned = if returning {
+            previous_top.and_then(|id| self.catalog_visits.remove(&id))
+        } else {
+            None
+        };
+        if returning {
+            self.title_restore = previous_top.and_then(|id| self.title_visits.remove(&id));
+        } else if changed {
+            self.title_restore = None;
+        }
         self.catalog_visits
             .retain(|id, _| self.trail.contains_id(*id));
+        self.title_visits
+            .retain(|id, _| self.trail.contains_id(*id));
         self.continuation = CatalogContinuation::default();
+        if changed {
+            self.catalog_restore = None;
+        }
+        let restored_snapshot = returned.and_then(|visit| {
+            self.catalog_restore = Some(visit.position);
+            visit.page.map(|page| (page, visit.continuation))
+        });
         let retry_personal = !changed && self.error && matches!(next, Route::Playlist(_));
         if back && let Route::Search(q) = &next {
             let q = q.clone();
@@ -1770,7 +2047,7 @@ impl Browser {
         if let Some(a) = self.access.clone().filter(Access::local)
             && !matches!(next, Route::Now | Route::Queue | Route::Appearance)
         {
-            self.visit_local(a, next, returned.map(|visit| visit.position));
+            self.visit_local(a, next);
             return;
         }
         if next.personal() {
@@ -1781,14 +2058,13 @@ impl Browser {
             self.personal_changed(true);
             return;
         }
-        if let Some(visit) = returned
-            && !visit.page.local_audio
+        if let Some((page, continuation)) = restored_snapshot
+            && !page.local_audio
             && self.access.as_ref().is_some_and(|a| !a.local())
         {
             self.route = next;
-            self.page = visit.page;
-            self.continuation = visit.continuation;
-            self.catalog_restore = Some(visit.position);
+            self.page = page;
+            self.continuation = continuation;
             self.render(true);
             return;
         }
@@ -1867,7 +2143,7 @@ impl Browser {
             }
         }));
     }
-    fn visit_local(&mut self, access: Access, next: Route, restore: Option<CatalogPosition>) {
+    fn visit_local(&mut self, access: Access, next: Route) {
         let serial = self.serial;
         let mode = *access.session.network_changes().borrow();
         let current = self.route == next;
@@ -1948,7 +2224,7 @@ impl Browser {
             let _ = tx
                 .send(Delivery {
                     serial,
-                    result: Update::LocalRead(mode, result, restore),
+                    result: Update::LocalRead(mode, result),
                 })
                 .await;
         }));
@@ -2023,7 +2299,10 @@ impl Browser {
     }
     fn input(&mut self, mut i: Input) {
         self.catalog_position = if i.generation == self.generation {
-            i.catalog_position.take()
+            i.catalog_position.take().map(|mut position| {
+                position.capture_keys(&self.page.rows);
+                position
+            })
         } else {
             None
         };
@@ -2178,7 +2457,11 @@ impl Browser {
         }
         if matches!(op.as_str(), "album" | "artist") {
             if let Some(target) = pages::music_route(&op, &val).filter(|target| *target != route) {
-                self.visit(Navigation::Follow(target));
+                let origin = i.title_origin.filter(|origin| {
+                    origin.source != TitleSource::Playlist
+                        || origin.playlist_index(&page.rows, &route).is_some()
+                });
+                self.visit_from(Navigation::Follow(target), origin);
             }
             return;
         }
@@ -2355,7 +2638,7 @@ impl Browser {
         {
             return;
         }
-        if let Update::LocalRead(mode, _, _) = &d.result
+        if let Update::LocalRead(mode, _) = &d.result
             && !self.access.as_ref().is_some_and(|a| {
                 a.local() && a.usable() && *a.session.network_changes().borrow() == *mode
             })
@@ -2416,11 +2699,10 @@ impl Browser {
                 let summary = result.unwrap_or_else(|_| "Storage unavailable".into());
                 self.scoped_ui(move |ui| ui.set_music_storage(summary.into()));
             }
-            Update::LocalRead(_, result, restore) => match result {
+            Update::LocalRead(_, result) => match result {
                 Ok(page) => {
                     let changed = *self.page != page;
                     self.page = Arc::new(page);
-                    self.catalog_restore = restore;
                     self.render(changed);
                 }
                 Err(e) => {
@@ -2790,8 +3072,165 @@ mod tests {
         assert_eq!(projected_music(Some(&credit), true), ("ar", "Artist"));
         assert_eq!(projected_music(Some(&credit), false), ("", "Artist"));
     }
+    #[test]
+    fn title_target_comes_only_from_an_addressable_track_album() {
+        let mut row = pages::Row {
+            kind: "track".into(),
+            music: pages::MusicMetadata {
+                album: Some(pages::Credit {
+                    name: "Genuine display name".into(),
+                    target: Some(Route::Album("album%2F1".into())),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(track_album(&row), ("album%2F1", "Genuine display name"));
+        let album = row.music.album.as_mut().unwrap();
+        album.target = Some(Route::Album("bad/id".into()));
+        assert_eq!(track_album(&row), ("", "Genuine display name"));
+        row.music.album.as_mut().unwrap().target = None;
+        assert_eq!(track_album(&row), ("", "Genuine display name"));
+        row.kind = "album".into();
+        assert_eq!(track_album(&row), ("", ""));
+    }
+
+    #[test]
+    fn search_track_unavailable_distinguishes_media_from_play_controls() {
+        let route = Route::Search("fixture".into());
+        let mut row = pages::Row {
+            kind: "track".into(),
+            ..Default::default()
+        };
+        assert!(search_track_unavailable(&route, &row));
+        assert!(!search_track_unavailable(
+            &Route::Playlist("list".into()),
+            &row
+        ));
+        row.kind = "album".into();
+        assert!(!search_track_unavailable(&route, &row));
+        row.kind = "track".into();
+        row.playable = true;
+        assert!(!search_track_unavailable(&route, &row));
+    }
+
+    #[test]
+    fn playlist_title_return_resolves_the_exact_occurrence_after_a_reorder() {
+        let route = Route::Playlist("list".into());
+        let occurrence = |entry_id: &str, album: &str| pages::Row {
+            kind: "track".into(),
+            id: "repeated-song".into(),
+            key: RowKey::ManualEntry {
+                playlist_id: "list".into(),
+                entry_id: entry_id.into(),
+            },
+            music: pages::MusicMetadata {
+                album: Some(pages::Credit {
+                    name: "Same display name".into(),
+                    target: Some(Route::Album(album.into())),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let origin = TitleOrigin {
+            source: TitleSource::Playlist,
+            key: "entry-b".into(),
+            album: "exact-album".into(),
+        };
+        let a = occurrence("entry-a", "exact-album");
+        let b = occurrence("entry-b", "exact-album");
+        assert_eq!(
+            origin.playlist_index(&[a.clone(), b.clone()], &route),
+            Some(1)
+        );
+        assert_eq!(
+            origin.playlist_index(&[b.clone(), a.clone()], &route),
+            Some(0)
+        );
+        assert_eq!(origin.playlist_index(&[a], &route), None);
+        assert_eq!(origin.playlist_index(&[b.clone(), b.clone()], &route), None);
+        assert_eq!(
+            origin.playlist_index(&[b, occurrence("entry-b", "new-album")], &route),
+            None
+        );
+        assert_eq!(
+            origin.playlist_index(&[occurrence("entry-b", "new-album")], &route),
+            None
+        );
+    }
+
+    #[test]
+    fn replacement_does_not_transfer_title_focus_to_a_playable_body() {
+        let row = |album: &str| BrowseRow {
+            occurrence_key: "entry".into(),
+            album_id: album.into(),
+            playable: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            playlist_focus_destination(&[row("album%2F1")], "entry", "album:album%2F1"),
+            Some(0)
+        );
+        for album in ["", "new-album"] {
+            assert_eq!(
+                playlist_focus_destination(&[row(album)], "entry", "album:album%2F1"),
+                None
+            );
+            assert_eq!(
+                playlist_focus_destination(&[row(album)], "entry", ""),
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_return_remaps_focus_and_scroll_anchor_by_typed_row_key() {
+        let row = |key| pages::Row {
+            key,
+            ..Default::default()
+        };
+        let track = row(RowKey::Track("same-id".into()));
+        let album = row(RowKey::Album("same-id".into()));
+        let mut position = CatalogPosition {
+            y: -150.0,
+            anchor: 0,
+            anchor_key: None,
+            anchor_offset: -5.0,
+            row: 1,
+            row_key: None,
+            part: "album".into(),
+            credit: "exact-title-album".into(),
+        };
+        position.capture_keys(&[album.clone(), track.clone()]);
+        let mut visit = CatalogVisit {
+            page: Some(Arc::new(Page {
+                rows: vec![album.clone(), track.clone()],
+                ..Default::default()
+            })),
+            position,
+            continuation: CatalogContinuation {
+                loading: true,
+                ..Default::default()
+            },
+        };
+        visit.retire_snapshot();
+        assert!(visit.page.is_none() && !visit.continuation.loading);
+        let mut position = visit.position;
+        position.resolve_keys(&[track, album.clone()]);
+        assert_eq!((position.anchor, position.row), (1, 0));
+        assert_eq!(
+            (position.part.as_str(), position.credit.as_str()),
+            ("album", "exact-title-album")
+        );
+        position.resolve_keys(&[album]);
+        assert_eq!((position.anchor, position.row), (0, -1));
+    }
+
     fn step(route: &mut Route, trail: &mut Trail, navigation: Navigation) {
-        *route = navigation.resolve(route, trail, false, false).unwrap();
+        *route = navigation
+            .resolve(route, trail, false, false, false)
+            .unwrap();
     }
 
     #[test]
@@ -2821,7 +3260,7 @@ mod tests {
             assert_eq!(route, expected);
             assert!(!trail.can_back(), "{target} must not offer Back");
             assert_eq!(
-                Navigation::Back.resolve(&route, &mut trail, false, false),
+                Navigation::Back.resolve(&route, &mut trail, false, false, false),
                 None
             );
         }
@@ -2856,11 +3295,14 @@ mod tests {
     fn reselecting_a_root_reached_by_following_a_link_clears_back_even_while_reading() {
         let mut trail = Trail::default();
         let saved = Navigation::Follow(Route::Offline)
-            .resolve(&Route::Appearance, &mut trail, false, false)
+            .resolve(&Route::Appearance, &mut trail, false, false, false)
             .unwrap();
         assert!(trail.can_back());
         let root = Navigation::named("offline").unwrap();
-        assert_eq!(root.resolve(&saved, &mut trail, true, false), Some(saved));
+        assert_eq!(
+            root.resolve(&saved, &mut trail, true, false, false),
+            Some(saved)
+        );
         assert!(!trail.can_back());
     }
 
@@ -3245,7 +3687,7 @@ pub fn start(
             .expect("browser runtime");
         runtime.block_on(async move {
             let (pins, mut pin_updates) = playlist_pins::start(access.clone(), epoch.clone());
-            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),catalog_visits:HashMap::new(),catalog_position:None,catalog_restore:None,continuation:CatalogContinuation::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
+            let mut b=Browser {ui:window,epoch,shown,engine,access:None,route:INITIAL_ROUTE,page_keys:RandomState::new(),trail:Trail::default(),cache:Replica::default(),page:Arc::default(),catalog_visits:HashMap::new(),catalog_position:None,catalog_restore:None,title_visits:HashMap::new(),title_restore:None,continuation:CatalogContinuation::default(),generation:0,serial:0,busy:false,silent_read:false,personal_ready:false,personal_due:None,personal_view:None,playlist_order:None,playlist_order_model_generation:None,playlist_order_serial:0,unconfirmed_orders:HashMap::new(),pending:None,edit_basis:None,row_editor:None,writing:false,message:String::new(),error:false,task:None,results,art,pins,pin_view:playlist_pins::View::default(),saved_reload_due:false,unpinning:false};
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);

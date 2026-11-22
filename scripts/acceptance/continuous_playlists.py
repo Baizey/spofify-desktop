@@ -245,7 +245,7 @@ class Review:
 
         self.reveal(1100, 1101)
         before = bounds(self.context(1100)[0])
-        album_link = self.child(1100, "Open album: Synthetic Album")
+        album_link = self.child(1100, "Open album for Repeated recording")
         self.pointer("album-link", 1100, album_link)
         self.expect("page", self.detail, "album", "fixture-album")
         self.window.title("Synthetic Album")

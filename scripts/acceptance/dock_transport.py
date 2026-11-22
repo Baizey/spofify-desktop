@@ -27,7 +27,7 @@ REQUEST = "Connecting this output…"
 BUFFERING = "Loading audio…"
 ACTIONS = ("Shuffle", "Previous track", "Play|Pause", "Next track", "Repeat")
 ACCENT = (102, 227, 180)
-METADATA = ("track title", "artist credits", "album title")
+METADATA = ("track title", "artist credits", "Open Now Playing")
 
 
 @dataclass
@@ -98,7 +98,7 @@ def capture(window, phase, pictures, *, status="", playing=False, ticked=False, 
     catalog = element_id(elements, "catalog-scroll")
     check(catalog, "missing catalog viewport")
     children = window.subtree(dock, max_elements=1000)
-    title = named(window, children, "Now playing: Synthetic Tone 001")
+    title = named(window, children, "Open album for Synthetic Tone 001")
     check(title and title.get("accessibleEnabled", True), "retained track lost its title action")
     output = named(window, children, "Playback devices")
     expected_output = "This desktop" if status == BUFFERING or playing else "No output selected"
@@ -109,9 +109,10 @@ def capture(window, phase, pictures, *, status="", playing=False, ticked=False, 
     check(transport, "missing transport")
     seek = named(window, children, "Playback position", "Slider")
     stable = {"track information": element_id(children, "track-info"), "track title": title,
-              "artist credits": element_type(children, "CreditLine"), "album title": element_type(children, "AlbumLine"),
+              "artist credits": element_type(children, "CreditLine"),
               "Desktop volume": named(window, children, "Desktop volume", "Slider"), "output control": output}
-    stable.update((label, named(window, children, label)) for label in ("Lyrics", "Play queue", "Mute desktop playback"))
+    stable.update((label, named(window, children, label)) for label in
+                  ("Lyrics", "Play queue", "Mute desktop playback", "Open Now Playing"))
     for name, item in stable.items():
         check(item and contains(dock, item), f"missing or clipped dock item: {name}")
     if caption:

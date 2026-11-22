@@ -25,14 +25,15 @@ WIDE = (1280, 720)
 COMPACT = (640, 640)
 MINIMUM = (480, 640)
 ULTRAWIDE = (2560, 720)
-DOCK_TITLE = r"Now playing: Synthetic Tone \d{3}"
+DOCK_TITLE = r"Open album for Synthetic Tone \d{3}"
+OPEN_NOW_PLAYING = "Open Now Playing"
 TRACK = "Synthetic Tone 001"
 PLAYLIST = "Synthetic Manual Duplicates"
 OFFLINE_SWITCH = r"Work offline|Go online|Stay offline"
 OLD_NAV = r"Liked|Like|Unlike|Home|Search|Albums|Artists|Downloads"
 SAVED = "Saved offline"
 ESCAPE, CONTROL, ALT, LEFT, DOWN, RETURN = "\x1b", "\x11", "\x12", "\uf702", "\uf701", "\n"
-END = "\uf72b"
+END, TAB = "\uf72b", "\t"
 
 
 def mcp_class():
@@ -332,7 +333,7 @@ def assert_empty_dock(window):
     dock = assert_dock_anchor(window)
     elements = window.subtree(dock, max_elements=1000)
     check(not any(element_type(elements, kind) for kind in ("Cover", "CreditLine", "AlbumLine", "Clock"))
-          and not any(window.matches(e, r"Now playing:.*|No song selected|(?:\d+:)?\d+:\d{2}") for e in elements),
+          and not any(window.matches(e, r"Open Now Playing|Open album for .+|No song selected|(?:\d+:)?\d+:\d{2}") for e in elements),
           "empty dock exposes track metadata, artwork, or clocks")
     transport = element_type(elements, "Transport")
     assert_transport(window, transport, "empty dock")
@@ -371,7 +372,11 @@ def assert_dock_layout(window, title=DOCK_TITLE):
     track_info = element_id(dock_controls, "track-info")
     title_target = named(window, dock_controls, title)
     volume = named(window, dock_controls, "Desktop volume", "Slider")
-    assert_usable(title_target, title, 96, 20)
+    assert_usable(title_target, title, 48, 16)
+    now_target = named(window, dock_controls, OPEN_NOW_PLAYING)
+    assert_usable(now_target, OPEN_NOW_PLAYING, 32, 32)
+    check(track_info and contains(track_info, now_target), "Now Playing target escapes the track information area")
+    assert_disjoint((("track title", title_target), (OPEN_NOW_PLAYING, now_target)))
     assert_usable(volume, "desktop volume", 48, 22)
     assert_usable(seek, "dock seek slider", 80, 20)
     check(track_info and contains(track_info, title_target), "dock title escapes the track information area")
@@ -424,9 +429,9 @@ def assert_queue_columns(window):
     print("PASS Queue columns: artless rows start at the leading cover edge", flush=True)
 
 
-def full_player(window, title, name, width, failures):
+def full_player(window, name, width, failures):
     before = dock_identity(window)
-    window.click(title, within=player_bar(window))  # Strict pointer activation, no fallback.
+    window.click(OPEN_NOW_PLAYING, within=player_bar(window))  # Strict pointer activation, no fallback.
     try:
         page = wait("full-player page", lambda: element_type(window.elements(), "NowPlaying"), timeout=3)
     except Failure:
@@ -622,7 +627,7 @@ def selected_desktop(snapshot):
 def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None, *,
                   playlist_actions_only=False, playlist_offline_only=False):
     from workspace_checks import (check_navigation, check_shortcut_back, committed_playlist_edits,
-                                  compact_queue, empty_devices, manual_actions, open_manual,
+                                  compact_queue, dock_title_routes, empty_devices, manual_actions, open_manual,
                                   pane_layout, playlist_back, playlist_editor_actions, playlist_hit_checks, playlist_row_menu,
                                   playlists_root, queue_state, real_playlist_actions, real_playlist_offline_actions,
                                   root_navigation, rules_editor, synthetic_playlist_actions, track_face,
@@ -729,6 +734,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             # independent of how the direct actions wrap in the compact checks.
             window.resize(DESKTOP)
             track_play_and_highlight(window, ready["play_requests"])
+            dock_title_routes(window, ready["play_requests"])
             synthetic_playlist_actions(window, ready["play_requests"])
             print("PASS workspace interaction against Go-shaped wire data (no playback execution)", flush=True)
             return
@@ -833,14 +839,14 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             window.pixels("06-dock-paused-compact", COMPACT[0])
             print("PASS canonical paused selection retains the dock and its controls", flush=True)
             compact_queue(window, lambda: window.title(PLAYLIST), populated=True, capture="06-queue-paused-compact")
-            full_player(window, DOCK_TITLE, "07-player-compact", COMPACT[0], failures)
+            full_player(window, "07-player-compact", COMPACT[0], failures)
             window.click("Back")
             window.title(PLAYLIST)
             check(dock_identity(window) == before_pause, "Back from Now Playing moved or replaced the dock")
             window.resize(WIDE)
 
         album = next(target["name"] for target in ready["targets"] if target["kind"] == "album")
-        window.click(f"Open album: {re.escape(album)}")
+        window.click(DOCK_TITLE, within=player_bar(window))
         window.title(album)
         window.find(f"Play track: {TRACK}", roles=("Button",))
         window.pixels("09-album-detail", WIDE[0])
@@ -864,7 +870,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             baseline = pcm.stat().st_size
         track_face(window, double=True)
         window.section(SAVED)
-        window.find("Now playing: Synthetic Tone 001", roles=("Button",), within=player_bar(window))
+        window.find("Open album for Synthetic Tone 001", roles=("Button",), within=player_bar(window))
         check(dock_identity(window) == before_saved_play, "offline Play moved or replaced the empty dock")
         window.pixels("12-offline-dock")
         if pcm is not None:
@@ -872,7 +878,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
                 wait("220 Hz saved Go fixture tone at the private monitor", lambda: heard_tone(pcm, hz=220, start=baseline), 5)
                 print("PASS saved Go track rendered 220 Hz PCM while offline", flush=True)
         print("PASS native save, manual offline switch and saved-audio dock", flush=True)
-        full_player(window, f"Now playing: {TRACK}", "13-now-playing-wide", WIDE[0], failures)
+        full_player(window, "13-now-playing-wide", WIDE[0], failures)
         window.click("Back")
         window.section(SAVED)
         check(dock_identity(window) == before_saved_play, "Back to Saved offline moved or replaced the dock")

@@ -57,16 +57,30 @@ pub(crate) fn project(
         ),
         Route::Album(id) => {
             let album = known.albums.get(id.as_str());
+            // An explicit track album ID can differ from the album listing
+            // that supplied it. Expose that evidence in this detail view only;
+            // don't change Artist cards, membership, or playback ordering.
+            let supplemental = known.tracks.iter().filter_map(|(&track_id, links)| {
+                let (credit_id, credit) = links.album_credit?;
+                (credit_id == id.as_str() && links.title_album() == Some(id.as_str()))
+                    .then_some((track_id, credit))
+            });
             let title = album
                 .and_then(|album| album.display.name())
+                .or_else(|| {
+                    supplemental
+                        .clone()
+                        .filter_map(|(_, credit)| {
+                            (!credit.name.is_empty() && credit.name != "Album details")
+                                .then_some(credit.name.as_str())
+                        })
+                        .min()
+                })
                 .unwrap_or("Album");
             let music = album
                 .map(|album| known.album_music(album))
                 .unwrap_or_default();
-            let rows = album
-                .into_iter()
-                .flat_map(|album| known.album_tracks(album, verified))
-                .collect();
+            let rows = known.album_detail_tracks(album, verified, supplemental.map(|(id, _)| id));
             (ui_text(title), music, rows)
         }
         Route::Artist(id) => {
@@ -150,7 +164,11 @@ pub(crate) fn attach_track_links(
             .is_none_or(|credit| credit.target.is_none())
             && let Some(mut existing) = row.music.album.take()
         {
-            if !matches!(&existing.target, Some(Route::Album(id)) if segment_id(id)) {
+            let ambiguous = known
+                .tracks
+                .get(item.id.as_str())
+                .is_some_and(TrackLinks::ambiguous_title_album);
+            if ambiguous || !matches!(&existing.target, Some(Route::Album(id)) if segment_id(id)) {
                 existing.target = None;
             }
             match &mut music.album {
@@ -230,15 +248,32 @@ struct Artist<'a> {
 #[derive(Default)]
 struct TrackLinks<'a> {
     detail_album: Option<&'a str>,
+    conflicting_detail_album: bool,
     album_credit: Option<(&'a str, &'a Credit)>,
+    conflicting_album_credit: bool,
     artists: HashMap<&'a str, &'a Credit>,
     display_credits: Option<&'a [Credit]>,
 }
 
 impl<'a> TrackLinks<'a> {
     fn album(&self) -> Option<&'a str> {
+        // Keep existing collection membership and Artist playback semantics.
         self.detail_album
             .or_else(|| self.album_credit.map(|(id, _)| id))
+    }
+
+    fn ambiguous_title_album(&self) -> bool {
+        self.conflicting_album_credit
+            || (self.album_credit.is_none() && self.conflicting_detail_album)
+    }
+
+    fn title_album(&self) -> Option<&'a str> {
+        // Explicit track metadata wins only for the title link. Equally
+        // authoritative but incompatible IDs cannot establish a destination.
+        if self.ambiguous_title_album() {
+            return None;
+        }
+        self.album_credit.map(|(id, _)| id).or(self.detail_album)
     }
 }
 
@@ -411,18 +446,27 @@ impl<'a> Known<'a> {
             return;
         }
         let links = self.tracks.entry(&row.id).or_default();
-        if links.detail_album.is_none() {
-            links.detail_album = album;
+        if let Some(album) = album {
+            if links.detail_album.is_some_and(|known| known != album) {
+                links.conflicting_detail_album = true;
+            } else {
+                links.detail_album = Some(album);
+            }
         }
-        if links.album_credit.is_none() {
-            links.album_credit = row
-                .music
+        if let Some((id, credit)) =
+            row.music
                 .album
                 .as_ref()
                 .and_then(|credit| match &credit.target {
                     Some(Route::Album(id)) if segment_id(id) => Some((id.as_str(), credit)),
                     _ => None,
-                });
+                })
+        {
+            if let Some((accepted, _)) = links.album_credit {
+                links.conflicting_album_credit |= accepted != id;
+            } else {
+                links.album_credit = Some((id, credit));
+            }
         }
         for (id, credit) in artist_credits(&row.music) {
             links.artists.entry(id).or_insert(credit);
@@ -436,21 +480,30 @@ impl<'a> Known<'a> {
 
     fn track_music(&self, item: &Item) -> MusicMetadata {
         let links = self.tracks.get(item.id.as_str());
-        let album = links.and_then(TrackLinks::album);
+        let album = links.and_then(TrackLinks::title_album);
         let name = ui_text(&item.album_name);
-        let album = if name.is_empty() {
-            album.and_then(|id| {
-                Some(Credit {
-                    name: ui_text(self.albums.get(id)?.display.name()?),
-                    target: Some(Route::Album(id.into())),
+        let name = if name.is_empty() {
+            album
+                .and_then(|id| {
+                    self.albums
+                        .get(id)
+                        .and_then(|album| album.display.name())
+                        .or_else(|| {
+                            links?
+                                .album_credit
+                                .filter(|(credit_id, _)| *credit_id == id)
+                                .map(|(_, credit)| credit.name.as_str())
+                        })
                 })
-            })
+                .map(ui_text)
+                .unwrap_or_default()
         } else {
-            Some(Credit {
-                name,
-                target: album.map(|id| Route::Album(id.into())),
-            })
+            name
         };
+        let album = (album.is_some() || !name.is_empty()).then(|| Credit {
+            name,
+            target: album.map(|id| Route::Album(id.into())),
+        });
         let credits = links
             .and_then(|links| links.display_credits)
             .map(|credits| self.local_credits(credits))
@@ -499,10 +552,22 @@ impl<'a> Known<'a> {
     }
 
     fn album_tracks(&self, album: &Album<'_>, verified: &HashMap<String, Item>) -> Vec<Row> {
-        let ordered: HashSet<_> = album.order.iter().copied().collect();
+        self.album_detail_tracks(Some(album), verified, std::iter::empty())
+    }
+
+    fn album_detail_tracks(
+        &self,
+        album: Option<&Album<'a>>,
+        verified: &HashMap<String, Item>,
+        supplemental: impl Iterator<Item = &'a str>,
+    ) -> Vec<Row> {
+        let order = album.map_or(&[][..], |album| album.order.as_slice());
+        let mut seen: HashSet<_> = order.iter().copied().collect();
         let mut tail: Vec<_> = album
-            .members
-            .difference(&ordered)
+            .into_iter()
+            .flat_map(|album| album.members.iter().copied())
+            .chain(supplemental)
+            .filter(|id| seen.insert(*id))
             .filter_map(|id| local_track(verified, id))
             .collect();
         // Keep the accepted detail order. For other exact members use genuine
@@ -515,8 +580,7 @@ impl<'a> Known<'a> {
                 item.id.as_str(),
             )
         });
-        album
-            .order
+        order
             .iter()
             .filter_map(|id| local_track(verified, id))
             .chain(tail)
@@ -894,6 +958,66 @@ mod tests {
         assert_eq!(artist.rows[0].kind, "album");
         assert!(artist.local_collection_playable && artist.rows[0].playable);
         assert_local(&artist);
+    }
+
+    #[test]
+    fn exact_track_album_id_survives_without_a_label_and_wins_over_membership() {
+        let q = Route::Search("fixture".into());
+        let a = Route::Album("listing-a".into());
+        let b = Route::Album("listing-b".into());
+        let in_a = accepted(&a, "First listing", vec![known_track("song", None, None)]);
+        let in_b = accepted(&b, "Second listing", vec![known_track("song", None, None)]);
+        let mut item = recording("song", 1);
+        item.album_name.clear();
+        let verified = verified([item.clone()]);
+        let ambiguous = Known::new(&verified, &[(&a, &in_a), (&b, &in_b)], None);
+        assert!(ambiguous.track_music(&item).album.is_none());
+        assert_eq!(ambiguous.tracks["song"].album(), Some("listing-b"));
+        let mut exact = known_track("song", Some("album%2F1"), Some("artist"));
+        exact.music.album.as_mut().unwrap().name.clear();
+        let exact_inside_a = accepted(&a, "First listing", vec![exact.clone()]);
+        let search = accepted(&q, "Search", vec![exact]);
+        let with_exact = Known::new(&verified, &[(&a, &in_a), (&b, &in_b), (&q, &search)], None);
+        assert_eq!(
+            with_exact.track_music(&item).album,
+            Some(Credit {
+                name: String::new(),
+                target: Some(Route::Album("album%2F1".into())),
+            })
+        );
+        assert_eq!(with_exact.tracks["song"].album(), Some("listing-b"));
+        assert_eq!(
+            with_exact.artist_albums(&with_exact.artists["artist"]),
+            ["listing-b"]
+        );
+
+        let explicit_id = Route::Album("album%2F1".into());
+        let detail = project(&explicit_id, &verified, &[(&a, &exact_inside_a)], None).unwrap();
+        assert_eq!(ids(&detail), ["song"]);
+        assert!(detail.local_collection_playable);
+
+        let other_query = Route::Search("other".into());
+        let conflicting = accepted(
+            &other_query,
+            "Search",
+            vec![known_track("song", Some("other-release"), None)],
+        );
+        for pages in [
+            [(&q, &search), (&other_query, &conflicting)],
+            [(&other_query, &conflicting), (&q, &search)],
+        ] {
+            let known = Known::new(&verified, &pages, None);
+            assert!(known.track_music(&item).album.is_none());
+            let mut labelled = item.clone();
+            labelled.album_name = "Saved album label".into();
+            assert_eq!(
+                known.track_music(&labelled).album,
+                Some(Credit {
+                    name: "Saved album label".into(),
+                    target: None
+                })
+            );
+        }
     }
 
     #[test]

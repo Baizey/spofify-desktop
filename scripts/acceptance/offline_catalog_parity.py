@@ -34,8 +34,9 @@ sys.dont_write_bytecode = True
 from audio_smoke import heard_tone, output as private_pcm
 from catalog_continuity import View, query
 from fixture import Failure, check, private_env
-from native import ALT, DOWN, END, ESCAPE, LEFT, RETURN, bounds, contains, desktop, element_id, element_type, verify, wait
-from offline_catalog_parity_wire import COUNT, FREQUENCIES, MANUAL, ORDER, RULES, TITLES, Wire
+from native import (ALT, DOWN, END, ESCAPE, LEFT, RETURN, bounds, contains, desktop,
+                    element_id, element_type, player_bar, verify, wait)
+from offline_catalog_parity_wire import ALBUM, COUNT, FREQUENCIES, MANUAL, ORDER, RULES, TITLES, Wire
 from settings import resize
 
 MODE = (1280, 840)
@@ -244,7 +245,7 @@ class Review(View):
                 x, y, r, b = bounds(words)
                 geometry["ink:" + key] = (x + 4, y, min(r, x + 190), min(b, y + 21))
                 for label, child in (("artist", element_id(children, "artist-line")),
-                                     ("album", element_type(children, "AlbumLine"))):
+                                     ("track-title", element_type(children, "TrackTitle"))):
                     if child and contains(row, child):
                         l, t, r, b = bounds(child)
                         geometry[f"{label}:{key}"] = (l, t, min(r, l + 140), b)
@@ -291,7 +292,7 @@ class Review(View):
                 a, b = self.ink(online, a), self.ink(offline, b)
                 if a and b:
                     metrics[k + ":ink"] = delta(a, b)
-            elif k.startswith(("artist:", "album:")):
+            elif k.startswith(("artist:", "track-title:")):
                 first, second = self.ink(online, a), self.ink(offline, b)
                 if first and second:
                     metrics[k + ":baseline"] = abs(first[3] - second[3])
@@ -401,6 +402,25 @@ class Review(View):
         self.window.section("Playlists")
         return result
 
+    def album_from_search(self, *, offline):
+        self.nav("Playlists")
+        query(self.window, ROW_TITLE)
+        self.window.title("Search")
+        self.clicked("recording title opens its album", lambda: self.find("Open album for " + name_filter(ROW_TITLE)))
+        self.window.title(name_filter(ALBUM["name"]))
+        for name in TITLES[:-1]:
+            self.find("Play track: " + name_filter(name))
+        unsaved_play = "Play track: " + name_filter(TITLES[-1])
+        if offline:
+            self.window.absent(unsaved_play, roles=("Button",))
+            self.frame("offline-title-opens-partial-album")
+        else:
+            self.find(unsaved_play)
+        self.window.click("Back")
+        self.sample_search("title-back-offline" if offline else "title-back-online")
+        self.window.shortcut(ALT, LEFT)
+        self.window.section("Playlists")
+
     def fixture_offline_intent(self, root):
         path = root / "parity-mode-intent"
         pending = path.with_suffix(".next")
@@ -505,7 +525,7 @@ class Review(View):
                 _, top, _, bottom = bounds(scroll)
                 if not (top <= y and min(b, y + 20) <= bottom):
                     continue
-                names = {(e.get("accessibleLabel") or "").removeprefix("Play track: ") for e in children
+                names = {(e.get("accessibleLabel") or "").removeprefix("Play track: ").removeprefix("Open album for ") for e in children
                          if e.get("accessibleRole") in ("Text", "Button")} & set(TITLES)
                 check(len(names) == 1, f"queue row at {bounds(line)} has ambiguous identity: {names}")
                 identities.append((names.pop(), bounds(line), (x, y, r, min(b, y + 20))))
@@ -547,21 +567,23 @@ class Review(View):
 
     def playback(self, title, pcm):
         self.open_detail(title)
-        self.window.absent(r"Now playing: .*", roles=("Button",))
+        self.window.absent("Open Now Playing", roles=("Button",))
         self.clicked("header Add to queue", lambda: self.header_button("Add to queue"))
         self.window.click("Play queue")
         with verify(self.failures, "idle native queue shows ordered duplicate prefix and wheel reaches tail"):
             self.queue([TITLES[i] for i in ORDER[:5]])
             self.frame("offline-header-queue-ordered-duplicates")
             self.queue_tail([TITLES[i] for i in ORDER[-4:]])
-        self.window.absent(r"Now playing: .*", roles=("Button",))
+        self.window.absent("Open Now Playing", roles=("Button",))
         self.window.click("Close play queue")
         # Activate the second matching Refrain with the ordinary row layout,
         # by keyboard after using a normal press to focus its face.
         self.clicked("focus second Refrain", lambda: self.song_face(4, ROW_TITLE))
         baseline = pcm.stat().st_size if pcm is not None else None
         self.window.key(RETURN)
-        self.find("Now playing: " + ROW_TITLE)
+        dock = player_bar(self.window)
+        self.window.find("Open Now Playing", roles=("Button",), within=dock)
+        self.window.find("Open album for " + name_filter(ROW_TITLE), roles=("Button",), within=dock)
         if pcm is not None:
             with verify(self.failures, "local Refrain decoder reaches the private monitor"):
                 hz = FREQUENCIES[ROW_TITLE]
@@ -574,7 +596,7 @@ class Review(View):
         self.scroll(20000)
         self.window.title(title)
         self.clicked("header Play", lambda: self.header_button("Play"))
-        self.find("Now playing: " + TITLES[0])
+        self.window.find("Open album for " + name_filter(TITLES[0]), roles=("Button",), within=dock)
         self.window.click("Play queue")
         self.queue([TITLES[i] for i in ORDER[:5]])
         self.frame("offline-header-play-ordered-duplicates")
@@ -694,7 +716,11 @@ def journey(window, output, magick, wire, ready, args, root, pcm):
     review.nav(SAVED)
     with verify(failures, "online Saved detail"):
         online["saved"] = review.detail("online-saved", MANUAL)
+    with verify(failures, "online Search title opens complete album"):
+        review.album_from_search(offline=False)
     review.go_offline("first")
+    with verify(failures, "offline Search title opens verified partial album"):
+        review.album_from_search(offline=True)
     for tag, run in (("list", lambda: review.list_page("offline")),
                      ("manual", lambda: review.detail("offline-manual", MANUAL)),
                      ("rules", lambda: review.detail("offline-rules", RULES)),

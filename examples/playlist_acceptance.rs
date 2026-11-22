@@ -134,6 +134,14 @@ fn show(ui: &AppWindow, page: Page, has_parent: bool, generation: usize) {
     // Publish routes and models in the same order as the application.
     ui.set_playlist_order_scope("".into());
     ui.set_manual_offline(matches!(page, Page::Offline | Page::Saved));
+    ui.set_page_album_id(
+        if page == Page::Album {
+            "fixture-album"
+        } else {
+            ""
+        }
+        .into(),
+    );
     ui.set_page_kind(page.kind().into());
     ui.set_page_key(page.kind().into());
     ui.set_page_title(page.title().into());
@@ -196,6 +204,7 @@ fn show(ui: &AppWindow, page: Page, has_parent: bool, generation: usize) {
 
 fn show_manual_loading(ui: &AppWindow, generation: usize) {
     ui.set_playlist_order_scope("".into());
+    ui.set_page_album_id("".into());
     ui.set_page_kind("playlist".into());
     ui.set_page_key(Page::Manual.kind().into());
     ui.set_page_title("Playlist".into());
@@ -221,6 +230,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generation = Rc::new(Cell::new(0));
     show(&ui, Page::Playlists, false, generation.get());
     let stack = Rc::new(RefCell::new(vec![Page::Playlists]));
+    let title_origin = Rc::new(RefCell::new(None::<slint::SharedString>));
+    let return_origin = title_origin.clone();
 
     let window = ui.as_weak();
     let routes = stack.clone();
@@ -251,10 +262,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             show_manual_loading(&ui, token);
             let version = version.clone();
             let window = window.clone();
+            let origin = return_origin.borrow_mut().take();
             Timer::single_shot(Duration::from_millis(900), move || {
                 if version.get() == token {
                     version.set(token + 1);
-                    show(&window.unwrap(), next, true, version.get());
+                    let ui = window.unwrap();
+                    show(&ui, next, true, version.get());
+                    if let Some(key) = origin
+                        && let Some(index) = ui
+                            .get_browse_rows()
+                            .iter()
+                            .position(|row| row.occurrence_key == key)
+                    {
+                        ui.set_title_return_source("playlist".into());
+                        ui.set_title_return_key(key);
+                        ui.set_title_return_album("fixture-album".into());
+                        ui.set_title_return_row(index as i32);
+                        ui.set_title_return_serial(ui.get_title_return_serial() + 1);
+                    }
                 }
             });
         } else {
@@ -296,9 +321,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let page = *stack.last().unwrap();
         record(&events, format_args!("page\t{}\t{op}\t{id}", page.kind()));
         if op == "album" && id == "fixture-album" && matches!(page, Page::Manual | Page::Rules) {
+            let ui = window.unwrap();
+            if ui.get_title_source() == "playlist" {
+                *title_origin.borrow_mut() = Some(ui.get_title_source_key());
+            }
             stack.push(Page::Album);
             generation.set(generation.get() + 1);
-            show(&window.unwrap(), Page::Album, true, generation.get());
+            show(&ui, Page::Album, true, generation.get());
         }
     });
     ui.on_playlist_order_drop(move |scope, key, after| {

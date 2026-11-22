@@ -72,6 +72,7 @@ fn clear(ui: &AppWindow) {
     ui.set_form_description("".into());
     ui.set_now_track_id("".into());
     ui.set_room_token("".into());
+    ui.set_queue_room_key("".into());
     ui.set_media_track_token("".into());
     ui.set_now_album_id("".into());
     ui.set_now_album_name("".into());

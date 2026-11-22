@@ -5,11 +5,11 @@ from time import monotonic, sleep
 
 from fixture import Failure, check
 from native import (ALT, CONTROL, DESKTOP, ESCAPE, LEFT, OFFLINE_SWITCH, OLD_NAV, PLAYLIST,
-                    RETURN, SAVED, TRACK, assert_disjoint, assert_dock_anchor, assert_empty_dock, bounds, contains,
+                    RETURN, SAVED, TAB, TRACK, assert_disjoint, assert_dock_anchor, assert_empty_dock, bounds, contains,
                     dock_identity, element_id, element_type, named, player_bar, wait)
 from wire_ui import (ALBUM_NAME, ARTIST_NAME, ENTRIES, GUEST_NAME, ID_ONLY_RELEASE,
                      LARGE_MANUAL, LARGE_PLAYLIST_COUNT, LARGE_RULE, NAME_ONLY,
-                     NEGATIVE_PLAYLISTS, SINGLE_TRACK, SUMMARY)
+                     NEGATIVE_PLAYLISTS, SINGLE_TRACK, SUMMARY, UNKNOWN_ALBUM_TRACK)
 
 
 QUEUE_TITLE = "Queue"
@@ -424,7 +424,7 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
     album_label = re.escape(album)
     open_playlists(window)
     open_manual(window)
-    window.click(f"Open album: {album_label}")
+    window.click_element(track_link(window, title_link(TRACK)))
     window.title(album)
     window.click("Save offline")
     window.find(r"Saved (?:all \d+ tracks on this device\.|\d+ of \d+ tracks\. Some audio is unavailable\.)",
@@ -619,13 +619,13 @@ def track_row(window, title=TRACK, occurrence=0):
     return row, window.subtree(row)
 
 
-def track_face(window, region="title", *, title=TRACK, occurrence=0, double=False):
+def track_face(window, region="bottom padding", *, title=TRACK, occurrence=0, double=False):
     row, elements = track_row(window, title, occurrence)
-    # The accessible row button covers the face; its center could coincide
-    # with an independent credit/control. Hit title or padding deliberately.
+    # The title and credits are independent links; use the bottom padding
+    # to exercise the row face without falling through from a link.
     words = element_id(elements, "words")
     check(words, "missing track title layout")
-    target = (element_type(window.subtree(words), "Text") if region == "title"
+    target = (element_type(window.subtree(words), "TrackTitle") if region == "title"
               else element_type(elements, "Divider"))
     controls = [e for e in elements if e.get("accessibleRole") == "Button"
                 and not window.matches(e, r"Play track: .+")]
@@ -638,36 +638,66 @@ def track_face(window, region="title", *, title=TRACK, occurrence=0, double=Fals
           f"track {region} press {point} landed on a control or outside its row")
 
 
+def title_link(title):
+    return re.escape(f"Open album for {title}")
+
+
+def track_link(window, label, *, title=TRACK, occurrence=0):
+    row, elements = track_row(window, title, occurrence)
+    target = named(window, elements, label)
+    check(target and contains(row, target), f"track row has no usable {label}")
+    return target
+
+
 def search_track_targets(window, width, capture, *, check_padding):
+    # typed_catalog also opens the real artist and album results, so a
+    # track-only rendering cannot satisfy these assertions.
+    _, children = track_row(window)
+    forbidden = rf"Track|0:01|{re.escape(ALBUM_NAME)}|Open album: .+"
+    check(not any(window.matches(e, forbidden) for e in children
+                  if e.get("accessibleRole") in ("Text", "Button") and e.get("visible", True)),
+          "Search track row exposes its type, duration or a redundant album line")
     track_face(window)
     search_results(window)
-    if check_padding:
-        track_face(window, "bottom padding")
-        search_results(window)
-    for name in ((ARTIST_NAME, ALBUM_NAME) if check_padding else (ARTIST_NAME, GUEST_NAME, ALBUM_NAME)):
-        is_album = name == ALBUM_NAME
-        link = f"Open {'album' if is_album else 'artist'}: {name}"
-        row, elements = track_row(window)
-        target = next((e for e in elements if e.get("accessibleRole") == "Button"
-                       and window.matches(e, re.escape(link))), None)
-        check(target, f"missing search track link {link}")
-        point = window.pointer_position_for_click(link, element=target)
-        check(inside(point, target) and inside(point, row), f"{link} press did not hit the track row link")
-        if is_album:
-            window.title(ALBUM_NAME)
-            window.find(f"Play track: {TRACK}", roles=("Button",))
-            qualified_credits(window)
-            if capture:
-                window.pixels(f"album-{width}", width)
-            window.click(f"Open artist: {ARTIST_NAME}")
-            artist(window, ARTIST_NAME)
-            window.click("Back")
-            window.title(ALBUM_NAME)
-        else:
-            artist(window, name)
+    for credit in ((ARTIST_NAME,) if check_padding else (ARTIST_NAME, GUEST_NAME)):
+        window.click_element(track_link(window, re.escape(f"Open artist: {credit}")))
+        artist(window, credit)
         window.click("Back")
         search_results(window)
-    print("PASS search track title/padding stay on Results; in-row artist and album links open only their destinations",
+
+    title = title_link(TRACK)
+    window.click_element(track_link(window, title))
+    window.title(ALBUM_NAME)
+    window.find(f"Play track: {TRACK}", roles=("Button",))
+    qualified_credits(window)
+    if capture:
+        window.pixels(f"album-{width}", width)
+    window.click(f"Open artist: {ARTIST_NAME}")
+    artist(window, ARTIST_NAME)
+    window.click("Back")
+    window.title(ALBUM_NAME)
+    window.click("Back")
+    search_results(window)
+    track_face(window)
+    window.key(TAB)  # title link follows the row face, independently of Play
+    for _ in range(2):
+        window.key(RETURN)
+        window.title(ALBUM_NAME)
+        window.click("Back")
+        search_results(window)
+
+    if not check_padding:
+        second = SINGLE_TRACK["name"]
+        window.click_element(track_link(window, title_link(second), title=second))
+        window.title(ID_ONLY_RELEASE["name"])
+        window.click("Back")
+        search_results(window)
+        name = UNKNOWN_ALBUM_TRACK["name"]
+        _, children = track_row(window, name)
+        check(not named(window, children, title_link(name)), "display album name created a link without an ID")
+        track_face(window, "title", title=name)
+        search_results(window)
+    print("PASS mixed Search metadata, artist credits and ID-based title links; repeated Back restores the title",
           flush=True)
 
 
@@ -677,6 +707,15 @@ def track_play_and_highlight(window, play_requests):
     open_playlists(window)
     open_manual(window)
     check(not play_requests(), "browsing, credits, or overflow sent an unexpected Play")
+    _, children = track_row(window, occurrence=1)
+    check(named(window, children, "0:01", "Text"), "playlist track duration disappeared")
+    window.click_element(track_link(window, title_link(TRACK), occurrence=1))
+    for attempt in range(2):
+        window.title(ALBUM_NAME)
+        window.click("Back")
+        manual_detail(window)
+        if not attempt:
+            window.key(RETURN)
     track_face(window, occurrence=1)
     sleep(0.6)  # Drain any accidental async Play and end the single-click sequence.
     window.title(PLAYLIST)
@@ -737,6 +776,40 @@ def track_play_and_highlight(window, play_requests):
     sleep(0.6)
     check(play_requests() == expected, "a gesture or metadata link sent more than one Play")
     print("PASS single click focuses; face double-click, explicit Play (including double-click) and Return select the same occurrence once; highlight follows recording ID",
+          flush=True)
+
+
+def dock_title_routes(window, play_requests):
+    before = play_requests()
+    window.resize(COMPACT)
+    search_results(window)
+    dock = player_bar(window)
+    track = SINGLE_TRACK["name"]
+    title = window.find(title_link(track), roles=("Button",), within=dock)
+    now = window.find("Open Now Playing", roles=("Button",), within=dock)
+    lyrics = window.find("Lyrics", roles=("Button",), within=dock)
+    assert_disjoint((("title", title), ("Now Playing", now), ("Lyrics", lyrics)))
+    check(not any(element_type(window.subtree(dock), kind) for kind in ("Cover", "AlbumLine")),
+          "no-artwork compact dock did not use its separate Now Playing fallback")
+    window.pixels("compact-no-artwork-dock", COMPACT[0])
+    window.click_element(title)
+    for attempt in range(2):
+        window.title(ID_ONLY_RELEASE["name"])
+        window.click("Back")
+        search_results(window)
+        if not attempt:
+            window.key(RETURN)
+    window.click("Open Now Playing", within=dock)
+    window.title("Now playing")
+    window.click("Back")
+    search_results(window)
+    window.click("Lyrics", within=dock)
+    window.title("Lyrics")
+    window.key(ESCAPE)
+    search_results(window)
+    check(play_requests() == before, "dock metadata, Now Playing or Lyrics sent Play")
+    window.resize(DESKTOP)
+    print("PASS compact artless Now Playing, Lyrics and ID-based dock title are separate; Back returns title focus",
           flush=True)
 
 
@@ -960,7 +1033,7 @@ def playlist_open_by_pointer(window, region):
     check(inside(point, target) and not any(inside(point, e) for e in (play, overflow)),
           f"{region} press {point} did not hit its own part of the playlist row")
     manual_detail(window, timeout=2)
-    window.absent(r"Now playing: .+", roles=("Button",))
+    window.absent("Open Now Playing", roles=("Button",))
     window.click("Back")
     playlists_root(window)
     print(f"PASS {window.dimensions()[0]:g}px playlist row {region} opens the correct detail by pointer", flush=True)
@@ -988,7 +1061,7 @@ def playlist_overflow(window):
     window.key(ESCAPE)
     window.find(playlist_option_trigger(PLAYLIST), roles=("Button",))
     window.absent(save, roles=("Button",))
-    window.absent(r"Now playing: .+", roles=("Button",))
+    window.absent("Open Now Playing", roles=("Button",))
     print(f"PASS {window.dimensions()[0]:g}px playlist row overflow offers Save offline and restores focus on Escape",
           flush=True)
 
@@ -1033,7 +1106,7 @@ def queue_state(window, populated):
             check(control.get("accessibleEnabled"), f"populated queue has disabled {label}")
         window.title("Now playing")
         window.find("Up next|Played", roles=("Text",))
-        window.find(r"Synthetic Tone \d{3}", roles=("Text",))
+        window.find(r"(Open album for )?Synthetic Tone \d{3}", roles=("Text", "Button"), within=pane)
     else:
         window.find(r"The queue is empty\..*", roles=("Text",), within=pane)
         elements = window.subtree(pane, max_elements=1000)

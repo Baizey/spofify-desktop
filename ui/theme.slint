@@ -232,9 +232,12 @@ export component CheckChoice inherits Rectangle {
 export component TextTarget inherits Rectangle {
     in property <string> text;
     in property <string> label: text;
+    in property <string> description;
     in property <bool> interactive: true;
     in property <bool> link;
     in property <bool> fit-link;
+    in property <bool> plain-accessible: true;
+    in property <string> click-scope;
     in property <bool> restore-focus;
     in property <color> ink: Theme.text;
     in property <length> font-size: 15px * Theme.density;
@@ -254,6 +257,7 @@ export component TextTarget inherits Rectangle {
         forward-focus: key;
         accessible-role: button;
         accessible-label: root.label;
+        accessible-description: root.description;
         accessible-action-default => { key.focus(); root.activated(); }
         border-radius: 5px;
         border-width: key.has-focus ? 2px : 0px;
@@ -267,15 +271,27 @@ export component TextTarget inherits Rectangle {
         }
         pointer := TouchArea {
             mouse-cursor: MouseCursor.pointer;
-            clicked => { key.focus(); root.activated(); }
+            property <string> pressed-scope;
+            pointer-event(event) => {
+                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down { self.pressed-scope = root.click-scope; }
+            }
+            clicked => {
+                if self.pressed-scope == root.click-scope { key.focus(); root.activated(); }
+            }
         }
         key := FocusScope {
             property <bool> restoring: root.restore-focus;
-            init => { if self.restoring { self.focus(); } }
-            changed restoring => { if self.restoring { self.focus(); } }
+            // A live model refresh can ask the same mounted title to keep
+            // focus. Acknowledge it even though no new FocusIn is sent.
+            function restore-target() {
+                if self.has-focus { root.focused(); }
+                else { self.focus(); }
+            }
+            init => { if self.restoring { self.restore-target(); } }
+            changed restoring => { if self.restoring { self.restore-target(); } }
             focus-on-click: false;
             property <int> resume: root.focus-serial;
-            changed resume => { if self.resume != 0 { self.focus(); } }
+            changed resume => { if self.resume != 0 { self.restore-target(); } }
             focus-gained(reason) => {
                 if reason != FocusReason.window-activation { root.keyboard-focus-changed(true); }
                 root.focused();
@@ -297,8 +313,27 @@ export component TextTarget inherits Rectangle {
         text: root.text; color: root.ink;
         font-size: root.font-size; font-weight: root.font-weight;
         vertical-alignment: center; overflow: elide;
-        accessible-role: AccessibleRole.text; accessible-label: root.text;
+        accessible-role: none;
     }
+    if !root.interactive && root.plain-accessible: Rectangle {
+        width: parent.width; height: parent.height;
+        accessible-role: AccessibleRole.text;
+        accessible-label: root.text;
+        accessible-description: root.description;
+    }
+}
+
+export component TrackTitle inherits TextTarget {
+    in property <string> album-id;
+    in property <string> album-name;
+    in property <string> current-album-id;
+    in property <string> track-description;
+    in property <bool> links-enabled;
+    label: "Open album for " + self.text;
+    interactive: links-enabled && album-id != "" && album-id != current-album-id && self.text != "";
+    description: track-description + (self.interactive && album-name != ""
+        ? (track-description == "" ? "" : ", ") + "Album: " + album-name : "");
+    fit-link: true;
 }
 
 export component AlbumLine inherits TextTarget {

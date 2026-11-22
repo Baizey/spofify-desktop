@@ -1,5 +1,6 @@
 import { Slider } from "std-widgets.slint";
-import { Action, AlbumLine, Caption, Cover, Divider, TextTarget, Theme } from "theme.slint";
+import { Action, Caption, Cover, Divider, Theme, TrackTitle } from "theme.slint";
+import { Glyph } from "icon.slint";
 import { ArtistCredit, CreditLine } from "credits.slint";
 import { DeviceRow, OutputPicker } from "output-picker.slint";
 
@@ -173,8 +174,8 @@ component VolumeSlider inherits Rectangle {
 }
 
 export global DockLayout {
-    // Fit the title, credits, and album targets above the status lane, even
-    // when the user's text scale increases their minimum heights.
+    // Keep the compact metadata and seek lanes stable across playback states,
+    // with more room for the title and credits at larger text scales.
     out property <length> compact-metadata-height: 62px + 40px * max(0, Theme.density - 1);
     out property <length> status-height: 18px;
 
@@ -189,6 +190,7 @@ export component PlayerBar inherits Rectangle {
     in property <bool> has-track;
     in property <bool> locked;
     in property <string> track;
+    in property <string> track-id;
     in property <string> subtitle;
     in property <string> output;
     in property <[DeviceRow]> devices;
@@ -214,6 +216,8 @@ export component PlayerBar inherits Rectangle {
     in property <[ArtistCredit]> credits;
     in property <string> album-id;
     in property <string> album-name;
+    in property <string> current-album-id;
+    in property <int> title-focus-serial;
     callback page-action(string, string);
     callback previous();
     callback next();
@@ -230,6 +234,11 @@ export component PlayerBar inherits Rectangle {
         else { queue-trigger.take-focus(); }
     }
     public function focus-lyrics() { if lyrics-trigger.enabled { lyrics-trigger.take-focus(); } }
+    public function focus-now() {
+        if now-trigger.enabled { now-trigger.take-focus(); }
+        else if lyrics-trigger.enabled { lyrics-trigger.take-focus(); }
+        else if queue-trigger.enabled { queue-trigger.take-focus(); }
+    }
     public function dismiss-devices() { devices-trigger.dismiss(); }
     property <length> edge: clamp(root.width * 0.018, 12px, 24px);
     property <length> column-gap: root.layered ? 10px : 16px;
@@ -243,6 +252,16 @@ export component PlayerBar inherits Rectangle {
     property <length> metadata-height: root.layered ? DockLayout.compact-metadata-height : root.height - DockLayout.status-height;
     property <bool> title-repaint-phase;
     changed track => { root.title-repaint-phase = !root.title-repaint-phase; }
+    property <string> title-identity: root.track-id + "/" + root.album-id;
+    property <string> focused-title-identity;
+    property <bool> title-focused;
+    changed title-identity => {
+        if root.title-focused && root.focused-title-identity != root.title-identity {
+            root.title-focused = false;
+            root.focus-now();
+        }
+    }
+    changed current-album-id => { if root.current-album-id == root.album-id { root.title-focused = false; } }
     vertical-stretch: 0; background: Theme.rail;
     Divider { y: 0px; }
     track-info := Rectangle {
@@ -254,11 +273,34 @@ export component PlayerBar inherits Rectangle {
         // The transparent border affects neither layout nor progress-only damage.
         border-color: transparent;
         border-width: root.title-repaint-phase ? 1px : 0px;
-        property <bool> show-cover: self.width >= 150px;
+        property <length> cover-size: self.width < 150px ? 36px : root.layered ? 40px : 48px;
+        property <bool> show-art: self.width >= 150px && root.artwork.width > 0;
         Cover {
-            visible: root.has-track && parent.show-cover;
-            x: 0px; width: root.layered ? 40px : 48px; height: self.width;
+            visible: root.has-track && track-info.show-art;
+            x: 0px; width: track-info.cover-size; height: self.width;
             y: (parent.height - self.height)/2; artwork: root.artwork;
+        }
+        now-trigger := Action {
+            x: 0px; width: track-info.cover-size; height: self.width;
+            y: (parent.height - self.height) / 2;
+            visible: root.has-track;
+            enabled: root.has-track && !root.locked && !root.on-now-page;
+            accessible-label: "Open Now Playing";
+            click-scope: root.track-id;
+            quiet: track-info.show-art || root.on-now-page;
+            icon: track-info.show-art ? "" : root.on-now-page ? "♫" : "now-playing";
+            border-radius: min(Theme.container-radius, self.height / 5);
+            background: !track-info.show-art ? (self.has-hover || self.has-focus ? Theme.raised : Theme.panel)
+                : self.enabled && (self.has-hover || self.has-focus) ? Theme.bg.with-alpha(0.65) : transparent;
+            if track-info.show-art && now-trigger.enabled: Rectangle {
+                x: parent.width - self.width - 4px; y: parent.height - self.height - 4px;
+                width: 16px; height: self.width; border-radius: 4px; background: Theme.bg;
+                Glyph {
+                    x: 2px; y: 2px; width: 12px; height: self.width;
+                    ink: Theme.text; name: "now-playing";
+                }
+            }
+            clicked => { root.navigate("now"); }
         }
         if !root.has-track: Caption {
             x: 4px; width: max(0px, parent.width - self.x); height: parent.height;
@@ -267,22 +309,32 @@ export component PlayerBar inherits Rectangle {
             accessible-role: text; accessible-label: self.text;
         }
         if root.has-track: VerticalLayout {
-            x: track-info.show-cover ? (root.layered ? 49px : 61px) : 0px;
+            x: track-info.cover-size + (root.layered ? 9px : 13px);
             width: max(0px, parent.width - self.x); height: parent.height;
             alignment: center;
-            TextTarget {
-                text: root.track; label: "Now playing: " + root.track; font-weight: 700;
-                interactive: !root.locked && !root.on-now-page;
-                activated => { root.navigate("now"); }
+            TrackTitle {
+                text: root.track; font-weight: 700;
+                album-id: root.album-id; album-name: root.album-name;
+                current-album-id: root.current-album-id;
+                links-enabled: !root.locked;
+                click-scope: root.title-identity;
+                focus-serial: root.title-focus-serial;
+                keyboard-focus-changed(owns) => {
+                    if owns { root.focused-title-identity = root.title-identity; }
+                    root.title-focused = owns;
+                }
+                activated => {
+                    if root.focused-title-identity == root.title-identity { root.page-action("album", root.album-id); }
+                }
             }
-            if root.credits.length > 0 || root.subtitle != "": CreditLine {
-                credits: root.credits; fallback: root.subtitle; interactive: !root.locked;
-                height: max(20px, self.font-size + 6px);
-                activated(id) => { root.page-action("artist", id); }
-            }
-            if root.album-name != "": AlbumLine {
-                text: root.album-name; album-id: root.album-id; links-enabled: !root.locked;
-                activated => { root.page-action("album", root.album-id); }
+            if root.credits.length > 0 || root.subtitle != "": Rectangle {
+                height: artists.preferred-height;
+                artists := CreditLine {
+                    x: root.credits.length > 0 ? 2px : 4px;
+                    width: max(0px, parent.width - 2 * self.x); height: parent.height;
+                    credits: root.credits; fallback: root.subtitle; interactive: !root.locked;
+                    activated(id) => { root.page-action("artist", id); }
+                }
             }
         }
     }

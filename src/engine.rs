@@ -1556,6 +1556,18 @@ impl Engine {
                 })
                 .collect();
         }
+        // Room identity is independent of queue revision/cursor changes. The
+        // local queue can be replaced within the same authenticated room.
+        if !p.queue.is_empty() {
+            if p.local_playback {
+                p.queue_room_key = format!(
+                    "local:{}:{}",
+                    self.room_incarnation, self.local_queue_instance
+                );
+            } else if let Some(generation) = self.online_generation() {
+                p.queue_room_key = format!("online:{}:{generation}", self.room_incarnation);
+            }
+        }
         p.queue_order_writable = !p.queue_order_token.is_empty()
             && (p.local_playback || !self.online.queue_order_pending());
         p.queue_order_awaiting_echo = !p.queue_order_token.is_empty()
@@ -1620,7 +1632,7 @@ struct CreditView {
 
 fn local_album(track: &LocalTrack) -> String {
     match track.music.album.as_ref().and_then(|c| c.target.as_ref()) {
-        Some(crate::pages::Route::Album(id)) => id.clone(),
+        Some(crate::pages::Route::Album(id)) => album_route_id(id).into(),
         _ => String::new(),
     }
 }
@@ -1715,6 +1727,7 @@ struct PlayerView {
     repeat: &'static str,
     status: &'static str,
     room_token: String,
+    queue_room_key: String,
     queue_order_token: String,
     queue_order_writable: bool,
     queue_order_awaiting_echo: bool,
@@ -1750,6 +1763,7 @@ impl PlayerView {
             ui.set_reconnecting(self.reconnecting);
             ui.set_saved_queue_enabled(self.saved_queue_enabled);
             ui.set_room_token(self.room_token.into());
+            ui.set_queue_room_key(self.queue_room_key.into());
             ui.set_media_track_token(self.media_track_token.into());
             ui.set_shuffle(self.shuffle);
             ui.set_repeat_mode(
@@ -1948,6 +1962,14 @@ fn metadata_id(id: &str) -> &str {
         id
     }
 }
+
+fn album_route_id(id: &str) -> &str {
+    if crate::api::catalog::segment_id(id) {
+        id
+    } else {
+        ""
+    }
+}
 fn credit_views(artists: &[socket::Artist]) -> Vec<CreditView> {
     artists
         .iter()
@@ -2110,6 +2132,24 @@ mod tests {
             artist_subtitle(&credits),
             "First, Name only, Also name only, Last"
         );
+    }
+
+    #[test]
+    fn player_album_links_preserve_the_exact_addressable_id() {
+        assert_eq!(album_route_id("album%2F原"), "album%2F原");
+        for invalid in ["", "..", "bad/segment", "bad\\segment", " album"] {
+            assert_eq!(album_route_id(invalid), "");
+        }
+        let mut track = LocalTrack {
+            album_name: "The display name is not an ID".into(),
+            ..Default::default()
+        };
+        assert_eq!(local_album(&track), "");
+        track.music.album = Some(crate::pages::Credit {
+            name: String::new(),
+            target: Some(crate::pages::Route::Album("album%2F原".into())),
+        });
+        assert_eq!(local_album(&track), "album%2F原");
     }
 
     #[test]

@@ -10,7 +10,8 @@
 //!
 //! Supply a new output directory for each run. Frames are native RGBA snapshots
 //! of the same 1280×720 layout; use matching PNG names for design comparisons.
-//! Add `--capture-only` after the directory to skip the callback/focus journey.
+//! Add `--capture-only` to skip the callbacks, or `--compact` for a short
+//! artless dock/Queue journey on a headless output set to 640×640.
 
 use slint::platform::{Key, PointerEventButton, WindowEvent};
 use slint::{
@@ -41,14 +42,20 @@ const OUTSIDE: Point = (4., 4.);
 // Logical anchors measured in the 1280×720 native frames. Use the body clear
 // of metadata for selection and hover; Play and menu explicitly hit their slots.
 const SEARCH_BODY: Point = (400., 241.);
-const SEARCH_PLAY: Point = (244., 269.);
-const SEARCH_FALLBACK: Point = (244., 437.);
-const SEARCH_MENU: Point = (928., 269.);
-const UPCOMING_HOVER: Point = (1065., 322.);
-const QUEUE_BODY: Point = (1120., 303.);
-const QUEUE_MENU: Point = (1245., 322.);
-const RULES_BODY: Point = (400., 400.);
-const RULES_PLAY: Point = (240., 419.);
+const SEARCH_PLAY: Point = (244., 251.);
+const SEARCH_FALLBACK: Point = (244., 367.);
+const SEARCH_MENU: Point = (928., 251.);
+const SEARCH_TITLE: Point = (310., 241.);
+const UPCOMING_HOVER: Point = (1120., 295.);
+const QUEUE_BODY: Point = (1120., 295.);
+const QUEUE_TITLE: Point = (1035., 285.);
+const QUEUE_MENU: Point = (1245., 295.);
+const QUEUE_SECOND_BODY: Point = (1120., 351.);
+const RULES_BODY: Point = (400., 365.);
+const RULES_PLAY: Point = (240., 373.);
+const RULES_TITLE: Point = (310., 364.);
+const DOCK_TITLE: Point = (126., 650.);
+const DOCK_NOW: Point = (46., 660.);
 const ALBUM_PLAY: Point = (240., 460.);
 const SAVED_PLAY: Point = (244., 259.);
 type Point = (f32, f32);
@@ -218,7 +225,12 @@ fn track(page: Page, i: i32) -> BrowseRow {
         } else {
             credits()
         },
-        album_id: "glass-coast".into(),
+        album_id: if page == Page::Search && i == 5 {
+            ""
+        } else {
+            "release:glass-42"
+        }
+        .into(),
         album_name: if page == Page::Saved {
             ""
         } else {
@@ -233,6 +245,7 @@ fn track(page: Page, i: i32) -> BrowseRow {
         }
         .into(),
         playable,
+        track_unavailable: page == Page::Search && !playable,
         actions: if playable && page != Page::Saved {
             ops(&["queue", "add", "save"])
         } else {
@@ -248,7 +261,12 @@ fn queue() -> ModelRc<QueueRow> {
         title: title.into(),
         track_id: track.into(),
         credits: credits(),
-        album_id: "glass-coast".into(),
+        album_id: if key == "q-next-2" {
+            ""
+        } else {
+            "release:glass-42"
+        }
+        .into(),
         album_name: "Glass Coast".into(),
         current,
         upcoming,
@@ -311,6 +329,7 @@ impl CatalogPosition {
 }
 
 struct Fixture {
+    dimensions: (f32, f32),
     output: PathBuf,
     log: RefCell<File>,
     art: Image,
@@ -318,6 +337,15 @@ struct Fixture {
     generation: Cell<u32>,
     visit: Cell<Option<CatalogPosition>>,
     follow_artist: Cell<bool>,
+    follow_title: Cell<Option<Page>>,
+    title_visit: RefCell<
+        Option<(
+            slint::SharedString,
+            slint::SharedString,
+            slint::SharedString,
+            i32,
+        )>,
+    >,
 }
 
 impl Fixture {
@@ -329,6 +357,14 @@ impl Fixture {
     fn show(&self, ui: &AppWindow, page: Page) {
         move_to(ui, OUTSIDE);
         ui.set_manual_offline(page == Page::Saved);
+        ui.set_page_album_id(
+            if page == Page::Album {
+                "release:glass-42"
+            } else {
+                ""
+            }
+            .into(),
+        );
         ui.set_page_kind(page.kind().into());
         ui.set_page_key(page.key().into());
         ui.set_page_title(page.title().into());
@@ -348,7 +384,9 @@ impl Fixture {
                 Image::default()
             },
         );
-        ui.set_can_back(page == Page::Artist);
+        ui.set_can_back(
+            page == Page::Artist || (page == Page::Album && self.follow_title.get().is_some()),
+        );
         ui.set_playlist_metadata(
             match page {
                 Page::Rules => "Rule playlist · 1,207 songs",
@@ -433,12 +471,59 @@ impl Fixture {
             ))
         });
         let f = self.clone();
-        ui.on_page_action(move |op, id| f.record(Receipt::Entity(op.to_string(), id.to_string())));
+        let weak = ui.as_weak();
+        ui.on_page_action(move |op, id| {
+            f.record(Receipt::Entity(op.to_string(), id.to_string()));
+            let ui = weak.unwrap();
+            if op == "album" && f.follow_title.get().is_some() && id == "release:glass-42" {
+                let source = ui.get_title_source();
+                let key = ui.get_title_source_key();
+                let row = if source == "playlist" {
+                    ui.get_browse_rows()
+                        .iter()
+                        .position(|entry| entry.occurrence_key == key)
+                        .unwrap_or(usize::MAX) as i32
+                } else {
+                    -1
+                };
+                *f.title_visit.borrow_mut() = Some((source, key, id, row));
+                f.visit.set(Some(CatalogPosition::read(&ui)));
+                f.show(&ui, Page::Album);
+            }
+        });
         let f = self.clone();
         let weak = ui.as_weak();
         ui.on_navigate(move |route| {
             let ui = weak.unwrap();
             f.record(Receipt::Navigate(route.to_string()));
+            if route == "back"
+                && ui.get_page_kind() == "album"
+                && let Some(page) = f.follow_title.get()
+                && let Some((source, key, album, row)) = f.title_visit.borrow_mut().take()
+            {
+                f.show(&ui, page);
+                if source == "" {
+                    let pos = f.visit.get().expect("catalog title visit");
+                    ui.set_catalog_return_key(page.key().into());
+                    ui.set_catalog_return_y(pos.y);
+                    ui.set_catalog_return_anchor(pos.anchor);
+                    ui.set_catalog_return_offset(pos.offset);
+                    ui.set_catalog_return_row(pos.row);
+                    ui.set_catalog_return_part("album".into());
+                    ui.set_catalog_return_credit(album);
+                    ui.set_catalog_return_serial(ui.get_catalog_return_serial() + 1);
+                } else {
+                    if source == "queue" {
+                        ui.set_title_return_track("night-ferry".into());
+                        ui.set_title_return_room("fixture-room".into());
+                    }
+                    ui.set_title_return_source(source);
+                    ui.set_title_return_key(key);
+                    ui.set_title_return_album(album);
+                    ui.set_title_return_row(row);
+                    ui.set_title_return_serial(ui.get_title_return_serial() + 1);
+                }
+            }
             if route == "back" && ui.get_page_kind() == "artist" {
                 if let Some(pos) = f.visit.get() {
                     f.show(&ui, Page::Search);
@@ -472,10 +557,11 @@ impl Fixture {
 
     fn snapshot(&self, ui: &AppWindow) -> Outcome<Frame> {
         let frame = ui.window().take_snapshot()?;
+        let (width, height) = self.dimensions;
         check(
-            frame.width() == WIDTH as u32 && frame.height() == HEIGHT as u32,
+            frame.width() == width as u32 && frame.height() == height as u32,
             format!(
-                "expected {WIDTH}×{HEIGHT} native pixels, got {}×{}",
+                "expected {width}×{height} native pixels, got {}×{}",
                 frame.width(),
                 frame.height()
             ),
@@ -587,11 +673,13 @@ fn captures(script: &mut Script) {
     script.shot("01-search-normal");
     script.hover(SEARCH_BODY);
     script.shot("02-search-art-hover");
+    script.hover(SEARCH_TITLE);
+    script.shot("02a-search-title-hover");
     script.hover((400., SEARCH_FALLBACK.1));
     script.shot("03-search-fallback-hover");
-    script.hover((400., 353.));
+    script.hover((400., 309.));
     script.shot("03a-search-album-hover");
-    script.hover((400., 513.));
+    script.hover((400., 425.));
     script.shot("03b-search-artist-hover");
     script.hover(OUTSIDE);
     script.shot("05-queue-current-art-and-played");
@@ -629,7 +717,7 @@ fn captures(script: &mut Script) {
     script.key(Key::Escape);
     script.hover(OUTSIDE);
     script.shot("07b-queue-menu-escape");
-    // The whole face comes before artist and album links, then overflow.
+    // The whole face precedes the title and artist credit, then overflow.
     for _ in 0..3 {
         script.key(Key::Backtab);
     }
@@ -671,6 +759,10 @@ fn queue_receipt(op: &str, key: &str) -> Receipt {
     Receipt::Queue(op.into(), key.into())
 }
 
+fn album_receipt() -> Receipt {
+    Receipt::Entity("album".into(), "release:glass-42".into())
+}
+
 /// A small control's ring has gold pixels across its vertical center.
 /// The row outline never intersects this inner check region.
 fn play_ring(frame: &Frame, (x, y): Point) -> bool {
@@ -708,7 +800,7 @@ impl Script {
 
 fn queue_body_ring(frame: &Frame) -> bool {
     let stride = frame.width() as usize * 4;
-    (285..290)
+    (266..272)
         .flat_map(|y| {
             frame.as_bytes()[y * stride + 1000 * 4..y * stride + 1240 * 4].chunks_exact(4)
         })
@@ -719,7 +811,7 @@ fn queue_body_ring(frame: &Frame) -> bool {
 
 fn queue_upcoming_ink(frame: &Frame) -> Vec<(usize, usize)> {
     let stride = frame.width() as usize * 4;
-    (293..313)
+    (275..293)
         .flat_map(|y| (996..1140).map(move |x| (x, y)))
         .filter(|&(x, y)| {
             frame.as_bytes()[y * stride + x * 4..y * stride + x * 4 + 3] == [0xf4, 0xf6, 0xfa]
@@ -746,8 +838,8 @@ fn assertions(s: &mut Script) {
                 "Queue hover moved upcoming title ink",
             )?;
             check(
-                (285..358).all(|y| normal.as_bytes()[row(y)] == after.as_bytes()[row(y)])
-                    && (285..358).any(|y| normal.as_bytes()[row(y)] != hovered.as_bytes()[row(y)]),
+                (267..323).all(|y| normal.as_bytes()[row(y)] == after.as_bytes()[row(y)])
+                    && (267..323).any(|y| normal.as_bytes()[row(y)] != hovered.as_bytes()[row(y)]),
                 "Queue hover did not reveal paint and then restore the unchanged row",
             )
         },
@@ -808,15 +900,15 @@ fn assertions(s: &mut Script) {
         vec![row("play", Page::Search, 0)],
     );
 
-    s.click((312., 279.));
+    s.click((312., 263.));
     s.expect(
         "artist link avoids row Play",
         vec![Receipt::Entity("artist".into(), "vera".into())],
     );
-    s.click((312., 299.));
+    s.click(SEARCH_TITLE);
     s.expect(
-        "album link avoids row Play",
-        vec![Receipt::Entity("album".into(), "glass-coast".into())],
+        "Search title opens the actual album ID without Play",
+        vec![album_receipt()],
     );
     s.click(SEARCH_MENU);
     s.key(Key::Return);
@@ -824,7 +916,7 @@ fn assertions(s: &mut Script) {
         "overflow menu routes its own operation",
         vec![row("queue", Page::Search, 0)],
     );
-    s.click((400., 333.));
+    s.click((400., 300.));
     let album = Receipt::Row("open".into(), 1, "album-glass".into());
     s.expect(
         "album row body opens instead of playing",
@@ -834,18 +926,18 @@ fn assertions(s: &mut Script) {
     s.expect("Enter on album body opens", vec![album.clone()]);
     s.key(Key::Space);
     s.expect("Space on album body opens", vec![album]);
-    s.click((244., 353.));
+    s.click((244., 309.));
     s.expect(
         "album artwork Play is distinct from opening the album",
         vec![Receipt::Row("play".into(), 1, "album-glass".into())],
     );
-    s.click((244., 513.));
+    s.click((244., 425.));
     s.expect(
         "unplayable artist art still opens the artist",
         vec![Receipt::Row("open".into(), 3, "artist-vera".into())],
     );
 
-    s.click((244., 588.));
+    s.click((244., 483.));
     s.key(Key::Return);
     s.key(Key::Space);
     s.expect(
@@ -876,7 +968,7 @@ fn assertions(s: &mut Script) {
         "menu Play names the first duplicate",
         vec![queue_receipt("play", "q-next-1")],
     );
-    s.click((QUEUE_MENU.0, 396.));
+    s.click((QUEUE_MENU.0, QUEUE_SECOND_BODY.1));
     s.key(Key::End);
     s.key(Key::Return);
     s.expect(
@@ -908,24 +1000,24 @@ fn assertions(s: &mut Script) {
     s.key(Key::Tab);
     s.key(Key::Return);
     s.expect(
-        "Tab moves to artist link, not a duplicate Play stop",
-        vec![Receipt::Entity("artist".into(), "vera".into())],
+        "Tab moves to the actual album title action, not a duplicate Play stop",
+        vec![album_receipt()],
     );
     s.key(Key::Tab);
     s.key(Key::Return);
     s.expect(
-        "album link retains its own keyboard action",
-        vec![Receipt::Entity("album".into(), "glass-coast".into())],
+        "Queue artist link retains its own keyboard action",
+        vec![Receipt::Entity("artist".into(), "vera".into())],
     );
-    s.click((1012., 323.));
+    s.click((1012., 307.));
     s.expect(
         "pointer opens artist link without Play",
         vec![Receipt::Entity("artist".into(), "vera".into())],
     );
-    s.click((1012., 343.));
+    s.click(QUEUE_TITLE);
     s.expect(
-        "pointer opens album link without Play",
-        vec![Receipt::Entity("album".into(), "glass-coast".into())],
+        "pointer opens Queue title album without Play",
+        vec![album_receipt()],
     );
     s.step("show overflowing credit list", |_, ui| {
         ui.set_queue_rows(long_queue());
@@ -934,7 +1026,6 @@ fn assertions(s: &mut Script) {
     s.click(QUEUE_MENU);
     s.key(Key::Escape);
     s.hover(OUTSIDE);
-    s.key(Key::Backtab);
     s.key(Key::Backtab);
     s.shot("16f-queue-overflowed-credit-focus");
     s.key(Key::Return);
@@ -949,9 +1040,8 @@ fn assertions(s: &mut Script) {
     s.click(QUEUE_BODY);
     s.expect("single body click does not play", vec![]);
     s.step("double-click duplicate row body", |_, ui| {
-        let second = (QUEUE_BODY.0, 377.);
-        click(ui, second);
-        click(ui, second);
+        click(ui, QUEUE_SECOND_BODY);
+        click(ui, QUEUE_SECOND_BODY);
         Ok(())
     });
     s.expect(
@@ -1047,7 +1137,7 @@ fn assertions(s: &mut Script) {
         Ok(())
     });
     s.shot("16g-queue-idle-local");
-    let idle_menu = (QUEUE_MENU.0, 218.);
+    let idle_menu = (QUEUE_MENU.0, 209.);
     s.click(idle_menu);
     s.key(Key::Return);
     s.expect(
@@ -1129,7 +1219,7 @@ fn assertions(s: &mut Script) {
         vec![],
     );
     s.step("restore original Queue", |_, ui| {
-        wheel(ui, (1065., 322.), 40_000.);
+        wheel(ui, UPCOMING_HOVER, 40_000.);
         ui.set_queue_rows(queue());
         Ok(())
     });
@@ -1391,23 +1481,210 @@ fn assertions(s: &mut Script) {
         "restored live artist focus opens without retabbing",
         vec![artist_open],
     );
+    title_routes(s);
+}
+
+fn title_routes(s: &mut Script) {
+    for (page, point, source, key, frame) in [
+        (
+            Page::Search,
+            SEARCH_TITLE,
+            "",
+            "",
+            "24-search-title-restored",
+        ),
+        (
+            Page::Rules,
+            RULES_TITLE,
+            "playlist",
+            "playlist-rules-2",
+            "25-playlist-title-restored",
+        ),
+        (
+            Page::Search,
+            QUEUE_TITLE,
+            "queue",
+            "q-next-1",
+            "26-queue-title-restored",
+        ),
+        (
+            Page::Search,
+            DOCK_TITLE,
+            "dock",
+            "amber-lines",
+            "27-dock-title-restored",
+        ),
+    ] {
+        s.step("enable title route", move |f, ui| {
+            f.follow_title.set(Some(page));
+            f.show(ui, page);
+            Ok(())
+        });
+        s.click(point);
+        for attempt in 0..2 {
+            s.expect(
+                "title opens album without Play or row Open",
+                vec![album_receipt()],
+            );
+            s.step("verify exact album and title source", move |f, ui| {
+                check(
+                    ui.get_page_album_id() == "release:glass-42",
+                    "title chose the wrong album",
+                )?;
+                let visit = f.title_visit.borrow();
+                let (actual_source, actual_key, _, _) =
+                    visit.as_ref().ok_or("missing title visit")?;
+                check(
+                    actual_source == source && actual_key == key,
+                    format!(
+                        "wrong title origin: ({actual_source}, {actual_key}) vs ({source}, {key})"
+                    ),
+                )
+            });
+            s.key(Key::Escape);
+            s.expect(
+                "Back returns from title album",
+                vec![Receipt::Navigate("back".into())],
+            );
+            if attempt == 0 {
+                s.shot(frame);
+                s.key(Key::Return);
+            }
+        }
+    }
+    s.step(
+        "keep the mounted playlist title focused during a same-route refresh",
+        |f, ui| {
+            f.follow_title.set(None);
+            f.show(ui, Page::Rules);
+            // Enter the title through keyboard focus without navigating first.
+            click(ui, RULES_BODY);
+            key(ui, Key::Tab);
+            check(
+                ui.get_playlist_focus_index() == 2
+                    && ui.get_playlist_focus_control() == "album:release:glass-42",
+                "fixture did not focus the exact playlist title",
+            )?;
+            ui.set_playlist_source_restore(PlaylistSourceRestore {
+                y: ui.get_catalog_scroll_y(),
+                before: 2,
+                after: 2,
+                occurrence: "playlist-rules-2".into(),
+                control: "album:release:glass-42".into(),
+                serial: 1,
+            });
+            Ok(())
+        },
+    );
+    s.key(Key::Return);
+    s.expect(
+        "same-mounted title refresh retains Album activation, not row Play",
+        vec![album_receipt()],
+    );
+    s.step("return from playlist refresh fixture", |f, ui| {
+        f.follow_title.set(Some(Page::Search));
+        f.show(ui, Page::Search);
+        Ok(())
+    });
+    s.click((330., 531.));
+    s.click((1025., 340.));
+    s.step("artless dock with an unknown album", |_, ui| {
+        ui.set_now_album_id("".into());
+        ui.set_cover_art(Image::default());
+        Ok(())
+    });
+    s.click(DOCK_TITLE);
+    s.expect(
+        "unknown album titles in Search, Queue and dock never navigate or Play",
+        vec![],
+    );
+    s.shot("28-dock-artless-title-non-action");
+    s.click(DOCK_NOW);
+    s.expect(
+        "separate artless dock target opens Now Playing",
+        vec![Receipt::Navigate("now".into())],
+    );
+    s.click(QUEUE_TITLE);
+    s.expect(
+        "open Queue album before live eviction",
+        vec![album_receipt()],
+    );
+    s.step(
+        "evict the Queue occurrence while its album is open",
+        |_, ui| {
+            ui.set_queue_rows(model(
+                queue().iter().filter(|row| row.key != "q-next-1").collect(),
+            ));
+            Ok(())
+        },
+    );
+    s.key(Key::Escape);
+    s.expect(
+        "Back after Queue eviction",
+        vec![Receipt::Navigate("back".into())],
+    );
+    s.key(Key::Return);
+    s.expect(
+        "evicted title cannot activate a replacement occurrence",
+        vec![],
+    );
+}
+
+fn compact_captures(s: &mut Script) {
+    s.step("show compact without any current artwork", |_, ui| {
+        ui.set_cover_art(Image::default());
+        Ok(())
+    });
+    s.shot("01-compact-dock-artless");
+    s.click((99., 511.));
+    s.expect(
+        "compact dock title opens its known album",
+        vec![album_receipt()],
+    );
+    s.step("same compact dock, unknown album", |_, ui| {
+        ui.set_now_album_id("".into());
+        Ok(())
+    });
+    s.shot("02-compact-dock-unknown-album");
+    s.click((99., 511.));
+    s.expect(
+        "compact dock title has no action without an album ID",
+        vec![],
+    );
+    s.click((32., 522.));
+    s.expect(
+        "compact artless cover button opens Now Playing",
+        vec![Receipt::Navigate("now".into())],
+    );
+    s.click((426., 522.));
+    // The shell opens Now Playing for both actions, entering the Lyrics
+    // reader specifically for the microphone; the full player run checks it.
+    s.expect(
+        "compact Lyrics still opens the player directly",
+        vec![Receipt::Navigate("now".into())],
+    );
 }
 
 fn main() -> Outcome {
     let mut args = std::env::args_os().skip(1);
     let output = PathBuf::from(args.next().ok_or("provide a new output directory")?);
-    let capture_only = match args.next() {
-        None => false,
-        Some(flag) if flag == "--capture-only" => true,
-        Some(_) => {
-            return Err("expected optional --capture-only after the output directory".into());
-        }
-    };
+    let mode = args.next();
+    check(
+        mode.as_ref()
+            .is_none_or(|flag| flag == "--capture-only" || flag == "--compact"),
+        "expected optional --capture-only or --compact after the output directory",
+    )?;
+    let compact = mode.as_ref().is_some_and(|flag| flag == "--compact");
     check(args.next().is_none(), "too many arguments")?;
     fs::DirBuilder::new().mode(0o700).create(&output)?;
     let ui = AppWindow::new()?;
-    ui.set_inspection_width(WIDTH);
-    ui.set_inspection_height(HEIGHT);
+    let dimensions = if compact {
+        (640., 640.)
+    } else {
+        (WIDTH, HEIGHT)
+    };
+    ui.set_inspection_width(dimensions.0);
+    ui.set_inspection_height(dimensions.1);
     ui.set_reduced_motion(true);
     ui.set_signed_in(true);
     ui.set_account_label("Fixture listener".into());
@@ -1415,7 +1692,7 @@ fn main() -> Outcome {
     ui.set_now_track_id("amber-lines".into());
     ui.set_now_title("Amber Lines".into());
     ui.set_now_credits(credits());
-    ui.set_now_album_id("glass-coast".into());
+    ui.set_now_album_id("release:glass-42".into());
     ui.set_now_album_name("Glass Coast".into());
     ui.set_playing(true);
     ui.set_can_control(true);
@@ -1425,10 +1702,13 @@ fn main() -> Outcome {
     ui.set_duration(222.);
     ui.set_local_volume(0.68);
     ui.set_output_name("Fixture output".into());
+    ui.set_room_token("fixture-room:1".into());
+    ui.set_queue_room_key("fixture-room".into());
     ui.set_queue_rows(queue());
     let art = sleeve(0);
     ui.set_cover_art(art.clone());
     let fixture = Rc::new(Fixture {
+        dimensions,
         log: RefCell::new(File::create(output.join("events.log"))?),
         output,
         art,
@@ -1436,14 +1716,20 @@ fn main() -> Outcome {
         generation: Default::default(),
         visit: Default::default(),
         follow_artist: Default::default(),
+        follow_title: Default::default(),
+        title_visit: Default::default(),
     });
     playlist_view::install(&ui);
     fixture.bind(&ui);
     fixture.show(&ui, Page::Search);
     let mut script = Script::new();
-    captures(&mut script);
-    if !capture_only {
-        assertions(&mut script);
+    if compact {
+        compact_captures(&mut script);
+    } else {
+        captures(&mut script);
+        if mode.is_none() {
+            assertions(&mut script);
+        }
     }
 
     let timer = Timer::default();
