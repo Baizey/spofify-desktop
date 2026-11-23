@@ -226,20 +226,16 @@ fn list_projection<'a>(
             Row {
                 playlist: Some(read_only_metadata(summary)),
                 detail: pages::ui_text(&summary.description),
-                ..playlist_row(
-                    &summary.id,
-                    &summary.name,
-                    summary.kind,
-                    summary.track_count,
-                )
+                ..playlist_row(&summary.id, &summary.name, summary.track_count)
             }
         })
         .collect();
     rows.extend(pins.iter().filter_map(|pin| {
-        let Target { id, kind, title } = &pin.target;
+        let Target { id, title, .. } = &pin.target;
         (pin.wanted && !is_deleted(id) && !known.contains(id.as_str())).then(|| {
             let title = pin.committed.as_ref().map_or(title, |m| &m.title);
-            playlist_row(id, title, *kind, None)
+            // Downloaded membership is not an authoritative playlist total.
+            playlist_row(id, title, None)
         })
     }));
     rows.sort_unstable_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
@@ -261,18 +257,14 @@ fn display_title(name: &str) -> String {
     }
 }
 
-fn playlist_row(id: &str, name: &str, kind: PlaylistKind, count: Option<u64>) -> Row {
-    let label = kind_label(kind);
+fn playlist_row(id: &str, name: &str, count: Option<u64>) -> Row {
     Row {
         id: id.into(),
         title: display_title(name),
         key: RowKey::Playlist(id.into()),
         route: Some(Route::Playlist(id.into())),
         kind: "playlist".into(),
-        subtitle: count.map_or_else(
-            || label.into(),
-            |n| format!("{label} · {n} {}", if n == 1 { "song" } else { "songs" }),
-        ),
+        subtitle: pages::playlist_count(count),
         ..Row::default()
     }
 }
@@ -286,13 +278,6 @@ fn read_only_metadata(summary: &Summary) -> PlaylistMetadata {
         track_count: summary.track_count,
         available_count: summary.available_count,
         capabilities: READ_ONLY,
-    }
-}
-
-fn kind_label(kind: PlaylistKind) -> &'static str {
-    match kind {
-        PlaylistKind::Manual => "Playlist",
-        PlaylistKind::Derived => "Rule playlist",
     }
 }
 
@@ -976,6 +961,43 @@ mod tests {
             assert_eq!(row.playlist.as_ref(), Some(&read_only_metadata(summary)));
             assert!(!row.playable && row.playback.is_none());
         }
+    }
+
+    #[test]
+    fn offline_playlist_list_uses_observed_totals_not_pin_membership() {
+        let mut pin = pin("key", true, true);
+        pin.target.id = "pin-only".into();
+        assert_eq!(pin.committed.as_ref().unwrap().tracks.len(), 1);
+        let summaries = [
+            ("empty", PlaylistKind::Manual, Some(0)),
+            ("one", PlaylistKind::Derived, Some(1)),
+            ("many", PlaylistKind::Manual, Some(3)),
+            ("pending", PlaylistKind::Derived, None),
+        ]
+        .map(|(id, kind, count)| Summary {
+            track_count: count,
+            available_count: count.map(|_| 0),
+            evaluation_state: (kind == PlaylistKind::Derived).then_some(if count.is_some() {
+                EvaluationState::Ready
+            } else {
+                EvaluationState::Pending
+            }),
+            ..summary(id, kind)
+        });
+        let page = list_projection(summaries.iter(), |_| false, &[pin]);
+        let label = |id| {
+            page.rows
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .subtitle
+                .as_str()
+        };
+        assert_eq!(label("empty"), "0 songs");
+        assert_eq!(label("one"), "1 song");
+        assert_eq!(label("many"), "3 songs");
+        assert_eq!(label("pending"), "");
+        assert_eq!(label("pin-only"), "");
     }
 
     #[test]

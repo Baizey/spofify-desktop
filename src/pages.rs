@@ -728,7 +728,13 @@ pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
         .filter(|p| !picker || (p.kind == PlaylistKind::Manual && p.capabilities.add_tracks))
         .cloned()
         .map(|summary| {
+            let subtitle = if picker {
+                playlist_subtitle(&summary)
+            } else {
+                playlist_count(summary.track_count)
+            };
             let mut row = playlist_row(summary);
+            row.subtitle = subtitle;
             if picker {
                 row.playable = false;
                 row.playback = None;
@@ -1070,7 +1076,6 @@ fn playlist_row(summary: PlaylistSummary) -> Row {
     Row {
         kind: "playlist".into(),
         title: name,
-        subtitle: playlist_subtitle(&summary),
         detail: ui_text(&summary.description),
         id: summary.id.clone(),
         key: RowKey::Playlist(summary.id.clone()),
@@ -1143,6 +1148,10 @@ pub(crate) fn join_labels(left: &str, right: &str) -> String {
         return ui_text(left);
     }
     ui_text(&format!("{left} · {right}"))
+}
+
+pub(crate) fn playlist_count(count: Option<u64>) -> String {
+    count.map_or_else(String::new, |n| count_label(n, "song", "songs"))
 }
 
 pub(crate) fn count_label(n: u64, singular: &str, plural: &str) -> String {
@@ -1345,6 +1354,57 @@ mod tests {
                 add_tracks: false,
             },
         }
+    }
+
+    #[test]
+    fn playlist_list_shows_only_known_song_counts_without_changing_the_picker() {
+        let metadata = rule_metadata();
+        let mut summary = PlaylistSummary {
+            id: metadata.id,
+            name: metadata.name,
+            description: String::new(),
+            kind: PlaylistKind::Derived,
+            count_state: library::CountState::Exact,
+            evaluation_state: Some(EvaluationState::Ready),
+            evaluation_error_code: None,
+            track_count: Some(0),
+            available_count: Some(0),
+            capabilities: metadata.capabilities,
+            revision: metadata.revision,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        for (count, label) in [
+            (Some(0), "0 songs"),
+            (Some(1), "1 song"),
+            (Some(3), "3 songs"),
+            (None, ""),
+        ] {
+            summary.track_count = count;
+            summary.available_count = count.map(|_| 0);
+            summary.count_state = if count.is_none() {
+                library::CountState::Pending
+            } else {
+                library::CountState::Exact
+            };
+            summary.evaluation_state = Some(if count.is_none() {
+                EvaluationState::Pending
+            } else {
+                EvaluationState::Ready
+            });
+            let page = personal_list(&Route::Playlists, std::slice::from_ref(&summary));
+            assert_eq!(page.rows[0].subtitle, label);
+        }
+        summary.kind = PlaylistKind::Manual;
+        summary.evaluation_state = None;
+        summary.count_state = library::CountState::Exact;
+        summary.track_count = Some(3);
+        summary.available_count = Some(3);
+        summary.capabilities.add_tracks = true;
+        let list = personal_list(&Route::Playlists, std::slice::from_ref(&summary));
+        assert_eq!(list.rows[0].subtitle, "3 songs");
+        let picker = personal_list(&Route::Picker("track".into()), &[summary]);
+        assert_eq!(picker.rows[0].subtitle, "Playlist · 3 songs");
     }
 
     #[test]

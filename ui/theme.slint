@@ -64,6 +64,8 @@ export component Action inherits Rectangle {
     in property <bool> keyboard-focusable: true;
     // Hover-revealed actions can keep Tab access without a hidden pointer target.
     in property <bool> pointer-enabled: true;
+    in property <length> pointer-left-extension;
+    in property <length> pointer-vertical-extension;
     // Let playback buttons keep Tab position without painting a pointer-only ring.
     in property <bool> pointer-focus-visible: true;
     out property <bool> has-focus: key.has-focus;
@@ -111,6 +113,9 @@ export component Action inherits Rectangle {
         font-size: 14px * Theme.density; font-weight: 600; overflow: elide; vertical-alignment: center; accessible-role: none;
     }
     pointer := TouchArea {
+        x: -root.pointer-left-extension; y: -root.pointer-vertical-extension;
+        width: root.width + root.pointer-left-extension;
+        height: root.height + 2 * root.pointer-vertical-extension;
         enabled: root.enabled && root.pointer-enabled;
         mouse-cursor: MouseCursor.pointer;
         pointer-event(event) => {
@@ -405,6 +410,7 @@ export component Field inherits Rectangle {
 export component Cover inherits Rectangle {
     in property <image> artwork;
     in property <string> mark: "♫";
+    in property <bool> show-mark: true;
     in property <bool> circular;
     border-radius: circular && artwork.width == 0 ? self.height / 2 : min(Theme.container-radius, self.height / 5);
     background: Theme.raised;
@@ -412,7 +418,7 @@ export component Cover inherits Rectangle {
     border-color: Theme.line;
     clip: true;
     accessible-role: none;
-    if root.artwork.width == 0: Glyph { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: parent.height * 0.47; height: self.width; name: root.mark; ink: Theme.subtle; }
+    if root.show-mark && root.artwork.width == 0: Glyph { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: parent.height * 0.47; height: self.width; name: root.mark; ink: Theme.subtle; }
     Image {
         x: 0; y: 0; width: parent.width; height: parent.height;
         source: root.artwork; visible: root.artwork.width > 0; image-fit: cover; accessible-role: none;

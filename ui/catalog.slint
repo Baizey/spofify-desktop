@@ -2,6 +2,7 @@ import { Action, AlbumLine, Caption, Cover, Divider, Eyebrow, Theme, TrackTitle 
 import { ArtistCredit, CreditLine, WrappingCredits } from "credits.slint";
 import { ActionCopy, OverflowMenu } from "overflow-menu.slint";
 import { Glyph } from "icon.slint";
+import { PlaylistListIndicator, PlaylistListOffline, PlaylistOfflineMark } from "playlist-list-offline.slint";
 
 export global Copy {
     public pure function title(kind: string) -> string {
@@ -180,12 +181,15 @@ export component MediaLine inherits Rectangle {
     in property <bool> can-open;
     in property <bool> selectable;
     in property <bool> playlist-track-row;
+    in property <bool> playlist-list-row;
+    in property <PlaylistListOffline> playlist-list-offline;
+    property <bool> has-playlist-indicator: root.playlist-list-row && root.playlist-list-offline.mark != PlaylistOfflineMark.None;
     in property <string> restore-control;
     in property <string> open-label: "Open " + root.title;
     in property <int> sequence;
     in property <bool> compact;
     in property <bool> queue-row;
-    property <bool> leading-cover: root.sequence == 0 && (root.queue-row ? root.artwork.width > 0 : !root.compact);
+    property <bool> leading-cover: root.sequence == 0 && (root.queue-row ? root.artwork.width > 0 : root.playlist-list-row || !root.compact);
     property <bool> leading-state: root.queue-row && root.current-track && !root.leading-cover;
     property <bool> leading-marker: root.sequence == 0 && root.compact && !root.queue-row
         && (root.kind == "track" || root.type-mark != "");
@@ -300,7 +304,7 @@ export component MediaLine inherits Rectangle {
             || root.row-viewport-y + words.y + song-title.y >= root.play-viewport-height)));
     changed title-unavailable => { if root.title-unavailable { root.title-focused = false; root.play-focus-evicted(); } }
     min-width: 0px;
-    min-height: Copy.row-height(root.has-credits, root.show-album-line);
+    min-height: Copy.row-height(root.playlist-list-row || root.has-credits, root.show-album-line);
     vertical-stretch: 0;
     property <bool> play-on-activate: root.selectable && root.playable && !root.can-open;
     property <bool> body-actionable: root.can-open || root.play-on-activate;
@@ -372,7 +376,7 @@ export component MediaLine inherits Rectangle {
             width: parent.width; height: parent.height;
             accessible-role: button;
             accessible-label: root.can-open ? root.open-label : "Play track: " + root.title;
-            accessible-description: root.track-state-label;
+            accessible-description: root.playlist-list-row ? root.playlist-list-offline.description : root.track-state-label;
             accessible-action-default => { root.take-row-focus(); root.activate-row(); }
             forward-focus: row-keys;
         }
@@ -452,6 +456,7 @@ export component MediaLine inherits Rectangle {
                 TrackCover {
                     y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
+                    show-mark: !root.has-playlist-indicator;
                     current-track: root.current-track; playing-track: root.playing-track;
                     state-motion: root.state-motion-visible;
                     viewport-y: root.row-viewport-y + (root.height - self.height) / 2;
@@ -563,6 +568,11 @@ export component MediaLine inherits Rectangle {
             property <bool> revealed: root.row-reveals-play || self.has-focus;
             opacity: self.revealed ? 1 : 0;
             pointer-enabled: self.revealed;
+            // Compact playlists already used the inset for Play. Keep that
+            // pointer target when the new cover takes over its paint.
+            property <bool> compact-playlist: root.playlist-list-row && root.compact;
+            pointer-left-extension: self.compact-playlist ? max(0px, -row-face.x - 1px) : 0px;
+            pointer-vertical-extension: self.compact-playlist ? max(0px, (clamp(root.height - 4px, 0px, 46px) - self.height) / 2) : 0px;
             accessible-label: "Play " + root.title;
             accessible-description: root.track-state-label;
             single-pointer-activation: true; click-scope: root.menu-key;
@@ -574,6 +584,12 @@ export component MediaLine inherits Rectangle {
                 root.play-focused = owns;
             }
             clicked => { root.action("play"); }
+        }
+        if root.has-playlist-indicator: PlaylistListIndicator {
+            x: -row-face.x; y: root.play-top;
+            width: root.leading-slot; height: root.play-height;
+            status: root.playlist-list-offline;
+            badge: root.artwork.width > 0 || (root.playable && (root.row-reveals-play || root.play-focused));
         }
         // Real art gets a type mark in its corner; fallback art already
         // communicates the type. Keep the mark visible next to hover Play.

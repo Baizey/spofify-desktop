@@ -88,7 +88,7 @@ impl Status {
     }
 
     /// Detail represents committed audio on the control itself. Keep only
-    /// actionable state information beside it; list-row copy stays unchanged.
+    /// actionable state information beside it.
     pub(crate) fn detail_feedback(&self) -> String {
         match (self.phase, self.has_committed) {
             (Phase::Saved, _) => String::new(),
@@ -122,6 +122,23 @@ impl Status {
             && self.key == other.key
             && self.wanted == other.wanted
             && self.committed == other.committed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(phase: Phase, has_committed: bool, hint: Option<&'static str>) -> Self {
+        Self {
+            target: Target {
+                id: "mix".into(),
+                title: "Mix".into(),
+                kind: crate::api::library::PlaylistKind::Manual,
+            },
+            key: "mix".into(),
+            wanted: true,
+            has_committed,
+            phase,
+            committed: None,
+            hint,
+        }
     }
 }
 

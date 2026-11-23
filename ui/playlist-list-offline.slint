@@ -1,0 +1,47 @@
+import { Glyph } from "icon.slint";
+import { Theme } from "theme.slint";
+
+export enum PlaylistOfflineMark { None, Saved, Pending, Downloading, Retry }
+export struct PlaylistListOffline { mark: PlaylistOfflineMark, retained: bool, percent: string, description: string }
+
+// Paint only. The row's existing open button owns the status description.
+export component PlaylistListIndicator inherits Rectangle {
+    in property <PlaylistListOffline> status;
+    in property <bool> badge;
+    accessible-role: none;
+    property <color> ink: root.status.mark == PlaylistOfflineMark.Retry ? Theme.error
+        : root.status.mark == PlaylistOfflineMark.Pending ? Theme.muted : Theme.primary;
+    property <string> glyph: root.status.mark == PlaylistOfflineMark.Saved ? "downloaded"
+        : root.status.mark == PlaylistOfflineMark.Pending ? "pending"
+        : root.status.mark == PlaylistOfflineMark.Retry ? "download-alert" : "↓";
+
+    // When Play or artwork owns the center, only paint a corner badge.
+    state-mark := Rectangle {
+        width: !root.badge ? parent.width : root.status.percent == "" ? 17px : 26px;
+        height: !root.badge ? parent.height : root.status.percent == "" ? self.width : 14px;
+        x: parent.width - self.width; y: parent.height - self.height;
+        background: root.badge ? Theme.bg : transparent;
+        border-radius: 5px;
+        if root.status.percent == "": Glyph {
+            width: root.badge ? 15px : 23px; height: self.width;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            name: root.glyph; ink: root.ink;
+        }
+        if root.status.percent != "": Text {
+            width: parent.width; height: parent.height;
+            text: root.status.percent; color: root.ink;
+            font-size: root.badge ? 9px : 12px; font-weight: 650;
+            horizontal-alignment: center; vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    if root.status.retained: Rectangle {
+        width: 15px; height: self.width; x: 0px; y: 0px;
+        background: Theme.bg; border-radius: 5px;
+        Glyph {
+            width: 13px; height: self.width;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            name: "downloaded"; ink: Theme.primary;
+        }
+    }
+}

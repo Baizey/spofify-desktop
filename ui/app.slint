@@ -2,6 +2,7 @@ import { ScrollView } from "std-widgets.slint";
 import { Action, Caption, Divider, Eyebrow, Field, Notice, Theme } from "theme.slint";
 import { Copy, EmptyState, Hero, MediaLine } from "catalog.slint";
 import { PlaylistDetailHeader } from "playlist-detail.slint";
+import { PlaylistListOffline, PlaylistOfflineMark } from "playlist-list-offline.slint";
 import { ReorderList, ReorderRow } from "reorder.slint";
 import { ArtistCredit } from "credits.slint";
 import { Editor, SignInView } from "forms.slint";
@@ -12,12 +13,12 @@ import { Settings } from "settings.slint";
 import { WorkspaceRail } from "workspace-parts.slint";
 import { SearchAddChoice, SearchAddPicker, SearchAddProgress, SearchAddRow } from "search-add.slint";
 import "../assets/JetBrainsMono-v2.304-wght.ttf";
-export { ArtistCredit, DeviceRow, ReorderRow, SearchAddChoice }
+export { ArtistCredit, DeviceRow, ReorderRow, SearchAddChoice, PlaylistListOffline, PlaylistOfflineMark }
 export struct SearchAddSelection { id: string, name: string, detail: string, option-index: int }
 
 export struct BrowseRow {
     kind: string, title: string, subtitle: string, detail: string, playable: bool, can-open: bool, actions: [string], section: string,
-    track-unavailable: bool,
+    track-unavailable: bool, playlist-list-offline: PlaylistListOffline,
     credits: [ArtistCredit], album-id: string, album-name: string, track-id: string, occurrence-key: string, playlist-pinned: bool,
 }
 export struct QueueRow {
@@ -40,6 +41,9 @@ component BrowseLine inherits MediaLine {
     in property <string> page-kind;
     in property <bool> is-playlist;
     title: entry.title; subtitle: entry.subtitle; kind: entry.kind;
+    playlist-list-row: page-kind == "playlists" && entry.kind == "playlist";
+    playlist-list-offline: entry.playlist-list-offline;
+    align-credit-fallback: self.playlist-list-row;
     availability-status: page-kind == "search" && entry.kind == "track" && entry.track-unavailable;
     detail: page-kind == "search" ? (self.availability-status ? "Unavailable" : "") : entry.detail;
     title-opens-album: entry.kind == "track" && (page-kind == "search" || is-playlist);

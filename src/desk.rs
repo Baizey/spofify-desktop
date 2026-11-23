@@ -1,8 +1,9 @@
 //! Desktop browsing controller. A single owner accepts navigation and writes;
 //! cancellable reads populate bounded account-scoped snapshots off the UI thread.
 use crate::{
-    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, PlaylistOfflineState,
-    PlaylistSourceRestore, ReorderRow, SearchAddChoice, SearchAddRow, SearchAddSelection, actions,
+    AppWindow, ArtistCredit, BrowseRow, PlaylistActions, PlaylistListOffline, PlaylistOfflineMark,
+    PlaylistOfflineState, PlaylistSourceRestore, ReorderRow, SearchAddChoice, SearchAddRow,
+    SearchAddSelection, actions,
     api::{Api, ApiError, Session, library::PlaylistKind},
     engine::Command,
     pages::{self, Page, Route, RowKey},
@@ -1056,6 +1057,55 @@ fn pin_subtitle(row: &pages::Row, status: Option<&playlist_pins::Status>) -> sli
     }
 }
 
+fn playlist_list_offline(status: Option<&playlist_pins::Status>) -> PlaylistListOffline {
+    use playlist_pins::Phase;
+
+    let Some(status) = status.filter(|status| status.wanted) else {
+        return PlaylistListOffline::default();
+    };
+    let (mark, percent) = match status.phase {
+        Phase::Saved => (PlaylistOfflineMark::Saved, String::new()),
+        Phase::Pending => (PlaylistOfflineMark::Pending, String::new()),
+        Phase::Retry => (PlaylistOfflineMark::Retry, String::new()),
+        Phase::Downloading { verified, total } => (
+            PlaylistOfflineMark::Downloading,
+            if total == 0 {
+                String::new()
+            } else {
+                format!("{}%", verified.min(total) as u128 * 100 / total as u128)
+            },
+        ),
+    };
+    let description = match status.phase {
+        Phase::Retry if status.has_committed => {
+            format!(
+                "Saved · Offline refresh interrupted: {}",
+                status.detail_feedback()
+            )
+        }
+        Phase::Retry => format!("Offline download interrupted: {}", status.detail_feedback()),
+        _ => status.label(),
+    };
+    PlaylistListOffline {
+        mark,
+        retained: status.has_committed && status.phase != Phase::Saved,
+        percent: percent.into(),
+        description: description.into(),
+    }
+}
+
+fn pin_row_copy(
+    route: &Route,
+    row: &pages::Row,
+    status: Option<&playlist_pins::Status>,
+) -> (slint::SharedString, PlaylistListOffline) {
+    match route {
+        Route::Playlists => (row.subtitle.as_str().into(), playlist_list_offline(status)),
+        Route::Offline => (pin_subtitle(row, status), PlaylistListOffline::default()),
+        _ => (row.subtitle.as_str().into(), PlaylistListOffline::default()),
+    }
+}
+
 fn playlist_detail_offline(
     route: &Route,
     page: &Page,
@@ -1595,11 +1645,12 @@ impl Browser {
                     .skip(append_from.unwrap_or(0))
                     .map(|r| {
                         let (album_id, album_name) = track_album(r);
-                        let status = if matches!(kind.as_str(), "playlists" | "offline") {
+                        let status = if matches!(route, Route::Playlists | Route::Offline) {
                             pin.row(r)
                         } else {
                             None
                         };
+                        let (subtitle, playlist_list_offline) = pin_row_copy(&route, r, status);
                         BrowseRow {
                             section: Default::default(),
                             actions: strings(row_actions(
@@ -1613,7 +1664,8 @@ impl Browser {
                             track_id: if r.kind == "track" { r.id.as_str() } else { "" }.into(),
                             occurrence_key: playlist_occurrence_key(r, &route).as_ref().into(),
                             title: r.title.as_str().into(),
-                            subtitle: pin_subtitle(r, status),
+                            subtitle,
+                            playlist_list_offline,
                             playlist_pinned: status.is_some(),
                             detail: r.detail.as_str().into(),
                             can_open: if matches!(route, Route::Picker(_)) {
@@ -1737,11 +1789,12 @@ impl Browser {
             return;
         }
         let structural = old.epoch != self.pin_view.epoch || old.revision != self.pin_view.revision;
+        let refresh_local_list =
+            structural && self.page.local_audio && self.route == Route::Playlists;
         if structural {
             self.cache.saved_changed();
             if saved_route(&self.route)
-                || self.page.local_audio
-                    && matches!(self.route, Route::Playlists | Route::Playlist(_))
+                || self.page.local_audio && matches!(self.route, Route::Playlist(_))
             {
                 if self.writing {
                     self.saved_reload_due = true;
@@ -1775,8 +1828,9 @@ impl Browser {
                             pinned,
                         )
                     });
-                    (actions.is_some() || old.map(|r| r.label()) != new.map(|r| r.label()))
-                        .then(|| (i, pin_subtitle(row, new), actions))
+                    let copy = pin_row_copy(&self.route, row, new);
+                    (actions.is_some() || pin_row_copy(&self.route, row, old) != copy)
+                        .then_some((i, copy, actions))
                 })
                 .collect()
         } else {
@@ -1802,9 +1856,10 @@ impl Browser {
                     ui.set_playlist_actions(actions);
                 }
                 let rows = ui.get_browse_rows();
-                for (index, text, actions) in changes {
+                for (index, (subtitle, offline), actions) in changes {
                     if let Some(mut row) = rows.row_data(index) {
-                        row.subtitle = text;
+                        row.subtitle = subtitle;
+                        row.playlist_list_offline = offline;
                         if let Some((actions, pinned)) = actions {
                             row.actions = strings(actions);
                             row.playlist_pinned = pinned;
@@ -1820,6 +1875,16 @@ impl Browser {
         };
         if detail_state(old) != detail_state(new) {
             self.render(false);
+        }
+        // A pin can change the badge and menu without changing the offline
+        // projection (e.g. local audio from a different source remains). Patch
+        // surviving rows before re-reading membership and playability.
+        if refresh_local_list {
+            if self.writing {
+                self.saved_reload_due = true;
+            } else {
+                self.visit(Navigation::Untracked(self.route.clone()));
+            }
         }
     }
     fn reset(&mut self, access: Option<Access>) {
@@ -3447,6 +3512,93 @@ async fn downloads_page(access: &Access) -> Result<Page, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_list_offline_marks_keep_intent_progress_errors_and_commits_distinct() {
+        use playlist_pins::{Phase, Status};
+        let project = |phase, committed, hint| {
+            playlist_list_offline(Some(&Status::fixture(phase, committed, hint)))
+        };
+        assert_eq!(playlist_list_offline(None), PlaylistListOffline::default());
+        let mut removed = Status::fixture(Phase::Saved, true, None);
+        removed.wanted = false;
+        assert_eq!(
+            playlist_list_offline(Some(&removed)),
+            PlaylistListOffline::default()
+        );
+
+        let saved = project(Phase::Saved, true, None);
+        assert_eq!(saved.mark, PlaylistOfflineMark::Saved);
+        assert!(!saved.retained);
+        assert_eq!(saved.description.as_str(), "Saved on this device");
+
+        for committed in [false, true] {
+            let pending = project(Phase::Pending, committed, None);
+            assert_eq!(pending.mark, PlaylistOfflineMark::Pending);
+            assert_eq!(pending.retained, committed);
+            assert!(pending.description.contains(if committed {
+                "Refresh pending"
+            } else {
+                "Waiting to download"
+            }));
+            let starting = project(
+                Phase::Downloading {
+                    verified: 0,
+                    total: 0,
+                },
+                committed,
+                None,
+            );
+            assert_eq!(starting.mark, PlaylistOfflineMark::Downloading);
+            assert!(starting.percent.is_empty());
+            let progress = project(
+                Phase::Downloading {
+                    verified: 1,
+                    total: 3,
+                },
+                committed,
+                None,
+            );
+            assert_eq!(progress.mark, PlaylistOfflineMark::Downloading);
+            assert_eq!(progress.percent.as_str(), "33%");
+            assert!(progress.description.contains("1 of 3"));
+            assert_eq!(progress.retained, committed);
+            let complete = project(
+                Phase::Downloading {
+                    verified: usize::MAX,
+                    total: usize::MAX,
+                },
+                committed,
+                None,
+            );
+            assert_eq!(complete.mark, PlaylistOfflineMark::Downloading);
+            assert_eq!(complete.percent.as_str(), "100%");
+            let interrupted = project(
+                Phase::Retry,
+                committed,
+                Some("A track is not saved on this device."),
+            );
+            assert_eq!(interrupted.mark, PlaylistOfflineMark::Retry);
+            assert_eq!(interrupted.retained, committed);
+            assert!(interrupted.description.contains("A track is not saved"));
+            assert_ne!(interrupted.description, saved.description);
+        }
+    }
+
+    #[test]
+    fn playlist_list_status_is_separate_from_count_and_does_not_change_saved_route() {
+        let row = pages::Row {
+            subtitle: "1 song".into(),
+            ..Default::default()
+        };
+        let status = playlist_pins::Status::fixture(playlist_pins::Phase::Pending, false, None);
+        let (count, mark) = pin_row_copy(&Route::Playlists, &row, Some(&status));
+        assert_eq!(count.as_str(), "1 song");
+        assert_eq!(mark.mark, PlaylistOfflineMark::Pending);
+        let (saved_subtitle, saved_mark) = pin_row_copy(&Route::Offline, &row, Some(&status));
+        assert_eq!(saved_subtitle.as_str(), "1 song · Waiting to download");
+        assert_eq!(saved_mark, PlaylistListOffline::default());
+    }
 
     #[test]
     fn playlist_order_basis_preserves_only_the_original_online_authority() {
