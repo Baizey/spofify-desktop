@@ -45,6 +45,8 @@ mod pages;
 mod personal;
 #[path = "../src/personal_bridge.rs"]
 mod personal_bridge;
+#[path = "../src/playback_sync.rs"]
+mod playback_sync;
 #[path = "../src/player.rs"]
 mod player;
 #[path = "../src/playlist_browser.rs"]
