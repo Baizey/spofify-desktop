@@ -1404,7 +1404,7 @@ async fn quick_add_writer_parks_unapplied_ingress_without_blocking_normal_writes
             json!({"type":"personal","command":{"type":"addEntry","playlistId":"target","trackId":"song"}})
         );
         assert!(
-            time::timeout(Duration::from_millis(30), server.next())
+            time::timeout(Duration::from_millis(30), read_json(&mut server))
                 .await
                 .is_err()
         );
