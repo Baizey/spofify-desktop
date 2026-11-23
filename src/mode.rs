@@ -119,6 +119,22 @@ impl ModeControl {
     pub(crate) fn request(&self, access: &Access, offline: bool) {
         self.request_inner(offline, || Some(access.clone()));
     }
+    /// Reserve the cold auto-connect epoch without overriding any later manual choice.
+    pub(crate) fn begin_automatic(&self, epoch: u64) -> Option<u64> {
+        let mut s = self.choice.lock().unwrap_or_else(|e| e.into_inner());
+        if s.epoch > epoch || (s.epoch == epoch && (s.unread || s.offline)) {
+            return None;
+        }
+        *s = Choice {
+            epoch,
+            offline: false,
+            serial: s.serial.wrapping_add(1),
+            unread: false,
+        };
+        self.changed.send_replace(s.serial);
+        Some(s.serial)
+    }
+
     /// Serialize opening network access with a possible concurrent close. The
     /// callback only performs local state transitions/tasks, never network I/O.
     pub fn apply(&self, epoch: u64, callback: impl FnOnce(bool, u64)) {

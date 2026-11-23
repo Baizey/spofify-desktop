@@ -111,6 +111,11 @@ async fn online_large_wav_starts_before_tail_and_seeks_and_ends_on_one_body() {
     let startup = started_at.elapsed();
     assert!(audio.has_started() && audio.facts().elapsed > 0.0);
     assert!(!source.cacheable(), "the tail has not been sent");
+    assert!(source.reusable_online());
+    assert!(
+        source.isolated().is_none(),
+        "a written prefix is not enough"
+    );
 
     let duration = DATA as f64 / (2 * RATE) as f64;
     let seek = duration - 0.025;
@@ -147,6 +152,16 @@ async fn online_large_wav_starts_before_tail_and_seeks_and_ends_on_one_body() {
     assert_eq!(audio.failure(), None);
     assert_eq!(audio.facts().elapsed, duration);
     assert!(source.cacheable());
+    let isolated = source
+        .isolated()
+        .expect("complete spool is reusable offline");
+    assert!(isolated._transfer.is_none());
+    drop((audio, source));
+    let mut reader = isolated.reader();
+    reader.seek(SeekFrom::End(-2)).unwrap();
+    let mut tail = [0; 2];
+    reader.read_exact(&mut tail).unwrap();
+    assert_eq!(tail, SAMPLE);
     server.await.unwrap();
     eprintln!(
         "34 MiB online: prefix PCM at {startup:?}, far seek after releasing tail in {seek_wait:?}"
@@ -196,4 +211,13 @@ async fn online_short_body_is_not_success_or_cacheable() {
             .is_err()
     );
     assert!(!source.cacheable());
+    assert!(source.isolated().is_none());
+}
+
+#[test]
+fn unverified_file_is_not_an_isolated_input() {
+    let file = anonymous_fixture().unwrap();
+    file.write_all_at(&SAMPLE, 0).unwrap();
+    let source = AudioInput::file(file, 0, SAMPLE.len() as u64);
+    assert!(source.isolated().is_none());
 }

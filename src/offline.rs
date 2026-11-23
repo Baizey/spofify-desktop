@@ -1,6 +1,6 @@
 //! Explicitly downloaded audio. Linux, local filesystem, private to the OS user.
-//! Explicit Offline uses the non-revoked local grant from the current sign-in,
-//! independently of the network cookie deadline. Nothing grants offline sign-in.
+//! Access requires the account's non-revoked local grant, independent of the
+//! network cookie deadline while offline. A record is never sign-in authority.
 //! Downloaded bytes survive logout but become inaccessible until the same account
 //! at the same canonical origin signs in again. No credentials or server paths
 //! are persisted. A download grants no player/coordinator authority.
@@ -672,7 +672,7 @@ impl OfflineStore {
         check()?;
         Ok(PlaybackInput {
             item: header.track.item(),
-            source: AudioInput::file(file, offset, header.bytes),
+            source: AudioInput::verified_saved(file, offset, header.bytes),
             recording: actual_recording,
         })
     }
@@ -1540,6 +1540,16 @@ mod tests {
         let mut actual = Vec::new();
         chosen.source.reader().read_to_end(&mut actual).unwrap();
         assert_eq!(actual, b"verified local bytes");
+        // In isolation the engine can keep this exact verified descriptor;
+        // a fresh online admission must still reopen and verify by account.
+        let isolated = chosen.source.isolated().unwrap();
+        let local = session.clone();
+        local.set_offline(true);
+        assert!(store.remove(&api, &local, "saved").unwrap());
+        actual.clear();
+        isolated.reader().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, b"verified local bytes");
+        local.set_offline(false);
         for id in ["foreign", "missing"] {
             let chosen = read(id).await.unwrap();
             assert!(chosen.source.reusable_online());

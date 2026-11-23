@@ -22,7 +22,7 @@ use rustix::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    api::{Origin, RememberedCredential, RememberedLogin},
+    api::{Origin, RememberedLogin},
     storage::{DIR_FLAGS, private_dir},
 };
 
@@ -92,6 +92,14 @@ pub(crate) struct LoginStore {
 #[derive(Clone)]
 pub(crate) struct StagedMode(LoginProfile);
 
+impl StagedMode {
+    pub(crate) fn matches(&self, profile: &LoginProfile) -> bool {
+        self.0.active_slot == profile.active_slot
+            && self.0.origin.as_str() == profile.origin.as_str()
+            && self.0.username == profile.username
+    }
+}
+
 impl LoginStore {
     pub(crate) fn open_default() -> Result<Self> {
         let absolute = |name: &str| {
@@ -130,10 +138,18 @@ impl LoginStore {
         &self,
         origin: &Origin,
         username: &str,
-        credential: Option<&RememberedCredential>,
+        login: Option<&RememberedLogin>,
         permitted: Permit<'_>,
     ) -> Result<LoginProfile> {
-        let blob = credential
+        if let Some(login) = login {
+            let RememberedLogin::Offline(grant) = login else {
+                return Err(StoreError::InvalidInput);
+            };
+            grant
+                .validate(origin, username)
+                .map_err(|_| StoreError::InvalidInput)?;
+        }
+        let blob = login
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_| StoreError::InvalidInput)?;
@@ -179,51 +195,93 @@ impl LoginStore {
         self.retire_active(expected).map(|_| ())
     }
 
-    pub(crate) async fn change_mode(
+    /// Change the preference already bound to this account. A cold local
+    /// session has no bearer or deadline to export: the exact staged keyring
+    /// record is read and its format is the only grant field changed.
+    pub(crate) async fn change_preference(
+        &self,
+        expected: &LoginProfile,
+        staged: &StagedMode,
+        account: &str,
+        manual_offline: bool,
+        permitted: Permit<'_>,
+    ) -> Result<LoginProfile> {
+        self.replace_remembered(
+            &SecretService,
+            expected,
+            Some(staged),
+            |current| preferred(current, expected, account, manual_offline),
+            permitted,
+        )
+        .await
+    }
+
+    /// Upgrade only the existing legacy bearer after the engine accepted its
+    /// HTTP-validated session. Never substitute a different cookie or account.
+    pub(crate) async fn upgrade_legacy(
         &self,
         expected: &LoginProfile,
         login: &RememberedLogin,
-        staged: &StagedMode,
         permitted: Permit<'_>,
     ) -> Result<LoginProfile> {
-        self.change_mode_with_permit(&SecretService, expected, login, staged, permitted)
-            .await
+        self.replace_remembered(
+            &SecretService,
+            expected,
+            None,
+            |current| upgraded(current, expected, login),
+            permitted,
+        )
+        .await
     }
 
-    async fn change_mode_with_permit(
+    async fn replace_remembered(
         &self,
         keyring: &impl Keyring,
         expected: &LoginProfile,
-        login: &RememberedLogin,
-        StagedMode(staged): &StagedMode,
+        staged: Option<&StagedMode>,
+        update: impl FnOnce(RememberedLogin) -> Result<RememberedLogin>,
         permitted: Permit<'_>,
     ) -> Result<LoginProfile> {
-        let blob = serde_json::to_vec(login).map_err(|_| StoreError::InvalidInput)?;
-        if !valid_secret(&blob) {
-            return Err(StoreError::InvalidInput);
-        }
         let _lock = self.lock()?;
-        let mut old = self
-            .read()?
-            .filter(|meta| {
-                meta.active.is_none()
-                    && meta.cleanup.is_some()
-                    && meta.cleanup == staged.active_slot
-                    && staged.active_slot == expected.active_slot
-                    && meta.matches(staged)
-                    && meta.matches(expected)
-            })
-            .ok_or(StoreError::InvalidCredential)?;
+        if !permitted() {
+            return Err(StoreError::InvalidCredential);
+        }
+        let mut old = self.read()?.ok_or(StoreError::InvalidCredential)?;
+        let slot = match staged {
+            Some(StagedMode(staged))
+                if old.active.is_none()
+                    && old.cleanup == expected.active_slot
+                    && expected.active_slot == staged.active_slot
+                    && old.matches(expected)
+                    && old.matches(staged) =>
+            {
+                old.cleanup
+            }
+            None if old.active_matches(expected) => old.active,
+            _ => None,
+        }
+        .ok_or(StoreError::InvalidCredential)?;
+        config(fs::fsync(&self.dir))?;
         let current = keyring
-            .lookup(old.cleanup.unwrap())
+            .lookup(slot)
             .await?
             .filter(|b| valid_secret(b))
             .ok_or(StoreError::InvalidCredential)?;
-        let current: RememberedLogin =
+        let current =
             serde_json::from_slice(&current).map_err(|_| StoreError::InvalidCredential)?;
-        // A lost, replaced or differently bound item must not be re-created.
-        if current.credential() != login.credential() {
+        let replacement = update(current)?;
+        let blob = serde_json::to_vec(&replacement).map_err(|_| StoreError::InvalidInput)?;
+        if !valid_secret(&blob) {
+            return Err(StoreError::InvalidInput);
+        }
+        if !permitted() {
             return Err(StoreError::InvalidCredential);
+        }
+        // An upgrade validates the still-active legacy record before disarming
+        // it. Other writes can supply their prior exact, durably disarmed slot.
+        if old.active.is_some() {
+            old.cleanup = old.active.take();
+            self.commit(&old)?;
         }
         self.finish_cleanup(keyring, &mut old).await?;
         self.publish_keyring(keyring, old, Some(&blob), permitted)
@@ -447,6 +505,45 @@ impl LoginStore {
         drop(temp);
         config(fs::fsync(&self.dir))
     }
+}
+
+fn preferred(
+    current: RememberedLogin,
+    expected: &LoginProfile,
+    account: &str,
+    manual_offline: bool,
+) -> Result<RememberedLogin> {
+    let RememberedLogin::Offline(mut grant) = current else {
+        return Err(StoreError::InvalidCredential);
+    };
+    grant
+        .validate(&expected.origin, &expected.username)
+        .map_err(|_| StoreError::InvalidCredential)?;
+    if !grant.matches_principal(&expected.username, account) {
+        return Err(StoreError::InvalidCredential);
+    }
+    grant.set_manual_offline(manual_offline);
+    Ok(RememberedLogin::Offline(grant))
+}
+
+fn upgraded(
+    current: RememberedLogin,
+    expected: &LoginProfile,
+    login: &RememberedLogin,
+) -> Result<RememberedLogin> {
+    let (RememberedLogin::Online(legacy), RememberedLogin::Offline(grant)) = (current, login)
+    else {
+        return Err(StoreError::InvalidCredential);
+    };
+    grant
+        .validate(&expected.origin, &expected.username)
+        .map_err(|_| StoreError::InvalidCredential)?;
+    if grant.manual_offline() || &legacy != login.credential() {
+        return Err(StoreError::InvalidCredential);
+    }
+    // The server-validated candidate is in memory; never derive a grant from
+    // an unvalidated bearer. Clone only this exact candidate for publication.
+    Ok(login.clone())
 }
 
 struct Stage<'a>(&'a OwnedFd);

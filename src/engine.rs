@@ -1,10 +1,13 @@
-//! Account-state.v1 controller, output executor, and independent saved queue.
+//! Desktop playback actor: independent local playback and the v3 account room.
+#[cfg(test)]
+#[path = "engine_cross_native_tests.rs"]
+mod cross_native_tests;
 #[path = "engine_crossfade.rs"]
 mod crossfade;
+#[path = "engine_native_v3.rs"]
+mod native;
 #[path = "engine_online.rs"]
 mod online;
-#[path = "engine_output.rs"]
-mod output;
 
 use crate::{
     AppWindow, ArtistCredit, DeviceRow, QueueRow,
@@ -29,7 +32,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     sync::{Semaphore, mpsc, watch},
@@ -53,8 +56,6 @@ pub enum AuthCommand {
 
 pub enum Command {
     Scoped(u64, Box<Command>),
-    Toggle,
-    Transport(&'static str),
     Playback(Action),
     Personal {
         epoch: u64,
@@ -78,7 +79,6 @@ pub enum Command {
         key: u64,
         after: Option<u64>,
     },
-    #[cfg(target_os = "linux")]
     GuardedToggle(String),
     #[cfg(test)]
     Offline(bool),
@@ -101,12 +101,9 @@ impl Command {
     }
 }
 
-const REPORT_INTERVAL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(25);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_FIRST_DELAY: Duration = Duration::from_millis(500);
-const PROBE_MAX_DELAY: Duration = Duration::from_secs(30);
-const INITIAL_PLAY_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_ATTEMPTS: u8 = 4;
 const LYRIC_SEEK_LEAD_MS: i32 = 250;
 
 fn lyric_seek_before_ms(duration: f64) -> i32 {
@@ -147,8 +144,8 @@ enum Reply {
     },
     Media {
         epoch: u64,
-        operation: u64,
-        result: Result<offline::OnlineMedia, ApiError>,
+        request: native::MediaRequest,
+        source: Option<crate::audio_input::AudioInput>,
     },
     OfflineMedia {
         epoch: u64,
@@ -174,7 +171,6 @@ struct Engine {
     logouts: Vec<JoinHandle<()>>,
     account: Option<Account>,
     offline: bool,
-    pending_initial_play: Option<(Instant, socket::Command)>,
     audio: Option<Audio>,
     master_gain: MasterGain,
     local: LocalQueue,
@@ -201,90 +197,93 @@ impl Engine {
         self.epoch == self.shared_epoch.load(Ordering::SeqCst)
     }
     fn room_token(&self) -> Option<String> {
-        if !self.current() {
+        if !self.current() || !self.account.as_ref()?.session.can_access_local() {
             return None;
         }
-        if self.offline || self.local_store.is_some() {
-            return self
-                .account
-                .as_ref()
-                .filter(|a| a.session.can_access_local())
-                .map(|_| format!("local:{}:{}", self.room_incarnation, self.local_revision));
+        if self.online_generation().is_none() {
+            if self.local_store.is_some() || !self.online.detached {
+                return Some(format!(
+                    "local:{}:{}:{}",
+                    self.room_incarnation,
+                    self.local_queue_instance,
+                    self.local.occurrence.as_deref().unwrap_or_default()
+                ));
+            }
+            let cursor = self.online.native.cursor()?;
+            return Some(format!(
+                "isolated:{}:{}",
+                self.room_incarnation,
+                cursor.occurrence.as_deref().unwrap_or_default()
+            ));
         }
-        self.online_generation()?;
-        self.online
-            .state
-            .as_ref()
-            .map(|_| format!("{}:{}", self.room_incarnation, self.online.revision))
+        let basis = self.online.projection.basis(&socket::Action::Next)?;
+        Some(format!(
+            "{}:{}:{}:{}:{}",
+            self.room_incarnation,
+            basis.session_id,
+            basis.generation,
+            basis.occurrence.as_deref().unwrap_or_default(),
+            basis.successor_key.unwrap_or_default()
+        ))
     }
     fn lyric_seek_before_ms(&self) -> i32 {
-        // Online Saved can also display fetched lyrics, without a room link.
-        if !self.network_allowed() || self.reconnect.is_some() {
+        if self.online_generation().is_none() {
             return 0;
         }
-        let (duration, executing) = if self.local_store.is_some() {
-            (
-                self.local.current().map(|row| row.track.duration),
-                self.local.desired,
-            )
-        } else {
-            // A detached/provisional clock is not an authoritative seek target.
-            if self.online.has_provisional_cursor()
-                || self.online.starting_locally()
-                || self.pending_initial_play.is_some()
-                || self.online_generation().is_none()
-            {
-                return 0;
-            }
-            (
-                self.online
-                    .state
-                    .as_ref()
-                    .and_then(|state| state.current())
-                    .map(|row| row.duration),
-                self.online.execution.is_some(),
-            )
+        let Some(state) = self.online.visible() else {
+            return 0;
         };
-        let mut before_ms = lyric_seek_before_ms(duration.unwrap_or_default());
-        if executing && let Some(audio) = self.audio.as_ref() {
+        let mut cap = lyric_seek_before_ms(state.current().map_or(0.0, |row| row.duration));
+        if self.online.is_owner(&self.device_id)
+            && let Some(audio) = &self.audio
+        {
             let decoded = lyric_seek_before_ms(audio.facts().duration);
-            if decoded > 0 || self.local_store.is_some() {
-                before_ms = before_ms.min(decoded);
+            if decoded > 0 {
+                cap = cap.min(decoded);
             }
         }
-        before_ms
+        cap
     }
     fn can_queue_saved(&self) -> bool {
         self.current()
-            && self.account.as_ref().is_some_and(|a| {
-                a.session.can_access_local() && a.session.is_offline() == self.offline
-            })
-            // While online, append only to a queue that is already local.
-            // Even an apparently empty account queue may have a write in flight.
-            && (self.offline || self.local_store.is_some())
+            && self.online_generation().is_none()
+            && !self.online.detached
+            && self
+                .account
+                .as_ref()
+                .is_some_and(|a| a.session.can_access_local())
     }
     fn queue_order_token(&self) -> Option<String> {
-        let has_targets = if self.offline || self.local_store.is_some() {
-            self.local
-                .entries
-                .len()
-                .saturating_sub(self.local.upcoming_start())
-                > 1
+        let order = if self.online_generation().is_none() && !self.online.detached {
+            let upcoming = &self.local.entries[self.local.upcoming_start()..];
+            (upcoming.len() > 1).then_some(self.local_revision)?
         } else {
-            // The output engine may be auditioning a provisional successor.
-            // Only Go's canonical cursor defines the editable upcoming range.
-            if self.online.has_provisional_cursor() || self.pending_initial_play.is_some() {
+            use std::hash::{Hash, Hasher};
+            let upcoming = self.online_upcoming()?;
+            if upcoming.len() < 2 {
                 return None;
             }
-            let state = self.online.state.as_ref()?;
-            let current = state.queue.iter().position(|r| r.key == state.cursor.key)?;
-            state.queue.len().saturating_sub(current + 1) > 1
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            for row in upcoming {
+                row.key.hash(&mut hash);
+            }
+            hash.finish()
         };
-        if !has_targets {
-            return None;
-        }
         let mode = *self.account.as_ref()?.session.network_changes().borrow();
-        Some(format!("{}:{mode}", self.room_token()?))
+        Some(format!("{}:{order}:{mode}", self.room_token()?))
+    }
+    fn online_upcoming(&self) -> Option<&[socket::Track]> {
+        let (state, key) = if self.online.detached {
+            (
+                self.online.native.state()?,
+                self.online.native.cursor()?.key,
+            )
+        } else {
+            let state = self.online.visible()?;
+            (state, state.cursor.key)
+        };
+        let current = state.queue.iter().position(|r| r.key == key)?;
+        Some(&state.queue[current + 1..])
     }
 
     fn reorder_queue(&mut self, basis: &str, key: u64, after: Option<u64>) {
@@ -293,10 +292,8 @@ impl Engine {
         if !self.offline && self.socket.as_ref().is_some_and(|s| !s.events.is_empty()) {
             return;
         }
-        let local = self.offline || self.local_store.is_some();
-        if (!local && self.online.queue_order_pending())
-            || self.queue_order_token().as_deref() != Some(basis)
-        {
+        let local = self.online_generation().is_none() && !self.online.detached;
+        if self.queue_order_token().as_deref() != Some(basis) {
             return;
         }
         let valid = if local {
@@ -310,20 +307,14 @@ impl Engine {
                 after,
             )
         } else {
-            self.online.state.as_ref().is_some_and(|s| {
-                s.queue
-                    .iter()
-                    .position(|r| r.key == s.cursor.key)
-                    .is_some_and(|pos| {
-                        queue_destination(s.queue.iter().skip(pos + 1).map(|r| r.key), key, after)
-                    })
-            })
+            self.online_upcoming()
+                .is_some_and(|rows| queue_destination(rows.iter().map(|r| r.key), key, after))
         };
         if valid {
             let Some(mode_stamp) = basis
                 .rsplit(':')
                 .next()
-                .and_then(|stamp| stamp.parse().ok())
+                .and_then(|stamp| stamp.parse::<u64>().ok())
             else {
                 return;
             };
@@ -338,26 +329,16 @@ impl Engine {
                 }
                 let change = self.local.action(action);
                 self.local_change(change);
-            } else {
-                self.send_queue_order(action, mode_stamp);
+            } else if self
+                .account
+                .as_ref()
+                .is_some_and(|a| *a.session.network_changes().borrow() == mode_stamp)
+            {
+                self.action(action);
             }
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn detached_media_token(&self) -> Option<String> {
-        if !self.network_allowed()
-            || self.local_store.is_some()
-            || self.online_generation().is_some()
-        {
-            return None;
-        }
-        self.online.execution.as_ref()?.media_pause_token(
-            self.online.cursor()?,
-            self.room_incarnation,
-            self.online.revision,
-        )
-    }
     fn network_allowed(&self) -> bool {
         self.current()
             && !self.offline
@@ -371,7 +352,7 @@ impl Engine {
             epoch: self.epoch,
             api: a.api.clone(),
             session: a.session.clone(),
-            offline: self.offline,
+            offline: self.online_generation().is_none(),
             personal: self.personal.access(),
         });
         self.personal
@@ -473,7 +454,6 @@ impl Engine {
         }
     }
     fn clear_output(&mut self) {
-        self.pending_initial_play = None;
         self.room_incarnation = self.room_incarnation.wrapping_add(1);
         self.local_revision = 0;
         self.cancel_work();
@@ -488,66 +468,52 @@ impl Engine {
         self.action_status = "";
     }
     fn connect(&mut self) {
-        if self.network_allowed()
-            && let Some(a) = &self.account
-            && self.socket.is_none()
-        {
-            self.audio = Some(Audio::new(
-                Some(a.session.clone()),
-                false,
-                self.shared_epoch.clone(),
-                self.epoch,
-                self.master_gain.clone(),
-            ));
-            self.socket = socket::spawn(
-                a.api.clone(),
-                a.session.clone(),
-                socket::DeviceIdentity {
-                    device_id: self.device_id.clone(),
-                    name: "Spofify Desktop".into(),
-                    can_play: true,
-                },
-            )
-            .ok();
+        if !self.network_allowed() || self.socket.is_some() || self.online.superseded {
+            return;
         }
+        let Some(a) = &self.account else {
+            return;
+        };
+        self.socket = socket::spawn(
+            a.api.clone(),
+            a.session.clone(),
+            socket::DeviceIdentity {
+                device_id: self.device_id.clone(),
+                name: "Spofify Desktop".into(),
+                can_play: self.audio.is_some(),
+            },
+        )
+        .ok();
     }
     fn apply_mode(&mut self) {
         let mode = self.mode.clone();
-        let mut retired = None;
         mode.apply(self.epoch, |desired, serial| {
             self.cancel_reconnect();
-            // Even a superseded offline choice fences the Session immediately.
-            // Retire old online work, but never discard an existing local queue
-            // merely to validate a possible return online.
-            let fenced = self
-                .account
-                .as_ref()
-                .is_some_and(|a| a.session.is_offline());
-            let entering = (desired || fenced) && self.needs_mode_change(true);
-            if entering {
-                self.stop();
-                retired = self.audio.take();
-                self.set_offline(true);
-                // A later Go online is not yet a successful online choice.
-                self.save_mode(true, None);
-            }
-            if !desired && self.offline {
-                self.start_reconnect(serial);
+            if desired {
+                self.persist_fallback();
+            } else {
+                self.online.superseded = false;
+                if self.offline
+                    || self
+                        .account
+                        .as_ref()
+                        .is_some_and(|a| a.session.is_offline())
+                {
+                    self.set_offline(true);
+                    self.start_reconnect(serial);
+                } else {
+                    self.connect();
+                }
             }
         });
-        // Closing a native stream can join its backend thread. Never do that
-        // under the shared mode lock, which the UI uses for immediate fencing.
-        drop(retired);
-        // The native source and API consult this same immediate mode fence.
-        // An offline request that lands just after apply is also safe here.
         if !self.offline
+            && self.reconnect.is_none()
             && self
                 .account
                 .as_ref()
-                .is_some_and(|a| a.session.is_offline())
+                .is_some_and(|a| a.session.is_offline() && !a.session.is_local_only())
         {
-            self.set_offline(true);
-            self.save_mode(true, None);
+            self.persist_fallback();
         }
     }
     fn cancel_reconnect(&mut self) {
@@ -585,9 +551,8 @@ impl Engine {
                     &mode,
                     serial,
                     || current.load(Ordering::SeqCst) == epoch,
-                    Some(3),
                     || {
-                        auth::reconnect_local(&store, &profile, &session, || {
+                        auth::reconnect_local(&store, &profile, &api, &session, || {
                             current.load(Ordering::SeqCst) == epoch && mode.can_probe(epoch, serial)
                         })
                     },
@@ -613,7 +578,6 @@ impl Engine {
                     &mode,
                     serial,
                     || current.load(Ordering::SeqCst) == epoch,
-                    None,
                     || async {
                         api.validate_reconnect(&session).await.map_err(|error| {
                             if retained.is_some() && error.rejects_local_grant() {
@@ -670,7 +634,6 @@ impl Engine {
     fn finish_reconnect(&mut self, epoch: u64, serial: u64, result: Result<Rejoined, ApiError>) {
         if epoch != self.epoch
             || !self.current()
-            || !self.offline
             || self
                 .reconnect
                 .as_ref()
@@ -682,18 +645,21 @@ impl Engine {
         match result {
             Ok(rejoined) => {
                 let mode = self.mode.clone();
-                let mut retired = None;
                 mode.if_current_online(epoch, serial, || {
                     if !self.current() {
                         return;
                     }
                     let cold = matches!(&rejoined, Rejoined::Cold(..));
+                    let was_manual = self.offline;
                     let profile = match &rejoined {
                         Rejoined::Cold(_, profile) => Some(profile.clone()),
                         Rejoined::Existing => self.retained.as_ref().and_then(Retention::profile),
                     };
                     let mut staged = None;
-                    if self.retained.is_some() && (profile.is_some() || self.login_store.is_ok()) {
+                    if was_manual
+                        && self.retained.is_some()
+                        && (profile.is_some() || self.login_store.is_ok())
+                    {
                         match self
                             .login_store
                             .as_deref()
@@ -711,62 +677,55 @@ impl Engine {
                             }
                         }
                     }
-                    if let Rejoined::Cold(account, _) = rejoined
-                        && let Some(local) = self.account.replace(account)
-                    {
-                        self.revoke(local);
+                    if let Rejoined::Cold(account, _) = rejoined {
+                        if let Some(audio) = &mut self.audio {
+                            audio.rebind_account_session(account.session.clone());
+                        }
+                        if let Some(local) = self.account.replace(account) {
+                            self.revoke(local);
+                        }
                     }
-                    self.stop();
-                    retired = self.audio.take();
-                    self.save_mode(false, staged);
                     self.set_offline(false);
+                    if was_manual {
+                        self.save_mode(false, staged);
+                    }
                 });
-                drop(retired);
             }
             Err(e) if e.expired || e.status == 401 => self.expire(),
-            Err(_) => self.action_status = "Working offline",
+            Err(_) => self.persist_fallback(),
         }
     }
-    fn needs_mode_change(&self, offline: bool) -> bool {
-        self.offline != offline
-            || self
-                .account
-                .as_ref()
-                .is_some_and(|a| a.session.is_offline() != offline)
-    }
-    fn set_offline(&mut self, offline: bool) {
-        if !self.needs_mode_change(offline) {
+    fn persist_fallback(&mut self) {
+        if self.offline && self.socket.is_none() {
             return;
         }
-        // Going offline fences all credential clones before any old task can
-        // resume. Going online retires the local decoder before lifting it.
+        self.set_offline(true);
+        self.save_mode(true, None);
+    }
+    fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
+        if self.audio.is_none()
+            && let Some(a) = &self.account
+        {
+            self.audio = Some(Audio::new_account_scoped(
+                a.session.clone(),
+                self.shared_epoch.clone(),
+                self.epoch,
+                self.master_gain.clone(),
+            ));
+        }
         if offline {
+            self.cancel_login();
+            self.retire_pending(false);
             self.mode.block_updates();
             if let Some(a) = &self.account {
                 a.session.set_offline(true);
             }
-        }
-        self.cancel_login();
-        self.retire_pending(false);
-        self.clear_output();
-        // Previous account teardown requests must not keep running in offline mode.
-        if offline {
+            self.leave_link();
+            self.socket = None;
             for task in &self.logouts {
                 task.abort();
             }
-        }
-        self.offline = offline;
-        if self.offline {
-            self.audio = self.account.as_ref().map(|a| {
-                Audio::new(
-                    Some(a.session.clone()),
-                    true,
-                    self.shared_epoch.clone(),
-                    self.epoch,
-                    self.master_gain.clone(),
-                )
-            });
-            self.login_view(false, false, "");
         } else if let Some(a) = &self.account {
             if a.session.is_expired() {
                 self.expire();
@@ -782,34 +741,36 @@ impl Engine {
         let (Some(retained), Some(account)) = (&self.retained, &self.account) else {
             return;
         };
-        let grant = if offline {
-            account.api.offline_grant(&account.session)
-        } else {
-            account
-                .api
-                .remembered_credential(&account.session)
-                .map(crate::api::RememberedLogin::Online)
+        // Network state and the persisted manual preference differ. Publish
+        // only explicit choices (or exhaustion), scoped to the exact keyring slot.
+        let staged = staged.or_else(|| {
+            let profile = retained.profile()?;
+            self.login_store.as_ref().ok()?.stage_mode(&profile).ok()
+        });
+        self.write_auth(
+            self.epoch,
+            Write::preference(retained.clone(), account.session.clone(), offline, staged),
+        );
+    }
+    fn auth_transport_expired(&mut self) {
+        let Some(session) = self.account.as_ref().map(|a| a.session.clone()) else {
+            return;
         };
-        if let Ok(grant) = grant {
-            // Disarm the old mode before freeing its publication fence when
-            // possible; the ordered writer can stage a still-pending login slot.
-            let staged = staged.or_else(|| {
-                let profile = retained.profile()?;
-                self.login_store.as_ref().ok()?.stage_mode(&profile).ok()
-            });
-            self.write_auth(
-                self.epoch,
-                Write::Mode(retained.clone(), account.session.clone(), grant, staged),
-            );
-        } else if offline && !account.session.is_local_only() {
-            // A credential that expired or was denied just before Work offline
-            // cannot mint a new grant. Do not leave its previous online choice armed.
-            if let Some(profile) = retained.profile()
-                && let Ok(store) = &self.login_store
-            {
-                let _ = store.retire(Some(&profile));
-            }
-            self.write_auth(self.epoch, Write::ForgetRetained(retained.clone()));
+        if session.is_revoked() {
+            self.expire();
+            return;
+        }
+        if self.offline || self.reconnect.is_some() {
+            return;
+        }
+        // A local cookie deadline is not a server denial. Keep the local grant
+        // and decoder while rechecking the prior credential separately.
+        session.set_offline(true);
+        self.leave_link();
+        self.socket = None;
+        self.publish_access();
+        if let Some(serial) = self.mode.begin_automatic(self.epoch) {
+            self.start_reconnect(serial);
         }
     }
     fn expire(&mut self) {
@@ -962,9 +923,25 @@ impl Engine {
         }
     }
     fn scoped(&mut self, command: Command) {
-        if !self.offline {
-            // Resolve buffered canonical changes before comparing a displayed
-            // queue token or deciding whether the transport button is Pause.
+        // A guarded local transport event was issued against the displayed
+        // offline visit. Serialize it ahead of an opening snapshot queued
+        // concurrently; any resulting cursor is eligible for claim repair,
+        // never reinterpreted as a new command sent to another owner.
+        let local_transport = self.online_generation().is_none()
+            && match &command {
+                Command::GuardedToggle(token)
+                | Command::Guarded(
+                    token,
+                    Action::Pause
+                    | Action::Resume
+                    | Action::Seek(_)
+                    | Action::Next
+                    | Action::Previous
+                    | Action::Jump(_),
+                ) => !token.is_empty() && self.room_token().as_deref() == Some(token),
+                _ => false,
+            };
+        if !local_transport {
             self.drain_online_events(None);
         }
         match command {
@@ -977,9 +954,9 @@ impl Engine {
                 input,
                 store,
             } if self.audio.is_some()
+                && self.online_generation().is_none()
                 && self.account.as_ref().is_some_and(|a| {
                     *a.session.network_changes().borrow() == mode_stamp
-                        && a.session.is_offline() == self.offline
                         && a.session.can_access_local()
                 }) =>
             {
@@ -990,13 +967,8 @@ impl Engine {
                 {
                     return;
                 }
-                if !self.offline && !self.pause_room_for_saved() {
-                    return;
-                }
                 if self.local.replace(queue, index, false) == Change::Start {
-                    // A newer explicit Saved Play supersedes a catalog Play
-                    // still waiting for the first account snapshot.
-                    self.pending_initial_play = None;
+                    self.online.detached = false;
                     self.cancel_work();
                     self.stop();
                     self.local_store = Some(store);
@@ -1022,20 +994,23 @@ impl Engine {
                     self.local_change(Change::Edit);
                 }
             }
-            #[cfg(target_os = "linux")]
-            Command::Guarded(token, Action::Pause) | Command::GuardedToggle(token)
-                if token.starts_with("detached:")
-                    && self.detached_media_token().as_deref() == Some(token.as_str()) =>
-            {
-                self.pause_detached_media();
-            }
             Command::ReorderQueue { basis, key, after } => self.reorder_queue(&basis, key, after),
             Command::Guarded(token, action) => {
-                if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) {
+                let current = self.room_token();
+                // Next's successor guard must not discard a rapid explicit
+                // repeat change merely because it changed what Next means.
+                let same_room = self.online_generation().is_some()
+                    && matches!(
+                        action,
+                        Action::CycleRepeat | Action::Repeat(_) | Action::Shuffle(_)
+                    )
+                    && token
+                        .rsplit_once(':')
+                        .zip(current.as_deref().and_then(|t| t.rsplit_once(':')))
+                        .is_some_and(|((before, _), (now, _))| before == now);
+                if !token.is_empty() && (same_room || current.as_deref() == Some(token.as_str())) {
                     match action {
-                        Action::Pause if !self.wants_pause() && !self.online.starting_locally() => {
-                            ()
-                        }
+                        Action::Pause if !self.wants_pause() => (),
                         Action::Resume if self.wants_pause() => (),
                         _ => self.action(action),
                     }
@@ -1054,59 +1029,55 @@ impl Engine {
                     && let Some(seconds) = lyric_seek_seconds(start_ms, self.lyric_seek_before_ms())
                     && snapshot.is_current()
                 {
-                    if self.local_store.is_some() {
-                        self.action(Action::Seek(seconds));
-                    } else {
-                        self.seek_online_lyric(seconds, snapshot);
-                    }
+                    self.action(Action::Seek(seconds));
                 }
             }
             Command::Playback(action) if !action.depends_on_visible_queue() => self.action(action),
-            #[cfg(target_os = "linux")]
             Command::GuardedToggle(token)
                 if !token.is_empty() && self.room_token().as_deref() == Some(token.as_str()) =>
             {
                 self.toggle();
             }
-            Command::Toggle => self.toggle(),
-            Command::Transport("next") => self.action(Action::Next),
-            Command::Transport("previous") => self.action(Action::Previous),
-            Command::Transport("pause") => self.action(Action::Pause),
-            Command::Transport("resume") => self.action(Action::Resume),
-            Command::Transport("close") => self.action(Action::Close),
             _ => {}
+        }
+        if local_transport {
+            self.drain_online_events(None);
         }
     }
     fn wants_pause(&self) -> bool {
-        if self.offline || self.local_store.is_some() {
+        if self.online_generation().is_some() {
+            self.online.wants_pause()
+        } else if self.local_store.is_some() {
             self.local.desired
         } else {
-            self.online.wants_pause()
+            self.online.detached
+                && self
+                    .online
+                    .native
+                    .cursor()
+                    .is_some_and(|c| c.desired_playing)
         }
     }
     fn toggle(&mut self) {
-        self.action(if self.wants_pause() || self.online.starting_locally() {
+        self.action(if self.wants_pause() {
             Action::Pause
         } else {
             Action::Resume
         });
     }
     fn action(&mut self, action: Action) {
-        if !self.offline {
-            match action {
-                Action::Play { .. } | Action::SelectDevice(_) => {
-                    self.leave_saved_queue();
-                    self.online_action(action);
-                    return;
-                }
-                Action::Enqueue { .. } | Action::RenameDevice { .. } => {
-                    self.online_action(action);
-                    return;
-                }
-                _ => {}
+        if self.online_generation().is_some() {
+            if !self.online.reconciling_claim()
+                || matches!(
+                    action,
+                    Action::SelectDevice(_) | Action::RenameDevice { .. }
+                )
+            {
+                self.online_action(action);
             }
+            return;
         }
-        if self.offline || self.local_store.is_some() {
+        if self.local_store.is_some() || (!self.online.detached && !self.local.entries.is_empty()) {
             if self.local.desired
                 && self.local.current().is_some()
                 && let Some(audio) = &self.audio
@@ -1115,14 +1086,8 @@ impl Engine {
             }
             let change = self.local.action(action);
             self.local_change(change);
-            return;
-        }
-        self.online_action(action);
-    }
-    fn leave_saved_queue(&mut self) {
-        if self.local_store.is_some() {
-            self.local_change(Change::Clear);
-            self.local = LocalQueue::default();
+        } else if self.online.detached {
+            self.detached_action(action);
         }
     }
     fn tick_saved(&mut self) {
@@ -1132,7 +1097,7 @@ impl Engine {
                 self.local.elapsed = audio.facts().elapsed;
                 self.local.desired = false;
                 self.local_status = status;
-                self.stop();
+                self.stop_local();
                 return;
             }
             self.tick_saved_crossfade();
@@ -1150,12 +1115,12 @@ impl Engine {
         match change {
             Change::Start => {
                 self.cancel_work();
-                self.stop();
+                self.stop_local();
                 self.start_saved(None);
             }
             Change::Stop => {
                 self.cancel_work();
-                self.stop();
+                self.stop_local();
                 self.local_status = Status::Ok;
             }
             Change::Clear => {
@@ -1349,6 +1314,7 @@ impl Engine {
                 session,
                 origin,
                 kind,
+                manual_offline,
             },
         ) = self.auth_ready.take().unwrap();
         let cold = session.is_local_only();
@@ -1374,7 +1340,16 @@ impl Engine {
             })
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.retained = match kind {
-            Kind::Restored(profile) => Some(Retention::new(profile)),
+            Kind::Restored(profile) => {
+                let retained = Retention::new(profile);
+                if !cold && let Ok(login) = api.remembered_login(&session) {
+                    self.write_auth(
+                        epoch,
+                        Write::UpgradeLegacy(retained.clone(), session.clone(), login),
+                    );
+                }
+                Some(retained)
+            }
             Kind::Password { remember } => {
                 // Account replacement cannot leave an old cold slot active
                 // while keyring deletion / publication is pending.
@@ -1387,8 +1362,8 @@ impl Engine {
                     return;
                 }
                 let retained = Retention::default();
-                let credential = remember
-                    .then(|| api.remembered_credential(&session).ok())
+                let login = remember
+                    .then(|| api.remembered_login(&session).ok())
                     .flatten();
                 self.write_auth(
                     epoch,
@@ -1396,7 +1371,7 @@ impl Engine {
                         origin,
                         username: session.username.clone(),
                         wanted: remember,
-                        credential,
+                        login,
                         retained: retained.clone(),
                         session: session.clone(),
                     },
@@ -1404,16 +1379,25 @@ impl Engine {
                 remember.then_some(retained)
             }
         };
+        self.audio = Some(Audio::new_account_scoped(
+            session.clone(),
+            self.shared_epoch.clone(),
+            self.epoch,
+            self.master_gain.clone(),
+        ));
         self.account = Some(Account { api, session });
-        if cold {
-            // No socket, output selection, or resumed playback on admission.
+        if manual_offline {
             self.set_offline(true);
         } else {
-            // An accepted explicit sign-in can resolve a denied or unknown
-            // startup preference. A later sign-out is not a mode change.
-            self.mode.allow_updates(epoch, &self.shared_epoch);
             self.publish_access();
-            self.connect();
+            if cold {
+                if let Some(serial) = self.mode.begin_automatic(epoch) {
+                    self.start_reconnect(serial);
+                }
+            } else {
+                self.mode.allow_updates(epoch, &self.shared_epoch);
+                self.connect();
+            }
         }
     }
     fn finish_login(&self, fallback: auth::Fallback) {
@@ -1485,40 +1469,33 @@ impl Engine {
             }
             Reply::Media {
                 epoch,
-                operation,
-                result,
-            } if self.epoch == epoch && self.operation == operation && !self.offline => {
-                self.media = None;
-                self.complete_online(operation, result);
-            }
+                request,
+                source,
+            } if self.epoch == epoch => self.complete_online(request, source),
             _ => {}
         }
     }
     fn link(&self) -> Link {
-        self.socket.as_ref().map_or(Link::Closed, |s| {
-            if s.link.has_changed().is_err() {
-                Link::Closed
-            } else {
-                *s.link.borrow()
-            }
-        })
+        self.socket
+            .as_ref()
+            .map_or(Link::Closed, |s| *s.link.borrow())
     }
     fn cancel_work(&mut self) {
         self.operation = self.operation.wrapping_add(1);
         if let Some(task) = self.media.take() {
             task.abort();
         }
-        self.online.work = None;
     }
-    fn stop(&mut self) {
+    fn stop_local(&mut self) {
         self.local_lookahead = None;
-        self.cancel_online_crossfade();
-        self.online.execution = None;
-        self.online.clear_handoff();
-        self.online.clear_local_start();
         if let Some(audio) = &mut self.audio {
             audio.stop();
         }
+    }
+    fn stop(&mut self) {
+        self.online.cancel_loads();
+        self.online.native = native::NativeV3::default();
+        self.stop_local();
     }
     fn tick(&mut self) {
         self.tick_with_event(None);
@@ -1542,39 +1519,27 @@ impl Engine {
         // This control has no mailbox backlog; consumption and lifting the
         // shared Session fence happen under its latest-request lock.
         self.apply_mode();
-        if self.offline {
-            if self
-                .account
-                .as_ref()
-                .is_some_and(|a| !a.session.can_access_local())
-            {
-                self.expire();
-                return;
-            }
-            self.tick_saved();
-            return;
-        }
         if self
             .account
             .as_ref()
-            .is_some_and(|a| a.session.is_expired())
+            .is_some_and(|a| !a.session.can_access_local())
         {
-            self.expire();
-            return;
-        }
-        if !self.network_allowed() {
-            self.cancel_work();
-            self.stop();
-            self.socket = None;
-            return;
+            self.auth_transport_expired();
+            if self.account.is_none() {
+                return;
+            }
         }
         self.tick_online(event);
     }
     fn publish(&self) {
         let mut p = PlayerView {
             offline: self.offline,
-            local_playback: self.offline || self.local_store.is_some(),
-            reconnecting: self.reconnect.is_some(),
+            local_playback: self.online_generation().is_none(),
+            reconnecting: self.reconnect.is_some()
+                || (!self.offline
+                    && !self.online.superseded
+                    && self.account.is_some()
+                    && self.online_generation().is_none()),
             saved_queue_enabled: self.can_queue_saved(),
             status: self.action_status,
             room_token: self.room_token().unwrap_or_default(),
@@ -1582,18 +1547,9 @@ impl Engine {
             lyric_seek_before_ms: self.lyric_seek_before_ms(),
             ..PlayerView::default()
         };
-        if !self.offline {
-            self.project_online(&mut p);
-            #[cfg(target_os = "linux")]
-            if p.room_token.is_empty() && p.control {
-                p.room_token = self.detached_media_token().unwrap_or_default();
-            }
-            if let Some(cursor) = self.online.cursor().filter(|_| !p.track.is_empty()) {
-                p.media_track_token =
-                    format!("online:{}:{}:{}", cursor.key, cursor.chain, cursor.visit);
-            }
-        }
-        if p.local_playback {
+        self.project_online(&mut p);
+        let saved = p.local_playback && !self.online.detached;
+        if saved {
             p.media_track_token.clear();
             p.output = "This desktop".into();
             p.status = self.action_status;
@@ -1605,11 +1561,14 @@ impl Engine {
             p.context_name.clear();
             p.shuffle = self.local.shuffle;
             p.repeat = self.local.repeat.wire();
+            p.wants_pause = self.local.desired;
             p.elapsed = self.local.elapsed;
             if let Some(entry) = self.local.current() {
                 p.media_track_token = format!(
                     "local:{}:{}:{}",
-                    self.room_incarnation, self.local_queue_instance, entry.key
+                    self.room_incarnation,
+                    self.local_queue_instance,
+                    self.local.occurrence.as_deref().unwrap_or_default()
                 );
                 p.title = entry.track.title.clone();
                 p.detail = entry.track.subtitle.clone();
@@ -1661,20 +1620,18 @@ impl Engine {
         // Room identity is independent of queue revision/cursor changes. The
         // local queue can be replaced within the same authenticated room.
         if !p.queue.is_empty() {
-            if p.local_playback {
+            if saved {
                 p.queue_room_key = format!(
                     "local:{}:{}",
                     self.room_incarnation, self.local_queue_instance
                 );
+            } else if self.online.detached {
+                p.queue_room_key = format!("isolated:{}", self.room_incarnation);
             } else if let Some(generation) = self.online_generation() {
                 p.queue_room_key = format!("online:{}:{generation}", self.room_incarnation);
             }
         }
-        p.queue_order_writable = !p.queue_order_token.is_empty()
-            && (p.local_playback || !self.online.queue_order_pending());
-        p.queue_order_awaiting_echo = !p.queue_order_token.is_empty()
-            && !p.local_playback
-            && self.online.queue_order_awaiting_echo();
+        p.queue_order_writable = !p.queue_order_token.is_empty();
         p.publish(self.window.clone(), self.shared_epoch.clone(), self.epoch);
     }
 }
@@ -1836,6 +1793,7 @@ struct PlayerView {
     media_track_token: String,
     lyric_seek_before_ms: i32,
     playing: bool,
+    wants_pause: bool,
     control: bool,
     transport: bool,
     elapsed: f64,
@@ -1862,6 +1820,7 @@ impl PlayerView {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            ui.set_manual_offline(self.offline);
             ui.set_local_playback(self.local_playback);
             ui.set_reconnecting(self.reconnecting);
             ui.set_saved_queue_enabled(self.saved_queue_enabled);
@@ -1894,6 +1853,7 @@ impl PlayerView {
             ui.set_now_context_name(self.context_name.into());
             ui.set_output_name(self.output.into());
             ui.set_playing(self.playing);
+            ui.set_wants_pause(self.wants_pause);
             ui.set_can_control(self.control);
             ui.set_remote_controls(self.transport);
             ui.set_can_seek(self.transport && self.duration > 0.0);
@@ -1972,7 +1932,6 @@ async fn reconnect_attempts<T, F, Fut>(
     mode: &ModeControl,
     serial: u64,
     current_epoch: impl Fn() -> bool,
-    attempt_limit: Option<u8>,
     mut probe: F,
 ) -> Option<Result<T, ApiError>>
 where
@@ -1981,9 +1940,7 @@ where
 {
     let cancelled = mode.cancelled(serial);
     tokio::pin!(cancelled);
-    let mut delay = PROBE_FIRST_DELAY;
-    let mut attempts = 0_u8;
-    loop {
+    for attempt in 1..=AUTH_ATTEMPTS {
         if !current_epoch() {
             return None;
         }
@@ -1994,34 +1951,16 @@ where
                 message: "Connection is unavailable.", status: 408, expired: false,
             })),
         };
-        attempts = attempts.saturating_add(1);
-        let transient = result.as_ref().is_err_and(|e| {
-            !e.expired
-                && if attempt_limit.is_some() {
-                    e.can_retry_restore()
-                } else {
-                    matches!(e.status, 0 | 408 | 429 | 500..=599)
-                }
-        });
-        if !transient || attempt_limit.is_some_and(|limit| attempts >= limit) {
+        if attempt == AUTH_ATTEMPTS || !result.as_ref().is_err_and(|e| e.can_retry_restore()) {
             return Some(result);
         }
-        tokio::select! {
-            biased;
-            _ = &mut cancelled => return None,
-            _ = tokio::time::sleep(delay) => {}
-        }
-        delay = next_probe_delay(delay);
     }
-}
-fn next_probe_delay(delay: Duration) -> Duration {
-    delay.saturating_mul(2).min(PROBE_MAX_DELAY)
+    unreachable!("authentication attempts must be positive")
 }
 async fn socket_signal(socket: Option<&mut socket::Socket>) -> Option<socket::Event> {
     if let Some(socket) = socket {
         tokio::select! {
             Ok(_) = socket.link.changed() => return None,
-            Ok(_) = socket.authority.changed() => return None,
             Some(event) = socket.events.recv() => return Some(event),
             else => {}
         }
@@ -2131,7 +2070,6 @@ pub fn start(
                 logouts: vec![],
                 account: None,
                 offline: false,
-                pending_initial_play: None,
                 audio: None,
                 master_gain: output.master_gain,
                 local: LocalQueue::default(),
@@ -2186,6 +2124,7 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn credit_projection_keeps_order_and_never_invents_ids() {
@@ -2346,7 +2285,6 @@ mod tests {
             logouts: vec![],
             account: None,
             offline: false,
-            pending_initial_play: None,
             audio: None,
             master_gain: MasterGain::default(),
             local: LocalQueue::default(),
@@ -2438,7 +2376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lyric_seek_for_online_saved_is_paused_and_fenced_at_admission() {
+    async fn lyric_seek_cannot_submit_to_an_isolated_saved_queue() {
         use crate::presentation::LyricSnapshot;
         use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
 
@@ -2480,7 +2418,7 @@ mod tests {
         };
         let first = e.room_token().unwrap();
         e.command(seek(&first, 1, 2345));
-        assert_eq!(e.local.elapsed, 2.095);
+        assert_eq!(e.local.elapsed, 0.0);
         assert!(!e.local.desired && e.socket.is_none() && e.media.is_none());
 
         let before_next = e.room_token().unwrap();
@@ -2501,7 +2439,7 @@ mod tests {
         assert_eq!(e.room_token().as_deref(), Some(second.as_str()));
         e.command(seek(&second, 2, 7));
         assert_eq!(e.local.elapsed, 0.0);
-        assert_ne!(e.room_token().as_deref(), Some(second.as_str()));
+        assert_eq!(e.room_token().as_deref(), Some(second.as_str()));
         assert!(!e.local.desired);
         let before_account_change = e.room_token().unwrap();
         e.shared_epoch.store(8, Ordering::SeqCst);
@@ -2608,7 +2546,10 @@ mod tests {
             api,
             session: session.clone(),
         });
-        assert!(!e.can_queue_saved());
+        assert!(e.can_queue_saved()); // before any account socket is admitted
+        e.online.detached = true;
+        assert!(!e.can_queue_saved()); // do not strand the retained native run
+        e.online.detached = false;
         e.local_store = Some(store.clone());
         assert!(e.can_queue_saved());
         e.command(Command::Offline(true).scoped(7));
@@ -2636,6 +2577,10 @@ mod tests {
         assert_eq!(e.local.entries.len(), 2);
         assert_ne!(e.local.entries[0].key, e.local.entries[1].key);
         assert!(!e.local.desired && e.local.current().is_none() && e.media.is_none());
+        let claim = e.saved_claim().unwrap();
+        assert_eq!(claim.cursor.key, e.local.entries[0].key);
+        assert!(claim.cursor.occurrence.is_some() && !claim.cursor.desired_playing);
+        assert_eq!(claim.queue.len(), 2);
         assert!(e.socket.is_none() && e.queue_order_token().is_some());
         drop(e);
         fs::remove_dir_all(dir).unwrap();
@@ -2738,6 +2683,7 @@ mod tests {
                 session: session.clone(),
                 origin,
                 kind: Kind::Password { remember: true },
+                manual_offline: false,
             },
         ));
         e.shared_epoch.store(8, Ordering::SeqCst);
@@ -2783,6 +2729,36 @@ mod tests {
         assert!(e.offline && e.account.is_none() && e.socket.is_none());
         assert!(e.access.borrow().is_none());
         assert!(session.is_offline()); // never reopened the expired internet credential
+    }
+    #[tokio::test]
+    async fn local_cookie_deadline_does_not_revoke_retained_account_or_queue() {
+        let mut e = engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session_with_deadline(Instant::now() - Duration::from_secs(1));
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
+        });
+        e.retained = Some(Retention::new(LoginProfile::test_remembered()));
+        assert_eq!(
+            e.local.replace(
+                vec![LocalTrack {
+                    id: "saved".into(),
+                    ..Default::default()
+                }],
+                0,
+                false
+            ),
+            Change::Start
+        );
+        assert!(!session.can_access_local());
+        e.tick();
+        assert!(session.is_offline() && session.can_access_local() && !session.is_revoked());
+        assert!(e.retained.as_ref().unwrap().profile().is_some());
+        assert_eq!(e.local.current().unwrap().track.id, "saved");
+        assert!(e.access.borrow().as_ref().unwrap().offline);
+        assert!(e.reconnect.is_some());
+        e.cancel_reconnect();
     }
     #[tokio::test]
     async fn explicit_sign_in_leaves_offline_even_if_the_new_origin_is_invalid() {
@@ -2925,27 +2901,37 @@ mod tests {
             serial,
             result: Ok(Rejoined::Existing),
         });
-        assert!(e.local.current().is_none() && !session.is_offline());
-        assert!(!e.access.borrow().as_ref().unwrap().offline);
-    }
-    #[test]
-    fn probe_delay_caps_without_a_retry_attempt_limit() {
-        let delays: Vec<_> = std::iter::successors(Some(PROBE_FIRST_DELAY), |delay| {
-            Some(next_probe_delay(*delay))
-        })
-        .take(12)
-        .map(|delay| delay.as_millis())
-        .collect();
-        assert_eq!(
-            delays,
-            [
-                500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000, 30_000,
-                30_000
-            ]
+        assert_eq!(e.local.current().unwrap().track.id, "saved");
+        assert!(!session.is_offline());
+        assert!(
+            e.access.borrow().as_ref().unwrap().offline,
+            "local remains visible until a playback snapshot"
         );
     }
     #[tokio::test]
-    async fn stay_offline_cancels_probe_during_retry_delay() {
+    async fn auth_recheck_has_four_bounded_attempts() {
+        let mode = ModeControl::default();
+        let serial = mode.begin_automatic(7).unwrap();
+        let mut count = 0;
+        let result = reconnect_attempts(
+            &mode,
+            serial,
+            || true,
+            || {
+                count += 1;
+                std::future::ready(Err::<(), _>(ApiError {
+                    message: "Temporary",
+                    expired: false,
+                    status: 503,
+                }))
+            },
+        )
+        .await;
+        assert!(result.unwrap().is_err());
+        assert_eq!(count, AUTH_ATTEMPTS);
+    }
+    #[tokio::test]
+    async fn stay_offline_cancels_inflight_auth_probe() {
         let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
         let session = api.test_session();
         let access = Access {
@@ -2965,18 +2951,13 @@ mod tests {
             &mode,
             serial.unwrap(),
             || true,
-            None,
             || {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(());
                 } else {
                     panic!("cancelled probe retried");
                 }
-                std::future::ready(Err::<(), _>(ApiError {
-                    message: "Temporary",
-                    expired: false,
-                    status: 503,
-                }))
+                std::future::pending::<Result<(), ApiError>>()
             },
         );
         let work_offline = async {

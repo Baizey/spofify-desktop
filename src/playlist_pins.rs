@@ -934,7 +934,10 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Api, Origin, library::PlaylistKind};
+    use crate::{
+        api::{Api, Origin, library::PlaylistKind},
+        playlist_pin_store::Provenance,
+    };
     use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
     use tokio::time::timeout;
 
@@ -1016,11 +1019,15 @@ mod tests {
         let mut record = pending_record("a");
         let mut rows = Rows::default();
         let (tx, view) = watch::channel(View::default());
-        let membership = |track: &str| Membership {
+        let membership = |track: &str, occurrence_id: &str| Membership {
             title: "Saved".into(),
             tracks: vec![track.into()],
+            provenance: Some(Provenance {
+                revision: 7,
+                occurrence_ids: vec![occurrence_id.into()],
+            }),
         };
-        record.committed = Some(membership("one"));
+        record.committed = Some(membership("one", "first"));
         rows.put(record.clone().into());
         rows.project(Some(3), &tx);
         let revision = view.borrow().revision;
@@ -1053,11 +1060,17 @@ mod tests {
         rows.project(Some(3), &tx);
         assert_eq!(view.borrow().revision, revision);
         assert_eq!(view.borrow().records["a"].phase, Phase::Saved);
-        record.committed = Some(membership("two"));
-        rows.put(record.into());
+        // A replaced playlist entry can retain the same recording and title.
+        // Its changed identity must still invalidate the Saved page projection.
+        record.committed = Some(membership("one", "second"));
+        rows.put(record.clone().into());
         rows.project(Some(3), &tx);
         assert_eq!(view.borrow().revision, revision + 1);
         assert_eq!(view.borrow().records["a"].phase, Phase::Saved);
+        record.committed = Some(membership("two", "third"));
+        rows.put(record.into());
+        rows.project(Some(3), &tx);
+        assert_eq!(view.borrow().revision, revision + 2);
     }
 
     struct Fixture(PathBuf);
@@ -1097,6 +1110,10 @@ mod tests {
         let snapshot = |title: &str| Membership {
             title: title.into(),
             tracks: vec![],
+            provenance: Some(Provenance {
+                revision: 7,
+                occurrence_ids: vec![],
+            }),
         };
         let token = store
             .publish(&online, &pin, None, snapshot("Previous"), || Ok(()))
@@ -1236,6 +1253,10 @@ mod tests {
             let membership = Membership {
                 title: "Stale".into(),
                 tracks: vec![],
+                provenance: Some(Provenance {
+                    revision: 7,
+                    occurrence_ids: vec![],
+                }),
             };
             assert_eq!(
                 store

@@ -13,6 +13,7 @@ use crate::{
     offline::{self, Download, OfflineStore},
     pages::{Page, Route, Row, RowKey},
     player::{LocalContext, LocalTrack},
+    socket::{Context as PlaybackSource, ContextKind, PlaybackContext, TrackRef},
 };
 
 const STORAGE: ApiError = ApiError {
@@ -222,26 +223,35 @@ pub async fn play(
         result = offline::read_verified_recording(access.api.clone(), access.session.clone(), slot, track_id, recording, OfflineStore::open_default) => result.map_err(error)?,
     };
     access.api.authenticated_account(&access.session)?;
-    if *network.borrow() != mode_stamp || access.offline != access.session.is_offline() {
+    if *network.borrow() != mode_stamp {
         return Err(MODE_CHANGED);
     }
     // Prefer the presentation metadata paired with the verified local bytes.
     // Other occurrences carry only identities/labels and load lazily in the engine.
     let context = LocalContext::for_page(route, page);
+    let playback_context = saved_playback_context(&context, page);
     queue[selected] = input.item.clone();
     let rows = page.rows.iter().filter(|r| local_item(r).is_some());
     let mut queue: Vec<_> = queue
         .into_iter()
         .zip(rows)
-        .map(|(item, row)| LocalTrack {
-            id: item.id,
-            title: item.name,
-            subtitle: item.artists,
-            album_name: item.album_name,
-            duration: item.duration_ms as f64 / 1000.0,
-            music: row.music.clone(),
-            context: context.clone(),
-            recording: row.local_recording,
+        .map(|(item, row)| {
+            let source = saved_playback_ref(&playback_context, &row.key, &item.id);
+            let playback_context = playback_context.clone().filter(|c| {
+                !matches!(c.kind, ContextKind::Playlist | ContextKind::Derived) || source.is_some()
+            });
+            LocalTrack {
+                id: item.id,
+                title: item.name,
+                subtitle: item.artists,
+                album_name: item.album_name,
+                duration: item.duration_ms as f64 / 1000.0,
+                music: row.music.clone(),
+                context: context.clone(),
+                recording: row.local_recording,
+                source,
+                playback_context,
+            }
         })
         .collect();
     let single = index.is_some() && (enqueue || matches!(route, Route::Search(_) | Route::History));
@@ -265,6 +275,78 @@ pub async fn play(
             input,
             store,
         })
+    }
+}
+
+fn saved_playback_context(context: &Option<LocalContext>, page: &Page) -> Option<PlaybackContext> {
+    if let Some((pin, revision)) = page
+        .saved_pin
+        .as_ref()
+        .zip(page.playlist_membership_revision)
+    {
+        let kind = match pin.kind {
+            crate::api::library::PlaylistKind::Manual => ContextKind::Playlist,
+            crate::api::library::PlaylistKind::Derived => ContextKind::Derived,
+        };
+        return Some(PlaybackContext {
+            context: PlaybackSource {
+                kind,
+                id: pin.id.clone(),
+                name: page.title.clone(),
+            },
+            revision,
+            fence: None,
+        });
+    }
+    let context = context.as_ref()?;
+    let kind = match context.kind {
+        "album" => ContextKind::Album,
+        "artist" => ContextKind::Artist,
+        "playlist" => ContextKind::Playlist,
+        "derived" => ContextKind::Derived,
+        _ => return None,
+    };
+    Some(
+        PlaybackSource {
+            kind,
+            id: context.id.clone(),
+            name: context.name.clone(),
+        }
+        .into(),
+    )
+}
+
+fn saved_playback_ref(
+    context: &Option<PlaybackContext>,
+    key: &RowKey,
+    id: &str,
+) -> Option<TrackRef> {
+    let context = context.as_ref()?;
+    match (context.kind, key) {
+        (
+            ContextKind::Playlist,
+            RowKey::ManualEntry {
+                playlist_id,
+                entry_id,
+            },
+        ) if context.id == *playlist_id => Some(TrackRef {
+            id: id.into(),
+            entry_id: Some(entry_id.clone()),
+            ..Default::default()
+        }),
+        (
+            ContextKind::Derived,
+            RowKey::DerivedOccurrence {
+                playlist_id,
+                occurrence_id,
+            },
+        ) if context.id == *playlist_id => Some(TrackRef {
+            id: id.into(),
+            target_id: Some(playlist_id.clone()),
+            occurrence_id: Some(occurrence_id.clone()),
+            ..Default::default()
+        }),
+        _ => None,
     }
 }
 

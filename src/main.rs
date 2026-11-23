@@ -20,6 +20,7 @@ mod output_identity;
 mod pages;
 mod personal;
 mod personal_bridge;
+mod playback_sync;
 mod player;
 mod playlist_browser;
 mod playlist_observations;
@@ -180,10 +181,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     &tx,
                     scope(
                         &epoch,
-                        if op == "toggle" {
-                            Command::Toggle
-                        } else {
-                            Command::Transport(op)
+                        match op {
+                            "next" => {
+                                Command::Guarded(ui.get_room_token().into(), player::Action::Next)
+                            }
+                            "previous" => Command::Guarded(
+                                ui.get_room_token().into(),
+                                player::Action::Previous,
+                            ),
+                            _ => Command::GuardedToggle(ui.get_room_token().into()),
                         },
                     ),
                     &ui,
@@ -231,11 +237,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 "clear" => Some(A::Clear),
                 "close" => Some(A::Close),
                 "shuffle" => Some(A::Shuffle(!ui.get_shuffle())),
-                "repeat" => Some(A::Repeat(match ui.get_repeat_mode().as_str() {
-                    "off" => player::Repeat::All,
-                    "all" => player::Repeat::One,
-                    _ => player::Repeat::Off,
-                })),
+                "repeat" => Some(A::CycleRepeat),
                 _ => None,
             };
             if let Some(a) = action {

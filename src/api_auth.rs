@@ -79,15 +79,18 @@ impl RememberedCredential {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum LocalFormat {
     #[serde(rename = "local-v1")]
-    V1,
+    ManualOffline,
+    #[serde(rename = "local-online-v1")]
+    AutoOffline,
 }
 
-/// Written only from an admitted, remembered server session on Work offline.
-/// No password or CSRF is stored; the cookie is only for a separate Go online probe.
-#[derive(Serialize, Deserialize)]
+/// Authority derived from an accepted, remembered server session. The format
+/// records the startup preference, not permission to open a transport. No
+/// password or CSRF is stored; the cookie is only for separate HTTP validation.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct LocalGrant {
     format: LocalFormat,
@@ -96,7 +99,7 @@ pub(crate) struct LocalGrant {
     role: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RememberedLogin {
     Online(RememberedCredential),
@@ -113,15 +116,23 @@ impl RememberedLogin {
 }
 
 impl LocalGrant {
+    pub(crate) fn manual_offline(&self) -> bool {
+        matches!(self.format, LocalFormat::ManualOffline)
+    }
+
+    pub(crate) fn set_manual_offline(&mut self, manual: bool) {
+        self.format = if manual {
+            LocalFormat::ManualOffline
+        } else {
+            LocalFormat::AutoOffline
+        };
+    }
+
     pub(crate) fn matches_principal(&self, username: &str, account_id: &str) -> bool {
         self.username == username && self.credential.account_id == account_id
     }
 
-    pub(crate) fn admit(
-        &self,
-        origin: &Origin,
-        username: &str,
-    ) -> Result<(Api, Session), ApiError> {
+    pub(crate) fn validate(&self, origin: &Origin, username: &str) -> Result<(), ApiError> {
         self.credential.header(origin)?;
         if self.username != username
             || !valid_text(&self.username, 256)
@@ -129,6 +140,15 @@ impl LocalGrant {
         {
             return Err(INVALID_INPUT);
         }
+        Ok(())
+    }
+
+    pub(crate) fn admit(
+        &self,
+        origin: &Origin,
+        username: &str,
+    ) -> Result<(Api, Session), ApiError> {
+        self.validate(origin, username)?;
         let api = Api {
             origin: origin.clone(),
             client: None,
@@ -155,6 +175,14 @@ impl LocalGrant {
             }),
         };
         Ok((api, session))
+    }
+}
+
+impl Session {
+    /// Match a retained record against the immutable account binding, not the
+    /// mutable UI summary. Callers separately check the exact slot and origin.
+    pub(crate) fn remembered_account_id(&self) -> &str {
+        &self.secrets.account_id
     }
 }
 
@@ -229,18 +257,21 @@ impl Api {
         }
     }
 
-    pub(crate) fn offline_grant(&self, session: &Session) -> Result<RememberedLogin, ApiError> {
-        if !session.is_offline() {
-            return Err(INVALID_INPUT);
-        }
-        // The grant can outlast the cookie once installed, but only a live,
-        // non-revoked credential can create a new local grant.
-        Ok(RememberedLogin::Offline(LocalGrant {
-            format: LocalFormat::V1,
+    /// Prepare a typed auto-offline record from a fresh remembered sign-in or
+    /// an HTTP-validated legacy login. Only the engine's ordered writer may
+    /// persist it after admitting that account.
+    pub(crate) fn remembered_login(&self, session: &Session) -> Result<RememberedLogin, ApiError> {
+        // A new grant requires a live, non-revoked rolling credential. A
+        // previously installed grant can outlast the cookie and change its
+        // preference without exporting a new credential.
+        let grant = LocalGrant {
+            format: LocalFormat::AutoOffline,
             credential: self.remembered_credential(session)?,
             username: session.username.clone(),
             role: session.role.clone(),
-        }))
+        };
+        grant.validate(&self.origin, &session.username)?;
+        Ok(RememberedLogin::Offline(grant))
     }
 
     /// Export only an active, negotiated session owned by this connection.
@@ -425,18 +456,20 @@ mod tests {
             server_expires: Some(OffsetDateTime::now_utc() + Duration::from_secs(10)),
         };
         let server = api.session_from_summary(summary, cookie, deadline).unwrap();
-        assert!(api.offline_grant(&server).is_err());
         let legacy = serde_json::to_vec(&api.remembered_credential(&server).unwrap()).unwrap();
         assert!(matches!(
             serde_json::from_slice(&legacy),
             Ok(RememberedLogin::Online(_))
         ));
-        server.set_offline(true);
-        let saved = serde_json::to_vec(&api.offline_grant(&server).unwrap()).unwrap();
-        assert!(!String::from_utf8_lossy(&saved).contains("synthetic-csrf"));
+        let saved = serde_json::to_vec(&api.remembered_login(&server).unwrap()).unwrap();
+        let encoded = String::from_utf8_lossy(&saved);
+        assert!(!encoded.contains("synthetic-csrf"));
+        assert!(encoded.contains("local-online-v1"));
         let RememberedLogin::Offline(grant) = serde_json::from_slice(&saved).unwrap() else {
             panic!("expected a local grant")
         };
+        assert!(!grant.manual_offline());
+        server.set_offline(true);
         assert!(
             grant
                 .admit(&Origin::parse("https://other.example").unwrap(), "listener")
@@ -464,7 +497,7 @@ mod tests {
         assert!(local_api.authenticated_account(&clone).is_err());
         server.lifetime().deadline.instant = Instant::now();
         assert!(server.can_access_local()); // running local access can outlast its bearer
-        assert!(api.offline_grant(&server).is_err()); // but cannot create a new cold grant now
+        assert!(api.remembered_login(&server).is_err()); // cannot create a new cold grant now
     }
 }
 

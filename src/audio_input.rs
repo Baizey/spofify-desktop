@@ -46,9 +46,10 @@ pub struct AudioInput {
 
 #[derive(Clone, Debug)]
 enum Backing {
-    Saved {
+    File {
         file: Arc<File>,
         offset: u64,
+        verified_saved: bool,
     },
     Online(Arc<Progress>),
     #[cfg(test)]
@@ -83,10 +84,20 @@ impl Drop for FailUnlessComplete {
 
 impl AudioInput {
     pub fn file(file: File, offset: u64, len: u64) -> Self {
+        Self::file_input(file, offset, len, false)
+    }
+
+    /// Only for the exact Saved descriptor after its full payload is verified.
+    pub(crate) fn verified_saved(file: File, offset: u64, len: u64) -> Self {
+        Self::file_input(file, offset, len, true)
+    }
+
+    fn file_input(file: File, offset: u64, len: u64, verified_saved: bool) -> Self {
         Self {
-            backing: Backing::Saved {
+            backing: Backing::File {
                 file: Arc::new(file),
                 offset,
+                verified_saved,
             },
             _transfer: None,
             len,
@@ -171,7 +182,7 @@ impl AudioInput {
     pub(crate) fn reusable_online(&self) -> bool {
         match &self.backing {
             Backing::Online(_) => !self.is_failed(),
-            Backing::Saved { .. } => false,
+            Backing::File { .. } => false,
             #[cfg(test)]
             Backing::Memory(_) => true,
         }
@@ -180,10 +191,25 @@ impl AudioInput {
     pub(crate) fn cacheable(&self) -> bool {
         match &self.backing {
             Backing::Online(progress) => progress.state.load(Ordering::Acquire) == COMPLETE,
-            Backing::Saved { .. } => false,
+            Backing::File { .. } => false,
             #[cfg(test)]
             Backing::Memory(_) => true,
         }
+    }
+
+    /// Pin bytes already usable without HTTP. Does not wait for a partial
+    /// transfer, retain the transfer task, or authorize playback. Keep only
+    /// the current/next inputs, fenced by account and queue identity.
+    pub(crate) fn isolated(&self) -> Option<Self> {
+        (self.cacheable()
+            || matches!(
+                &self.backing,
+                Backing::File {
+                    verified_saved: true,
+                    ..
+                }
+            ))
+        .then(|| self.decoder_input())
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -294,7 +320,7 @@ impl Read for AudioReader {
             return Ok(0);
         }
         let n = match &self.input.backing {
-            Backing::Saved { file, offset } => {
+            Backing::File { file, offset, .. } => {
                 let absolute = offset
                     .checked_add(self.pos)
                     .ok_or(io::ErrorKind::InvalidInput)?;

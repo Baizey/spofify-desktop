@@ -10,7 +10,9 @@ const TARGET: &str = "target";
 
 fn player_snapshot() -> Value {
     json!({
-        "type":"snapshot", "connectionId":CONNECTION, "owner":"playing", "devices":[],
+        "type":"snapshot", "sessionId":"bulk-room", "connectionId":CONNECTION,
+        "revision":0, "owner":{"generation":1,"deviceId":"playing"}, "serverTimeMs":1000,
+        "devices":[{"deviceId":DEVICE,"name":"Spofify Desktop","canPlay":false}],
         "player":{"queue":[],"cursor":Cursor::default(),"repeat":"off","shuffle":false}
     })
 }
@@ -71,7 +73,6 @@ async fn links(capacity: usize) -> (Session, Peer, Peer, Incoming) {
     .await;
     let peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
     let frame = player_snapshot().to_string();
-    assert!(matches!(decode(&frame, DEVICE), Err(End::Protocol)));
     let frame = decode_link(&frame, DEVICE, true).unwrap();
     (session, client, peer, frame)
 }
@@ -99,22 +100,26 @@ async fn bulk_order_waits_for_the_latest_primary_personal_publication() {
 }
 
 #[test]
-fn bulk_snapshot_allows_shared_identity_with_or_without_its_nonplaying_row() {
+fn bulk_snapshot_requires_its_own_nonplaying_identity() {
     let mut frame = player_snapshot();
-    frame["devices"] = json!([
-        {"id":"playing","deviceId":DEVICE,"name":"Spofify Desktop","canPlay":true},
-        {"id":CONNECTION,"deviceId":DEVICE,"name":"Spofify Desktop","canPlay":false}
-    ]);
+    frame["devices"].as_array_mut().unwrap().push(json!({
+        "deviceId":"playing", "name":"Spofify Desktop", "canPlay":true
+    }));
     assert!(decode_link(&frame.to_string(), DEVICE, true).is_ok());
-    frame["devices"][1]["canPlay"] = true.into();
+    frame["devices"][0]["canPlay"] = true.into();
     assert!(matches!(
         decode_link(&frame.to_string(), DEVICE, true),
         Err(End::Protocol)
     ));
-    frame["devices"].as_array_mut().unwrap().pop();
-    assert!(decode_link(&frame.to_string(), DEVICE, true).is_ok());
+    frame["devices"][0]["canPlay"] = false.into();
+    frame["owner"]["deviceId"] = DEVICE.into();
     assert!(matches!(
-        decode(&frame.to_string(), DEVICE),
+        decode_link(&frame.to_string(), DEVICE, true),
+        Err(End::Protocol)
+    ));
+    frame["devices"][0]["deviceId"] = "some-other-device".into();
+    assert!(matches!(
+        decode_link(&frame.to_string(), DEVICE, true),
         Err(End::Protocol)
     ));
 }

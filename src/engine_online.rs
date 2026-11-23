@@ -1,283 +1,146 @@
-//! Online actor. Socket admission is not a server acknowledgement. Player state
-//! comes from Go; only a native EOF can advance the shared cursor. A local
-//! crossfade can overlap its known successor under the attached output grant.
-#[path = "engine_local_start.rs"]
-mod local_start;
-#[cfg(test)]
-#[path = "engine_online_pcm_tests.rs"]
-mod pcm_tests;
+//! Playback room actor. The socket binding fences messages; only device ownership
+//! authorizes the native executor. The optimistic controller is never an input
+//! to that executor.
 use super::{
-    CreditView, Engine, PlayerView, QueueEntryView, REPORT_INTERVAL, Reply, album_route_id,
-    artist_subtitle, context_kind, credit_views, crossfade, output,
+    Engine, PlayerView, QueueEntryView, Reply, album_route_id, artist_subtitle, context_kind,
+    credit_views, native,
 };
 use crate::{
     DeviceRow,
-    api::ApiError,
-    audio::CROSSFADE_SECONDS,
     audio_input::AudioInput,
-    offline::{self, OnlineMedia},
+    offline,
     personal::{Command as PersonalCommand, Update as PersonalUpdate},
-    player::{Action, Status},
-    socket::{
-        self, Cursor, Event, EventKind, FactError, Generation, Link, OutputAuthority, Outputs,
-        State,
-    },
+    playback_sync::Projection,
+    player::{self, Action, LocalQueue},
+    socket::{self, Claim, Event, EventKind, Generation, Link, State},
 };
 use std::{
-    collections::{HashSet, VecDeque},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Instant,
+    sync::atomic::Ordering,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(super) struct Work {
-    generation: Generation,
-    cursor: Cursor,
-    id: String,
-    duration: f64,
-}
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-pub(super) struct Execution {
-    cursor: Cursor,
-    permit: output::RunPermit,
-    pending_crossfade: Option<CrossfadeConfirmation>,
-    status: Status,
-    last_fact: Option<Instant>,
-    stop_fact_pending: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl Execution {
-    /// A detached run may still be audible under the existing grace permit.
-    pub(super) fn media_pause_token(
-        &self,
-        displayed: &Cursor,
-        room: u64,
-        revision: u64,
-    ) -> Option<String> {
-        (self.status == Status::Ok
-            && output::same_execution(&self.cursor, displayed)
-            && self.permit.granted())
-        .then(|| {
-            let cursor = &self.cursor;
-            format!(
-                "detached:{room}:{revision}:{}:{}:{}:{}",
-                cursor.key, cursor.chain, cursor.visit, cursor.run
-            )
-        })
-    }
-}
-
-#[derive(Clone)]
-struct PreviewKey {
-    generation: Generation,
-    from: Cursor,
-    to: Cursor,
-    id: String,
-}
-impl PreviewKey {
-    fn matches_landing(&self, generation: Generation, from: &Cursor, to: &Cursor) -> bool {
-        self.generation == generation
-            && output::same_execution(&self.from, from)
-            && output::same_execution(&self.to, to)
-    }
-}
-struct PreviewPlayback {
-    permit: output::RunPermit,
-    confirmation: CrossfadeConfirmation,
-    source: AudioInput,
-    admitted: bool,
-}
-struct Handoff {
-    key: PreviewKey,
-    media: HandoffMedia,
-}
-enum HandoffMedia {
-    Ready(AudioInput),
-    Loading(crossfade::Load),
-}
-struct CrossfadeConfirmation {
-    generation: Generation,
-    confirmed: Arc<AtomicBool>,
-}
-
-struct Advance {
-    from: Cursor,
-    to: Cursor,
-}
-
-const ORDER_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
-struct OrderEcho {
-    key: u64,
-    after: Option<u64>,
-    refresh_due: Option<Instant>,
-    refresh_attempts: u8,
-    refresh_id: Option<u64>,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SyncRead {
-    Repair,
-    Order(u64),
-}
-impl OrderEcho {
-    fn placement_observed(&self, state: &socket::State) -> bool {
-        let Some(current) = state
-            .queue
-            .iter()
-            .position(|row| row.key == state.cursor.key)
-        else {
-            return false;
-        };
-        state
-            .queue
-            .iter()
-            .skip(current + 1)
-            .scan(None, |previous, row| {
-                let pair = (*previous, row.key);
-                *previous = Some(row.key);
-                Some(pair)
-            })
-            .any(|(predecessor, occurrence)| occurrence == self.key && predecessor == self.after)
+fn cycle_repeat(repeat: socket::Repeat) -> player::Repeat {
+    match repeat {
+        socket::Repeat::Off => player::Repeat::All,
+        socket::Repeat::All => player::Repeat::One,
+        socket::Repeat::One => player::Repeat::Off,
     }
 }
 
 #[derive(Default)]
 pub(super) struct Online {
-    pub state: Option<State>,
-    pub revision: u64,
-    order_echo: Option<OrderEcho>,
-    // Go responds to sync on the same connection in request order. Retain
-    // older repairs so their replies cannot release a later move fence.
-    sync_reads: VecDeque<SyncRead>,
-    sync_serial: u64,
-    pub work: Option<Work>,
-    pub execution: Option<Execution>,
-    connection: String,
-    outputs: Outputs,
-    local_start: Option<local_start::Start>,
-    receipts: local_start::Receipts,
-    // We saw this very socket retire and queued Release after stopping it.
-    // An opening/unknown empty owner never establishes vacancy.
-    released_here: bool,
-    generation: Option<Generation>,
+    pub projection: Projection,
+    transport: Option<Generation>,
     personal_generation: Option<Generation>,
-    repair: Option<Generation>,
-    player_gap: bool,
-    observed_at: Option<Instant>,
-    advance: Option<Advance>,
-    stopped: Option<Cursor>,
-    lookahead: Option<crossfade::Lookahead<PreviewKey, PreviewPlayback>>,
-    handoff: Option<Handoff>,
-    suppress_crossfade: Option<Cursor>,
+    connection_id: String,
+    pub detached: bool,
+    pub superseded: bool,
+    gap: bool,
+    repair_sent: bool,
+    refresh_at: Option<Instant>,
+    claim_offer: Option<ClaimOffer>,
+    claim_pending: Option<PendingClaim>,
+    clock_offset_ms: Option<i64>,
+    pub native: native::NativeV3,
+    primary: Option<(native::MediaRequest, tokio::task::JoinHandle<()>)>,
+    preview: Option<(native::MediaRequest, tokio::task::JoinHandle<()>)>,
+    claim_media: [Option<(native::MediaRequest, Option<AudioInput>)>; 2],
+}
+
+struct ClaimOffer {
+    cursor: socket::Cursor,
+    source: ClaimSource,
+    reattach_basis: Option<socket::ReattachBasis>,
+}
+
+enum ClaimSource {
+    Saved {
+        operation: u64,
+        revision: u64,
+        run: Option<u64>,
+    },
+    Detached {
+        intent: socket::Cursor,
+        run: Option<u64>,
+    },
+}
+
+struct PendingClaim {
+    id: String,
+    deadline: Instant,
+    target: socket::Cursor,
+    saved_run: Option<u64>,
+    saved_revision: u64,
+}
+
+fn claim_cursor_matches(offered: &socket::Cursor, accepted: &State) -> bool {
+    let mut expected = offered.clone();
+    if let Some(track) = accepted.current().filter(|row| row.duration > 0.0) {
+        expected.position_ms = expected
+            .position_ms
+            .min((track.duration * 1000.0).round() as u64);
+    }
+    expected == accepted.cursor
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(socket::MAX_SAFE_INTEGER as u128) as u64
 }
 
 impl Online {
-    pub fn cursor(&self) -> Option<&Cursor> {
-        self.advance
-            .as_ref()
-            .map(|advance| &advance.to)
-            .or_else(|| self.state.as_ref().map(|s| &s.cursor))
+    pub fn visible(&self) -> Option<&State> {
+        self.projection.projected()
     }
-    pub(super) fn queue_order_pending(&self) -> bool {
-        self.order_echo.is_some()
+    pub fn is_owner(&self, device: &str) -> bool {
+        self.projection
+            .owner()
+            .and_then(|owner| owner.device_id.as_deref())
+            == Some(device)
     }
-
-    pub(super) fn queue_order_awaiting_echo(&self) -> bool {
-        // The timeout ends the UI preview. Keep the write fence until an
-        // authoritative order or the existing read-only recovery resolves it.
-        self.order_echo
-            .as_ref()
-            .is_some_and(|echo| echo.refresh_attempts == 0)
+    pub fn reconciling_claim(&self) -> bool {
+        self.claim_pending.is_some()
     }
-
-    pub(super) fn has_provisional_cursor(&self) -> bool {
-        self.advance.is_some()
-    }
-
     pub fn wants_pause(&self) -> bool {
-        self.cursor().is_some_and(|cursor| {
-            cursor.desired
-                && !self.stop_for(cursor)
-                && self
-                    .execution
-                    .as_ref()
-                    .is_none_or(|e| e.status == Status::Ok)
-        })
+        self.claim_pending.as_ref().map_or_else(
+            || self.visible().is_some_and(|p| p.cursor.desired_playing),
+            |pending| pending.target.desired_playing,
+        )
     }
-    fn is_owner(&self) -> bool {
-        !self.connection.is_empty() && self.outputs.owner == self.connection
-    }
-    pub fn starting_locally(&self) -> bool {
-        self.local_start.is_some()
-    }
-    pub fn clear_local_start(&mut self) {
-        self.local_start = None;
-    }
-    pub(super) fn clear_handoff(&mut self) {
-        self.handoff = None;
-    }
-    fn locally_vacant(&self) -> bool {
-        self.released_here
-            && self.outputs.owner.is_empty()
-            && self
-                .outputs
-                .devices
-                .iter()
-                .all(|d| !d.can_play || d.id == self.connection)
-            && self
-                .outputs
-                .devices
-                .iter()
-                .any(|d| d.can_play && d.id == self.connection)
-    }
-    fn stop_for(&self, cursor: &Cursor) -> bool {
-        self.stopped
-            .as_ref()
-            .is_some_and(|c| output::same_execution(c, cursor))
-    }
-    /// An observation from before the already-reported EOF cannot rewind a
-    /// running successor. Canonical correction and newer snapshots can.
-    fn adopt_cursor(&mut self, cursor: &Cursor, observed: bool) {
-        if let Some(advance) = &self.advance {
-            if observed && output::same_execution(&advance.from, cursor) {
-                return;
-            }
-            self.advance = None;
+    pub fn cancel_loads(&mut self) {
+        self.claim_media = Default::default();
+        for (_, task) in self.primary.take().into_iter().chain(self.preview.take()) {
+            task.abort();
         }
-        if !self.stop_for(cursor) {
-            self.stopped = None;
-        }
-        if self
-            .suppress_crossfade
-            .as_ref()
-            .is_some_and(|c| !output::same_execution(c, cursor))
+    }
+    fn cancel(&mut self, request: &native::MediaRequest) {
+        let slot = if request.preview {
+            &mut self.preview
+        } else {
+            &mut self.primary
+        };
+        if slot.as_ref().is_some_and(|(r, _)| r == request)
+            && let Some((_, task)) = slot.take()
         {
-            self.suppress_crossfade = None;
+            task.abort();
         }
     }
 }
 
 impl Engine {
+    fn transport_generation(&self) -> Option<Generation> {
+        let generation = self.online.transport?;
+        (self.network_allowed() && self.link() == Link::Connected(generation)).then_some(generation)
+    }
     pub(super) fn online_generation(&self) -> Option<Generation> {
-        let generation = self.online.generation?;
-        (self.network_allowed()
-            && self.link() == Link::Connected(generation)
-            && !self.online.player_gap)
-            .then_some(generation)
-    }
-    fn grant(&self) -> Option<OutputAuthority> {
-        let socket = self.socket.as_ref()?;
-        if socket.authority.has_changed().is_err() {
-            return None;
-        }
-        (*socket.authority.borrow()).filter(|g| g.permits(Instant::now()))
-    }
-    fn attached(&self) -> Option<OutputAuthority> {
-        let generation = self.online_generation()?;
-        self.grant()
-            .filter(|g| self.online.is_owner() && g.attached && g.generation == generation)
+        (!self.online.gap)
+            .then_some(self.transport_generation())
+            .flatten()
     }
     pub(super) fn disconnect_personal(&mut self) {
         if let Some(generation) = self.online.personal_generation.take() {
@@ -291,7 +154,7 @@ impl Engine {
         command: &PersonalCommand,
     ) {
         if epoch != self.epoch
-            || self.online_generation() != Some(generation)
+            || self.transport_generation() != Some(generation)
             || self.online.personal_generation != Some(generation)
         {
             return;
@@ -323,7 +186,7 @@ impl Engine {
         let access = self.personal.access();
         if !self.current()
             || self.epoch != ticket.epoch
-            || self.online_generation() != Some(ticket.generation)
+            || self.transport_generation() != Some(ticket.generation)
             || self.online.personal_generation != Some(ticket.generation)
             || !self.socket.as_ref().is_some_and(|socket| {
                 self.personal.admit_quick_add(&ticket, || {
@@ -340,7 +203,6 @@ impl Engine {
             access.quick_cancel(&ticket);
         }
     }
-
     pub(super) fn send_playlist_order(
         &self,
         observed: super::PersonalStatus,
@@ -351,228 +213,259 @@ impl Engine {
         let (Some(account), Some(socket)) = (&self.account, &self.socket) else {
             return false;
         };
-        if self.online_generation() != Some(generation)
+        if self.transport_generation() != Some(generation)
             || self.online.personal_generation != Some(generation)
             || !socket.events.is_empty()
         {
             return false;
         }
         let mode = *account.session.network_changes().borrow();
-        // Do not hold this read lock: socket admission also checks mode, and
-        // its writer-owning actor independently fences any stamp change.
-        if mode != mode_stamp {
-            return false;
-        }
-        self.personal.admit_move(observed, command, || {
-            socket
-                .personal_order(generation, mode_stamp, command)
-                .is_ok()
-        })
+        mode == mode_stamp
+            && self.personal.admit_move(observed, command, || {
+                socket
+                    .personal_order(generation, mode_stamp, command)
+                    .is_ok()
+            })
     }
-
     fn repair(&mut self, generation: Generation) {
-        // One repair per socket generation. Do not spin on a malformed peer
-        // or repeat any user mutation while waiting for a fresh projection.
-        if self.online.repair == Some(generation) {
-            return;
-        }
-        self.online.repair = Some(generation);
-        if self
-            .socket
-            .as_ref()
-            .is_some_and(|socket| socket.sync(generation).is_ok())
-        {
-            self.online.sync_reads.push_back(SyncRead::Repair);
-        }
-    }
-    fn player_gap(&mut self, generation: Generation) {
-        self.online.player_gap = true;
-        self.online.advance = None;
-        self.online.revision = self.online.revision.wrapping_add(1);
-        if self.local_store.is_none() {
-            self.cancel_work();
-            self.stop();
-        }
-        self.action_status = "Playback state is out of sync.";
-        self.repair(generation);
-    }
-    fn accept_outputs(&mut self, generation: Generation, outputs: Outputs) {
-        let retiring = self.online.is_owner() && outputs.owner.is_empty();
-        if !outputs.owner.is_empty() {
-            self.online.released_here = false;
-        }
-        self.online.outputs = outputs;
-        if retiring {
-            if self.local_store.is_none() {
-                self.cancel_work();
-                self.stop();
-            }
-            self.online.advance = None;
-            self.online.released_here = self
+        if !self.online.repair_sent
+            && self
                 .socket
                 .as_ref()
-                .is_some_and(|socket| socket.command(generation, socket::Command::Release).is_ok());
-        }
-        if self.online.is_owner() || self.online.locally_vacant() {
-            if let Some(start) = &mut self.online.local_start {
-                start.output_confirmed();
-            }
-        } else {
-            self.cancel_local_start();
-        }
-    }
-    fn handle_event(&mut self, event: Event) {
-        let stamp = event.personal_stamp;
-        self.apply_event(event);
-        if let (Some(stamp), Some(socket)) = (stamp, &self.socket) {
-            socket.mark_personal_applied(stamp);
-        }
-    }
-
-    fn apply_event(&mut self, event: Event) {
-        let generation = event.generation;
-        if self.link() != Link::Connected(generation) {
-            return;
-        }
-        let own_output = match &event.kind {
-            EventKind::Snapshot {
-                connection_id,
-                outputs,
-                ..
-            } => Some((connection_id.as_str(), outputs)),
-            EventKind::Outputs(outputs) => Some((self.online.connection.as_str(), outputs)),
-            _ => None,
-        };
-        if let Some(((connection, outputs), socket)) = own_output.zip(self.socket.as_ref())
-            && let Some(device) = outputs
-                .devices
-                .iter()
-                .find(|d| d.id == connection && d.can_play)
+                .is_some_and(|socket| socket.sync(generation).is_ok())
         {
-            self.personal
-                .set_bulk_device(crate::personal_bridge::BulkDevice {
-                    id: device.device_id.clone(),
-                    name: device.name.clone(),
-                    link: socket.link.clone(),
-                    order: socket.bulk_order(),
-                });
+            self.online.repair_sent = true;
         }
+    }
+    pub(super) fn drain_online_events(&mut self, first: Option<Event>) {
         if self
             .online
-            .local_start
-            .as_ref()
-            .is_some_and(|s| s.output_pulse.is_some())
-            && !matches!(&event.kind, EventKind::Outputs(_))
+            .transport
+            .is_some_and(|g| self.link() != Link::Connected(g))
         {
-            self.cancel_local_start();
+            self.leave_link();
         }
+        if let Some(event) = first {
+            self.apply_event(event);
+        }
+        for _ in 0..16 {
+            let Some(event) = self.socket.as_mut().and_then(|s| s.events.try_recv().ok()) else {
+                break;
+            };
+            self.apply_event(event);
+        }
+    }
+    pub(super) fn leave_link(&mut self) {
+        let departed = self.online.transport.take();
+        self.disconnect_personal();
+        self.online.projection.clear_pending();
+        self.online.claim_offer = None;
+        self.online.claim_pending = None;
+        self.online.clock_offset_ms = None;
+        self.online.repair_sent = false;
+        self.online.refresh_at = None;
+        if let Some(generation) = departed {
+            let link = self.link();
+            let demoted = self
+                .socket
+                .as_ref()
+                .and_then(|socket| socket.last_owner(generation))
+                == Some(false);
+            self.online.detached = self.local_store.is_none()
+                && !self.online.gap
+                && !demoted
+                && link != Link::Superseded
+                && self
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| !a.session.is_revoked())
+                && self.online.is_owner(&self.device_id);
+            if demoted || link == Link::Superseded {
+                if self.local_store.is_some() {
+                    if let Some(audio) = &self.audio {
+                        self.local.elapsed = audio.facts().elapsed;
+                    }
+                    self.local.desired = false;
+                    self.cancel_work();
+                }
+                self.stop();
+            } else if !self.online.detached && self.local_store.is_none() {
+                self.stop();
+            }
+            self.publish_access();
+        }
+    }
+    fn apply_event(&mut self, event: Event) {
+        let generation = event.generation;
+        // A handshake requests a fresh, actor-serialized claim; a polling watch
+        // can lose the final local action or EOF immediately before a reconnect.
+        if let EventKind::ClaimRequested(reply) = event.kind {
+            if self.network_allowed() {
+                self.drive_native(NativeEvent::Tick);
+                let _ = reply.send(self.current_claim());
+            }
+            return;
+        }
+        if self.link() != Link::Connected(generation) {
+            if matches!(&event.kind, EventKind::Snapshot(_))
+                && self.socket.as_ref().and_then(|s| s.last_owner(generation)) == Some(false)
+            {
+                // The socket decoded a losing initial claim before closing.
+                self.retire_saved_claim();
+                self.online.detached = false;
+                self.stop();
+            }
+            return;
+        }
+        let stamp = event.personal_stamp;
         match event.kind {
-            EventKind::Snapshot {
-                connection_id,
-                player,
-                outputs,
-            } => {
-                self.cancel_local_start();
-                self.online.released_here = false;
-                let fresh = self.online.generation != Some(generation);
-                let read = if fresh {
-                    self.online.sync_reads.clear();
-                    None
-                } else {
-                    self.online.sync_reads.pop_front()
-                };
+            EventKind::Snapshot(snapshot) => {
+                let fresh = self.online.transport != Some(generation);
+                let owns = snapshot.owner.device_id.as_deref() == Some(self.device_id.as_str());
+                let offered = fresh.then(|| self.online.claim_offer.take()).flatten();
+                let resolving = self.online.claim_pending.take();
+                let newer_cursor = offered
+                    .as_ref()
+                    .and_then(|offer| self.newer_claim_cursor(offer, &snapshot));
+                let run = self.audio.as_ref().and_then(|a| a.run_identity());
+                let adopted = owns && self.local_store.is_some()
+                    && self.local.current().is_some_and(|row| snapshot.player.current().is_some_and(|remote| remote.id == row.track.id))
+                    && (offered.as_ref().is_some_and(|offer| {
+                        matches!(&offer.source, ClaimSource::Saved { revision, run: sent, .. }
+                            if *revision == self.local_revision && sent.is_none_or(|sent| Some(sent) == run))
+                        && claim_cursor_matches(&offer.cursor, &snapshot.player)
+                    }) || resolving.as_ref().is_some_and(|pending| {
+                        pending.saved_revision == self.local_revision && pending.saved_run.is_none_or(|sent| Some(sent) == run)
+                            && claim_cursor_matches(&pending.target, &snapshot.player)
+                    }));
+                let outcome = self.online.projection.apply_snapshot(snapshot.clone());
+                if outcome.needs_sync() {
+                    self.online.gap = true;
+                    self.repair(generation);
+                }
+                if !outcome.applied() {
+                    self.online.claim_offer = offered;
+                    self.online.claim_pending = resolving;
+                    return;
+                }
+                self.online.gap = false;
+                self.online.repair_sent = false;
+                self.online.refresh_at = None;
+                self.online.detached = false;
                 if fresh {
-                    self.online.receipts = local_start::Receipts::default();
                     self.disconnect_personal();
-                    self.online.generation = Some(generation);
-                    self.online.connection = connection_id;
+                    self.online.transport = Some(generation);
+                    self.online
+                        .connection_id
+                        .clone_from(&snapshot.connection_id);
                     self.online.personal_generation = Some(generation);
                     self.personal.begin(self.epoch, generation);
                 }
-                if !output::valid(&player) {
-                    self.player_gap(generation);
+                self.update_bulk_device();
+                if let Some(cursor) = newer_cursor
+                    && self.begin_claim_reconcile(generation, &snapshot, cursor)
+                {
+                    self.publish_access();
                     return;
                 }
-                if self.online.player_gap {
-                    self.action_status = "";
-                }
-                self.online.player_gap = false;
-                if self.online.order_echo.as_ref().is_some_and(|echo| {
-                    fresh
-                        || echo
-                            .refresh_id
-                            .is_some_and(|id| read == Some(SyncRead::Order(id)))
-                        || echo.placement_observed(&player)
-                }) {
-                    self.online.order_echo = None;
-                    self.action_status = "";
-                }
-                self.online.revision = self.online.revision.wrapping_add(1);
-                // While awaiting actual reattach confirmation, the opening
-                // snapshot may still contain the pre-EOF base. Keep the local
-                // successor only under the prior owner's live grace.
-                let waiting = fresh
-                    && self
-                        .grant()
-                        .is_some_and(|g| g.generation != generation || !g.attached);
-                self.online.adopt_cursor(&player.cursor, waiting);
-                self.online.observed_at = Some(Instant::now());
-                self.online.state = Some(player);
+                self.finish_local_claim(&snapshot.player, adopted);
+                self.drive_native(NativeEvent::Snapshot);
                 if fresh {
-                    self.online.outputs = outputs;
-                } else {
-                    self.accept_outputs(generation, outputs);
+                    self.publish_access();
                 }
             }
-            _ if self.online.generation != Some(generation) => {}
-            EventKind::Player(delta) => {
-                if self.online.player_gap {
-                    return;
-                }
-                let Some(state) = &mut self.online.state else {
-                    return;
-                };
-                let Ok(changed) = output::apply(state, &delta) else {
-                    self.player_gap(generation);
-                    return;
-                };
-                if delta.queue.is_some()
-                    && self
-                        .online
-                        .order_echo
-                        .as_ref()
-                        .is_some_and(|echo| echo.placement_observed(state))
-                {
-                    self.online.order_echo = None;
-                    if self.action_status == "The queue order is unconfirmed." {
-                        self.action_status = "";
+            EventKind::ClaimRequested(_) => unreachable!(),
+            _ if self.online.transport != Some(generation) => return,
+            EventKind::State(update) => {
+                let command = update.command.clone();
+                let cursor_changed = update.delta.cursor.is_some();
+                let revision = update.revision;
+                if !self.online.gap {
+                    let outcome = self.online.projection.apply_state(update);
+                    if outcome.needs_sync() {
+                        self.online.gap = true;
+                        self.repair(generation);
+                        self.drive_native(NativeEvent::Tick);
+                    } else if outcome.applied() && self.online.projection.revision() == revision {
+                        if cursor_changed && self.online.claim_pending.take().is_some() {
+                            // An already-admitted shared transport update wins
+                            // even if it reaches us before the claim repair.
+                            self.retire_saved_claim();
+                            self.drive_native(NativeEvent::OpeningState(command.as_ref()));
+                        } else {
+                            self.drive_native(NativeEvent::State(command.as_ref()));
+                        }
                     }
                 }
-                if changed {
-                    self.online.revision = self.online.revision.wrapping_add(1);
-                }
-                let own = delta.source.as_deref() == Some(self.online.connection.as_str());
-                if own {
-                    self.online.receipts.received(&delta, state);
-                    self.action_status = if delta.queue.is_none() {
-                        "That selection is unavailable."
-                    } else {
-                        ""
-                    };
-                }
-                let vacant = self.online.locally_vacant();
-                if let (Some(start), Some(state)) =
-                    (&mut self.online.local_start, &self.online.state)
-                    && !start.observe(&delta, state, own, vacant)
+            }
+            EventKind::Execute(execute) => {
+                if !self.online.gap
+                    && self.online.projection.revision() == execute.revision
+                    && self
+                        .online
+                        .projection
+                        .owner()
+                        .is_some_and(|owner| owner.generation == execute.generation)
+                    && self.online.is_owner(&self.device_id)
                 {
-                    self.cancel_local_start();
-                }
-                if let Some(cursor) = &delta.cursor {
-                    self.online.adopt_cursor(cursor, delta.observed);
-                    self.online.observed_at = Some(Instant::now());
+                    if self.online.claim_pending.take().is_some() {
+                        self.retire_saved_claim();
+                        self.drive_native(NativeEvent::Snapshot);
+                    }
+                    self.drive_native(NativeEvent::Execute(&execute.command));
                 }
             }
-            EventKind::Outputs(outputs) => self.accept_outputs(generation, outputs),
+            EventKind::Observation(update) => {
+                if self
+                    .online
+                    .projection
+                    .apply_observation(update)
+                    .needs_sync()
+                {
+                    self.online.gap = true;
+                    self.repair(generation);
+                    self.drive_native(NativeEvent::Tick);
+                }
+            }
+            EventKind::Ownership(update) => {
+                if self.online.projection.apply_ownership(update).needs_sync() {
+                    self.online.gap = true;
+                    self.repair(generation);
+                }
+                self.update_bulk_device();
+                self.drive_native(NativeEvent::Tick);
+            }
+            EventKind::Offer(offer) => {
+                // Acceptance means we can assume the role, not that audio can
+                // start. Native initialization opens devices only after commit.
+                if self.network_allowed()
+                    && self.audio.is_some()
+                    && let Some(socket) = &self.socket
+                {
+                    let _ = socket.accept(generation, offer);
+                }
+            }
+            EventKind::Result(result) => {
+                if self
+                    .online
+                    .claim_pending
+                    .as_ref()
+                    .is_some_and(|p| p.id == result.id)
+                {
+                    // The matching or corrective snapshot is the authoritative
+                    // response. Do not publish or execute a terminal echo twice.
+                    return;
+                }
+                let status = result.status;
+                if self.online.projection.apply_result(result) {
+                    self.action_status = match status {
+                        socket::ResultStatus::Failed => "Playback could not be changed.",
+                        socket::ResultStatus::Unavailable => "Playback is unavailable.",
+                        _ => "",
+                    };
+                }
+            }
+            EventKind::SampleClock(clock) => self.online.clock_offset_ms = clock.offset_ms,
             EventKind::Personal(value) => {
                 let Ok(update) = serde_json::from_value::<PersonalUpdate>(value) else {
                     self.personal.gap(self.epoch, generation);
@@ -586,1297 +479,893 @@ impl Engine {
                 }
             }
         }
+        if let (Some(stamp), Some(socket)) = (stamp, &self.socket) {
+            socket.mark_personal_applied(stamp);
+        }
     }
-    pub(super) fn drain_online_events(&mut self, first: Option<Event>) {
-        if self
-            .online
-            .personal_generation
-            .is_some_and(|g| self.link() != Link::Connected(g))
+    fn newer_claim_cursor(
+        &self,
+        offered: &ClaimOffer,
+        snapshot: &socket::Snapshot,
+    ) -> Option<socket::Cursor> {
+        if snapshot.owner.device_id.as_deref() != Some(&self.device_id)
+            || !claim_cursor_matches(&offered.cursor, &snapshot.player)
         {
-            self.disconnect_personal();
+            return None;
         }
-        if let Some(first) = first {
-            self.handle_event(first);
+        if let Some(basis) = &offered.reattach_basis
+            && snapshot.session_id == basis.session_id
+            && snapshot.owner.generation == basis.generation
+            && !(basis.revision..=basis.revision.saturating_add(1)).contains(&snapshot.revision)
+        {
+            return None;
         }
-        for _ in 0..16 {
-            let Some(event) = self.socket.as_mut().and_then(|s| s.events.try_recv().ok()) else {
-                break;
-            };
-            self.handle_event(event);
+        let local = match &offered.source {
+            ClaimSource::Saved { operation, .. } => {
+                let local = self.saved_claim()?;
+                if *operation == self.operation
+                    && local.cursor.key == offered.cursor.key
+                    && local.cursor.occurrence == offered.cursor.occurrence
+                    && local.cursor.desired_playing == offered.cursor.desired_playing
+                {
+                    return None;
+                }
+                local
+            }
+            ClaimSource::Detached { intent, run } => {
+                let audio = self.audio.as_ref()?;
+                if self.online.native.cursor() == Some(intent) && audio.run_identity() == *run {
+                    return None;
+                }
+                self.online.native.local_snapshot(audio)?
+            }
+        };
+        if local.cursor == snapshot.player.cursor || local.cursor.key == 0 {
+            return None;
+        }
+        let id = &local.current()?.id;
+        snapshot
+            .player
+            .queue
+            .iter()
+            .find(|row| row.key == local.cursor.key && &row.id == id)?;
+        Some(local.cursor)
+    }
+    fn begin_claim_reconcile(
+        &mut self,
+        generation: Generation,
+        snapshot: &socket::Snapshot,
+        cursor: socket::Cursor,
+    ) -> bool {
+        let basis = socket::ReattachBasis {
+            session_id: snapshot.session_id.clone(),
+            generation: snapshot.owner.generation,
+            revision: snapshot.revision,
+            occurrence: snapshot.player.cursor.occurrence.clone(),
+        };
+        let Some(socket) = &self.socket else {
+            return false;
+        };
+        let Ok(id) = socket.reconcile_claim(generation, basis, cursor.clone()) else {
+            return false;
+        };
+        if self.local_store.is_none()
+            && let Some(audio) = &self.audio
+        {
+            self.online.native.witness_claim_cursor(&cursor, audio);
+        }
+        self.online.claim_pending = Some(PendingClaim {
+            id,
+            deadline: Instant::now() + Duration::from_secs(5),
+            target: cursor,
+            saved_run: self.audio.as_ref().and_then(|a| a.run_identity()),
+            saved_revision: self.local_revision,
+        });
+        true
+    }
+    fn finish_local_claim(&mut self, state: &State, adopt: bool) {
+        if self.local_store.is_none() {
+            return;
+        }
+        if adopt && let Some(audio) = &self.audio {
+            self.online.native.adopt_local(state, audio);
+            self.local_lookahead = None;
+        } else {
+            self.stop_local();
+        }
+        self.cancel_work();
+        self.local = LocalQueue::default();
+        self.local_store = None;
+    }
+    fn retire_saved_claim(&mut self) {
+        if self.local_store.is_some() {
+            self.stop_local();
+            self.cancel_work();
+            self.local = LocalQueue::default();
+            self.local_store = None;
+        }
+    }
+    fn update_bulk_device(&self) {
+        let Some(socket) = &self.socket else {
+            return;
+        };
+        if let Some(device) = self
+            .online
+            .projection
+            .devices()
+            .iter()
+            .find(|d| d.device_id == self.device_id && d.can_play)
+        {
+            self.personal
+                .set_bulk_device(crate::personal_bridge::BulkDevice {
+                    id: device.device_id.clone(),
+                    name: device.name.clone(),
+                    link: socket.link.clone(),
+                    order: socket.bulk_order(),
+                });
         }
     }
     pub(super) fn tick_online(&mut self, first: Option<Event>) {
-        if self.link() == Link::Expired {
-            self.expire();
-            return;
-        }
         self.drain_online_events(first);
-        self.refresh_queue_order();
-        self.finish_initial_play();
-        if self.local_store.is_some() {
-            let room_needs_output = self.attached().is_some()
-                && self
-                    .online
-                    .cursor()
-                    .is_some_and(|c| c.desired && !self.online.stop_for(c));
-            if !room_needs_output {
-                self.tick_saved();
-                return;
-            }
-            self.leave_saved_queue();
-        }
-        self.reconcile_online();
-        self.tick_online_crossfade();
-        if self.sample_online(true, false) {
-            self.reconcile_online();
-        }
-    }
-    pub(super) fn pause_room_for_saved(&mut self) -> bool {
-        if self.online.is_owner()
-            && self
-                .online
-                .cursor()
-                .is_some_and(|c| c.desired && !self.online.stop_for(c))
-        {
-            self.online_action(Action::Pause);
-            return self.action_status.is_empty();
-        }
-        true
-    }
-    #[cfg(target_os = "linux")]
-    pub(super) fn pause_detached_media(&mut self) {
-        let Some(execution) = &self.online.execution else {
-            return;
-        };
-        // This path must never submit a room Pause: the transport can
-        // reattach concurrently while this actor is stopping its old run.
-        self.online.stopped = Some(execution.cursor.clone());
-        self.cancel_work();
-        self.stop();
-        if let (Some(grant), Some(socket)) = (self.grant(), &self.socket) {
-            let _ = socket.observe_local(grant.generation, Cursor::default());
-        }
-    }
-    pub(super) fn online_action(&mut self, action: Action) {
-        if !self.network_allowed() {
-            return;
-        }
-        let Some(command) = action.wire(&self.device_id) else {
-            return;
-        };
-        if matches!(
-            command,
-            socket::Command::Play { .. }
-                | socket::Command::Resume
-                | socket::Command::Pause
-                | socket::Command::Close
-                | socket::Command::Jump { .. }
-                | socket::Command::Select { .. }
-        ) {
-            self.pending_initial_play = None;
-        }
-        // Keep one explicit catalog Play that arrived before the first hello.
-        // Never defer selection/transport or replay a command on reconnect.
-        if self.link() == Link::Connecting
-            && self.online.generation.is_none()
-            && matches!(command, socket::Command::Play { .. })
-        {
-            self.pending_initial_play =
-                Some((Instant::now() + super::INITIAL_PLAY_TIMEOUT, command));
-            self.action_status = "Connecting playback controls…";
-            return;
-        }
-        // A later queue edit can itself drain the opening snapshot. Send any
-        // deferred Play first so it cannot erase that edit by arriving later.
-        self.finish_initial_play();
-        self.send_online_command(command, true);
-    }
-    pub(super) fn send_queue_order(&mut self, action: Action, mode_stamp: u64) {
-        let Some(generation) = self.online_generation() else {
-            return;
-        };
-        let Action::Move { key, after } = action else {
-            return;
-        };
-        let Some(command) = action.wire(&self.device_id) else {
-            return;
-        };
-        if self
-            .socket
-            .as_ref()
-            .is_some_and(|s| s.reorder(generation, mode_stamp, command).is_ok())
-        {
-            self.online.order_echo = Some(OrderEcho {
-                key,
-                after,
-                refresh_due: Some(Instant::now() + ORDER_REFRESH_DELAY),
-                refresh_attempts: 0,
-                refresh_id: None,
-            });
-            self.action_status = "";
-        } else {
-            self.action_status = "The queue order was not sent.";
-        }
-    }
-
-    fn refresh_queue_order(&mut self) {
-        let Some((socket, generation)) = self.socket.as_ref().zip(self.online_generation()) else {
-            return;
-        };
-        let Some(echo) = self.online.order_echo.as_mut() else {
-            return;
-        };
-        if echo.refresh_due.is_none_or(|due| Instant::now() < due) {
-            return;
-        }
-        // Admit at most one refresh. Back off a few times only if the read
-        // couldn't enter the local buffer; never repeat the order write.
-        echo.refresh_due = None;
-        echo.refresh_attempts += 1;
-        self.action_status = "The queue order is unconfirmed.";
-        if self.online.sync_reads.len() < 4 && socket.sync(generation).is_ok() {
-            self.online.sync_serial = self.online.sync_serial.wrapping_add(1);
-            let id = self.online.sync_serial;
-            echo.refresh_id = Some(id);
-            self.online.sync_reads.push_back(SyncRead::Order(id));
-        } else if echo.refresh_attempts < 3 {
-            echo.refresh_due = Some(
-                Instant::now()
-                    + std::time::Duration::from_millis(250 * u64::from(echo.refresh_attempts)),
-            );
-        }
-    }
-
-    pub(super) fn seek_online_lyric(
-        &mut self,
-        value: f64,
-        snapshot: crate::presentation::LyricSnapshot,
-    ) {
-        let Some(state) = &self.online.state else {
-            return;
-        };
-        let scope = socket::LyricSeekScope {
-            cursor: state.cursor.clone(),
-            snapshot,
-            epoch: self.epoch,
-            current_epoch: self.shared_epoch.clone(),
-        };
-        self.send_online_command_scoped(socket::Command::Seek { value }, false, Some(scope));
-    }
-
-    fn send_online_command(&mut self, command: socket::Command, explicit: bool) {
-        self.send_online_command_scoped(command, explicit, None);
-    }
-
-    fn send_online_command_scoped(
-        &mut self,
-        command: socket::Command,
-        explicit: bool,
-        lyric_scope: Option<socket::LyricSeekScope>,
-    ) {
-        let replaced_start = self.online.starting_locally();
-        if matches!(
-            command,
-            socket::Command::Play { .. }
-                | socket::Command::Resume
-                | socket::Command::Pause
-                | socket::Command::Close
-                | socket::Command::Seek { .. }
-                | socket::Command::Next
-                | socket::Command::Previous
-                | socket::Command::Jump { .. }
-                | socket::Command::Select { .. }
-        ) {
-            self.cancel_local_start();
-        }
-        if matches!(command, socket::Command::Pause | socket::Command::Close)
-            && (self.online.is_owner()
-                || self.online.execution.is_some()
-                || self.online.work.is_some())
-        {
-            // Preserve the real playback tail before Pause. Never send an end
-            // as a consequence of a physical stop.
-            self.sample_online(false, true);
-            self.online.stopped = self.online.cursor().cloned();
-            self.cancel_work();
-            self.stop();
-            if let (Some(grant), Some(socket)) = (self.grant(), &self.socket) {
-                let _ = socket.observe_local(grant.generation, Cursor::default());
-            }
-        }
-        let Some(generation) = self.online_generation() else {
-            self.action_status = "Playback controls are disconnected.";
-            return;
-        };
-        let changes_run = matches!(
-            command,
-            socket::Command::Play { .. }
-                | socket::Command::Next
-                | socket::Command::Previous
-                | socket::Command::Seek { .. }
-                | socket::Command::Jump { .. }
-                | socket::Command::Select { .. }
-        );
-        let socket = self.socket.as_ref().expect("live generation has a socket");
-        let start = if explicit
-            && !replaced_start
-            && socket.events.is_empty()
-            && self.audio.is_some()
-            && self.local_store.is_none()
-            && self.online.execution.is_none()
-            && self.online.work.is_none()
-            && self
-                .grant()
-                .is_none_or(|g| g.attached && g.generation == generation)
-            && (self.online.is_owner() || self.online.locally_vacant())
-        {
-            self.online.state.as_ref().and_then(|state| {
-                let resume_through = self.attached().map_or(0, |g| g.resume_through);
-                if !self.online.receipts.may_start(&command, resume_through) {
-                    return None;
+        match self.link() {
+            Link::Expired => {
+                self.auth_transport_expired();
+                if self.account.is_none() {
+                    return;
                 }
-                local_start::Start::new(
-                    &command,
-                    state,
-                    generation,
-                    socket.link.clone(),
-                    socket.authority.clone(),
-                    socket.direct_start.clone(),
-                )
-            })
+            }
+            Link::Exhausted => {
+                self.persist_fallback();
+            }
+            Link::Superseded => {
+                self.online.superseded = true;
+                self.online.detached = false;
+                self.socket = None;
+                self.cancel_work();
+                self.stop();
+                self.publish_access();
+            }
+            _ => {}
+        }
+        if self
+            .online
+            .claim_pending
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            self.online.claim_pending = None;
+            self.online.gap = true;
+            self.online.repair_sent = false;
+            self.retire_saved_claim();
+            self.stop();
+        }
+        if self.online.claim_pending.is_none() {
+            if self.local_store.is_some() {
+                self.tick_saved();
+            } else {
+                self.drive_native(NativeEvent::Tick);
+            }
+        }
+        if self.online.claim_pending.is_none() {
+            for (request, source) in std::mem::take(&mut self.online.claim_media)
+                .into_iter()
+                .flatten()
+            {
+                self.apply_media(request, source);
+            }
+        }
+        if self.online.gap
+            && let Some(generation) = self.transport_generation()
+        {
+            self.repair(generation);
+        }
+        if let Some(generation) = self.online_generation()
+            && self.online.is_owner(&self.device_id)
+        {
+            if self.online.refresh_at.is_none_or(|at| Instant::now() >= at)
+                && let Some(owner) = self.online.projection.owner()
+                && self
+                    .socket
+                    .as_ref()
+                    .is_some_and(|s| s.refresh(generation, owner.generation).is_ok())
+            {
+                self.online.refresh_at = Some(Instant::now() + REFRESH_INTERVAL);
+            }
+        }
+    }
+    pub(super) fn current_claim(&mut self) -> Claim {
+        let local = if self.local_store.is_some() {
+            self.saved_claim()
+        } else if self.online.detached || self.online.is_owner(&self.device_id) {
+            self.audio
+                .as_ref()
+                .and_then(|audio| self.online.native.detached_snapshot(audio))
         } else {
             None
         };
-        let admission = match (&command, lyric_scope) {
-            (socket::Command::Seek { value }, Some(scope)) => {
-                socket.seek_lyric(generation, *value, scope).map(|()| None)
-            }
-            _ => socket.command(generation, command.clone()),
-        };
-        self.action_status = if let Ok(resume) = admission {
-            self.online.receipts.sent(&command, resume);
-            if let Some(mut start) = start {
-                // This cache contains only the current account's previously
-                // authenticated media. Downloaded files always re-verify.
-                if let Some(source) = self
-                    .audio
-                    .as_ref()
-                    .and_then(|a| a.cached(&start.id))
-                    .filter(crate::audio_input::AudioInput::reusable_online)
-                {
-                    start.ready = Some(Ok(OnlineMedia { source }));
-                } else {
-                    self.load_online_media(start.id.clone(), None);
+        let reattach_basis = self
+            .online
+            .detached
+            .then(|| self.online.projection.reattach_basis())
+            .flatten();
+        self.online.claim_offer = local.as_ref().and_then(|offered| {
+            let source = if self.local_store.is_some() {
+                ClaimSource::Saved {
+                    operation: self.operation,
+                    revision: self.local_revision,
+                    run: self.audio.as_ref().and_then(|a| a.run_identity()),
                 }
-                self.online.local_start = Some(start);
-            }
-            if changes_run && self.crossfade_enabled.load(Ordering::Acquire) {
-                // Don't (re)start an overlap of the run a manual navigation
-                // is about to replace. A rejected choice can simply use EOF.
-                self.online.suppress_crossfade = self.online.cursor().cloned();
-                self.cancel_online_crossfade();
-            }
-            ""
-        } else {
-            "The playback action was not sent."
-        };
-    }
-    fn finish_initial_play(&mut self) {
-        let Some((deadline, _)) = self.pending_initial_play.as_ref() else {
-            return;
-        };
-        if Instant::now() >= *deadline
-            || !matches!(self.link(), Link::Connecting | Link::Connected(_))
-        {
-            self.pending_initial_play = None;
-            self.action_status = "The playback action was not sent.";
-        } else if self.online_generation().is_some() {
-            let (_, command) = self.pending_initial_play.take().unwrap();
-            self.send_online_command(command, false);
-        }
-    }
-    fn reconcile_online(&mut self) {
-        if self.reconcile_local_start() {
-            return;
-        }
-        let grant = self.grant();
-        if grant.is_none() && self.online.advance.take().is_some() {
-            self.online.revision = self.online.revision.wrapping_add(1);
-        }
-        let attached = self.attached();
-        if let Some(execution) = &mut self.online.execution
-            && let Some(pending) = &execution.pending_crossfade
-        {
-            if attached.is_none_or(|g| g.generation != pending.generation) {
-                // A queued EOF might not have reached Go. Never export the
-                // speculative successor or let it qualify for detached grace.
-                if self.online.advance.take().is_some() {
-                    self.online.revision = self.online.revision.wrapping_add(1);
+            } else {
+                ClaimSource::Detached {
+                    intent: self.online.native.cursor()?.clone(),
+                    run: self.audio.as_ref().and_then(|audio| audio.run_identity()),
                 }
-                self.stop();
-            } else if self.online.advance.is_none()
-                && self
-                    .online
-                    .state
-                    .as_ref()
-                    .is_some_and(|state| output::same_execution(&state.cursor, &execution.cursor))
-            {
-                pending.confirmed.store(true, Ordering::Release);
-                execution.pending_crossfade = None;
-            }
-        }
-        let cursor = self.online.cursor().cloned();
-        let current = cursor.as_ref().filter(|cursor| {
-            cursor.desired
-                && !self.online.stop_for(cursor)
-                && self
-                    .online
-                    .state
-                    .as_ref()
-                    .is_some_and(|s| s.queue.iter().any(|t| t.key == cursor.key))
+            };
+            Some(ClaimOffer {
+                cursor: offered.cursor.clone(),
+                source,
+                reattach_basis: reattach_basis.clone(),
+            })
         });
-        if self.online.handoff.as_ref().is_some_and(|handoff| {
-            attached.is_none_or(|g| g.generation != handoff.key.generation)
-                || current.is_none_or(|c| !output::same_execution(c, &handoff.key.to))
-        }) {
-            self.online.handoff = None;
-        }
-        if let Some(work) = &self.online.work
-            && (attached.is_none_or(|g| g.generation != work.generation)
-                || current.is_none_or(|c| !output::same_execution(c, &work.cursor)))
-        {
-            self.cancel_work();
-        }
-        if let Some(execution) = &self.online.execution {
-            let keep = !self.online.player_gap
-                && grant.is_some()
-                && execution.permit.granted()
-                && self.audio.as_ref().is_some_and(|audio| !audio.was_fenced())
-                && current.is_some_and(|c| output::same_execution(c, &execution.cursor))
-                && if let Some(grant) = attached {
-                    execution.permit.adopt(grant)
-                } else {
-                    // A terminal run has no output, but may owe Go a stop
-                    // after an exact same-run reattach. It must not refetch.
-                    matches!(execution.status, Status::Load | Status::Media)
-                        || self.audio.as_ref().is_some_and(|audio| audio.has_started())
-                };
-            if !keep {
-                // A canonical seek creates a new run and PCM buffer, but it
-                // can read the same authenticated GET for the same visit.
-                let seek = if let Some(grant) = attached
-                    && execution.permit.granted()
-                    && execution.pending_crossfade.is_none()
-                    && execution.status == Status::Ok
-                    && let Some(cursor) = current
-                    && cursor.key == execution.cursor.key
-                    && cursor.chain == execution.cursor.chain
-                    && cursor.visit == execution.cursor.visit
-                    && cursor.run != execution.cursor.run
-                    && let Some(track) = self.online.state.as_ref().and_then(State::current)
-                {
-                    self.audio
-                        .as_ref()
-                        .and_then(|a| a.cached(&track.id))
-                        .filter(AudioInput::reusable_online)
-                        .map(|source| Handoff {
-                            key: PreviewKey {
-                                generation: grant.generation,
-                                from: execution.cursor.clone(),
-                                to: cursor.clone(),
-                                id: track.id.clone(),
-                            },
-                            media: HandoffMedia::Ready(source),
-                        })
-                } else {
-                    None
-                };
-                self.stop();
-                // Keep ownership while reconciliation waits for queued events.
-                self.online.handoff = seek;
-            }
-        }
-        let (Some(grant), Some(cursor)) = (attached, current) else {
-            return;
-        };
-        if self.online.execution.is_some()
-            || self.online.work.is_some()
-            // Never start exportable playback for an EOF forecast. An
-            // admitted crossfade uses its separate confirmation fence.
-            || self.online.advance.is_some()
-            || self
-                .socket
-                .as_ref()
-                .is_some_and(|socket| !socket.events.is_empty())
-        {
-            return;
-        }
-        let Some(track) = self
-            .online
-            .state
-            .as_ref()
-            .and_then(|s| s.queue.iter().find(|t| t.key == cursor.key))
-        else {
-            return;
-        };
-        let work = Work {
-            generation: grant.generation,
-            cursor: cursor.clone(),
-            id: track.id.clone(),
-            duration: track.duration,
-        };
-        let fallback = self
-            .online
-            .handoff
-            .take()
-            .and_then(|handoff| (handoff.key.id == work.id).then_some(handoff.media));
-        self.cancel_work();
-        match fallback {
-            Some(HandoffMedia::Ready(source)) if source.reusable_online() => {
-                self.start_online(work, Ok(OnlineMedia { source }));
-            }
-            Some(HandoffMedia::Ready(source)) if source.is_failed() => {
-                self.start_online(work, Err(Status::Load));
-            }
-            pending => {
-                let load = match pending {
-                    Some(HandoffMedia::Loading(load)) => Some(load),
-                    _ => None,
-                };
-                self.load_online_media(work.id.clone(), load);
-                self.online.work = Some(work);
-            }
+        Claim {
+            local,
+            reattach_basis,
         }
     }
-    fn load_online_media(&mut self, id: String, pending: Option<crossfade::Load>) {
-        if let Some(account) = &self.account {
-            let (api, session, slot, replies, id) = (
-                account.api.clone(),
-                account.session.clone(),
-                self.local_read_slot.clone(),
-                self.results.clone(),
-                id,
-            );
-            let cached = self.audio.as_ref().and_then(|audio| audio.cached(&id));
-            let (epoch, operation) = (self.epoch, self.operation);
-            self.media = Some(tokio::spawn(async move {
-                let result = async {
-                    if let Some(load) = pending {
-                        match load.ready().await {
-                            Some(source) if source.reusable_online() => {
-                                return Ok(OnlineMedia { source });
-                            }
-                            Some(source) if !source.is_failed() => (), // Saved source: verify again.
-                            _ => {
-                                return Err(ApiError {
-                                    message: "Audio could not be loaded.",
-                                    expired: session.is_expired(),
-                                    status: 0,
-                                });
-                            }
-                        }
-                    }
-                    offline::online_media(&api, &session, slot, &id, cached).await
+    pub(super) fn online_action(&mut self, action: Action) {
+        let Some(generation) = self.online_generation() else {
+            return;
+        };
+        let action = if matches!(action, Action::CycleRepeat) {
+            let repeat = self
+                .online
+                .visible()
+                .map_or(socket::Repeat::Off, |p| p.repeat);
+            Action::Repeat(cycle_repeat(repeat))
+        } else {
+            action
+        };
+        let Some(socket) = &self.socket else {
+            return;
+        };
+        let action = match action {
+            Action::RenameDevice { device_id, name } => {
+                let id = device_id.as_deref().unwrap_or(&self.device_id);
+                let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+                if socket.rename(generation, id, name).is_err() {
+                    self.action_status = "Device name was not changed.";
                 }
-                .await;
-                let _ = replies
-                    .send(Reply::Media {
-                        epoch,
-                        operation,
-                        result,
-                    })
-                    .await;
-            }));
+                return;
+            }
+            other => other,
+        };
+        let Some(action) = action.wire() else {
+            return;
+        };
+        let Some(basis) = self.online.projection.basis(&action) else {
+            return;
+        };
+        if !self.online.projection.can_submit() {
+            self.action_status = "Playback controls are busy.";
+            return;
+        }
+        match socket.command(generation, basis.clone(), action.clone()) {
+            Ok(id) => {
+                self.online.projection.register(id, basis, action);
+                self.action_status = "";
+            }
+            Err(_) => self.action_status = "Playback command was not sent.",
+        }
+    }
+    pub(super) fn detached_action(&mut self, action: Action) {
+        let action = if matches!(action, Action::CycleRepeat) {
+            let repeat = self
+                .online
+                .native
+                .state()
+                .map_or(socket::Repeat::Off, |state| state.repeat);
+            Action::Repeat(cycle_repeat(repeat))
+        } else {
+            action
+        };
+        if self.online.detached
+            && self.online_generation().is_none()
+            && let Some(action) = action.wire()
+        {
+            self.drive_native(NativeEvent::Detached(action));
         }
     }
     pub(super) fn complete_online(
         &mut self,
-        operation: u64,
-        result: Result<OnlineMedia, ApiError>,
+        request: native::MediaRequest,
+        source: Option<AudioInput>,
     ) {
         self.drain_online_events(None);
-        if !self.network_allowed() {
-            if result.as_ref().is_err_and(|e| e.expired)
-                && self.current()
-                && !self.explicit_offline()
+        if self.online.claim_pending.is_some() {
+            let slot = if request.preview {
+                &self.online.preview
+            } else {
+                &self.online.primary
+            };
+            if slot
+                .as_ref()
+                .is_some_and(|(current, _)| *current == request)
             {
-                self.expire();
+                self.online.claim_media[usize::from(request.preview)] = Some((request, source));
             }
-            return;
-        }
-        if self.operation != operation {
-            return;
-        }
-        if result.as_ref().is_err_and(|e| e.expired) {
-            self.expire();
-            return;
-        }
-        let result = result.map_err(|_| Status::Load);
-        if let Some(start) = &mut self.online.local_start {
-            start.ready = Some(result);
-            self.reconcile_online();
-        } else if let Some(work) = self.online.work.take() {
-            self.start_online(work, result);
+        } else {
+            self.apply_media(request, source);
         }
     }
-    fn cancel_local_start(&mut self) {
-        if self.online.starting_locally() {
-            self.cancel_work();
-            self.stop();
-        }
-    }
-    /// Return true only while the separate local start owns native audio/load.
-    /// Promotion never stops/re-appends the sink or creates a new decoder.
-    fn reconcile_local_start(&mut self) -> bool {
-        if let (Some(start), Some(audio)) = (&mut self.online.local_start, &mut self.audio)
-            && start.started
-            && let Some(status) = audio.failure()
-        {
-            // Do not promote or export an already failed preview. Keep the
-            // failure tied to this request until its exact canonical echo.
-            audio.stop();
-            audio.discard_cache();
-            start.started = false;
-            start.ready = Some(Err(status));
-        }
-        let Some(start) = self.online.local_start.as_ref() else {
-            return false;
+    fn apply_media(&mut self, request: native::MediaRequest, source: Option<AudioInput>) {
+        let slot = if request.preview {
+            &mut self.online.preview
+        } else {
+            &mut self.online.primary
         };
-        if self.online_generation() != Some(start.generation)
-            || !start.permit.live()
-            || !(self.online.is_owner() || self.online.locally_vacant())
-            || start.started
-                && self
+        if slot.as_ref().is_none_or(|(r, _)| r != &request) {
+            return;
+        }
+        *slot = None;
+        self.drive_native(NativeEvent::Media(&request, source));
+    }
+    pub(super) fn drive_native(&mut self, event: NativeEvent<'_>) {
+        if self.local_store.is_some() || self.online.claim_pending.is_some() {
+            return;
+        }
+        let connected = self.online_generation();
+        let known_demoted = connected
+            .and_then(|generation| self.socket.as_ref()?.last_owner(generation))
+            == Some(false);
+        let mode = if connected.is_some() && !known_demoted && self.online.is_owner(&self.device_id)
+        {
+            native::Mode::Owner {
+                connection_id: &self.online.connection_id,
+            }
+        } else if self.online.detached
+            && connected.is_none()
+            && !self.online.superseded
+            && !self.online.gap
+        {
+            native::Mode::Detached
+        } else {
+            native::Mode::Follower
+        };
+        let Some(state) = self.online.projection.confirmed() else {
+            return;
+        };
+        let Some(audio) = &mut self.audio else {
+            return;
+        };
+        let cx = native::Context {
+            mode,
+            session_id: self.online.projection.session_id().unwrap_or_default(),
+            generation: self.online.projection.owner().map_or(0, |o| o.generation),
+            revision: self.online.projection.revision(),
+            command: match &event {
+                NativeEvent::Snapshot
+                | NativeEvent::Tick
+                | NativeEvent::Media(..)
+                | NativeEvent::Detached(_) => None,
+                NativeEvent::State(command) | NativeEvent::OpeningState(command) => *command,
+                NativeEvent::Execute(command) => Some(command),
+            },
+            snapshot: matches!(event, NativeEvent::Snapshot | NativeEvent::OpeningState(_)),
+            sampled_at_ms: now_ms(),
+            clock_offset_ms: self.online.clock_offset_ms,
+            crossfade: self.crossfade_enabled.load(Ordering::Acquire),
+            report: connected.is_some(),
+        };
+        let work = match event {
+            NativeEvent::Tick => self.online.native.tick(state, cx, audio),
+            NativeEvent::Snapshot | NativeEvent::State(_) | NativeEvent::OpeningState(_) => {
+                self.online.native.reconcile(state, cx, audio)
+            }
+            NativeEvent::Execute(_) => self.online.native.execute(state, cx, audio),
+            NativeEvent::Media(request, source) => self
+                .online
+                .native
+                .complete(state, cx, audio, request, source),
+            NativeEvent::Detached(action) => {
+                self.online.native.act_detached(action, state, cx, audio)
+            }
+        };
+        self.submit_native(work);
+    }
+    pub(super) fn submit_native(&mut self, work: Vec<native::Work>) {
+        for work in work {
+            match work {
+                native::Work::Cancel(request) => self.online.cancel(&request),
+                native::Work::Prepare(request) => {
+                    let connected = self.online_generation().is_some() && !request.portable_only;
+                    let Some(account) = &self.account else {
+                        continue;
+                    };
+                    let (api, session, replies, epoch) = (
+                        account.api.clone(),
+                        account.session.clone(),
+                        self.results.clone(),
+                        self.epoch,
+                    );
+                    let verify_slot = if request.preview {
+                        self.local_preview_slot.clone()
+                    } else {
+                        self.local_read_slot.clone()
+                    };
+                    let request_for_task = request.clone();
+                    let task = tokio::spawn(async move {
+                        let id = request_for_task.id.clone();
+                        let source = if connected {
+                            offline::online_media(&api, &session, verify_slot, &id, None)
+                                .await
+                                .ok()
+                                .map(|media| media.source)
+                        } else {
+                            offline::read_verified(api, session, verify_slot, id, || {
+                                OfflineStore::open_existing()?.ok_or(offline::Error::NotDownloaded)
+                            })
+                            .await
+                            .ok()
+                            .map(|(_, input)| input.source)
+                        };
+                        let _ = replies
+                            .send(Reply::Media {
+                                epoch,
+                                request: request_for_task,
+                                source,
+                            })
+                            .await;
+                    });
+                    let slot = if request.preview {
+                        &mut self.online.preview
+                    } else {
+                        &mut self.online.primary
+                    };
+                    if let Some((_, old)) = slot.replace((request, task)) {
+                        old.abort();
+                    }
+                }
+                native::Work::Report(report) => {
+                    if let (Some(generation), Some(socket)) =
+                        (self.online_generation(), &self.socket)
+                        && socket.report(generation, report.clone()).is_ok()
+                    {
+                        self.online.native.report_sent(&report);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn saved_claim(&self) -> Option<State> {
+        let local = &self.local;
+        let first = local.entries.first()?;
+        let cursor = local.current().map_or_else(
+            || socket::Cursor {
+                key: first.key,
+                occurrence: local.occurrence.clone(),
+                position_ms: 0,
+                desired_playing: false,
+            },
+            |current| {
+                let elapsed = self
                     .audio
                     .as_ref()
-                    .is_none_or(|a| a.was_fenced() || a.facts().ended)
-        {
-            self.cancel_local_start();
-            return false;
-        }
-        let Some(socket) = &self.socket else {
-            return false;
-        };
-        if !socket.events.is_empty() || start.output_pulse.is_some() {
-            return true;
-        }
-        let grant = self.attached();
-        let start = self.online.local_start.as_mut().expect("checked above");
-        if let (Some(grant), Some(cursor)) = (grant, start.canonical.as_ref()) {
-            if start.started {
-                let permit = output::RunPermit::new(socket.authority.clone(), grant);
-                if start
-                    .permit
-                    .commit(permit.source(socket.link.clone(), grant.generation))
-                {
-                    self.online.execution = Some(Execution {
-                        cursor: cursor.clone(),
-                        permit,
-                        pending_crossfade: None,
-                        status: Status::Ok,
-                        last_fact: None,
-                        stop_fact_pending: false,
-                    });
-                    self.online.clear_local_start();
-                    return false;
+                    .filter(|_| local.desired && self.media.is_none())
+                    .map_or(local.elapsed, |a| a.facts().elapsed);
+                socket::Cursor {
+                    key: current.key,
+                    occurrence: local.occurrence.clone(),
+                    position_ms: (elapsed.max(0.0) * 1000.0).round() as u64,
+                    desired_playing: local.desired,
                 }
-                self.cancel_local_start();
-                return false;
-            }
-            // Go won the race with media loading. Reuse the same fetch as
-            // canonical work instead of starting it or opening audio twice.
-            let mut start = self.online.local_start.take().unwrap();
-            let work = Work {
-                generation: grant.generation,
-                cursor: start.canonical.take().unwrap(),
-                id: start.id,
-                duration: self
-                    .online
-                    .state
-                    .as_ref()
-                    .and_then(State::current)
-                    .map_or(start.duration, |t| t.duration),
-            };
-            if let Some(media) = start.ready {
-                self.start_online(work, media);
-            } else {
-                self.online.work = Some(work);
-            }
-            return false;
-        }
-        if start.ready.as_ref().is_some_and(Result::is_ok) {
-            let Some(Ok(OnlineMedia { source })) = start.ready.take() else {
-                unreachable!()
-            };
-            let audio = self.audio.as_mut().expect("local start has audio");
-            let status = audio.play(
-                start.id.clone(),
-                source,
-                start.elapsed,
-                start.duration,
-                start.permit.source(),
-            );
-            if status != Status::Ok {
-                start.ready = Some(Err(status));
-            } else {
-                start.started = true;
-            }
-        }
-        true
-    }
-    fn start_online(&mut self, work: Work, media: Result<OnlineMedia, Status>) {
-        let Some(grant) = self.attached().filter(|g| g.generation == work.generation) else {
-            return;
-        };
-        if self.online.stop_for(&work.cursor)
-            || self
-                .online
-                .cursor()
-                .is_none_or(|c| !output::same_execution(c, &work.cursor))
-        {
-            return;
-        }
-        let (Some(socket), Some(audio)) = (&self.socket, &mut self.audio) else {
-            return;
-        };
-        let permit = output::RunPermit::new(socket.authority.clone(), grant);
-        audio.anchor(work.cursor.elapsed, work.duration);
-        let status = match media {
-            Ok(OnlineMedia { source }) => audio.play(
-                work.id,
-                source,
-                work.cursor.elapsed,
-                work.duration,
-                permit.source(socket.link.clone(), grant.generation),
-            ),
-            Err(status) => status,
-        };
-        if status != Status::Rejected {
-            self.online.execution = Some(Execution {
-                cursor: work.cursor,
-                permit,
-                pending_crossfade: None,
-                status,
-                last_fact: None,
-                stop_fact_pending: false,
-            });
-        }
-    }
-    pub(super) fn cancel_online_crossfade(&mut self) {
-        self.online.lookahead = None;
-        if let Some(audio) = &mut self.audio {
-            audio.cancel_crossfade();
-        }
-    }
-    fn tick_online_crossfade(&mut self) {
-        if !self.crossfade_enabled.load(Ordering::Acquire) {
-            self.cancel_online_crossfade();
-            return;
-        }
-        let Some(audio) = &self.audio else { return };
-        let remaining = audio.crossfade_remaining();
-        if self.online.lookahead.is_none()
-            && remaining.is_none_or(|s| s > crossfade::ONLINE_LOOKAHEAD)
-        {
-            return;
-        }
-        let target = self.attached().and_then(|grant| {
-            let execution = self.online.execution.as_ref()?;
-            let state = self.online.state.as_ref()?;
-            let from = &execution.cursor;
-            if !output::same_execution(&state.cursor, from)
-                || self.online.advance.is_some()
-                || execution.status != Status::Ok
-                || self
-                    .online
-                    .suppress_crossfade
-                    .as_ref()
-                    .is_some_and(|c| output::same_execution(c, from))
-            {
-                return None;
-            }
-            let to = output::successor(state, from)?;
-            if !to.desired || to.key == from.key {
-                return None;
-            }
-            let id = &state.queue.iter().find(|t| t.key == to.key)?.id;
-            Some((grant, from, to, id))
-        });
-        let Some((grant, from, to, id)) = target else {
-            self.cancel_online_crossfade();
-            return;
-        };
-        let audio = self.audio.as_mut().unwrap();
-        if self.online.lookahead.as_ref().is_some_and(|look| {
-            !look.key.matches_landing(grant.generation, from, &to) || look.key.id != *id
-        }) {
-            self.online.lookahead = None;
-            audio.cancel_crossfade();
-        }
-        audio.maintain_crossfade();
-        let Some(remaining) = remaining else { return };
-        let Some(socket) = &self.socket else { return };
-        // Drain already queued canonical edits before admitting a new source,
-        // without restarting a fade just because unrelated updates are busy.
-        if !socket.events.is_empty() {
-            return;
-        }
-        if self.online.lookahead.is_none() {
-            let Some(account) = &self.account else { return };
-            let (api, session, media_id) =
-                (account.api.clone(), account.session.clone(), id.clone());
-            let slot = self.local_preview_slot.clone();
-            let cached = audio.cached(&media_id);
-            let key = PreviewKey {
-                generation: grant.generation,
-                from: from.clone(),
-                to,
-                id: id.clone(),
-            };
-            self.online.lookahead = Some(crossfade::Lookahead::new(key, async move {
-                let media = offline::online_media(&api, &session, slot, &media_id, cached)
-                    .await
-                    .ok()?;
-                Some(media.source)
-            }));
-        }
-        if remaining <= CROSSFADE_SECONDS
-            && let Some(look) = &mut self.online.lookahead
-            && let Some(source) = look.take_source()
-        {
-            let permit = output::RunPermit::new(socket.authority.clone(), grant);
-            let confirmation = CrossfadeConfirmation {
-                generation: grant.generation,
-                confirmed: Arc::default(),
-            };
-            let authority = permit.preview_source(
-                socket.link.clone(),
-                grant.generation,
-                Arc::clone(&confirmation.confirmed),
-            );
-            let admitted = audio.start_crossfade(look.key.id.clone(), source.clone(), authority);
-            look.started(PreviewPlayback {
-                permit,
-                confirmation,
-                source,
-                admitted,
-            });
-        }
-    }
-    fn keep_online_crossfade(
-        &mut self,
-        generation: Generation,
-        from: &Cursor,
-        to: &Cursor,
-    ) -> (bool, Option<Handoff>) {
-        let Some(look) = self.online.lookahead.take() else {
-            return (false, None);
-        };
-        if self.attached().is_none_or(|g| g.generation != generation)
-            || !self.crossfade_enabled.load(Ordering::Acquire)
-            || !look.key.matches_landing(generation, from, to)
-        {
-            return (false, None);
-        }
-        let key = look.key.clone();
-        use crossfade::Landing;
-        let media = match look.landing() {
-            Landing::Playing(playing)
-                if playing.admitted
-                    && self.audio.as_mut().is_some_and(|a| a.promote_crossfade()) =>
-            {
-                self.online.execution = Some(Execution {
-                    cursor: to.clone(),
-                    permit: playing.permit,
-                    pending_crossfade: Some(playing.confirmation),
-                    status: Status::Ok,
-                    last_fact: None,
-                    stop_fact_pending: false,
-                });
-                return (true, None);
-            }
-            Landing::Ready(source) | Landing::Playing(PreviewPlayback { source, .. }) => {
-                HandoffMedia::Ready(source)
-            }
-            Landing::Loading(load) => HandoffMedia::Loading(load),
-            Landing::Unavailable => return (false, None),
-        };
-        (false, Some(Handoff { key, media }))
-    }
-    /// Publish actual native position to the transport even within transient
-    /// grace. Facts are admitted only by the current attached generation.
-    fn sample_online(&mut self, allow_end: bool, force: bool) -> bool {
-        if let (Some(audio), Some(execution)) = (&mut self.audio, &mut self.online.execution)
-            && execution.status == Status::Ok
-            && let Some(status) = audio.failure()
-        {
-            // Retain the failed execution so reconciliation doesn't issue a
-            // second transfer. Report the stop only if real PCM had started.
-            execution.stop_fact_pending =
-                execution.pending_crossfade.is_none() && audio.has_started();
-            execution.status = status;
-            audio.stop();
-            audio.discard_cache();
-            self.cancel_online_crossfade();
-        }
-        let grant = self.grant();
-        let (Some(grant), Some(socket), Some(audio), Some(execution)) =
-            (grant, &self.socket, &self.audio, &self.online.execution)
-        else {
-            return false;
-        };
-        let report_failure = execution.stop_fact_pending;
-        if !execution.permit.granted()
-            || (!report_failure && matches!(execution.status, Status::Media | Status::Load))
-            || !self.network_allowed()
-        {
-            return false;
-        }
-        let facts = audio.facts();
-        let now = Instant::now();
-        let actual = Cursor {
-            elapsed: facts.elapsed,
-            playing: facts.playing,
-            ..execution.cursor.clone()
-        };
-        if execution.pending_crossfade.is_none() && self.online.advance.is_none() {
-            let _ = socket.observe_local(grant.generation, actual);
-        }
-        let generation = grant.generation;
-        if !grant.attached
-            || self.link() != Link::Connected(generation)
-            || self.online.generation != Some(generation)
-            || !self.online.is_owner()
-            || self.online.player_gap
-            || self.online.advance.is_some()
-        {
-            return false;
-        }
-        if allow_end && facts.ended && self.online.lookahead.is_some() && !socket.events.is_empty()
-        {
-            // A bounded drain can leave a queue correction pending. Don't
-            // turn the preview up or let it continue alone while we catch up.
-            // Retaining its attempted key prevents a restart of that intro.
-            if let Some(audio) = &mut self.audio {
-                audio.cancel_crossfade();
-            }
-            return false;
-        }
-        let Some(execution) = &mut self.online.execution else {
-            return false;
-        };
-        let Some(state) = &self.online.state else {
-            return false;
-        };
-        if !output::same_execution(&state.cursor, &execution.cursor) {
-            return false;
-        }
-        let next = if allow_end && facts.ended && execution.status == Status::Ok {
-            output::successor(state, &execution.cursor)
-        } else {
-            None
-        };
-        if !force
-            && !report_failure
-            && next.is_none()
-            && execution.last_fact.is_some_and(|at| {
-                execution.status == Status::Blocked || now.duration_since(at) < REPORT_INTERVAL
-            })
-        {
-            return false;
-        }
-        if facts.ended && next.is_none() {
-            return false;
-        }
-        let landed = next.as_ref().map(|c| if c.desired { c.key } else { 0 });
-        let report = output::fact(
-            &execution.cursor,
-            facts.elapsed,
-            facts.playing,
-            facts.loading,
-            landed,
-            (execution.status == Status::Blocked).then_some(FactError::Blocked),
+            },
         );
-        if socket.fact(generation, report).is_err() {
-            if next.is_some()
-                && let Some(audio) = &mut self.audio
-            {
-                // Outbound pressure may clear on the next tick. Silence the
-                // preview, but keep its pinned GET under the existing key.
-                audio.cancel_crossfade();
-            }
-            return false;
-        }
-        execution.last_fact = Some(now);
-        execution.stop_fact_pending = false;
-        if let Some(to) = next {
-            let from = execution.cursor.clone();
-            let (promoted, fallback) = self.keep_online_crossfade(generation, &from, &to);
-            if !promoted {
-                self.stop();
-                self.online.handoff = fallback;
-            }
-            self.online.advance = Some(Advance { from, to });
-            self.online.revision = self.online.revision.wrapping_add(1);
-            return true;
-        }
-        false
+        let queue = local
+            .entries
+            .iter()
+            .map(|e| {
+                let t = &e.track;
+                let source = &t.source;
+                socket::Track {
+                    id: t.id.clone(),
+                    name: t.title.clone(),
+                    artists: super::local_credits(t)
+                        .into_iter()
+                        .map(|credit| socket::Artist {
+                            id: (!credit.id.is_empty()).then_some(credit.id),
+                            name: credit.name,
+                        })
+                        .collect(),
+                    album_name: t.album_name.clone(),
+                    album_id: super::local_album(t),
+                    duration: t.duration,
+                    key: e.key,
+                    order: e.order as u64 + 1,
+                    intent: socket::Intent::Low,
+                    entry_id: source.as_ref().and_then(|s| s.entry_id.clone()),
+                    target_id: source.as_ref().and_then(|s| s.target_id.clone()),
+                    occurrence_id: source.as_ref().and_then(|s| s.occurrence_id.clone()),
+                    playback_context: t.playback_context.clone(),
+                }
+            })
+            .collect();
+        Some(State {
+            queue,
+            cursor,
+            repeat: match local.repeat {
+                player::Repeat::Off => socket::Repeat::Off,
+                player::Repeat::All => socket::Repeat::All,
+                player::Repeat::One => socket::Repeat::One,
+            },
+            shuffle: local.shuffle,
+            collection_first: 0,
+        })
     }
     pub(super) fn project_online(&self, p: &mut PlayerView) {
         let live = self.online_generation().is_some();
-        let outputs = &self.online.outputs;
-        let active = outputs
-            .devices
+        let owner = self
+            .online
+            .projection
+            .owner()
+            .and_then(|o| o.device_id.as_deref());
+        let active = self
+            .online
+            .projection
+            .devices()
             .iter()
-            .find(|d| live && d.id == outputs.owner);
-        p.output = match active {
-            Some(device) => device.name.clone(),
-            None if !live => "Output unavailable".into(),
-            None if !outputs.owner.is_empty() => "Output disconnected".into(),
-            None => "No output selected".into(),
+            .find(|d| live && Some(d.device_id.as_str()) == owner);
+        p.output = if self.online.detached {
+            "This desktop".into()
+        } else {
+            match active {
+                Some(d) => d.name.clone(),
+                None if !live => "Output unavailable".into(),
+                None if owner.is_some() => "Output disconnected".into(),
+                None => "No output selected".into(),
+            }
         };
-        let Some(state) = &self.online.state else {
+        p.devices = self
+            .online
+            .projection
+            .devices()
+            .iter()
+            .filter(|_| live)
+            .map(|d| DeviceRow {
+                id: d.device_id.clone().into(),
+                name: d.name.clone().into(),
+                selected: Some(d.device_id.as_str()) == owner,
+                available: true,
+                can_play: d.can_play,
+            })
+            .collect();
+        if !live && !self.online.detached {
+            return;
+        }
+        let Some(state) = (if self.online.detached {
+            self.online.native.state()
+        } else {
+            self.online.visible()
+        }) else {
             return;
         };
-        let cursor = self.online.cursor().unwrap_or(&state.cursor);
-        let position = state.queue.iter().position(|t| t.key == cursor.key);
+        let cursor = if let Some(pending) = &self.online.claim_pending {
+            &pending.target
+        } else if self.online.detached {
+            self.online.native.cursor().unwrap_or(&state.cursor)
+        } else {
+            &state.cursor
+        };
+        let pos = state.queue.iter().position(|t| t.key == cursor.key);
         p.shuffle = state.shuffle;
         p.repeat = match state.repeat {
             socket::Repeat::Off => "off",
             socket::Repeat::All => "all",
             socket::Repeat::One => "one",
         };
-        p.transport = live && position.is_some();
-        p.control = p.transport
-            || self
-                .online
-                .execution
-                .as_ref()
-                .is_some_and(|e| e.permit.granted());
-        p.elapsed = cursor.elapsed;
-        if let Some(track) = position.and_then(|i| state.queue.get(i)) {
+        p.wants_pause = cursor.desired_playing;
+        p.transport = !self.online.reconciling_claim()
+            && (live || self.online.detached)
+            && pos.is_some()
+            && self.room_token().is_some();
+        p.control = p.transport;
+        p.elapsed = cursor.position_ms as f64 / 1000.0;
+        if let Some(track) = pos.and_then(|i| state.queue.get(i)) {
+            p.track = track.id.clone();
             p.title = track.name.clone();
             p.credits = credit_views(&track.artists);
             p.detail = artist_subtitle(&p.credits);
-            p.track = track.id.clone();
             p.album = album_route_id(&track.album_id).into();
             p.album_name = track.album_name.clone();
             p.duration = track.duration;
-            // The credit links already reach this page; don't repeat it as a source link.
-            if let Some(context) = &track.playback_context
-                && !(matches!(context.kind, socket::ContextKind::Artist)
-                    && p.credits
-                        .iter()
-                        .any(|a: &CreditView| !a.id.is_empty() && a.id == context.id))
+            if let Some(c) = &track.playback_context
+                && !(matches!(c.kind, socket::ContextKind::Artist)
+                    && p.credits.iter().any(|a| !a.id.is_empty() && a.id == c.id))
             {
-                p.context_kind = context_kind(context.kind);
-                p.context_id = context.id.clone();
-                p.context_name = context.name.clone();
+                p.context_kind = context_kind(c.kind);
+                p.context_id = c.id.clone();
+                p.context_name = c.name.clone();
+            }
+            if let Some(occurrence) = cursor.occurrence.as_ref() {
+                p.media_track_token = format!("online:{}:{occurrence}", self.room_incarnation);
             }
         }
-        if let (Some(execution), Some(audio)) = (&self.online.execution, &self.audio) {
-            let facts = audio.facts();
-            p.playing = facts.playing;
-            p.elapsed = facts.elapsed;
-            if facts.duration > 0.0 {
-                p.duration = facts.duration;
+        if self.online.detached || self.online.is_owner(&self.device_id) {
+            if p.status.is_empty() && self.online.native.failed() {
+                p.status = "Audio could not start on this desktop.";
             }
-            if p.status.is_empty() {
-                p.status = match execution.status {
-                    Status::Blocked => "Audio output is unavailable on this desktop.",
-                    Status::Load => "Audio could not be loaded from the server or local storage.",
-                    Status::Media => "This desktop could not decode or seek this audio.",
-                    _ => "",
-                };
-            }
-        } else if active.is_some() && !self.online.is_owner() && cursor.playing {
-            p.playing = true;
-            if let Some(at) = self.online.observed_at
-                && p.duration > 0.0
+            if let Some(audio) = &self.audio
+                && self.online.native.cursor().is_some_and(|actual| {
+                    actual.occurrence == cursor.occurrence
+                        && actual.desired_playing == cursor.desired_playing
+                        && actual.position_ms == cursor.position_ms
+                })
             {
-                p.elapsed = (p.elapsed + at.elapsed().as_secs_f64().min(3.0)).min(p.duration);
+                let facts = audio.facts();
+                p.elapsed = facts.elapsed;
+                p.playing = facts.playing;
+                if facts.duration > 0.0 {
+                    p.duration = facts.duration;
+                }
+            }
+        } else if live {
+            let time = self
+                .online
+                .clock_offset_ms
+                .map(|offset| now_ms().saturating_add_signed(offset));
+            if let Some(actual) = self.online.projection.remote_playback(time) {
+                p.playing = actual.playing();
+                p.elapsed = actual.position_ms as f64 / 1000.0;
+                if p.status.is_empty() && actual.status == Some(socket::ObservationStatus::Failed) {
+                    p.status = "Audio could not start on the selected device.";
+                }
             }
         }
         p.queue = state
             .queue
             .iter()
             .enumerate()
-            .map(|(i, t)| {
-                let credits = credit_views(&t.artists);
-                QueueEntryView {
-                    key: t.key.to_string(),
-                    track_id: t.id.clone(),
-                    title: t.name.clone(),
-                    subtitle: artist_subtitle(&credits),
-                    credits,
-                    album_id: album_route_id(&t.album_id).into(),
-                    album_name: t.album_name.clone(),
-                    current: position == Some(i),
-                    upcoming: position.is_some_and(|pos| i > pos),
-                }
+            .map(|(i, t)| QueueEntryView {
+                key: t.key.to_string(),
+                track_id: t.id.clone(),
+                title: t.name.clone(),
+                subtitle: artist_subtitle(&credit_views(&t.artists)),
+                album_name: t.album_name.clone(),
+                album_id: album_route_id(&t.album_id).into(),
+                credits: credit_views(&t.artists),
+                current: pos == Some(i),
+                upcoming: pos.is_some_and(|p| i > p),
             })
             .collect();
-        let mut seen = HashSet::new();
-        p.devices = self
-            .online
-            .outputs
-            .devices
-            .iter()
-            .filter(|d| seen.insert(&d.device_id))
-            .map(|d| {
-                let selected = active.is_some_and(|owner| owner.device_id == d.device_id);
-                let shown = if selected { active.unwrap_or(d) } else { d };
-                DeviceRow {
-                    id: d.device_id.clone().into(),
-                    name: shown.name.clone().into(),
-                    selected,
-                    available: live,
-                    can_play: shown.can_play,
-                }
-            })
-            .collect();
-        if p.status.is_empty() {
-            if self.online.starting_locally() {
-                p.status = "Starting playback…";
-            } else if self.online.work.is_some() {
-                p.status = "Loading audio…";
-            }
-        }
     }
 }
+
+pub(super) enum NativeEvent<'a> {
+    Tick,
+    Snapshot,
+    State(Option<&'a socket::Command>),
+    OpeningState(Option<&'a socket::Command>),
+    Execute(&'a socket::Command),
+    Media(&'a native::MediaRequest, Option<AudioInput>),
+    Detached(socket::Action),
+}
+
+use crate::offline::OfflineStore;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cursor(key: u64, visit: u64, run: u64) -> Cursor {
-        Cursor {
-            key,
-            visit,
-            run,
-            chain: "chain".into(),
-            desired: true,
-            ..Cursor::default()
+    use crate::{
+        audio::Audio,
+        engine::{Account, connection},
+        player::{Authority, Change, LocalTrack, Status},
+    };
+    use std::{os::unix::fs::DirBuilderExt, path::PathBuf, sync::Arc};
+
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    #[test]
-    fn empty_owner_only_allows_a_locally_witnessed_release_with_no_competitor() {
-        let mut online = Online {
-            connection: "local".into(),
-            ..Online::default()
-        };
-        let outputs = |owner, other| {
-            let mut devices = vec![serde_json::json!({
-                "id": "local", "deviceId": "desktop", "name": "Desktop", "canPlay": true
-            })];
-            if other {
-                devices.push(serde_json::json!({
-                    "id": "remote", "deviceId": "phone", "name": "Phone", "canPlay": true
-                }));
-            }
-            serde_json::from_value(serde_json::json!({"owner":owner,"devices":devices})).unwrap()
-        };
-        online.outputs = outputs("", false);
-        assert!(
-            !online.locally_vacant(),
-            "opening empty may be startup drain or an unseen handoff"
-        );
-        online.released_here = true;
-        assert!(online.locally_vacant());
-        online.outputs = outputs("", true);
-        assert!(
-            !online.locally_vacant(),
-            "a handoff may still elect another eligible output"
-        );
-        online.outputs = outputs("detached-remote", false);
-        assert!(
-            !online.locally_vacant(),
-            "missing roster row does not imply a detached owner is gone"
-        );
+    fn wav() -> Arc<[u8]> {
+        let samples = vec![1500_i16; 8000];
+        let len = samples.len() as u32 * 2;
+        let mut data = b"RIFF".to_vec();
+        data.extend((len + 36).to_le_bytes());
+        data.extend(b"WAVEfmt ");
+        data.extend(16_u32.to_le_bytes());
+        data.extend(1_u16.to_le_bytes()); // PCM
+        data.extend(1_u16.to_le_bytes()); // mono
+        data.extend(8000_u32.to_le_bytes());
+        data.extend(16000_u32.to_le_bytes());
+        data.extend(2_u16.to_le_bytes());
+        data.extend(16_u16.to_le_bytes());
+        data.extend(b"data");
+        data.extend(len.to_le_bytes());
+        for sample in samples {
+            data.extend(sample.to_le_bytes());
+        }
+        data.into()
     }
 
-    #[test]
-    fn disconnected_projection_does_not_keep_the_cached_device_selected() {
-        let mut engine = super::super::tests::engine();
-        engine.online.state = Some(State {
-            collection_first: 0,
-            queue: vec![],
-            cursor: Cursor::default(),
-            repeat: socket::Repeat::Off,
-            shuffle: false,
+    async fn hello_then_local_pause(wins: bool, drops: bool) {
+        let dir = Fixture(
+            std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("spofify-claim-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir.0)
+            .unwrap();
+        let store = OfflineStore::open(&dir.0).unwrap();
+        let mut e = crate::engine::tests::engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        let (mut audio, (mixer, mut samples)) = (
+            Audio::new_account_scoped(
+                session.clone(),
+                e.shared_epoch.clone(),
+                e.epoch,
+                e.master_gain.clone(),
+            ),
+            rodio::mixer::mixer(1, 8000),
+        );
+        let bytes = wav();
+        audio.use_test_output(mixer, "song".into(), bytes.clone());
+        assert_eq!(
+            audio.play("song".into(), bytes, 0.0, 1.0, Authority::offline()),
+            Status::Ok
+        );
+        assert!(samples.by_ref().take(320).any(|s| s != 0.0));
+        assert!(audio.facts().playing);
+        e.audio = Some(audio);
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
         });
-        engine.online.outputs = serde_json::from_value(serde_json::json!({
-            "owner": "remote-connection",
-            "devices": [{
-                "id": "remote-connection", "deviceId": "remote",
-                "name": "Remote speaker", "canPlay": true
-            }],
-        }))
-        .unwrap();
-        let mut view = PlayerView::default();
-        engine.project_online(&mut view);
-        assert_eq!(view.output, "Output unavailable");
-        assert_eq!(view.devices.len(), 1);
-        assert!(!view.devices[0].selected && !view.devices[0].available);
-        assert!(!view.playing && !view.transport);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn detached_media_cannot_pause_a_projected_successor() {
-        let old = cursor(5, 2, 1);
-        let next = cursor(6, 3, 0);
-        let grant = OutputAuthority {
-            generation: 8,
-            deadline: Instant::now() + std::time::Duration::from_secs(5),
-            attached: false,
-            resume_through: 0,
-        };
-        let (authority, receiver) = tokio::sync::watch::channel(Some(grant));
-        let execution = Execution {
-            cursor: old.clone(),
-            permit: output::RunPermit::new(receiver, grant),
-            pending_crossfade: None,
-            status: Status::Ok,
-            last_fact: None,
-            stop_fact_pending: false,
-        };
-        assert!(execution.media_pause_token(&old, 5, 3).is_some());
-        assert!(execution.media_pause_token(&next, 5, 3).is_none());
-        authority.send_replace(None);
-        assert!(execution.media_pause_token(&old, 5, 3).is_none());
-    }
-
-    #[test]
-    fn crossfade_promotion_is_bound_to_exact_run_occurrence_and_generation() {
-        let from = cursor(5, 2, 1);
-        let to = cursor(6, 3, 0);
-        let key = PreviewKey {
-            generation: 8,
-            from: from.clone(),
-            to: to.clone(),
-            id: "track".into(),
-        };
-        let fact = Cursor {
-            elapsed: 67.0,
-            playing: true,
-            ..from.clone()
-        };
-        assert!(key.matches_landing(8, &fact, &to));
-        assert!(!key.matches_landing(9, &fact, &to));
-        assert!(!key.matches_landing(
-            8,
-            &Cursor {
-                run: 2,
-                ..from.clone()
-            },
-            &to
-        ));
-        assert!(!key.matches_landing(
-            8,
-            &Cursor {
-                desired: false,
-                ..from.clone()
-            },
-            &to
-        ));
-        assert!(!key.matches_landing(8, &from, &Cursor { key: 7, ..to }));
-    }
-
-    #[test]
-    fn eof_prediction_ignores_old_observations_and_keeps_exact_confirmation() {
-        let from = cursor(5, 2, 1);
-        let to = cursor(6, 3, 0);
-        let mut state = Online {
-            state: Some(State {
-                cursor: from.clone(),
-                ..State::default()
-            }),
-            advance: Some(Advance {
-                from: from.clone(),
-                to: to.clone(),
-            }),
-            ..Online::default()
-        };
-        state.adopt_cursor(
-            &Cursor {
-                elapsed: 72.0,
-                ..from
-            },
-            true,
+        e.local_store = Some(store);
+        assert_eq!(
+            e.local.replace(
+                vec![LocalTrack {
+                    id: "song".into(),
+                    title: "Song".into(),
+                    duration: 1.0,
+                    ..Default::default()
+                }],
+                0,
+                false
+            ),
+            Change::Start
         );
-        assert!(output::same_execution(&to, state.cursor().unwrap()));
-        let confirmed = Cursor {
-            elapsed: 0.4,
-            playing: true,
-            ..to.clone()
+        let (socket, mut peer) = socket::Socket::test_peer(session, 11);
+        e.socket = Some(socket);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        e.tick_with_event(Some(Event {
+            generation: 0,
+            kind: EventKind::ClaimRequested(tx),
+            personal_stamp: None,
+        }));
+        let hello = rx.await.unwrap().local.unwrap();
+        assert!(hello.cursor.desired_playing);
+        // The user tapped Pause on the local view before the opening
+        // snapshot became available to the actor.
+        let room = e.room_token().unwrap();
+        let mut snapshot = socket::Snapshot {
+            session_id: "room".into(),
+            connection_id: "test-connection".into(),
+            revision: 1,
+            owner: socket::Owner {
+                generation: 7,
+                device_id: Some(if wins {
+                    e.device_id.clone()
+                } else {
+                    "other".into()
+                }),
+            },
+            devices: vec![],
+            player: hello,
+            observation: None,
+            server_time_ms: 100,
         };
-        state.state.as_mut().unwrap().cursor = confirmed.clone();
-        state.adopt_cursor(&confirmed, true);
-        assert!(state.advance.is_none());
-        assert!(output::same_execution(&to, state.cursor().unwrap()));
-        assert_eq!(state.cursor().unwrap().elapsed, 0.4);
+        if !wins {
+            snapshot.player.cursor.occurrence = Some("other-visit".into());
+        }
+        peer.set_opening_snapshot(&snapshot, wins);
+        let deliver = |e: &mut Engine, snapshot: socket::Snapshot| {
+            e.tick_with_event(Some(Event {
+                generation: 11,
+                kind: EventKind::Snapshot(snapshot),
+                personal_stamp: None,
+            }))
+        };
+        peer.events
+            .try_send(Event {
+                generation: 11,
+                kind: EventKind::Snapshot(snapshot.clone()),
+                personal_stamp: None,
+            })
+            .unwrap();
+        if drops {
+            peer.link.send_replace(Link::Disconnected);
+            e.tick();
+            assert!(e.online.projection.confirmed().is_none());
+            assert!(e.local_store.is_none());
+            assert!(!e.audio.as_ref().unwrap().facts().playing);
+            assert!(peer.read().is_none());
+            return;
+        }
+        e.command(crate::engine::Command::GuardedToggle(room).scoped(e.epoch));
+        assert!(!e.audio.as_ref().unwrap().facts().playing);
+        assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
+        let frames: Vec<_> = std::iter::from_fn(|| peer.read()).collect();
+        let reconciles: Vec<_> = frames
+            .iter()
+            .filter(|f| f["type"] == "reconcileClaim")
+            .collect();
+        if wins {
+            assert_eq!(reconciles.len(), 1);
+            assert_eq!(reconciles[0]["basis"]["revision"], 1);
+            assert_eq!(reconciles[0]["cursor"]["desiredPlaying"], false);
+            assert!(!e.wants_pause()); // no flash of a stale playing view
+            assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
+            assert!(e.online.claim_pending.is_some());
+            snapshot.revision += 1;
+            snapshot.player.cursor =
+                serde_json::from_value(reconciles[0]["cursor"].clone()).unwrap();
+            deliver(&mut e, snapshot);
+            assert!(e.online.claim_pending.is_none());
+            assert!(
+                !e.online
+                    .projection
+                    .confirmed()
+                    .unwrap()
+                    .cursor
+                    .desired_playing
+            );
+            assert!(
+                e.online.primary.is_none(),
+                "the accepted pause must not start a decoder"
+            );
+            assert!(!std::iter::from_fn(|| peer.read()).any(|f| f["type"] == "reconcileClaim"));
+        } else {
+            assert!(reconciles.is_empty());
+            assert!(e.online.claim_pending.is_none());
+            assert!(
+                e.online
+                    .projection
+                    .confirmed()
+                    .unwrap()
+                    .cursor
+                    .desired_playing
+            );
+            assert_eq!(
+                e.online.projection.owner().unwrap().device_id.as_deref(),
+                Some("other")
+            );
+        }
+        assert!(e.local_store.is_none());
+        assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
+        assert!(samples.by_ref().take(320).all(|v| v == 0.0));
     }
 
-    #[test]
-    fn terminal_eof_projects_same_row_stopped_at_zero_before_go_confirms() {
-        let from = Cursor {
-            elapsed: 12.0,
-            playing: true,
-            ..cursor(5, 2, 1)
-        };
-        let state = State {
-            queue: serde_json::from_value(serde_json::json!([
-                {"key":5,"order":5,"id":"tail","intent":"low"}
-            ]))
-            .unwrap(),
-            cursor: from.clone(),
-            ..State::default()
-        };
-        let to = output::successor(&state, &from).unwrap();
-        let mut online = Online {
-            state: Some(state),
-            advance: Some(Advance {
-                from: from.clone(),
-                to: to.clone(),
-            }),
-            ..Online::default()
-        };
-        online.adopt_cursor(&from, true);
-        let projected = online.cursor().unwrap();
-        assert_eq!((projected.key, projected.visit, projected.run), (5, 2, 2));
-        assert!(!projected.desired && !projected.playing);
-        assert_eq!(projected.elapsed, 0.0);
-
-        online.state.as_mut().unwrap().cursor = to.clone();
-        online.adopt_cursor(&to, true);
-        assert!(online.advance.is_none());
-        assert_eq!(online.cursor().unwrap().elapsed, 0.0);
+    #[tokio::test]
+    async fn winning_claim_reconciles_pause_from_delayed_snapshot_without_restarting() {
+        hello_then_local_pause(true, false).await;
     }
 
-    #[test]
-    fn eof_correction_and_later_resume_have_distinct_bindings() {
-        let from = cursor(5, 2, 1);
-        let to = cursor(6, 3, 0);
-        let correct = cursor(7, 3, 0);
-        let mut state = Online {
-            state: Some(State {
-                cursor: correct.clone(),
-                ..State::default()
-            }),
-            stopped: Some(to.clone()),
-            advance: Some(Advance {
-                from,
-                to: to.clone(),
-            }),
-            ..Online::default()
-        };
-        assert!(state.stop_for(&to));
-        assert!(!state.stop_for(&Cursor { run: 1, ..to }));
-        state.adopt_cursor(&correct, false);
-        assert!(state.advance.is_none());
-        assert!(output::same_execution(&correct, state.cursor().unwrap()));
-        assert!(state.stopped.is_none());
+    #[tokio::test]
+    async fn losing_claim_discards_post_hello_pause_and_never_sends_it() {
+        hello_then_local_pause(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn losing_initial_snapshot_fences_saved_pcm_even_if_link_already_dropped() {
+        hello_then_local_pause(false, true).await;
     }
 }

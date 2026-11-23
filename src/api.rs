@@ -2408,7 +2408,7 @@ mod tests {
         assert_eq!(socket.first_line, "GET /api/me/player/socket HTTP/1.1");
         assert_eq!(
             socket.header("sec-websocket-protocol"),
-            Some("spofify.account-state.v1")
+            Some("spofify.account-state.v3")
         );
         assert_eq!(socket.header("sec-websocket-version"), Some("13"));
         assert!(socket.body.is_empty());
@@ -2456,7 +2456,7 @@ mod tests {
             if response.is_empty() {
                 String::from_utf8(socket_reply(request, ""))
                     .unwrap()
-                    .replace("spofify.account-state.v1", "spofify.library-playback.v2")
+                    .replace("spofify.account-state.v3", "spofify.account-state.v1")
                     .into_bytes()
             } else {
                 response

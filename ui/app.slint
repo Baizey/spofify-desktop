@@ -87,6 +87,7 @@ export component AppWindow inherits Window {
     in property <string> player-status;
     in property <string> update-notice;
     in property <bool> playing;
+    in property <bool> wants-pause;
     in property <bool> can-control;
     in property <bool> remote-controls;
     in property <bool> can-seek;
@@ -276,7 +277,7 @@ export component AppWindow inherits Window {
     property <bool> is-settings: page-kind == "appearance" || page-kind == "settings" || page-kind == "account";
     property <bool> is-now: page-kind == "now";
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
-    property <bool> local-mode: manual-offline || reconnecting;
+    property <bool> local-mode: manual-offline || reconnecting || local-playback;
     out property <bool> can-seek-lyrics: signed-in && can-seek && !local-mode
         && !editor-open && !compact-queue-open && is-now && lyric-seek-before-ms > 0;
     property <bool> queue-controls: local-playback ? queue-rows.length > 0 : !local-mode && remote-controls;
@@ -1531,7 +1532,7 @@ export component AppWindow inherits Window {
             artwork: root.cover-art; elapsed: root.elapsed; duration: root.duration;
             waveform: root.waveform;
             can-seek: root.can-seek && (!root.local-mode || root.local-playback);
-            playing: root.playing; can-toggle: root.can-control && (!root.local-mode || root.local-playback);
+            playing: root.wants-pause; can-toggle: root.can-control && (!root.local-mode || root.local-playback);
             can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
             on-now-page: root.is-now; queue-open: root.queue-shown; offline: root.local-mode;
             layered: root.compact;

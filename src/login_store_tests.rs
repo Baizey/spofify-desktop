@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::RememberedCredential;
 use std::{
     cell::{Cell, RefCell},
     ffi::OsStr,
@@ -111,19 +112,41 @@ impl LoginStore {
         self.record_with_permit(keyring, origin, username, blob, &|| true)
             .await
     }
-    async fn change_mode_with(
+    async fn preference_with(
         &self,
         keyring: &impl Keyring,
         profile: &LoginProfile,
-        login: &RememberedLogin,
+        manual: bool,
         staged: Option<&StagedMode>,
     ) -> Result<LoginProfile> {
         let staged = match staged {
             Some(staged) => staged.clone(),
             None => self.stage_mode(profile)?,
         };
-        self.change_mode_with_permit(keyring, profile, login, &staged, &|| true)
-            .await
+        self.replace_remembered(
+            keyring,
+            profile,
+            Some(&staged),
+            |current| preferred(current, profile, "synthetic-account", manual),
+            &|| true,
+        )
+        .await
+    }
+
+    async fn upgrade_with(
+        &self,
+        keyring: &impl Keyring,
+        profile: &LoginProfile,
+        login: &RememberedLogin,
+    ) -> Result<LoginProfile> {
+        self.replace_remembered(
+            keyring,
+            profile,
+            None,
+            |current| upgraded(current, profile, login),
+            &|| true,
+        )
+        .await
     }
 }
 
@@ -363,6 +386,7 @@ async fn rejects_aliases_and_insecure_or_invalid_metadata_before_keyring_access(
 
 const ONLINE_LOGIN: &[u8] = br#"{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}"#;
 const LOCAL_LOGIN: &[u8] = br#"{"format":"local-v1","username":"listener","role":"user","credential":{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}}"#;
+const AUTO_LOGIN: &[u8] = br#"{"format":"local-online-v1","username":"listener","role":"user","credential":{"origin":"https://music.example","accountId":"synthetic-account","cookie":"__Host-spofify_session=synthetic-cookie"}}"#;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
@@ -381,6 +405,7 @@ async fn startup_update_permission_uses_the_saved_mode_before_account_admission(
     for (saved_record, unavailable, expected_online) in [
         (None, false, true),
         (Some(ONLINE_LOGIN), false, true),
+        (Some(AUTO_LOGIN), false, true),
         (Some(LOCAL_LOGIN), false, false),
         (Some(LOCAL_LOGIN), true, false),
         (Some(wrong_origin.as_slice()), false, false),
@@ -442,12 +467,11 @@ async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_
     let store = &fixture.store;
     let keyring = FakeKeyring::default();
     let online = store
-        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .record_with(&keyring, &origin(), "listener", Some(AUTO_LOGIN))
         .await
         .unwrap();
-    let offline: RememberedLogin = serde_json::from_slice(LOCAL_LOGIN).unwrap();
     let local = store
-        .change_mode_with(&keyring, &online, &offline, None)
+        .preference_with(&keyring, &online, true, None)
         .await
         .unwrap();
     assert!(!store.is_active(&online).unwrap());
@@ -468,13 +492,13 @@ async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_
             .is_none()
     );
     let blob = store.restore_with(&keyring, &local).await.unwrap().unwrap();
-    assert!(matches!(
-        serde_json::from_slice(&blob),
-        Ok(RememberedLogin::Offline(_))
-    ));
+    let RememberedLogin::Offline(manual) = serde_json::from_slice(&blob).unwrap() else {
+        panic!("preference must keep the typed grant");
+    };
+    assert!(manual.manual_offline());
     assert!(
         store
-            .change_mode_with(&keyring, &online, &offline, None)
+            .preference_with(&keyring, &online, true, None)
             .await
             .is_err()
     );
@@ -488,12 +512,7 @@ async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_
     assert!(!fixture.reopen().is_active(&local).unwrap());
     assert!(store.stage_active_mode(Some(&local)).unwrap().is_none());
     let online = store
-        .change_mode_with(
-            &keyring,
-            &local,
-            &serde_json::from_slice(ONLINE_LOGIN).unwrap(),
-            Some(&staged),
-        )
+        .preference_with(&keyring, &local, false, Some(&staged))
         .await
         .unwrap();
     assert!(
@@ -508,7 +527,13 @@ async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_
         .await
         .unwrap()
         .unwrap();
-    assert!(serde_json::from_slice::<RememberedCredential>(&blob).is_ok());
+    let auto: RememberedLogin = serde_json::from_slice(&blob).unwrap();
+    let original: RememberedLogin = serde_json::from_slice(AUTO_LOGIN).unwrap();
+    assert!(auto.credential() == original.credential());
+    let RememberedLogin::Offline(auto) = auto else {
+        panic!("returning online must not downgrade to a legacy bearer");
+    };
+    assert!(!auto.manual_offline());
     assert_eq!(keyring.items.borrow().len(), 1);
     store.forget_with(&keyring, Some(&online)).await.unwrap();
     assert!(
@@ -522,6 +547,90 @@ async fn explicit_mode_rotates_only_the_active_slot_and_keeps_disk_metadata_non_
 }
 
 #[tokio::test]
+async fn legacy_upgrade_requires_the_exact_validated_bearer_and_active_slot() {
+    let fixture = Fixture::new();
+    let store = &fixture.store;
+    let keyring = FakeKeyring::default();
+    let legacy = store
+        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .await
+        .unwrap();
+    let wrong = String::from_utf8(AUTO_LOGIN.to_vec())
+        .unwrap()
+        .replace("synthetic-cookie", "other-cookie");
+    let wrong = serde_json::from_str(&wrong).unwrap();
+    assert_eq!(
+        store.upgrade_with(&keyring, &legacy, &wrong).await.err(),
+        Some(StoreError::InvalidCredential)
+    );
+    assert!(store.is_active(&legacy).unwrap());
+    assert_eq!(keyring.calls.get(), (1, 1, 0));
+
+    let auto = serde_json::from_slice(AUTO_LOGIN).unwrap();
+    keyring.behavior.set(Behavior::Unavailable);
+    assert_eq!(
+        store.upgrade_with(&keyring, &legacy, &auto).await.err(),
+        Some(StoreError::KeyringUnavailable)
+    );
+    assert!(store.is_active(&legacy).unwrap());
+    keyring.behavior.set(Behavior::Available);
+    let updated = store.upgrade_with(&keyring, &legacy, &auto).await.unwrap();
+    assert!(!store.is_active(&legacy).unwrap());
+    let bytes = store
+        .restore_with(&keyring, &updated)
+        .await
+        .unwrap()
+        .unwrap();
+    let RememberedLogin::Offline(grant) = serde_json::from_slice(&bytes).unwrap() else {
+        panic!("upgrade must publish a typed local grant");
+    };
+    assert!(!grant.manual_offline());
+    let (api, session) = grant.admit(&origin(), "listener").unwrap();
+    assert_eq!(
+        api.authenticated_account(&session).unwrap().1,
+        "synthetic-account"
+    );
+    assert_eq!(
+        store.upgrade_with(&keyring, &legacy, &auto).await.err(),
+        Some(StoreError::InvalidCredential)
+    );
+    assert_eq!(
+        store.upgrade_with(&keyring, &updated, &auto).await.err(),
+        Some(StoreError::InvalidCredential)
+    );
+    assert!(store.is_active(&updated).unwrap());
+}
+
+#[tokio::test]
+async fn preference_cannot_authorize_legacy_or_a_mismatched_account() {
+    for blob in [ONLINE_LOGIN, AUTO_LOGIN] {
+        let fixture = Fixture::new();
+        let store = &fixture.store;
+        let keyring = FakeKeyring::default();
+        let profile = store
+            .record_with(&keyring, &origin(), "listener", Some(blob))
+            .await
+            .unwrap();
+        let staged = store.stage_mode(&profile).unwrap();
+        assert_eq!(
+            store
+                .replace_remembered(
+                    &keyring,
+                    &profile,
+                    Some(&staged),
+                    |current| preferred(current, &profile, "wrong-account", true),
+                    &|| true,
+                )
+                .await
+                .err(),
+            Some(StoreError::InvalidCredential)
+        );
+        assert!(!store.is_active(&profile).unwrap());
+        assert_eq!(keyring.calls.get(), (1, 1, 0));
+    }
+}
+
+#[tokio::test]
 async fn interrupted_or_missing_slot_cannot_fall_back_to_its_old_mode_or_create_a_grant() {
     for behavior in [
         Some(Behavior::Unavailable),
@@ -532,14 +641,13 @@ async fn interrupted_or_missing_slot_cannot_fall_back_to_its_old_mode_or_create_
         let store = &fixture.store;
         let keyring = FakeKeyring::default();
         let initial = store
-            .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+            .record_with(&keyring, &origin(), "listener", Some(AUTO_LOGIN))
             .await
             .unwrap();
-        let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
         match behavior {
             Some(Behavior::InterruptStore) => {
                 keyring.behavior.set(Behavior::InterruptStore);
-                cancel_after_first_poll(store.change_mode_with(&keyring, &initial, &offline, None))
+                cancel_after_first_poll(store.preference_with(&keyring, &initial, true, None))
                     .await;
             }
             behavior => {
@@ -550,7 +658,7 @@ async fn interrupted_or_missing_slot_cannot_fall_back_to_its_old_mode_or_create_
                 }
                 assert!(
                     store
-                        .change_mode_with(&keyring, &initial, &offline, None)
+                        .preference_with(&keyring, &initial, true, None)
                         .await
                         .is_err()
                 );
@@ -576,15 +684,14 @@ async fn the_same_admitted_owner_can_retry_its_stage_after_keyring_unlock() {
     let store = &fixture.store;
     let keyring = FakeKeyring::default();
     let online = store
-        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .record_with(&keyring, &origin(), "listener", Some(AUTO_LOGIN))
         .await
         .unwrap();
-    let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
     let stage = store.stage_mode(&online).unwrap();
     keyring.behavior.set(Behavior::Unavailable);
     assert_eq!(
         store
-            .change_mode_with(&keyring, &online, &offline, Some(&stage))
+            .preference_with(&keyring, &online, true, Some(&stage))
             .await
             .err(),
         Some(StoreError::KeyringUnavailable)
@@ -593,12 +700,12 @@ async fn the_same_admitted_owner_can_retry_its_stage_after_keyring_unlock() {
     keyring.behavior.set(Behavior::Available);
     assert!(
         store
-            .change_mode_with(&keyring, &online, &offline, None)
+            .preference_with(&keyring, &online, true, None)
             .await
             .is_err()
     );
     let local = store
-        .change_mode_with(&keyring, &online, &offline, Some(&stage))
+        .preference_with(&keyring, &online, true, Some(&stage))
         .await
         .unwrap();
     assert!(store.is_active(&local).unwrap());
@@ -610,14 +717,21 @@ async fn revoked_admission_can_never_publish_a_pending_keyring_write() {
     let store = &fixture.store;
     let keyring = FakeKeyring::default();
     let online = store
-        .record_with(&keyring, &origin(), "listener", Some(ONLINE_LOGIN))
+        .record_with(&keyring, &origin(), "listener", Some(AUTO_LOGIN))
         .await
         .unwrap();
-    let offline = serde_json::from_slice(LOCAL_LOGIN).unwrap();
     let staged = store.stage_mode(&online).unwrap();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let checks = AtomicUsize::new(0);
     assert_eq!(
         store
-            .change_mode_with_permit(&keyring, &online, &offline, &staged, &|| false)
+            .replace_remembered(
+                &keyring,
+                &online,
+                Some(&staged),
+                |current| preferred(current, &online, "synthetic-account", true),
+                &|| checks.fetch_add(1, Ordering::SeqCst) < 2,
+            )
             .await
             .err(),
         Some(StoreError::InvalidCredential)

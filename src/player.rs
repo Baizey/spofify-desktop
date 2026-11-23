@@ -64,6 +64,14 @@ pub enum Repeat {
     One,
 }
 impl Repeat {
+    pub(crate) fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
     pub fn wire(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -152,6 +160,7 @@ pub enum Action {
     Close,
     Shuffle(bool),
     Repeat(Repeat),
+    CycleRepeat,
     SelectDevice(String),
     RenameDevice {
         device_id: Option<String>,
@@ -252,8 +261,8 @@ impl Action {
             Self::Seek(_) | Self::Jump(_) | Self::Remove(_) | Self::Move { .. } | Self::Clear
         )
     }
-    pub(crate) fn wire(self, own_device: &str) -> Option<socket::Command> {
-        use socket::{Command as C, Intent};
+    pub(crate) fn wire(self) -> Option<socket::Action> {
+        use socket::{Action as C, Intent};
         Some(match self {
             Self::Play { selection, shuffle } if selection.valid() => C::Play {
                 selection: selection.into_wire(),
@@ -270,7 +279,9 @@ impl Action {
             Self::Previous => C::Previous,
             Self::Clear => C::Clear,
             Self::Close => C::Close,
-            Self::Seek(value) if seconds(value) => C::Seek { value },
+            Self::Seek(value) if seconds(value) => C::Seek {
+                position_ms: (value * 1000.0).round() as u64,
+            },
             Self::Jump(k) if key(k) => C::Jump { key: k },
             Self::Remove(k) if key(k) => C::Remove { key: k },
             Self::Move { key: k, after } if key(k) && after.is_none_or(|a| key(a) && a != k) => {
@@ -291,17 +302,6 @@ impl Action {
                 },
             },
             Self::SelectDevice(device_id) if id(&device_id, 128) => C::Select { device_id },
-            Self::RenameDevice { device_id, name } => {
-                let device_id = device_id.as_deref().unwrap_or(own_device);
-                let name = name.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-                if !id(device_id, 128) || !id(name, 256) || name.chars().count() > 64 {
-                    return None;
-                }
-                C::Rename {
-                    device_id: device_id.into(),
-                    name: name.into(),
-                }
-            }
             _ => return None,
         })
     }
@@ -319,6 +319,8 @@ pub struct LocalTrack {
     pub music: crate::pages::MusicMetadata,
     pub context: Option<LocalContext>,
     pub recording: Option<crate::offline::Recording>,
+    pub(crate) source: Option<socket::TrackRef>,
+    pub(crate) playback_context: Option<socket::PlaybackContext>,
 }
 
 #[derive(Clone)]
@@ -350,12 +352,13 @@ impl LocalContext {
 pub struct LocalEntry {
     pub key: u64,
     pub track: LocalTrack,
-    order: usize,
+    pub(crate) order: usize,
 }
 #[derive(Default)]
 pub struct LocalQueue {
     pub entries: Vec<LocalEntry>,
     pub position: Option<usize>,
+    pub occurrence: Option<String>,
     pub shuffle: bool,
     pub repeat: Repeat,
     pub desired: bool,
@@ -408,6 +411,10 @@ impl LocalQueue {
             return Change::Invalid;
         };
         self.entries.extend(entries);
+        // An idle queue still needs a stable paused visit if it wins a claim.
+        if self.occurrence.is_none() {
+            self.occurrence = Some(uuid::Uuid::new_v4().to_string());
+        }
         Change::Edit
     }
     fn allocate(&mut self, tracks: Vec<LocalTrack>, base: usize) -> Option<Vec<LocalEntry>> {
@@ -446,6 +453,7 @@ impl LocalQueue {
     }
     fn select(&mut self, position: usize) -> Change {
         self.position = Some(position);
+        self.occurrence = Some(uuid::Uuid::new_v4().to_string());
         self.desired = true;
         self.elapsed = 0.0;
         Change::Start
@@ -586,6 +594,10 @@ impl LocalQueue {
                 self.repeat = repeat;
                 Change::Edit
             }
+            Action::CycleRepeat => {
+                self.repeat = self.repeat.cycle();
+                Change::Edit
+            }
             _ => Change::Invalid,
         }
     }
@@ -673,7 +685,7 @@ mod tests {
             selection,
             shuffle: false,
         }
-        .wire("desktop")
+        .wire()
         .unwrap();
         assert_eq!(
             serde_json::to_value(wire).unwrap(),
@@ -684,7 +696,7 @@ mod tests {
             key: 7,
             after: None,
         }
-        .wire("desktop")
+        .wire()
         .unwrap();
         assert_eq!(
             serde_json::to_value(wire).unwrap(),
@@ -695,11 +707,11 @@ mod tests {
                 key: 7,
                 after: Some(7)
             })
-            .wire("desktop")
+            .wire()
             .is_none()
         );
-        assert!(Action::Seek(f64::NAN).wire("desktop").is_none());
-        assert!(Action::Jump(1 << 52).wire("desktop").is_none());
+        assert!(Action::Seek(f64::NAN).wire().is_none());
+        assert!(Action::Jump(1 << 52).wire().is_none());
     }
     #[test]
     fn duplicate_occurrences_rotate_without_history_and_repeat_one_only_on_end() {
@@ -829,7 +841,7 @@ mod tests {
             selection,
             shuffle: false,
         }
-        .wire("desktop")
+        .wire()
         .unwrap();
         assert_eq!(
             serde_json::to_value(wire).unwrap()["selection"],

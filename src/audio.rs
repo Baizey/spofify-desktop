@@ -1,5 +1,5 @@
 //! Native output. PCM reaches the mixer only through an exact operation
-//! capability, session, and account/mode epoch checked at the sample boundary.
+//! capability, local session grant, and account epoch checked at the sample boundary.
 #[path = "audio_pcm.rs"]
 mod pcm;
 
@@ -12,7 +12,7 @@ use pcm::{Format, NativeSinkOutput, Pcm, State};
 use rodio::{OutputStream, OutputStreamBuilder, Sink, mixer::Mixer};
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -71,10 +71,12 @@ pub struct Audio {
     master_gain: MasterGain,
     cached: Option<(String, AudioInput)>,
     scope: OutputScope,
+    account: Option<Arc<Mutex<Session>>>,
     elapsed: f64,
     duration: f64,
 }
 struct Run {
+    identity: u64,
     sink: Sink,
     authority: Authority,
     pcm: Arc<State>,
@@ -132,6 +134,63 @@ impl Audio {
         master_gain: MasterGain,
     ) -> Self {
         let network = session.as_ref().map(Session::network_changes);
+        Self::scoped(
+            OutputScope {
+                session,
+                network,
+                offline,
+                epoch,
+                expected,
+            },
+            None,
+            master_gain,
+        )
+    }
+
+    /// Device-owned playback survives mode switches and soft credential expiry.
+    /// The session still fences HTTP; hard revocation and account epoch fence PCM.
+    pub(crate) fn new_account_scoped(
+        session: Session,
+        epoch: Arc<AtomicU64>,
+        expected: u64,
+        master_gain: MasterGain,
+    ) -> Self {
+        Self::scoped(
+            OutputScope {
+                session: None,
+                network: None,
+                offline: false,
+                epoch,
+                expected,
+            },
+            Some(Arc::new(Mutex::new(session))),
+            master_gain,
+        )
+    }
+
+    /// Replace credentials for the same principal without rebuilding live PCM.
+    /// The actor must have verified the exact same origin as well as account.
+    pub(crate) fn rebind_account_session(&mut self, session: Session) -> bool {
+        if self.scope.epoch.load(Ordering::SeqCst) != self.scope.expected {
+            return false;
+        }
+        let Some(account) = &self.account else {
+            return false;
+        };
+        let mut current = account.lock().unwrap();
+        if current.account_id != session.account_id || current.is_revoked() || session.is_revoked()
+        {
+            return false;
+        }
+        *current = session;
+        true
+    }
+
+    fn scoped(
+        scope: OutputScope,
+        account: Option<Arc<Mutex<Session>>>,
+        master_gain: MasterGain,
+    ) -> Self {
         Self {
             stream: None,
             #[cfg(test)]
@@ -142,13 +201,8 @@ impl Audio {
             crossfade: None,
             master_gain,
             cached: None,
-            scope: OutputScope {
-                session,
-                network,
-                offline,
-                epoch,
-                expected,
-            },
+            scope,
+            account,
             elapsed: 0.0,
             duration: 0.0,
         }
@@ -171,6 +225,10 @@ impl Audio {
             .filter(|(loaded, _)| loaded == id)
             .map(|(_, source)| source.clone())
     }
+    pub(crate) fn run_identity(&self) -> Option<u64> {
+        self.primary.as_ref().map(|run| run.identity)
+    }
+
     pub fn discard_cache(&mut self) {
         self.cached = None;
     }
@@ -239,9 +297,20 @@ impl Audio {
             return Err(Status::Rejected);
         }
         let pcm = Arc::new(State::new(*format));
+        let fence_authority = if let Some(account) = &self.account {
+            let account = account.clone();
+            let output = authority.clone();
+            let start = authority.clone();
+            Authority::online(
+                move || output.is_valid() && !account.lock().unwrap().is_revoked(),
+                move || start.may_start(),
+            )
+        } else {
+            authority.clone()
+        };
         let fence = Fence {
             scope: self.scope.clone(),
-            authority: authority.clone(),
+            authority: fence_authority,
         };
         // Only old deterministic headless tests opt into eager in-memory PCM.
         #[cfg(test)]
@@ -261,7 +330,9 @@ impl Audio {
         }
         let (sink, output) = Sink::new();
         sink.set_volume(if fade { 0.0 } else { UNITY });
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
         let run = Run {
+            identity: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             sink,
             authority,
             pcm: pcm.clone(),
@@ -305,6 +376,10 @@ impl Audio {
     }
     fn current(&self) -> bool {
         self.scope.current()
+            && self
+                .account
+                .as_ref()
+                .is_none_or(|s| !s.lock().unwrap().is_revoked())
     }
     pub fn failure(&self) -> Option<Status> {
         self.primary.as_ref().and_then(|run| run.pcm.failure())
@@ -522,8 +597,7 @@ impl OutputScope {
                 .as_ref()
                 .is_none_or(|mode| matches!(mode.has_changed(), Ok(false)))
             && self.session.as_ref().is_none_or(|session| {
-                // Offline is an explicit local grant; cookie time is irrelevant
-                // until Go Online. A mode round trip still retires this scope.
+                // A legacy mode round trip still retires this scope.
                 session.is_offline() == self.offline && session.can_access_local()
             })
     }
@@ -632,6 +706,68 @@ mod tests {
             assert!(source.next().is_none());
         }
     }
+    #[test]
+    fn account_scoped_pcm_survives_mode_and_session_changes_but_not_retirement() {
+        use crate::api::{Api, Origin};
+        let api = Api::new(Origin::parse("https://music.invalid").unwrap()).unwrap();
+        for revoke_account in [false, true] {
+            let epoch = Arc::new(AtomicU64::new(1));
+            let session = api.test_session();
+            let mut audio =
+                Audio::new_account_scoped(session.clone(), epoch.clone(), 1, MasterGain::default());
+            let (mixer, mut output) = mixer(1, RATE);
+            let bytes = wav_samples(RATE, 8192);
+            audio.use_test_output(mixer, "file".into(), bytes.clone());
+            assert_eq!(
+                audio.play("file".into(), bytes, 0.0, 1.0, Authority::offline()),
+                Status::Ok
+            );
+            assert!(pump(&mut output, 20) > 0.0);
+            let run = audio.run_identity();
+            session.set_offline(true);
+            assert!(pump(&mut output, 20) > 0.0);
+            let restored = api.test_session();
+            assert!(audio.rebind_account_session(restored.clone()));
+            session.retire_local_grant();
+            assert!(pump(&mut output, 20) > 0.0);
+            assert_eq!(audio.run_identity(), run);
+            if revoke_account {
+                restored.retire_local_grant();
+            } else {
+                epoch.store(2, Ordering::SeqCst);
+            }
+            assert!(output.next().is_none_or(|sample| sample == 0.0));
+            assert!(!audio.facts().playing);
+            assert!(!audio.facts().ended, "fencing is not natural EOF");
+        }
+    }
+
+    #[test]
+    fn soft_session_deadline_does_not_end_account_scoped_pcm() {
+        use crate::api::{Api, Origin};
+        let api = Api::new(Origin::parse("https://music.invalid").unwrap()).unwrap();
+        let session = api.test_session_with_deadline(Instant::now());
+        assert!(session.is_expired());
+        assert!(!session.can_access_local());
+        let mut audio = Audio::new_account_scoped(
+            session.clone(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            MasterGain::default(),
+        );
+        let (mixer, mut output) = mixer(1, RATE);
+        let bytes = wav_samples(RATE, 8192);
+        audio.use_test_output(mixer, "file".into(), bytes.clone());
+        assert_eq!(
+            audio.play("file".into(), bytes, 0.0, 1.0, Authority::offline()),
+            Status::Ok
+        );
+        assert!(pump(&mut output, 20) > 0.0);
+        session.retire_local_grant();
+        assert!(output.next().is_none_or(|sample| sample == 0.0));
+        assert!(audio.was_fenced());
+    }
+
     #[test]
     fn an_unstarted_decoder_cannot_use_grace_and_fencing_is_not_natural_end() {
         let attached = Arc::new(std::sync::atomic::AtomicBool::new(false));

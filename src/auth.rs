@@ -2,10 +2,10 @@
 //!
 //! The engine owns admission: no attempt changes the saved profile before its
 //! epoch is accepted. A legacy cookie still requires server validation; only an
-//! explicit local grant from the active keyring slot can authorize cold offline use.
+//! typed local grant from the active keyring slot can authorize cold offline use.
 
 use crate::{
-    api::{Api, ApiError, Origin, RememberedCredential, RememberedLogin, Session},
+    api::{Api, ApiError, Origin, RememberedLogin, Session},
     login_store::{LoginProfile, LoginStore, StagedMode, StoreError},
 };
 use std::{
@@ -35,6 +35,9 @@ pub(crate) struct Success {
     pub session: Session,
     pub origin: Origin,
     pub kind: Kind,
+    /// The stored preference, not the transport state. A typed grant always
+    /// starts with a local-only session; only auto-offline tries online by default.
+    pub manual_offline: bool,
 }
 
 pub(crate) enum Kind {
@@ -74,6 +77,7 @@ pub(crate) async fn password(
         session,
         origin,
         kind: Kind::Password { remember },
+        manual_offline: false,
     })
 }
 
@@ -136,21 +140,23 @@ where
     if !profile.remembered || current.load(Ordering::SeqCst) != epoch {
         return Err(Fallback::default());
     }
-    let (api, session) = with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
-        restore_once(
-            lookup(&store, &profile),
-            &profile,
-            epoch,
-            current,
-            &online_preference_known,
-        )
-    })
-    .await?;
+    let (api, session, manual_offline) =
+        with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
+            restore_once(
+                lookup(&store, &profile),
+                &profile,
+                epoch,
+                current,
+                &online_preference_known,
+            )
+        })
+        .await?;
     Ok(Success {
         api,
         session,
         origin: profile.origin.clone(),
         kind: Kind::Restored(profile),
+        manual_offline,
     })
 }
 
@@ -165,7 +171,7 @@ async fn restore_once(
     epoch: u64,
     current: &AtomicU64,
     online_preference_known: &impl Fn(),
-) -> Result<(Arc<Api>, Session), RestoreFailure> {
+) -> Result<(Arc<Api>, Session, bool), RestoreFailure> {
     // Re-check the original login slot on each attempt. A changed profile
     // can neither substitute its credential nor reuse the old one here.
     let credential = match lookup.await {
@@ -188,10 +194,14 @@ async fn restore_once(
     }
     let credential = match credential {
         RememberedLogin::Offline(grant) => {
-            return grant
+            let (api, session) = grant
                 .admit(&profile.origin, &profile.username)
-                .map(|(api, session)| (Arc::new(api), session))
-                .map_err(|_| RestoreFailure::Final(stale(profile.clone())));
+                .map_err(|_| RestoreFailure::Final(stale(profile.clone())))?;
+            let manual = grant.manual_offline();
+            if !manual {
+                online_preference_known();
+            }
+            return Ok((Arc::new(api), session, manual));
         }
         RememberedLogin::Online(credential) => credential,
     };
@@ -207,7 +217,7 @@ async fn restore_once(
         })
         .await
     {
-        Ok(session) if session.username == profile.username => Ok((api, session)),
+        Ok(session) if session.username == profile.username => Ok((api, session, false)),
         // A renamed or mismatched account still needs explicit sign-in.
         Ok(_) => Err(RestoreFailure::Final(stale(profile.clone()))),
         Err(e) if e.expired || e.status == 401 => {
@@ -224,11 +234,13 @@ const LOST_LOCAL: ApiError = ApiError {
     status: 0,
 };
 
-/// Only the explicit Go online probe may build a transport for a cold local grant.
-/// The engine fences the entire operation and its result against the mode and account epoch.
+/// Validate a cold local grant for an online attempt without lifting its
+/// network fence. The engine owns the attempt deadline, rechecks the active
+/// slot before admission, and fences the returned capability by mode and epoch.
 pub(crate) async fn reconnect_local(
     store: &LoginStore,
     profile: &LoginProfile,
+    local_api: &Api,
     local: &Session,
     current: impl Fn() -> bool,
 ) -> Result<(Arc<Api>, Session), ApiError> {
@@ -237,9 +249,25 @@ pub(crate) async fn reconnect_local(
         status: 0,
         expired: false,
     };
-    let grant = match store.restore(profile).await {
+    if !current() {
+        return Err(unavailable);
+    }
+    let (origin, account) = local_api
+        .authenticated_account(local)
+        .map_err(|_| LOST_LOCAL)?;
+    if origin != profile.origin.as_str()
+        || local.username != profile.username
+        || !local.is_local_only()
+    {
+        return Err(LOST_LOCAL);
+    }
+    let found = store.restore(profile).await;
+    if !current() {
+        return Err(unavailable);
+    }
+    let grant = match found {
         Ok(Some(RememberedLogin::Offline(grant)))
-            if grant.matches_principal(&local.username, &local.account_id) =>
+            if grant.matches_principal(&profile.username, account) =>
         {
             grant
         }
@@ -252,17 +280,16 @@ pub(crate) async fn reconnect_local(
         Err(StoreError::Config | StoreError::KeyringUnavailable) => return Err(unavailable),
         _ => return Err(LOST_LOCAL),
     };
-    if !current() {
-        return Err(unavailable);
-    }
-    if !local.is_local_only() || !local.can_access_local() {
-        return Err(LOST_LOCAL);
-    }
+    grant
+        .validate(&profile.origin, &profile.username)
+        .map_err(|_| LOST_LOCAL)?;
     let api = Arc::new(Api::new(profile.origin.clone())?);
-    // `resume` requires a same-origin, same-account rolling-v1 response and
-    // constructs a real online session from its fresh summary, cookie and CSRF.
+    // `resume_if` requires a same-origin, same-account rolling-v1 response
+    // and constructs an online session from its fresh summary, cookie and CSRF.
     let session = api
-        .resume_if(RememberedLogin::Offline(grant).credential(), current)
+        .resume_if(RememberedLogin::Offline(grant).credential(), || {
+            current() && local.can_access_local()
+        })
         .await
         .map_err(|error| {
             if error.rejects_local_grant() {
@@ -271,8 +298,11 @@ pub(crate) async fn reconnect_local(
                 error
             }
         })?;
-    if session.username != profile.username {
+    if session.username != profile.username || !local.can_access_local() {
         return Err(LOST_LOCAL);
+    }
+    if !current() {
+        return Err(unavailable);
     }
     Ok((api, session))
 }
@@ -327,6 +357,85 @@ fn stale(profile: LoginProfile) -> Fallback {
 mod tests {
     use super::*;
     use std::future::ready;
+
+    fn typed_record(profile: &LoginProfile, format: &str) -> RememberedLogin {
+        serde_json::from_value(serde_json::json!({
+            "format": format,
+            "username": profile.username,
+            "role": "user",
+            "credential": {
+                "origin": profile.origin.as_str(),
+                "accountId": "fixture-account",
+                "cookie": "spofify_session=fixture-cookie"
+            },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remembered_manual_startup_admits_only_local_authority() {
+        let profile = LoginProfile::test_remembered();
+        let current = AtomicU64::new(7);
+        let (api, session, manual_offline) = restore_once(
+            ready(Ok(Some(typed_record(&profile, "local-v1")))),
+            &profile,
+            7,
+            &current,
+            &|| panic!("manual mode must keep network blocked"),
+        )
+        .await
+        .ok()
+        .expect("a valid typed grant needs no server");
+        assert!(manual_offline && session.is_local_only() && session.is_offline());
+        assert_eq!(
+            api.authenticated_account(&session).unwrap(),
+            (profile.origin.as_str(), "fixture-account")
+        );
+    }
+
+    #[tokio::test]
+    async fn remembered_online_preference_admits_local_before_http() {
+        let profile = LoginProfile::test_remembered();
+        let current = AtomicU64::new(7);
+        let auto = AtomicBool::new(false);
+        let (api, session, manual_offline) = restore_once(
+            ready(Ok(Some(typed_record(&profile, "local-online-v1")))),
+            &profile,
+            7,
+            &current,
+            &|| auto.store(true, Ordering::Relaxed),
+        )
+        .await
+        .ok()
+        .expect("an online preference must not gate local admission on HTTP");
+        assert!(auto.load(Ordering::Relaxed) && !manual_offline);
+        assert!(session.is_local_only() && session.is_offline());
+        assert_eq!(
+            api.authenticated_account(&session).unwrap().1,
+            "fixture-account"
+        );
+        assert!(api.remembered_login(&session).is_err());
+    }
+
+    #[tokio::test]
+    async fn keyring_result_after_epoch_change_cannot_admit_local_authority() {
+        let profile = LoginProfile::test_remembered();
+        let current = AtomicU64::new(7);
+        let result = restore_once(
+            async {
+                current.store(8, Ordering::SeqCst);
+                Ok(Some(typed_record(&profile, "local-v1")))
+            },
+            &profile,
+            7,
+            &current,
+            &|| panic!("a retired epoch must not open network"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RestoreFailure::Final(fallback)) if fallback.discard.is_none())
+        );
+    }
 
     #[tokio::test]
     async fn restore_automatically_recovers_then_stops_at_the_attempt_limit() {
@@ -431,7 +540,14 @@ impl Retention {
     }
 
     fn set_staged(&self, staged: StagedMode) {
-        self.0.slot.lock().unwrap().1 = Some(staged);
+        let mut slot = self.0.slot.lock().unwrap();
+        if slot
+            .0
+            .as_ref()
+            .is_some_and(|profile| staged.matches(profile))
+        {
+            slot.1 = Some(staged);
+        }
     }
 
     pub(crate) fn retire(&self) {
@@ -448,14 +564,20 @@ pub(crate) enum Write {
         origin: Origin,
         username: String,
         wanted: bool,
-        credential: Option<RememberedCredential>,
+        login: Option<RememberedLogin>,
         retained: Retention,
         session: Session,
     },
-    Mode(Retention, Session, RememberedLogin, Option<StagedMode>),
+    UpgradeLegacy(Retention, Session, RememberedLogin),
+    Preference(Retention, Session, bool, Option<StagedMode>),
     Forget(Option<LoginProfile>),
     ForgetRetained(Retention),
     Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+fn matches_retained_login(login: &RememberedLogin, session: &Session) -> bool {
+    matches!(login, RememberedLogin::Offline(grant)
+        if grant.matches_principal(&session.username, session.remembered_account_id()))
 }
 
 // Busy occurs before a mutation acquires its flock, so repeating this case
@@ -474,6 +596,19 @@ where
 }
 
 impl Write {
+    /// A preference is independent of the current session's network fence.
+    /// Writes run in issue order and publication is still fenced by retention
+    /// and revocation. In particular, a temporary auto-offline transport fence
+    /// must not itself change what the next launch does.
+    pub(crate) fn preference(
+        retained: Retention,
+        session: Session,
+        manual_offline: bool,
+        staged: Option<StagedMode>,
+    ) -> Self {
+        Self::Preference(retained, session, manual_offline, staged)
+    }
+
     async fn run(self, store: Result<&LoginStore, StoreError>) -> &'static str {
         if let Self::Barrier(done) = self {
             let _ = done.send(());
@@ -487,7 +622,7 @@ impl Write {
                 origin,
                 username,
                 wanted,
-                credential,
+                login,
                 retained,
                 session,
             } => {
@@ -495,17 +630,18 @@ impl Write {
                 if !permitted() {
                     return "";
                 }
+                let login = login.filter(|login| wanted && matches_retained_login(login, &session));
                 let stored = match store {
                     Ok(store) => {
                         with_write_admission(|| {
-                            store.record_login(&origin, &username, credential.as_ref(), &permitted)
+                            store.record_login(&origin, &username, login.as_ref(), &permitted)
                         })
                         .await
                     }
                     Err(e) => Err(e),
                 };
                 match stored {
-                    Ok(_) if wanted && credential.is_none() => NOT_SAVED,
+                    Ok(_) if wanted && login.is_none() => NOT_SAVED,
                     Ok(profile) => {
                         if profile.remembered {
                             retained.set(profile);
@@ -518,12 +654,33 @@ impl Write {
                     Err(_) => NOT_SAVED,
                 }
             }
-            Self::Mode(retained, session, login, staged) => {
+            Self::UpgradeLegacy(retained, session, login) => {
+                let permitted = || retained.permits(&session) && !session.is_local_only();
+                if !permitted() {
+                    return "";
+                }
+                let (Some(profile), Ok(store)) = (retained.profile(), store) else {
+                    return NOT_SAVED;
+                };
+                if !matches_retained_login(&login, &session) {
+                    return NOT_SAVED;
+                }
+                match with_write_admission(|| store.upgrade_legacy(&profile, &login, &permitted))
+                    .await
+                {
+                    Ok(profile) => {
+                        retained.set(profile);
+                        ""
+                    }
+                    Err(_) if !permitted() => "",
+                    Err(_) => NOT_SAVED,
+                }
+            }
+            Self::Preference(retained, session, manual_offline, staged) => {
                 if let Some(staged) = staged {
                     retained.set_staged(staged);
                 }
-                let offline = matches!(&login, RememberedLogin::Offline(_));
-                let permitted = || retained.permits(&session) && session.is_offline() == offline;
+                let permitted = || retained.permits(&session);
                 if !permitted() {
                     return "";
                 }
@@ -533,6 +690,9 @@ impl Write {
                 let Ok(store) = store else {
                     return MODE_NOT_SAVED;
                 };
+                if profile.username != session.username {
+                    return MODE_NOT_SAVED;
+                }
                 // If an accepted mode change disarmed the slot before a temporary
                 // keyring lock, the same admitted owner can still update that exact
                 // item after unlock. A fresh process cannot adopt the cleanup marker.
@@ -549,7 +709,13 @@ impl Write {
                 };
                 retained.set_staged(staged.clone());
                 match with_write_admission(|| {
-                    store.change_mode(&profile, &login, &staged, &permitted)
+                    store.change_preference(
+                        &profile,
+                        &staged,
+                        session.remembered_account_id(),
+                        manual_offline,
+                        &permitted,
+                    )
                 })
                 .await
                 {

@@ -2,6 +2,7 @@
 //! Neither a pin nor its tombstone owns audio or modifies legacy collections.
 
 use std::{
+    collections::HashSet,
     fs::File,
     io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     mem::MaybeUninit,
@@ -17,7 +18,7 @@ use rustix::{
     io::Errno,
     process::geteuid,
 };
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     api::{ApiError, library::PlaylistKind},
@@ -77,10 +78,40 @@ fn serialize_kind<S: Serializer>(kind: &PlaylistKind, serializer: S) -> Result<S
 pub(crate) struct Membership {
     pub(crate) title: String,
     pub(crate) tracks: Vec<String>,
+    /// Absent in older pins. Never infer identities from track IDs or positions.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_provenance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) provenance: Option<Provenance>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Provenance {
+    pub(crate) revision: u64,
+    /// Exact manifest identity in the same order as `Membership::tracks`.
+    pub(crate) occurrence_ids: Vec<String>,
+}
+
+fn deserialize_provenance<'de, D: Deserializer<'de>>(
+    value: D,
+) -> Result<Option<Provenance>, D::Error> {
+    Provenance::deserialize(value).map(Some)
 }
 
 pub(crate) fn fingerprint(membership: &Membership) -> [u8; 32] {
     let mut digest = Context::new(&SHA256);
+    if let Some(provenance) = &membership.provenance {
+        digest.update(b"spofify-pin-provenance\0");
+        digest.update(&provenance.revision.to_be_bytes());
+        digest.update(&(provenance.occurrence_ids.len() as u64).to_be_bytes());
+        for id in &provenance.occurrence_ids {
+            digest.update(&(id.len() as u64).to_be_bytes());
+            digest.update(id.as_bytes());
+        }
+    }
     for field in std::iter::once(&membership.title).chain(&membership.tracks) {
         digest.update(&(field.len() as u64).to_be_bytes());
         digest.update(field.as_bytes());
@@ -279,7 +310,7 @@ impl Store {
         }) else {
             return Ok(None);
         };
-        if !valid_membership(&membership) {
+        if membership.provenance.is_none() || !valid_membership(&membership, current.target.kind) {
             return Err(INVALID);
         }
         // Advance the CAS even if the refreshed membership has identical content.
@@ -364,7 +395,7 @@ impl Store {
             || record
                 .committed
                 .as_ref()
-                .is_some_and(|m| !valid_membership(m))
+                .is_some_and(|m| !valid_membership(m, record.target.kind))
             || playlist_key(access, &record.target.id)? != key
         {
             return Err(DAMAGED);
@@ -564,7 +595,7 @@ fn valid_target(target: &Target) -> bool {
         && valid_title(&target.title)
 }
 
-fn valid_membership(membership: &Membership) -> bool {
+fn valid_membership(membership: &Membership, kind: PlaylistKind) -> bool {
     valid_title(&membership.title)
         && membership.tracks.iter().all(|id| {
             // Track IDs use the offline track route's broader opaque ID rule.
@@ -573,6 +604,21 @@ fn valid_membership(membership: &Membership) -> bool {
                 && id.trim() == id
                 && !matches!(id.as_str(), "." | "..")
                 && !id.chars().any(char::is_control)
+        })
+        && membership.provenance.as_ref().is_none_or(|provenance| {
+            let max_id_bytes = match kind {
+                PlaylistKind::Manual => 512,
+                PlaylistKind::Derived => 4096,
+            };
+            let mut seen = HashSet::new();
+            (1..=9_007_199_254_740_991).contains(&provenance.revision)
+                && provenance.occurrence_ids.len() == membership.tracks.len()
+                && provenance.occurrence_ids.iter().all(|id| {
+                    !id.is_empty()
+                        && id.len() <= max_id_bytes
+                        && id.bytes().all(|byte| byte.is_ascii_graphic())
+                        && seen.insert(id.as_str())
+                })
         })
 }
 
@@ -639,7 +685,116 @@ mod tests {
         Membership {
             title: "Published title".into(),
             tracks: tracks.iter().map(|id| (*id).into()).collect(),
+            provenance: Some(Provenance {
+                revision: 7,
+                occurrence_ids: (0..tracks.len()).map(|i| format!("entry_{i}")).collect(),
+            }),
         }
+    }
+
+    #[test]
+    fn old_pin_is_read_without_rewrite_and_refresh_retains_exact_duplicate_rows() {
+        let fixture = Fixture::new();
+        let access = account("https://fixture.invalid");
+        let store = fixture.open(&access);
+        let pin = store
+            .set(
+                &access,
+                Target {
+                    kind: PlaylistKind::Derived,
+                    ..target()
+                },
+                true,
+                || Ok(()),
+            )
+            .unwrap();
+        let path = fixture
+            .0
+            .join(&store.scope)
+            .join(record_name(&pin.key).unwrap());
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&stdfs::read(&path).unwrap()).unwrap();
+        old["record"]["committed"] = serde_json::json!({
+            "title": "Published title",
+            "tracks": ["same", "same"],
+        });
+        let bytes = serde_json::to_vec(&old).unwrap();
+        stdfs::write(&path, &bytes).unwrap();
+        let store = fixture.open(&access);
+        let record = store.get(&access, &pin.key).unwrap().unwrap();
+        let old_members = record.committed.as_ref().unwrap();
+        assert_eq!(old_members.tracks, ["same", "same"]);
+        assert_eq!(old_members.provenance, None);
+        assert_eq!(store.list(&access).unwrap(), [record.clone()]);
+        assert_eq!(stdfs::read(&path).unwrap(), bytes);
+        let basis = Some(fingerprint(old_members));
+        assert_eq!(
+            store.publish(&access, &record, basis, old_members.clone(), || Ok(())),
+            Err(INVALID)
+        );
+        let refreshed = Membership {
+            provenance: Some(Provenance {
+                revision: 12,
+                occurrence_ids: vec!["o1_first".into(), "o1_second".into()],
+            }),
+            ..old_members.clone()
+        };
+        assert_ne!(Some(fingerprint(&refreshed)), basis);
+        let token = store
+            .publish(&access, &record, basis, refreshed.clone(), || Ok(()))
+            .unwrap()
+            .unwrap();
+        let reloaded = fixture
+            .open(&access)
+            .get(&access, &pin.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.token, token);
+        assert_eq!(reloaded.committed, Some(refreshed));
+    }
+
+    #[test]
+    fn malformed_provenance_cannot_publish_or_read_as_legacy() {
+        let fixture = Fixture::new();
+        let access = account("https://fixture.invalid");
+        let store = fixture.open(&access);
+        let pin = store.set(&access, target(), true, || Ok(())).unwrap();
+        let path = fixture
+            .0
+            .join(&store.scope)
+            .join(record_name(&pin.key).unwrap());
+        let original = stdfs::read(&path).unwrap();
+        for (revision, ids) in [
+            (0, vec!["first", "second"]),
+            (7, vec!["first"]),
+            (7, vec!["first", "first"]),
+            (7, vec!["", "second"]),
+        ] {
+            let damaged = Membership {
+                provenance: Some(Provenance {
+                    revision,
+                    occurrence_ids: ids.into_iter().map(str::to_owned).collect(),
+                }),
+                ..membership(&["same", "same"])
+            };
+            assert_eq!(
+                store.publish(&access, &pin, None, damaged.clone(), || Ok(())),
+                Err(INVALID)
+            );
+            let mut disk: DiskRecord = serde_json::from_slice(&original).unwrap();
+            disk.record.committed = Some(damaged);
+            stdfs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+            assert_eq!(store.get(&access, &pin.key), Err(DAMAGED));
+            stdfs::write(&path, &original).unwrap();
+        }
+        let mut disk: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        disk["record"]["committed"] = serde_json::json!({
+            "title": "Published title",
+            "tracks": ["same"],
+            "provenance": null,
+        });
+        stdfs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert_eq!(store.get(&access, &pin.key), Err(DAMAGED));
     }
 
     #[tokio::test]
@@ -802,6 +957,10 @@ mod tests {
         let pin = store.set(&access, target(), true, || Ok(())).unwrap();
         let saved = Membership {
             title: "Large membership".into(),
+            provenance: Some(Provenance {
+                revision: 7,
+                occurrence_ids: (0..9_000).map(|i| format!("entry_{i}")).collect(),
+            }),
             tracks: ["a".repeat(512), "b".repeat(512), "a".repeat(512)]
                 .into_iter()
                 .cycle()

@@ -1563,7 +1563,6 @@ impl Browser {
                 ui.set_playlist_order_scope(Default::default());
             }
             ui.set_account_label(account.into());
-            ui.set_manual_offline(offline);
             if kind == "now" && ui.get_page_kind() != "now" {
                 // Record reopening with the route, before the media observer runs.
                 ui.set_lyrics_open_generation(ui.get_lyrics_open_generation().wrapping_add(1));
@@ -2941,9 +2940,14 @@ impl Browser {
         if offline && !page.local_audio && !saved_route(&route) {
             return; // The previous online projection may still be painted, but is inert.
         }
-        let local_action = page.local_audio
-            && (saved_route(&route) || offline)
-            && matches!(op.as_str(), "play" | "queue");
+        let saved_action = saved_route(&route) && matches!(op.as_str(), "play" | "queue");
+        if saved_action && !offline {
+            // The room cannot reproduce a filtered downloaded queue exactly.
+            self.message = "Work offline to play this Saved queue.".into();
+            self.render(false);
+            return;
+        }
+        let local_action = page.local_audio && offline && matches!(op.as_str(), "play" | "queue");
         if route.personal()
             && !self.personal_ready
             && !(unpin

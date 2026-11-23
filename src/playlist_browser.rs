@@ -13,7 +13,7 @@ use crate::{
     offline::Download,
     pages::{self, Page, PlaylistMetadata, Route, Row, RowKey},
     playlist_observations::{self, Membership, Summary},
-    playlist_pin_store::{Record, Store, Target},
+    playlist_pin_store::{Provenance, Record, Store, Target},
     playlist_pins::Controller,
 };
 
@@ -305,15 +305,46 @@ struct Observation<'a> {
 
 enum Members<'a> {
     Observed(&'a Membership, PlaylistKind),
-    Saved(&'a [String]),
+    Saved {
+        tracks: &'a [String],
+        provenance: Option<(&'a Provenance, PlaylistKind)>,
+    },
     Unknown,
+}
+
+fn playlist_row_key(kind: PlaylistKind, playlist_id: &str, occurrence_id: &str) -> RowKey {
+    match kind {
+        PlaylistKind::Manual => RowKey::ManualEntry {
+            playlist_id: playlist_id.into(),
+            entry_id: occurrence_id.into(),
+        },
+        PlaylistKind::Derived => RowKey::DerivedOccurrence {
+            playlist_id: playlist_id.into(),
+            occurrence_id: occurrence_id.into(),
+        },
+    }
+}
+
+/// Local detail projection keeps original manifest positions even when unavailable
+/// audio is filtered. Never look up identity by track ID or visible row index.
+fn apply_saved_provenance(page: &mut Page, id: &str, kind: PlaylistKind, source: &Provenance) {
+    page.playlist_membership_revision = Some(source.revision);
+    for row in &mut page.rows {
+        if let Some(occurrence_id) = row
+            .position
+            .and_then(|position| usize::try_from(position).ok())
+            .and_then(|position| source.occurrence_ids.get(position))
+        {
+            row.key = playlist_row_key(kind, id, occurrence_id);
+        }
+    }
 }
 
 impl Members<'_> {
     fn track_ids(&self) -> impl Iterator<Item = &str> {
         let (observed, saved) = match self {
             Self::Observed(members, _) => (members.rows.as_slice(), &[][..]),
-            Self::Saved(ids) => (&[][..], *ids),
+            Self::Saved { tracks, .. } => (&[][..], *tracks),
             Self::Unknown => (&[][..], &[][..]),
         };
         observed
@@ -338,20 +369,11 @@ impl Members<'_> {
                 .iter()
                 .filter_map(|entry| {
                     let download = collections::local_track(available, &entry.track_id)?;
-                    let key = match kind {
-                        PlaylistKind::Manual => RowKey::ManualEntry {
-                            playlist_id: id.into(),
-                            entry_id: entry.occurrence_id.clone(),
-                        },
-                        PlaylistKind::Derived => RowKey::DerivedOccurrence {
-                            playlist_id: id.into(),
-                            occurrence_id: entry.occurrence_id.clone(),
-                        },
-                    };
+                    let key = playlist_row_key(*kind, id, &entry.occurrence_id);
                     Some(collections::local_track_row(download, key, entry.position))
                 })
                 .collect(),
-            Self::Saved(ids) => ids
+            Self::Saved { tracks, .. } => tracks
                 .iter()
                 .enumerate()
                 .filter_map(|(position, id)| {
@@ -365,12 +387,20 @@ impl Members<'_> {
                 .collect(),
             Self::Unknown => Vec::new(),
         };
+        if let Self::Saved {
+            provenance: Some((source, kind)),
+            ..
+        } = self
+        {
+            apply_saved_provenance(page, id, *kind, source);
+        }
     }
 
     fn revision(&self) -> Option<u64> {
         match self {
             Self::Observed(members, _) => Some(members.revision),
-            Self::Saved(_) | Self::Unknown => None,
+            Self::Saved { provenance, .. } => provenance.map(|(source, _)| source.revision),
+            Self::Unknown => None,
         }
     }
 }
@@ -421,14 +451,22 @@ fn source_members<'a>(
             return Members::Unknown;
         }
     }
-    if let Some(membership) = pin
-        .filter(|p| Some(p.target.kind) == kind)
-        .and_then(|p| p.committed.as_ref())
-    {
-        return Members::Saved(&membership.tracks);
+    if let Some(pin) = pin.filter(|p| Some(p.target.kind) == kind) {
+        if let Some(membership) = &pin.committed {
+            return Members::Saved {
+                tracks: &membership.tracks,
+                provenance: membership
+                    .provenance
+                    .as_ref()
+                    .map(|source| (source, pin.target.kind)),
+            };
+        }
     }
     if let Some(snapshot) = legacy.filter(|p| kind.is_none_or(|k| k == p.kind)) {
-        return Members::Saved(&snapshot.tracks);
+        return Members::Saved {
+            tracks: &snapshot.tracks,
+            provenance: None,
+        };
     }
     Members::Unknown
 }
@@ -471,7 +509,7 @@ fn detail_projection<'a>(
 
     let total = match (summary, &members) {
         (Some(s), _) => s.track_count,
-        (None, Members::Saved(tracks)) => Some(tracks.len() as u64),
+        (None, Members::Saved { tracks, .. }) => Some(tracks.len() as u64),
         _ => None,
     };
     let page = Page {
@@ -571,7 +609,13 @@ pub(crate) async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> 
     }
     let target = record.target;
     let mut page = if let Some(member) = record.committed {
-        collections::saved_playlist_page(access, member.title, target.kind, member.tracks).await?
+        let mut page =
+            collections::saved_playlist_page(access, member.title, target.kind, member.tracks)
+                .await?;
+        if let Some(source) = member.provenance {
+            apply_saved_provenance(&mut page, &target.id, target.kind, &source);
+        }
+        page
     } else {
         match collections::detail(access, id).await {
             Err(e) if e.status == 404 => Page {
@@ -746,6 +790,67 @@ mod tests {
                 );
                 assert!(row.music.credits.is_empty());
                 assert!(row.playable && row.playback.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn saved_pin_provenance_uses_manifest_position_not_visible_index_or_track_id() {
+        for kind in [PlaylistKind::Manual, PlaylistKind::Derived] {
+            let identity = |suffix| match kind {
+                PlaylistKind::Manual => format!("entry_{suffix}"),
+                PlaylistKind::Derived => format!("o1_{suffix}"),
+            };
+            let mut pin = pin("saved-route-key", true, true);
+            pin.target.kind = kind;
+            let member = pin.committed.as_mut().unwrap();
+            member.tracks = vec!["one".into(), "missing".into(), "one".into()];
+            let available = HashMap::from([("one".into(), local_download("one"))]);
+            let (mut legacy, members) =
+                detail_projection("source", Observation::default(), Some(&pin), None).unwrap();
+            members.project(&mut legacy, "source", &available);
+            assert!(legacy.playlist_membership_revision.is_none());
+            assert_eq!(legacy.total, Some(3));
+            assert_eq!(legacy.rows.len(), 2);
+            assert!(
+                legacy
+                    .rows
+                    .iter()
+                    .all(|row| row.key == RowKey::Track("one".into()))
+            );
+
+            let source = Provenance {
+                revision: 7,
+                occurrence_ids: vec![identity("last"), identity("middle"), identity("first")],
+            };
+            // Saved detail receives generic rows/positions from collections.
+            let mut saved = Page {
+                saved_pin: Some(pin.target.clone()),
+                ..legacy
+            };
+            apply_saved_provenance(&mut saved, &pin.target.id, kind, &source);
+            pin.committed.as_mut().unwrap().provenance = Some(source);
+            let (mut fallback, members) =
+                detail_projection("source", Observation::default(), Some(&pin), None).unwrap();
+            members.project(&mut fallback, "source", &available);
+            assert_eq!(saved.playlist_membership_revision, Some(7));
+            assert_eq!(fallback.playlist_membership_revision, Some(7));
+            assert_eq!(saved.rows, fallback.rows);
+            for (row, (position, suffix)) in saved.rows.iter().zip([(0, "last"), (2, "first")]) {
+                let key = match kind {
+                    PlaylistKind::Manual => RowKey::ManualEntry {
+                        playlist_id: "source".into(),
+                        entry_id: identity(suffix),
+                    },
+                    PlaylistKind::Derived => RowKey::DerivedOccurrence {
+                        playlist_id: "source".into(),
+                        occurrence_id: identity(suffix),
+                    },
+                };
+                assert_eq!(row.key, key);
+                assert_eq!(row.position, Some(position));
+                assert_eq!(row.id, "one");
+                assert_eq!(row.local_recording, Some(available["one"].recording));
             }
         }
     }
@@ -1148,6 +1253,7 @@ mod tests {
             committed: ready.then(|| PinMembership {
                 title: "Complete title".into(),
                 tracks: vec!["one".into()],
+                provenance: None,
             }),
         }
     }

@@ -30,7 +30,7 @@ use crate::{
     desk::Access,
     offline::{self, Download, OfflineStore},
     pages::{self, Credit, MusicMetadata, Page, Route, Row, RowKey},
-    playlist_pin_store::{Membership, Target as PinTarget},
+    playlist_pin_store::{Membership, Provenance, Target as PinTarget},
     storage as local_storage,
 };
 
@@ -1232,11 +1232,11 @@ trait ManifestSink {
 }
 
 trait ManifestTracks: Default {
-    fn push_track(&mut self, item: Item) -> Result<(), ApiError>;
+    fn push_track(&mut self, occurrence_id: &str, item: Item) -> Result<(), ApiError>;
 }
 
 impl ManifestTracks for Vec<Item> {
-    fn push_track(&mut self, item: Item) -> Result<(), ApiError> {
+    fn push_track(&mut self, _: &str, item: Item) -> Result<(), ApiError> {
         self.push(item);
         Ok(())
     }
@@ -1250,10 +1250,12 @@ impl<T: ManifestTracks> ManifestSink for MemoryManifest<T> {
             .ok_or(INVALID)
     }
     fn occurrence(&mut self, id: String, track: Item) -> Result<(), ApiError> {
-        if !self.occurrences.insert(id) {
+        if self.occurrences.contains(id.as_str()) {
             return Err(INVALID);
         }
-        self.tracks.push_track(track)
+        self.tracks.push_track(&id, track)?;
+        self.occurrences.insert(id);
+        Ok(())
     }
 }
 
@@ -1380,12 +1382,12 @@ impl ManifestState {
 
 #[derive(Default)]
 struct PlaylistTracks {
-    order: Vec<usize>,
+    order: Vec<(usize, String)>,
     unique: Vec<(Item, usize)>,
     by_id: HashMap<String, usize>,
 }
 impl ManifestTracks for PlaylistTracks {
-    fn push_track(&mut self, item: Item) -> Result<(), ApiError> {
+    fn push_track(&mut self, occurrence_id: &str, item: Item) -> Result<(), ApiError> {
         let index = if let Some(&i) = self.by_id.get(&item.id) {
             let (previous, count) = &mut self.unique[i];
             if *previous != item {
@@ -1399,7 +1401,7 @@ impl ManifestTracks for PlaylistTracks {
             self.unique.push((item, 1));
             i
         };
-        self.order.push(index);
+        self.order.push((index, occurrence_id.into()));
         Ok(())
     }
 }
@@ -1422,6 +1424,7 @@ impl ManifestState<PlaylistTracks> {
                 by_id,
             },
         ) = self.finish_parts()?;
+        let revision = header.revision.ok_or(INVALID)?;
         drop(by_id);
         live()?;
         let total = order.len();
@@ -1463,11 +1466,18 @@ impl ManifestState<PlaylistTracks> {
                 progress(verified, total);
             }
         }
-        let tracks = order.into_iter().map(|i| unique[i].0.id.clone()).collect();
+        let (tracks, occurrence_ids) = order
+            .into_iter()
+            .map(|(index, occurrence_id)| (unique[index].0.id.clone(), occurrence_id))
+            .unzip();
         live()?;
         Ok(Membership {
             title: header.name,
             tracks,
+            provenance: Some(Provenance {
+                revision,
+                occurrence_ids,
+            }),
         })
     }
 }
@@ -2278,6 +2288,13 @@ mod tests {
             .await
             .unwrap();
         assert!(membership.tracks.is_empty());
+        assert_eq!(
+            membership.provenance,
+            Some(Provenance {
+                revision: 7,
+                occurrence_ids: Vec::new()
+            })
+        );
         assert_eq!(milestones, [(0, 0)]);
         assert!(
             lock_playlist_members_with(&access, &membership, || {
@@ -2368,12 +2385,13 @@ mod tests {
         for start in (0..TOTAL).step_by(page_size) {
             let end = (start + page_size).min(TOTAL);
             let next = (end < TOTAL).then(|| format!("of1_page_{end}.signature"));
+            let mut page = wire_page("derived", TOTAL, start..end, next.as_deref());
+            for (position, item) in (start..end).zip(page["items"].as_array_mut().unwrap()) {
+                // Use IDs deliberately unrelated to track or forward position.
+                item["occurrenceId"] = json!(format!("o1_fixture_{}", TOTAL - position));
+            }
             assert_eq!(
-                append_pin(
-                    &mut state,
-                    PlaylistKind::Derived,
-                    wire_page("derived", TOTAL, start..end, next.as_deref())
-                ),
+                append_pin(&mut state, PlaylistKind::Derived, page),
                 Ok(next)
             );
         }
@@ -2391,7 +2409,15 @@ mod tests {
             .unwrap();
         assert_eq!(membership.title, "Fixture playlist");
         assert_eq!(membership.tracks.len(), TOTAL);
-        for (index, id) in membership.tracks.iter().enumerate() {
+        let provenance = membership.provenance.as_ref().unwrap();
+        assert_eq!(provenance.revision, 7);
+        assert_eq!(provenance.occurrence_ids.len(), TOTAL);
+        for (index, (id, occurrence_id)) in membership
+            .tracks
+            .iter()
+            .zip(&provenance.occurrence_ids)
+            .enumerate()
+        {
             assert_eq!(
                 id,
                 if matches!(index, 0 | 20) {
@@ -2400,6 +2426,7 @@ mod tests {
                     "track"
                 }
             );
+            assert_eq!(occurrence_id, &format!("o1_fixture_{}", TOTAL - index));
         }
         assert_eq!(milestones, [(0, TOTAL), (2, TOTAL), (TOTAL, TOTAL)]);
 
