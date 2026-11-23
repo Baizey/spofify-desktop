@@ -311,9 +311,8 @@ class Review:
         self.frame("01-editor-open", self.layout())
         self.idle_alignment()
         if surface == "playlist":
-            # The real playlist has a Back bar absent in the model-only preview.
-            # Move one row down before the local drag scenarios so row 007's
-            # whole delegate and its center clear the dock and autoscroll edge.
+            # The editable playlist reserves its order lane in both modes.
+            # Move one row down so row 007 clears the dock and autoscroll edge.
             viewport, _ = self.rows()
             _, top, _, bottom = bounds(self.row(6))
             self.scroll(viewport, top - bottom)
@@ -484,6 +483,7 @@ class Review:
         before = len(self.commands())
         start = self.row(DUPLICATE, 1)
         anchor = self.row(7)
+        viewport_before = bounds(self.rows()[0])
         point = self.grab_point(start)
         expected = self.command(5, 7)
         with recording(self.window, self.output, f"{self.surface}-slow-echo") as events:
@@ -497,10 +497,12 @@ class Review:
             self.window.key(" ")  # A pending drop cannot lift/place a second row.
             carried = element_id(self.tree(self.editor), "carried-card")
             check(carried and carried.get("visible", True), "preview snapped back before the delayed echo")
+            check(bounds(self.rows()[0]) == viewport_before, "pending write resized the order viewport")
             self.frame("slow-echo-02-pending", {"carried": bounds(carried)})
             check(not (self.output / "readback.jsonl").exists(), "pending frame was not captured before echo")
             self.expect_adjacent(DUPLICATE, 7, occurrence=1)
             check(not element_id(self.tree(self.editor), "carried-card"), "preview survived the echo")
+            check(bounds(self.rows()[0]) == viewport_before, "write confirmation resized the order viewport")
             check(abs(center(carried)[1] - center(self.row(DUPLICATE, 1))[1]) <= 2,
                   "the authoritative occurrence jumped to a different slot")
             self.frame("slow-echo-03-authoritative", self.layout())

@@ -311,8 +311,8 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
             elements = window.elements()
             current = any(window.matches(e, SAVED) and (e.get("accessibleDescription") or "").startswith("Current section")
                           for e in elements)
-            on_detail = any(window.matches(e, "Back") and e.get("accessibleRole") == "Button" for e in elements)
-            if current and not on_detail:
+            # Back can be disabled during a durable write on the detail page.
+            if current and named(window, elements, SAVED, role="Text"):
                 return True
             # Navigation presses during the durable write are ignored.
             window.click(SAVED)
@@ -398,7 +398,7 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
     window.click("Remove from Saved")
     window.title(SAVED)  # A successful removal returns to the listing itself.
     window.section(SAVED)
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
 
     def only_independent_save_remains():
         buttons = [e for e in window.elements() if e.get("accessibleRole") == "Button"]
@@ -444,7 +444,7 @@ def real_playlist_offline_actions(window, ready, *, offline_mode):
     window.click("Remove from Saved")
     window.title(SAVED)
     window.section(SAVED)
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
     window.find(f"Play track: {TRACK}", roles=("Button",))
     window.absent(f"Open {album_label}", roles=("Button",))
     print("PASS legacy Saved detail confirms removal and retains the independently saved track", flush=True)
@@ -822,6 +822,7 @@ def typed_catalog(window, width, *, capture=False, via_shortcut=False, check_com
     else:
         window.fill("Search tracks, albums or artists", "Synthetic")
     search_results(window)
+    search_tools = toolbar_layout(window, can_go_back=True, with_picker=True)
     if capture:
         window.pixels(f"search-{width}", width)
 
@@ -842,20 +843,30 @@ def typed_catalog(window, width, *, capture=False, via_shortcut=False, check_com
     window.click("Back")
     search_results(window)
 
+    restored_tools = toolbar_layout(window, can_go_back=True, with_picker=True)
+    check(same_tool_bounds(search_tools, restored_tools), "Back changed the Search toolbar or destination picker bounds")
     search_track_targets(window, width, capture, check_padding=check_compact_targets)
     open_playlists(window)
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
     print(f"PASS at {width}px: typed search, ID-only release, named credit routes and Back", flush=True)
 
 
 def check_shortcut_back(window):
     open_manual(window)
     window.shortcut(ALT, LEFT)
-    window.find(f"Open {PLAYLIST}", roles=("Button",))
-    window.absent("Back", roles=("Button",))
+    playlists_root(window)
 
 
-def search_layout(window, elements, toolbar):
+def same_tool_bounds(before, after):
+    return before.keys() == after.keys() and all(
+        abs(a - b) <= 1 for key in before for a, b in zip(before[key], after[key]))
+
+
+def toolbar_layout(window, *, can_go_back, with_picker=False):
+    back = window.back_control(enabled=can_go_back)
+    elements = window.elements()
+    toolbar = element_id(elements, "toolbar")
+    check(toolbar, "missing rendered toolbar")
     # TextInput excludes the icon and clear affordance; measure the painted Field.
     field = element_id(elements, "search")
     header = element_id(elements, "header-slot")
@@ -870,20 +881,41 @@ def search_layout(window, elements, toolbar):
     check(abs((y + bottom - ty - tbottom) / 2) <= 1
           and abs((y + bottom - bounds(brand)[1] - bounds(brand)[3]) / 2) <= 10,
           f"Search is not centered in the toolbar and aligned with the rail brand: {bounds(field)}")
+    bx, by, br, bb = bounds(back)
+    check(tx <= bx < br <= x and abs(x - br - 8) <= 1 and abs(by - y) <= 1 and abs(bb - bottom) <= 1,
+          f"Back and Search do not share the toolbar row: {bounds(back)}, {bounds(field)}")
     content_left, _, content_right, _ = bounds(header)
-    inset = x - tx
-    check(0 < inset <= 40 and abs(x - content_left) <= 2,
-          f"Search is not aligned with the catalog gutter: {x:g} vs {content_left:g}")
+    inset = bx - tx
+    check(0 < inset <= 40 and abs(bx - content_left) <= 2,
+          f"toolbar group is not aligned with the catalog gutter: {bx:g} vs {content_left:g}")
     usable_right = tright - inset
     check(abs(content_right - usable_right) <= 2,
           f"catalog content does not fill its usable width: ends at {content_right:g}, expected {usable_right:g}")
-    check(abs(right - usable_right) <= 2,
-          f"Search leaves unused toolbar space: field ends at {right:g}, usable edge at {usable_right:g}")
-    return x, right - x
+    tools = {"back": bounds(back), "search": bounds(field)}
+    if with_picker:
+        picker = window.find(r"Add to playlist: .+", roles=("Button",), within=toolbar)
+        px, py, pr, pb = bounds(picker)
+        check(abs(px - right - 8) <= 1 and abs(py - y) <= 1 and abs(pb - bottom) <= 1,
+              f"Search and destination picker do not share the toolbar row: {bounds(field)}, {bounds(picker)}")
+        check(abs(pr - usable_right) <= 2, "destination picker does not align with the right gutter")
+        tools["picker"] = bounds(picker)
+    else:
+        check(abs(right - usable_right) <= 2,
+              f"Search leaves unused toolbar space: field ends at {right:g}, usable edge at {usable_right:g}")
+    return tools
 
 
-def pane_layout(window, *, wide, queue_open=None, can_go_back=False):
-    elements = window.elements()
+def pane_layout(window, *, wide, queue_open=None, can_go_back=False, order_lane=False):
+    expected_lane = 46 if order_lane else 0
+
+    def settled_panes():
+        elements = window.elements()
+        toolbar = element_id(elements, "toolbar")
+        catalog = element_id(elements, "catalog-scroll")
+        if toolbar and catalog and abs(bounds(catalog)[1] - bounds(toolbar)[3] - expected_lane) <= 1:
+            return elements
+
+    elements = wait(f"catalog viewport below a {expected_lane}px order lane", settled_panes)
     work = element_id(elements, "work")
     rail = element_id(elements, "rail")
     toolbar = element_id(elements, "toolbar")
@@ -900,19 +932,10 @@ def pane_layout(window, *, wide, queue_open=None, can_go_back=False):
           and abs(rright - x) <= 2 and abs(rbottom - bottom) <= 2 and abs(wbottom - bottom) <= 2,
           f"navigation rail and workspace do not line up: {bounds(rail)}, {bounds(work)}, {bounds(catalog)}")
     check(abs(bottom - bounds(dock)[1]) <= 1, "catalog viewport does not meet the dock")
-    tx, ty, tright, tbottom = bounds(toolbar)
+    tx, ty, tright, _ = bounds(toolbar)
     check(ty == 0 and abs(tx - x) <= 1 and abs(tright - right) <= 1,
           f"toolbar and catalog have different edges: {bounds(toolbar)}, {bounds(catalog)}")
-    search = search_layout(window, elements, toolbar)
-    if can_go_back:
-        back = window.find("Back", roles=("Button",))
-        bx, by, br, bb = bounds(back)
-        check(abs(bx - search[0]) <= 2 and tbottom <= by < bb <= y and bx < br <= right,
-              f"Back does not sit below Search and above the catalog: {bounds(back)}, {bounds(catalog)}")
-    else:
-        window.absent("Back", roles=("Button",))
-        check(abs(tbottom - y) <= 1,
-              f"root reserves space for Back: toolbar ends at {tbottom:g}, catalog begins at {y:g}")
+    tools = toolbar_layout(window, can_go_back=can_go_back)
     if queue_open is None:
         queue_open = wide
     check(bool(queue) == queue_open, "queue pane visibility does not match the requested layout")
@@ -927,24 +950,44 @@ def pane_layout(window, *, wide, queue_open=None, can_go_back=False):
               f"unusable pane widths: catalog {right - x:g}, queue {qright - qx:g}, window {width:g}")
         check(abs(width - qright) <= 2 and abs(qx - right) <= 2 and x <= 0.2 * width,
               "desktop wastes space outside its panes")
-    return search
+    return tools
+
+
+def disabled_back_input(window):
+    # Settings is the last rail control, immediately before the toolbar.
+    window.click("Settings")
+    window.section("Settings")
+    window.click_element(window.back_control(enabled=False))
+    window.shortcut(ALT, LEFT)
+    window.key(ESCAPE)
+    window.section("Settings")
+    window.find("Work offline", roles=("Button",))
+    window.click("Settings")  # Re-anchor focus before counting Tab stops.
+    window.key(TAB)
+    window.key("Synthetic")
+    field = window.find("Search tracks, albums or artists", roles=("TextInput",))
+    check(field.get("accessibleValue") == "Synthetic", "Tab from the rail did not skip disabled Back and reach Search")
+    window.back_control(enabled=True)  # Wait for the probe's navigation before leaving Search.
+    print("PASS disabled Back ignores pointer and shortcuts and is skipped by Tab", flush=True)
 
 
 def root_navigation(window, *, wide):
+    disabled_back_input(window)
+    window.click("History")
     window.section("History")
-    expected_search = pane_layout(window, wide=wide)
+    expected_tools = pane_layout(window, wide=wide)
     dock = assert_empty_dock(window)
     # Exercise the actual rail, including both ways away from Saved offline.
     for label in ("Playlists", "Saved offline", "History", "Saved offline", "Settings", "Playlists"):
         window.click(label)
         window.section(label)
-        actual_search = pane_layout(window, wide=wide)
+        actual_tools = pane_layout(window, wide=wide)
         check(dock_identity(window) == dock, f"root {label} moved or replaced the empty dock")
-        check(all(abs(a - b) <= 1 for a, b in zip(actual_search, expected_search)),
-              f"Search x/width moved on root {label}: {actual_search} vs {expected_search}")
+        check(same_tool_bounds(expected_tools, actual_tools),
+              f"toolbar moved on root {label}: {actual_tools} vs {expected_tools}")
     window.find(f"Open {PLAYLIST}", roles=("Button",))
     width, _ = window.dimensions()
-    print(f"PASS {width:g}px rail roots preserve the empty dock and Search x/width without adding Back",
+    print(f"PASS {width:g}px rail roots preserve the empty dock and toolbar geometry with Back disabled",
           flush=True)
 
 
@@ -952,12 +995,12 @@ def playlist_back(window, *, wide):
     before = pane_layout(window, wide=wide)
     dock = dock_identity(window)
     open_manual(window)
-    detail = pane_layout(window, wide=wide, can_go_back=True)
+    detail = pane_layout(window, wide=wide, can_go_back=True, order_lane=True)
     check(dock_identity(window) == dock, "opening the playlist detail moved or replaced the dock")
-    check(all(abs(a - b) <= 1 for a, b in zip(detail, before)),
-          f"Back shifted Search: root {before}, detail {detail}")
+    check(same_tool_bounds(before, detail), f"enabling Back shifted the toolbar: root {before}, detail {detail}")
     window.click("Back")
     playlists_root(window)
+    check(same_tool_bounds(before, pane_layout(window, wide=wide)), "returning to Playlists shifted the toolbar")
     check(dock_identity(window) == dock, "returning from playlist detail moved or replaced the dock")
     print(f"PASS {window.dimensions()[0]:g}px playlist detail Back returns to the Playlists root", flush=True)
 
@@ -965,7 +1008,7 @@ def playlist_back(window, *, wide):
 def playlists_root(window):
     window.section("Playlists")
     window.find(f"Open {PLAYLIST}", roles=("Button",))
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
 
 
 def playlist_hit_checks(window):
@@ -1071,7 +1114,8 @@ def empty_devices(window, restore, *, wide, observer=False, capture=None):
     switch = window.find("Playback devices", roles=("Button",), within=player_bar(window))
     window.click_element(switch)
     window.title("Playback devices")
-    window.absent("Back|Manage devices|Deselect", roles=("Button",))
+    window.back_control(enabled=False)
+    window.absent("Manage devices|Deselect", roles=("Button",))
     restore()
     if observer:
         selected = next((e for e in window.elements() if e.get("accessibleDescription") == "Selected output"), None)
@@ -1090,7 +1134,7 @@ def empty_devices(window, restore, *, wide, observer=False, capture=None):
     window.title("Playback devices")
     window.click("Close playback devices")
     restore()
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
     check(dock_identity(window) == dock, "opening and dismissing devices moved or replaced the empty dock")
     print(f"PASS {window.dimensions()[0]:g}px empty-dock device popup preserves page and focus", flush=True)
 
@@ -1114,7 +1158,7 @@ def queue_state(window, populated):
             check(not named(window, elements, label), f"empty queue pane exposes {label}")
 
 
-def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
+def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False, order_lane=False):
     before = window.elements()
     dock = dock_identity(window, before)
     catalog = element_id(before, "catalog-scroll")
@@ -1127,27 +1171,29 @@ def wide_queue_toggle(window, restore, *, populated=False, can_go_back=False):
     resized = element_id(closed, "catalog-scroll")
     check(resized and abs(bounds(resized)[2] - bounds(queue)[2]) <= 2,
           "closing the desktop queue does not give its width back to the catalog")
-    expanded = pane_layout(window, wide=True, queue_open=False, can_go_back=can_go_back)
+    expanded = pane_layout(window, wide=True, queue_open=False, can_go_back=can_go_back, order_lane=order_lane)["search"]
     check(dock_identity(window) == dock, "closing the wide queue moved or replaced the dock")
     window.click("Play queue", within=player_bar(window))
     restore()
-    narrowed = pane_layout(window, wide=True, can_go_back=can_go_back)
+    narrowed = pane_layout(window, wide=True, can_go_back=can_go_back, order_lane=order_lane)["search"]
     check(dock_identity(window) == dock, "restoring the wide queue moved or replaced the dock")
     queue_left, _, queue_right, _ = bounds(queue)
     # Each pane uses its own responsive gutter on both sides. Account for
     # that change, not just the width released by the queue pane.
     gutter_delta = expanded[0] - narrowed[0]
-    check(expanded[1] > narrowed[1]
-          and abs(expanded[1] - narrowed[1] + 2 * gutter_delta - (queue_right - queue_left)) <= 2,
+    width_delta = (expanded[2] - expanded[0]) - (narrowed[2] - narrowed[0])
+    check(width_delta > 0 and abs(width_delta + 2 * gutter_delta - (queue_right - queue_left)) <= 2,
           f"Search and catalog do not expand and contract together: {expanded} vs {narrowed}")
     queue_state(window, populated)
     print("PASS desktop queue toggles independently and returns its width to Search and the catalog", flush=True)
 
 
-def compact_queue(window, restore, *, capture=None, populated=False):
+def compact_queue(window, restore, *, capture=None, populated=False, can_go_back=False):
     dock = dock_identity(window)
+    back_before = bounds(window.back_control(enabled=can_go_back))
     window.click("Play queue", within=player_bar(window))
     queue_state(window, populated)
+    check(bounds(window.back_control(enabled=False)) == back_before, "compact Queue moved the toolbar Back control")
     elements = window.elements()
     check(dock_identity(window, elements) == dock, "opening the compact queue moved or replaced the dock")
     queue = element_id(elements, "queue-pane")
@@ -1168,5 +1214,6 @@ def compact_queue(window, restore, *, capture=None, populated=False):
     window.click("Close play queue")
     restore()
     window.absent("Close play queue", roles=("Button",))
+    check(bounds(window.back_control(enabled=can_go_back)) == back_before, "closing compact Queue moved toolbar Back")
     check(dock_identity(window) == dock, "closing the compact queue moved or replaced the dock")
     print("PASS compact queue opens and closes by pointer without losing the catalog route", flush=True)

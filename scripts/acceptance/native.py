@@ -118,6 +118,11 @@ class Window:
         check(not any(self.matches(e, pattern) and (roles is None or e.get("accessibleRole") in roles)
                       for e in self.elements()), f"unexpected native element: {pattern}")
 
+    def back_control(self, *, enabled):
+        return wait(f"{'enabled' if enabled else 'disabled'} toolbar Back", lambda: next(
+            (e for e in self.elements() if self.matches(e, "Back")
+             and e.get("accessibleRole") == "Button" and e.get("accessibleEnabled", False) == enabled), None))
+
     def section(self, label):
         def current():
             return next((e for e in self.elements() if self.matches(e, label)
@@ -645,7 +650,7 @@ def save_fixture_track(window):
     window.absent(row_menu, roles=("Button",))
     window.click(SAVED)
     window.section(SAVED)
-    window.absent("Back", roles=("Button",))
+    window.back_control(enabled=False)
     window.find(f"Play track: {TRACK}", roles=("Button",))
     window.absent(OFFLINE_SWITCH, roles=("Button", "Checkbox"))
     print("PASS independently saved fixture track is in the Saved offline listing", flush=True)
@@ -751,10 +756,10 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             open_manual(window)
             manual_actions(window, capture="04-playlist-actions-1910")
             playlist_row_menu(window)
-            wide_queue_toggle(window, lambda: window.title(PLAYLIST), can_go_back=True)
+            wide_queue_toggle(window, lambda: window.title(PLAYLIST), can_go_back=True, order_lane=True)
             window.resize(COMPACT)
-            pane_layout(window, wide=False, can_go_back=True)
-            compact_queue(window, lambda: window.title(PLAYLIST), capture="05-queue-empty-compact")
+            pane_layout(window, wide=False, can_go_back=True, order_lane=True)
+            compact_queue(window, lambda: window.title(PLAYLIST), can_go_back=True, capture="05-queue-empty-compact")
             manual_actions(window, capture="05-playlist-actions-640")
             window.click("Back")
             window.find(f"Open {PLAYLIST}", roles=("Button",))
@@ -827,14 +832,13 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             check(dock_identity(window) == before_selection, "starting playback moved or replaced the empty dock")
             window.click("Back")
             restore_playlists()
-            window.absent("Back", roles=("Button",))
             print("PASS native track double-click selects the exact canonical Go occurrence without opening detail", flush=True)
             open_manual(window)
             for mode in (DESKTOP, WIDE):
                 if mode != DESKTOP:
                     window.resize(mode)
                 window.title(PLAYLIST)
-                pane_layout(window, wide=True, can_go_back=True)
+                pane_layout(window, wide=True, can_go_back=True, order_lane=True)
                 queue_state(window, populated=True)
                 window.pixels(f"04-dock-{mode[0]}", mode[0])
                 with verify(failures, f"dock geometry at {mode[0]}"):
@@ -851,7 +855,7 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             dock = player_bar(window)
             window.find(DOCK_TITLE, roles=("Button",), within=dock)
             before_pause = dock_identity(window)
-            pane_layout(window, wide=False, can_go_back=True)
+            pane_layout(window, wide=False, can_go_back=True, order_lane=True)
             window.pixels("05-dock-compact", COMPACT[0])
             with verify(failures, "compact dock geometry"):
                 assert_dock_layout(window)
@@ -867,11 +871,12 @@ def native_checks(binary, root, env, ready=None, api=None, pixels=None, pcm=None
             observe("paused or finished playback retains a canonical queue occurrence", paused_selection)
             window.find("Play", roles=("Button",), within=dock)
             check(dock_identity(window) == before_pause, "pausing moved or replaced the dock")
-            pane_layout(window, wide=False, can_go_back=True)
+            pane_layout(window, wide=False, can_go_back=True, order_lane=True)
             assert_dock_layout(window)
             window.pixels("06-dock-paused-compact", COMPACT[0])
             print("PASS canonical paused selection retains the dock and its controls", flush=True)
-            compact_queue(window, lambda: window.title(PLAYLIST), populated=True, capture="06-queue-paused-compact")
+            compact_queue(window, lambda: window.title(PLAYLIST), can_go_back=True, populated=True,
+                          capture="06-queue-paused-compact")
             full_player(window, "07-player-compact", COMPACT[0], failures)
             window.click("Back")
             window.title(PLAYLIST)
