@@ -687,9 +687,24 @@ export component AppWindow inherits Window {
                     property <length> picker-width: self.picker-label ? 122px : 39px;
                     background: Theme.rail;
                     Divider { x: 0px; y: parent.height - 1px; }
-                    search := Field {
+                    back-button := Action {
                         x: main.inset; y: (parent.height - self.height) / 2;
-                        width: toolbar.tools-width - (root.show-search-add ? toolbar.picker-width + 8px : 0px); height: 39px;
+                        width: 36px; height: 39px;
+                        icon: "chevron-left"; glyph-size: 20px; quiet: true;
+                        secondary-ink: self.enabled ? Theme.text : Theme.subtle.with-alpha(0.72);
+                        pointer-focus-visible: false;
+                        accessible-label: "Back";
+                        enabled: root.can-back && !root.editor-open && !root.compact-queue-open;
+                        // Route Back moves focus before navigation; this only handles history disappearing independently.
+                        changed enabled => {
+                            if !self.enabled && self.has-focus && !root.editor-open && !root.compact-queue-open { search.take-focus(); }
+                        }
+                        clicked => { if self.enabled { shell.route("back"); } }
+                    }
+                    search := Field {
+                        x: back-button.x + back-button.width + 8px; y: back-button.y;
+                        width: toolbar.tools-width - back-button.width - 8px
+                            - (root.show-search-add ? toolbar.picker-width + 8px : 0px); height: 39px;
                         text <=> root.query; prefix: "⌕"; clearable: true; enabled: !root.editor-open;
                         field-label: "Search tracks, albums or artists";
                         placeholder-text: main.width < 420px || (root.show-search-add && self.width < 360px)
@@ -731,29 +746,26 @@ export component AppWindow inherits Window {
                     shell.playlist-order-edit = true;
                     playlist-order.focus-list();
                 }
-                back-row := Rectangle {
+                sticky-order-lane := Rectangle {
                     x: main.inset; y: root.toolbar-height; width: parent.width - 2 * main.inset;
-                    visible: (root.can-back || main.can-edit-order || shell.playlist-order-edit)
-                        && !root.editor-open && !root.compact-queue-open;
-                    height: self.visible ? 46px : 0px;
-                    back-button := Action {
-                        x: 0px; y: 8px; width: self.min-width;
-                        text: "Back"; icon: "←"; quiet: true;
-                        visible: root.can-back;
-                        enabled: back-row.visible && self.visible; clicked => { shell.route("back"); }
-                    }
+                    // Keep the viewport fixed while the sticky shortcut or order
+                    // mode changes, even if the order model temporarily loses its
+                    // write token (for example after an unconfirmed reorder).
+                    height: root.is-playlist && (main.can-edit-order || root.playlist-order-rows.length > 0
+                        || shell.playlist-order-edit) ? 46px : 0px;
+                    visible: self.height > 0px && !root.editor-open && !root.compact-queue-open;
                     edit-playlist-order := Action {
                         x: parent.width - self.width; y: 8px; width: self.min-width;
                         text: "Edit order";
                         quiet: true; secondary-ink: Theme.muted;
-                        visible: main.sticky-order && !shell.playlist-order-edit;
-                        enabled: self.visible && back-row.visible;
+                        visible: sticky-order-lane.visible && main.sticky-order && !shell.playlist-order-edit;
+                        enabled: self.visible;
                         click-scope: root.playlist-order-scope;
                         clicked => { main.begin-playlist-order(); }
                     }
                 }
                 history-pane := FocusScope {
-                    x: 0px; y: back-row.y + back-row.height; width: parent.width; height: parent.height - self.y;
+                    x: 0px; y: root.toolbar-height + sticky-order-lane.height; width: parent.width; height: parent.height - self.y;
                     visible: !root.editor-open && !root.compact-queue-open;
                     focus-on-click: false; focus-on-tab-navigation: false;
                     if root.is-now: now := NowPlaying {
