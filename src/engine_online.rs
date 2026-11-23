@@ -311,6 +311,7 @@ impl Engine {
                 .native
                 .isolate_follower(state, position_ms, audio);
             self.online.detached = true;
+            self.online.gap = false; // repair only applies to the retired binding
         }
     }
     fn apply_event(&mut self, event: Event) {
