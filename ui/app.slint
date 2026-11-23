@@ -63,6 +63,10 @@ export component AppWindow inherits Window {
     in property <length> inspection-height: 0px;
     in property <bool> inspection-reorder-line;
     in property <bool> reduced-motion;
+    in property <bool> indicator-window-active;
+    in property <bool> indicator-preference-pending;
+    property <bool> indicator-motion: root.indicator-window-active && !root.minimized
+        && !root.reduced-motion && !root.indicator-preference-pending;
     preferred-width: 1280px;
     preferred-height: 790px;
     min-width: root.inspection-width > 0px ? root.inspection-width : 480px;
@@ -1079,6 +1083,7 @@ export component AppWindow inherits Window {
                                         compact: main.width < 435px; window-height: root.height;
                                         menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
                                         playlist-track-row: true;
+                                        state-motion: root.indicator-motion;
                                         title-focus-key: root.page-key + "/" + self.entry.occurrence-key;
                                         property <length> row-y: catalog-list.top + i * catalog-list.pitch;
                                         row-viewport-y: self.row-y + catalog-scroll.content-y;
@@ -1151,6 +1156,7 @@ export component AppWindow inherits Window {
                                             artwork: i < root.browse-artwork.length ? root.browse-artwork[i] : root.no-artwork;
                                             current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
                                             playing-track: self.current-track && root.playing;
+                                            state-motion: root.indicator-motion;
                                             compact: main.width < 435px; window-height: root.height;
                                             menu-key: root.page-key + "|" + root.browse-model-key + "|" + i;
                                             property <length> row-y: catalog-list.top + other-rows.y + shelf-row.y + self.y;
@@ -1207,6 +1213,7 @@ export component AppWindow inherits Window {
                                         width: parent.width; height: parent.height;
                                         entry: slot.browse-entry; index: i; page-kind: root.page-kind;
                                         align-credit-fallback: true;
+                                        state-motion: root.indicator-motion;
                                         paint-left: main.inset; paint-right: main.inset;
                                         artwork: self.index < root.browse-artwork.length ? root.browse-artwork[self.index] : root.no-artwork;
                                         current-track: self.entry.track-id != "" && self.entry.track-id == root.now-track-id;
@@ -1462,6 +1469,7 @@ export component AppWindow inherits Window {
                                             property <bool> matches-current-art: row.current && row.track-id != "" && row.track-id == root.now-track-id;
                                             current-track: row.current;
                                             playing-track: self.matches-current-art && root.playing;
+                                            state-motion: root.indicator-motion;
                                             credits: row.credits; metadata-enabled: !root.editor-open;
                                             title-opens-album: true;
                                             album-id: row.album-id; album-name: row.album-name; current-album-id: root.page-album-id;

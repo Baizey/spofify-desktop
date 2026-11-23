@@ -103,11 +103,45 @@ export component EmptyState inherits Rectangle {
     }
 }
 
+component PlayingBars inherits Rectangle {
+    // Match playing.svg's four rounded strokes, x positions and shared baseline.
+    // Stop independently of whether a hidden window rebuilds its item tree.
+    in property <bool> active;
+    property <int> phase;
+    Timer {
+        interval: 125ms; running: root.active;
+        triggered => { if root.active { root.phase = mod(root.phase + 1, 8); } }
+    }
+    for bar[i] in [
+        [7, 9, 10, 8, 6, 5, 5, 6],
+        [14, 12, 10, 11, 13, 14, 12, 13],
+        [9, 11, 12, 10, 8, 7, 8, 10],
+        [4, 5, 7, 8, 7, 6, 5, 4],
+    ]: Rectangle {
+        x: (4px + i * 5px) * 2 / 3;
+        y: 40px / 3 - self.height;
+        width: 4px / 3;
+        height: (bar[root.phase] + 2) * 2px / 3;
+        border-radius: self.width / 2;
+        background: Theme.primary;
+    }
+}
+
 component TrackState inherits Rectangle {
     in property <bool> playing;
+    in property <bool> motion-enabled;
+    in property <length> viewport-y;
+    in property <length> viewport-height;
+    // Test the maximum painted bar extent, excluding the glyph's blank margin.
+    property <bool> moving: root.playing && root.motion-enabled && root.viewport-height > 0px
+        && root.viewport-y + 40px / 3 > 0px && root.viewport-y + 8px / 3 < root.viewport-height;
     width: 16px; height: self.width;
+    if root.moving: PlayingBars {
+        active: root.moving;
+        width: parent.width; height: parent.height;
+    }
     Glyph {
-        visible: root.playing; name: "playing"; ink: Theme.primary;
+        visible: root.playing && !root.moving; name: "playing"; ink: Theme.primary;
         width: parent.width; height: parent.height;
     }
     Rectangle {
@@ -120,11 +154,19 @@ component TrackState inherits Rectangle {
 component TrackCover inherits Cover {
     in property <bool> current-track;
     in property <bool> playing-track;
+    in property <bool> state-motion;
+    in property <length> viewport-y;
+    in property <length> viewport-height;
     width: 39px; height: self.width;
-    if root.current-track: Rectangle {
+    if root.current-track: badge := Rectangle {
         x: parent.width - self.width; y: parent.height - self.height;
         width: 20px; height: self.width; border-radius: 5px; background: Theme.bg;
-        TrackState { x: 2px; y: 2px; playing: root.playing-track; }
+        TrackState {
+            x: 2px; y: 2px; playing: root.playing-track;
+            motion-enabled: root.state-motion;
+            viewport-y: root.viewport-y + badge.y + self.y;
+            viewport-height: root.viewport-height;
+        }
     }
 }
 
@@ -153,6 +195,9 @@ export component MediaLine inherits Rectangle {
     property <bool> row-reveals-play: row-face.has-hover || (row-keys.has-focus && !root.row-pointer-focus);
     property <bool> row-pointer-focus;
     property <bool> play-focused;
+    property <bool> state-motion-visible: root.state-motion && root.current-track
+        && !(root.playable && !root.queue-row && (root.row-reveals-play || root.play-focused)
+            && (!root.leading-cover || root.artwork.width == 0));
     // The scroll owner supplies the row's viewport position and receives
     // focus before a clipped Play action (or Queue face) can handle another key.
     in property <length> row-viewport-y;
@@ -198,6 +243,7 @@ export component MediaLine inherits Rectangle {
     in property <color> paint-surface: transparent;
     in property <bool> current-track;
     in property <bool> playing-track;
+    in property <bool> state-motion;
     in property <[string]> actions;
     in property <bool> quick-add-visible;
     // Empty hides the control; only ready can activate it.
@@ -395,6 +441,9 @@ export component MediaLine inherits Rectangle {
                 }
                 TrackState {
                     visible: root.current-track; playing: root.playing-track;
+                    motion-enabled: root.state-motion-visible;
+                    viewport-y: root.row-viewport-y + (root.height - self.height) / 2;
+                    viewport-height: root.play-viewport-height;
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 }
             }
@@ -404,6 +453,9 @@ export component MediaLine inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     artwork: root.artwork; mark: Copy.mark(root.kind); circular: root.kind == "artist";
                     current-track: root.current-track; playing-track: root.playing-track;
+                    state-motion: root.state-motion-visible;
+                    viewport-y: root.row-viewport-y + (root.height - self.height) / 2;
+                    viewport-height: root.play-viewport-height;
                 }
             }
             if root.leading-state: Rectangle {
@@ -411,11 +463,19 @@ export component MediaLine inherits Rectangle {
                 TrackState {
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                     playing: root.playing-track;
+                    motion-enabled: root.state-motion-visible;
+                    viewport-y: root.row-viewport-y + (root.height - self.height) / 2;
+                    viewport-height: root.play-viewport-height;
                 }
             }
             if root.leading-marker: Rectangle {
                 width: 16px;
-                TrackState { y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track; }
+                TrackState {
+                    y: (parent.height - self.height) / 2; visible: root.current-track; playing: root.playing-track;
+                    motion-enabled: root.state-motion-visible;
+                    viewport-y: root.row-viewport-y + (root.height - self.height) / 2;
+                    viewport-height: root.play-viewport-height;
+                }
                 if root.type-mark != "": Glyph {
                     width: 14px; height: self.width;
                     x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
