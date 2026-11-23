@@ -791,7 +791,8 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|(current, _)| *current == request)
             {
-                self.online.claim_media[usize::from(request.preview)] = Some((request, source));
+                let index = usize::from(request.preview);
+                self.online.claim_media[index] = Some((request, source));
             }
         } else {
             self.apply_media(request, source);
