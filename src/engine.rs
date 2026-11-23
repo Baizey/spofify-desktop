@@ -969,6 +969,7 @@ impl Engine {
                 }
                 if self.local.replace(queue, index, false) == Change::Start {
                     self.online.detached = false;
+                    self.online.detached_owner = false;
                     self.cancel_work();
                     self.stop();
                     self.local_store = Some(store);

@@ -72,6 +72,21 @@ impl Projection {
 
     /// For the UI only. A speculative visit has a queue key but no occurrence;
     /// never use this state as a local claim, report, or native execution plan.
+    /// Most recent accepted actual position for the confirmed visit. Pending
+    /// controller intent must not leak into the isolated playback cursor.
+    pub(crate) fn confirmed_position_ms(&self) -> Option<u64> {
+        let room = self.confirmed.as_ref()?;
+        let cursor = &room.player.cursor;
+        let position = room
+            .observation
+            .as_ref()
+            .filter(|sample| valid_observation(sample, cursor))
+            .map_or(cursor.position_ms, |sample| sample.position_ms);
+        Some(
+            duration_ms(room.player.current()?).map_or(position, |duration| position.min(duration)),
+        )
+    }
+
     pub(crate) fn projected(&self) -> Option<&State> {
         self.projected.as_ref().or_else(|| self.confirmed())
     }

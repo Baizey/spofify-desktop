@@ -269,6 +269,31 @@ async fn desktop_cross_native_play_and_handoff() {
             },
         )
         .await;
+    // Reciprocal proxy control: issue an ordinary Seek from the now-following
+    // Desktop. Android must execute it without a new output selection.
+    desktop.engine.action(crate::player::Action::Seek(5.0));
+    desktop
+        .until(
+            6,
+            "Android applying Desktop follower Seek without handoff",
+            |d| {
+                let e = &d.engine;
+                assert_eq!(e.online_generation(), Some(binding));
+                let owner = e.online.projection.owner()?;
+                assert_eq!(owner.device_id.as_deref(), Some(peer.as_str()));
+                assert_eq!(owner.generation, initial_owner + 1);
+                let cursor = &e.online.projection.confirmed()?.cursor;
+                assert_eq!(
+                    (cursor.key, &cursor.occurrence),
+                    (visit.key, &visit.occurrence)
+                );
+                let seek_applied = cursor.position_ms == 5000;
+                d.assert_silent();
+                let view = d.view();
+                (seek_applied && view.playing && view.elapsed >= 5.0).then_some(())
+            },
+        )
+        .await;
     // Keep the Android fixture alive until this actor has finished checking
     // the selected device, fresh Playing observation, and stopped local PCM.
     std::fs::File::create_new(control.join("cross-rust-asserted"))

@@ -631,6 +631,22 @@ impl NativeV3 {
         Some(state)
     }
 
+    /// Adopt the last confirmed shared traversal when a follower loses the
+    /// link. Its Playing observation never grants authority to start audio.
+    pub(crate) fn isolate_follower(&mut self, shared: &State, position_ms: u64, audio: &mut Audio) {
+        let mut state = shared.clone();
+        state.cursor.desired_playing = false;
+        state.cursor.position_ms = position_ms;
+        self.land(
+            state.cursor.clone(),
+            state.current(),
+            position_ms,
+            false,
+            audio,
+        );
+        self.confirmed = Some(state);
+    }
+
     /// Register the actor's exact Hello export for independent Saved PCM. If the
     /// run is replaced before the snapshot we reconcile normally, never relabel it.
     pub(crate) fn adopt_local(&mut self, exported: &State, audio: &Audio) {

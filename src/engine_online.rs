@@ -36,6 +36,7 @@ pub(super) struct Online {
     personal_generation: Option<Generation>,
     connection_id: String,
     pub detached: bool,
+    pub(super) detached_owner: bool,
     pub superseded: bool,
     gap: bool,
     repair_sent: bool,
@@ -258,7 +259,6 @@ impl Engine {
     pub(super) fn leave_link(&mut self) {
         let departed = self.online.transport.take();
         self.disconnect_personal();
-        self.online.projection.clear_pending();
         self.online.claim_offer = None;
         self.online.claim_pending = None;
         self.online.clock_offset_ms = None;
@@ -271,28 +271,46 @@ impl Engine {
                 .as_ref()
                 .and_then(|socket| socket.last_owner(generation))
                 == Some(false);
-            self.online.detached = self.local_store.is_none()
-                && !self.online.gap
-                && !demoted
-                && link != Link::Superseded
+            let eligible = link != Link::Superseded
                 && self
                     .account
                     .as_ref()
-                    .is_some_and(|a| !a.session.is_revoked())
-                && self.online.is_owner(&self.device_id);
-            if demoted || link == Link::Superseded {
-                if self.local_store.is_some() {
-                    if let Some(audio) = &self.audio {
-                        self.local.elapsed = audio.facts().elapsed;
-                    }
-                    self.local.desired = false;
-                    self.cancel_work();
-                }
+                    .is_some_and(|a| !a.session.is_revoked());
+            self.online.detached_owner =
+                eligible && !self.online.gap && !demoted && self.online.is_owner(&self.device_id);
+            self.online.detached = self.online.detached_owner
+                && self.local_store.is_none()
+                && self
+                    .online
+                    .native
+                    .state()
+                    .is_some_and(|state| !state.queue.is_empty());
+            if !eligible {
+                self.retire_saved_claim();
                 self.stop();
-            } else if !self.online.detached && self.local_store.is_none() {
-                self.stop();
+            } else if !self.online.detached_owner {
+                self.isolate_confirmed_follower();
             }
+        }
+        self.online.projection.clear_pending();
+        if departed.is_some() {
             self.publish_access();
+        }
+    }
+    fn isolate_confirmed_follower(&mut self) {
+        self.retire_saved_claim();
+        self.stop();
+        self.online.detached_owner = false;
+        self.online.detached = false;
+        if let (Some(state), Some(position_ms), Some(audio)) = (
+            self.online.projection.confirmed(),
+            self.online.projection.confirmed_position_ms(),
+            &mut self.audio,
+        ) {
+            self.online
+                .native
+                .isolate_follower(state, position_ms, audio);
+            self.online.detached = true;
         }
     }
     fn apply_event(&mut self, event: Event) {
@@ -307,13 +325,20 @@ impl Engine {
             return;
         }
         if self.link() != Link::Connected(generation) {
-            if matches!(&event.kind, EventKind::Snapshot(_))
+            if self.link() != Link::Superseded
+                && self
+                    .account
+                    .as_ref()
+                    .is_some_and(|a| !a.session.is_revoked())
                 && self.socket.as_ref().and_then(|s| s.last_owner(generation)) == Some(false)
+                && let EventKind::Snapshot(snapshot) = event.kind
+                && self.online.projection.apply_snapshot(snapshot).applied()
             {
-                // The socket decoded a losing initial claim before closing.
-                self.retire_saved_claim();
-                self.online.detached = false;
-                self.stop();
+                // A losing first snapshot is still confirmed data even if
+                // the socket closes before the actor installs its binding.
+                self.isolate_confirmed_follower();
+                self.online.projection.clear_pending();
+                self.publish_access();
             }
             return;
         }
@@ -352,6 +377,7 @@ impl Engine {
                 self.online.repair_sent = false;
                 self.online.refresh_at = None;
                 self.online.detached = false;
+                self.online.detached_owner = false;
                 if fresh {
                     self.disconnect_personal();
                     self.online.transport = Some(generation);
@@ -620,6 +646,7 @@ impl Engine {
             Link::Superseded => {
                 self.online.superseded = true;
                 self.online.detached = false;
+                self.online.detached_owner = false;
                 self.socket = None;
                 self.cancel_work();
                 self.stop();
@@ -685,7 +712,7 @@ impl Engine {
         };
         let reattach_basis = self
             .online
-            .detached
+            .detached_owner
             .then(|| self.online.projection.reattach_basis())
             .flatten();
         self.online.claim_offer = local.as_ref().and_then(|offered| {
@@ -1295,7 +1322,12 @@ mod tests {
         if drops {
             peer.link.send_replace(Link::Disconnected);
             e.tick();
-            assert!(e.online.projection.confirmed().is_none());
+            assert!(e.online.detached);
+            assert_eq!(
+                e.online.native.cursor().unwrap().occurrence.as_deref(),
+                Some("other-visit")
+            );
+            assert!(!e.online.native.cursor().unwrap().desired_playing);
             assert!(e.local_store.is_none());
             assert!(!e.audio.as_ref().unwrap().facts().playing);
             assert!(peer.read().is_none());
@@ -1368,5 +1400,149 @@ mod tests {
     #[tokio::test]
     async fn losing_initial_snapshot_fences_saved_pcm_even_if_link_already_dropped() {
         hello_then_local_pause(false, true).await;
+    }
+
+    async fn follower_takes_confirmed_queue_offline(manual: bool) {
+        let dir = Fixture(
+            std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("spofify-single-queue-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir.0)
+            .unwrap();
+        let mut e = crate::engine::tests::engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        let mut audio = Audio::new_account_scoped(
+            session.clone(),
+            e.shared_epoch.clone(),
+            e.epoch,
+            e.master_gain.clone(),
+        );
+        let (mixer, mut samples) = rodio::mixer::mixer(1, 8000);
+        audio.use_test_output(mixer, "offline-a".into(), wav());
+        e.audio = Some(audio);
+        e.account = Some(Account {
+            api,
+            session: session.clone(),
+        });
+        e.local_store = Some(OfflineStore::open(&dir.0).unwrap());
+        assert_eq!(
+            e.local.replace(
+                vec![LocalTrack {
+                    id: "offline-a".into(),
+                    duration: 1.0,
+                    ..Default::default()
+                }],
+                0,
+                false
+            ),
+            Change::Start
+        );
+        let (socket, mut peer) = socket::Socket::test_peer(session, 12);
+        e.socket = Some(socket);
+        assert_eq!(
+            e.current_claim().local.unwrap().current().unwrap().id,
+            "offline-a"
+        );
+        let state = State {
+            queue: vec![socket::Track {
+                id: "shared-b".into(),
+                name: "Shared B".into(),
+                key: 4,
+                order: 1,
+                duration: 1.0,
+                artists: vec![],
+                album_name: String::new(),
+                album_id: String::new(),
+                intent: socket::Intent::Low,
+                entry_id: None,
+                target_id: None,
+                occurrence_id: None,
+                playback_context: None,
+            }],
+            cursor: socket::Cursor {
+                key: 4,
+                occurrence: Some("shared-b-visit".into()),
+                position_ms: 120,
+                desired_playing: true,
+            },
+            repeat: socket::Repeat::One,
+            shuffle: true,
+            collection_first: 0,
+        };
+        let snap = socket::Snapshot {
+            session_id: "room".into(),
+            connection_id: "test-connection".into(),
+            revision: 7,
+            owner: socket::Owner {
+                device_id: Some("producer".into()),
+                generation: 8,
+            },
+            devices: vec![socket::Device {
+                device_id: "producer".into(),
+                name: "Producer".into(),
+                can_play: true,
+            }],
+            player: state,
+            observation: Some(socket::Observation {
+                key: 4,
+                occurrence: Some("shared-b-visit".into()),
+                position_ms: 350,
+                sampled_at_ms: now_ms(),
+                status: socket::ObservationStatus::Playing,
+            }),
+            server_time_ms: now_ms(),
+        };
+        peer.set_opening_snapshot(&snap, false);
+        e.tick_with_event(Some(Event {
+            generation: 12,
+            kind: EventKind::Snapshot(snap),
+            personal_stamp: None,
+        }));
+        assert!(e.local.entries.is_empty());
+        assert!(!e.audio.as_ref().unwrap().facts().playing);
+        e.action(Action::Seek(0.8)); // unconfirmed; must not become the offline position
+        assert!(std::iter::from_fn(|| peer.read()).any(|frame| frame["action"]["type"] == "seek"));
+        if manual {
+            e.set_offline(true);
+        } else {
+            peer.link.send_replace(Link::Disconnected);
+            e.tick();
+        }
+        let mut view = PlayerView::default();
+        e.project_online(&mut view);
+        assert_eq!(view.track, "shared-b");
+        assert_eq!(view.elapsed, 0.35);
+        assert!(!view.playing && !view.wants_pause);
+        assert!(view.shuffle);
+        assert_eq!(view.repeat, "one");
+        assert!(!e.online.detached_owner);
+        let claim = e.current_claim();
+        assert!(claim.reattach_basis.is_none());
+        assert_eq!(claim.local.unwrap().current().unwrap().id, "shared-b");
+        assert!(samples.by_ref().take(80).all(|sample| sample == 0.0));
+        e.action(Action::Resume);
+        let (request, task) = e.online.primary.as_ref().unwrap();
+        let request = request.clone();
+        assert_eq!(request.id, "shared-b");
+        assert!(request.portable_only);
+        task.abort();
+        e.complete_online(request, Some(wav().into()));
+        assert!(samples.by_ref().take(320).any(|s| s != 0.0));
+        assert!(e.audio.as_ref().unwrap().facts().playing);
+    }
+
+    #[tokio::test]
+    async fn follower_keeps_confirmed_b_paused_when_transport_drops_then_can_play_it() {
+        follower_takes_confirmed_queue_offline(false).await;
+    }
+
+    #[tokio::test]
+    async fn follower_keeps_confirmed_b_paused_in_manual_offline_then_can_play_it() {
+        follower_takes_confirmed_queue_offline(true).await;
     }
 }
