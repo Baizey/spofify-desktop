@@ -5,17 +5,13 @@ use std::time::Duration;
 use reqwest::{Method, header};
 
 use super::{
-    Api, ApiError, EXPIRED, INVALID_RESPONSE, LOGIN_BODY, NETWORK, OFFLINE, Session,
-    SessionSummary, content_type, decode, error, valid_id, valid_text,
+    Api, ApiError, EXPIRED, INVALID_RESPONSE, LOGIN_BODY, OFFLINE, Session, SessionSummary,
+    api_auth::{WRONG_ACCOUNT, auth_probe_transport},
+    content_type, decode_with, error, valid_id, valid_text,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const NOT_FENCED: ApiError = error("Reconnect validation requires an offline session.");
-const WRONG_ACCOUNT: ApiError = ApiError {
-    message: "The server returned a different account. Sign in again.",
-    expired: true,
-    status: 0,
-};
 
 impl Api {
     /// Validate the existing credential once, only for an explicit Go online intent.
@@ -56,7 +52,7 @@ impl Api {
                     .timeout(PROBE_TIMEOUT)
                     .send()
                     .await
-                    .map_err(|_| NETWORK)?;
+                    .map_err(auth_probe_transport)?;
                 match response.status().as_u16() {
                     200 if content_type(&response)? == "application/json" => {
                         let next = if rolling {
@@ -64,7 +60,7 @@ impl Api {
                         } else {
                             None // Ordinary reconnect never installs Set-Cookie.
                         };
-                        let summary = decode::<SessionSummary>(response, LOGIN_BODY).await?;
+                        let summary = decode_with::<SessionSummary>(response, LOGIN_BODY, auth_probe_transport).await?;
                         Ok((summary, next))
                     }
                     200..=299 => Err(INVALID_RESPONSE),
@@ -109,7 +105,10 @@ impl Api {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::Origin, media::TrackResource};
+    use crate::{
+        api::{Origin, api_auth::TRANSIENT_NETWORK},
+        media::TrackResource,
+    };
     use std::time::Instant;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -201,8 +200,10 @@ mod tests {
             (reply(200, ignored_cookie, SAME_ACCOUNT), Ok(())),
             (reply(401, "", "{}"), Err(EXPIRED)),
             (reply(200, "", OTHER_ACCOUNT), Err(WRONG_ACCOUNT)),
+            (reply(403, "", "{}"), Err(Api::response_error(403, false))),
             (reply(503, "", "{}"), Err(Api::response_error(503, false))),
-            (String::new(), Err(NETWORK)), // disconnect without a response
+            (String::new(), Err(TRANSIENT_NETWORK)), // disconnect without a response
+            (reply(200, "", "not JSON"), Err(INVALID_RESPONSE)),
             (
                 reply(302, "Location: /api/library/tracks/track/audio\r\n", ""),
                 Err(Api::response_error(302, false)),

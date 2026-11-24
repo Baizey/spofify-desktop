@@ -158,6 +158,23 @@ fn resume_backoff_classifies_only_known_transient_failures() {
     assert!(!NETWORK.can_retry_restore());
 }
 
+#[test]
+fn grant_rejection_excludes_policy_errors_malformed_replies_and_local_deadlines() {
+    for error in [EXPIRED, api_auth::WRONG_ACCOUNT] {
+        assert!(error.rejects_local_grant());
+    }
+    for error in [
+        Api::response_error(403, false),
+        INVALID_RESPONSE,
+        INVALID_INPUT,
+        NETWORK,
+        ROLLING_DEADLINE,
+        STALE_DENIAL,
+    ] {
+        assert!(!error.rejects_local_grant(), "{error:?}");
+    }
+}
+
 #[tokio::test]
 async fn opted_in_login_requires_both_mode_indicators_and_absolute_expiry() {
     let now = OffsetDateTime::now_utc();

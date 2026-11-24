@@ -24,9 +24,10 @@ const MODE_HEADER: &str = "x-spofify-session-mode";
 const ROLLING_V1: &str = "rolling-v1";
 const ROLLING_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const NOT_REMEMBERED: ApiError = error("This sign-in did not enable Remember me.");
-const TRANSIENT_NETWORK: ApiError = error("The connection to the server was interrupted.");
+pub(super) const TRANSIENT_NETWORK: ApiError =
+    error("The connection to the server was interrupted.");
 const WRONG_ORIGIN: ApiError = error("The remembered sign-in is for a different server address.");
-const WRONG_ACCOUNT: ApiError = ApiError {
+pub(super) const WRONG_ACCOUNT: ApiError = ApiError {
     message: "The server returned a different account. Sign in again.",
     expired: true,
     status: 0,
@@ -38,13 +39,13 @@ impl ApiError {
     }
 
     pub(crate) fn rejects_local_grant(self) -> bool {
-        self.expired
-            || matches!(self.status, 401 | 403)
-            || matches!(self, INVALID_RESPONSE | INVALID_INPUT | WRONG_ORIGIN)
+        // An already validated local grant does not depend on GET succeeding.
+        // Policy errors (e.g. 403) and incompatible responses do not revoke it.
+        self.status == 401 || self == WRONG_ACCOUNT
     }
 }
 
-fn restore_transport(error: reqwest::Error) -> ApiError {
+pub(super) fn auth_probe_transport(error: reqwest::Error) -> ApiError {
     if crate::api_transport::is_transient_error(&error) {
         TRANSIENT_NETWORK
     } else {
@@ -321,7 +322,7 @@ impl Api {
         if !current() {
             return Err(super::OFFLINE);
         }
-        let response = request.send().await.map_err(restore_transport)?;
+        let response = request.send().await.map_err(auth_probe_transport)?;
         if !response.status().is_success() {
             return Err(Self::response_error(response.status().as_u16(), false));
         }
@@ -329,7 +330,8 @@ impl Api {
         if cookie != saved_cookie {
             return Err(INVALID_RESPONSE); // rolling-v1 never replaces the bearer
         }
-        let summary: SessionSummary = decode_with(response, LOGIN_BODY, restore_transport).await?;
+        let summary: SessionSummary =
+            decode_with(response, LOGIN_BODY, auth_probe_transport).await?;
         // The GET has no sessionMode field in its body; its response header is authoritative.
         let session = self.session_from_summary(summary, cookie, deadline)?;
         if session.secrets.account_id != credential.account_id {

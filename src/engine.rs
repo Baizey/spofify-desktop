@@ -578,26 +578,15 @@ impl Engine {
                     &mode,
                     serial,
                     || current.load(Ordering::SeqCst) == epoch,
-                    || async {
-                        api.validate_reconnect(&session).await.map_err(|error| {
-                            if retained.is_some() && error.rejects_local_grant() {
-                                ApiError {
-                                    expired: true,
-                                    ..error
-                                }
-                            } else {
-                                error
-                            }
-                        })
-                    },
+                    || api.validate_reconnect(&session),
                 )
                 .await;
-                if result
-                    .as_ref()
-                    .is_some_and(|r| r.as_ref().is_err_and(|e| e.expired))
+                // The probe itself fences an authoritative revocation. A local
+                // deadline, failed request or malformed response is not a denial.
+                if result.as_ref().is_some_and(Result::is_err)
+                    && session.is_revoked()
                     && let Some(retained) = retained
                 {
-                    session.retire_local_grant();
                     retained.retire();
                     if let (Ok(store), Some(profile)) = (store, retained.profile()) {
                         let _ = store.retire(Some(&profile));
@@ -691,7 +680,15 @@ impl Engine {
                     }
                 });
             }
-            Err(e) if e.expired || e.status == 401 => self.expire(),
+            Err(e)
+                if e.status == 401
+                    || self
+                        .account
+                        .as_ref()
+                        .is_some_and(|a| a.session.is_revoked()) =>
+            {
+                self.expire();
+            }
             Err(_) => self.persist_fallback(),
         }
     }
@@ -2875,25 +2872,31 @@ mod tests {
             0,
             false,
         );
+        e.retained = Some(Retention::new(LoginProfile::test_remembered()));
         let token = e.room_token();
         let access = e.access.borrow().as_ref().unwrap().clone();
-        e.mode.request(&access, false);
-        e.tick();
-        let serial = e.reconnect.as_ref().unwrap().serial;
-        assert_eq!(e.room_token(), token);
-        e.reply(Reply::Reconnect {
-            epoch: 7,
-            serial,
-            result: Err(ApiError {
-                message: "Forbidden",
-                expired: false,
-                status: 403,
-            }),
-        });
-        assert_eq!(e.room_token(), token);
-        assert_eq!(e.local.current().unwrap().track.id, "saved");
-        assert!(session.is_offline() && e.socket.is_none());
-        assert!(e.access.borrow().as_ref().unwrap().offline);
+        for (status, expired) in [(403, false), (0, false), (0, true)] {
+            e.mode.request(&access, false);
+            e.tick();
+            let serial = e.reconnect.as_ref().unwrap().serial;
+            assert_eq!(e.room_token(), token);
+            e.reply(Reply::Reconnect {
+                epoch: 7,
+                serial,
+                result: Err(ApiError {
+                    message: "No valid network session",
+                    expired,
+                    status,
+                }),
+            });
+            assert_eq!(e.room_token(), token);
+            assert_eq!(e.local.current().unwrap().track.id, "saved");
+            assert!(session.is_offline() && session.can_access_local() && e.socket.is_none());
+            assert!(e.retained.as_ref().unwrap().profile().is_some());
+            assert!(e.access.borrow().as_ref().unwrap().offline);
+        }
+        // The synthetic capability has no real keyring slot to stage.
+        e.retained = None;
         e.mode.request(&access, false);
         e.tick();
         let serial = e.reconnect.as_ref().unwrap().serial;
