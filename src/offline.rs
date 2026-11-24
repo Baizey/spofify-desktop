@@ -1827,7 +1827,7 @@ mod tests {
             store.read(&api, &session, "track"),
             Err(Error::Damaged)
         ));
-        assert!(store.remove(&api, &session, "track").unwrap());
+        assert!(!store.remove(&api, &session, "track").unwrap(), "damaged entry was already retired");
     }
 
     // Simulate files left by a build without the old release's global quotas.
