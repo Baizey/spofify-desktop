@@ -450,6 +450,19 @@ impl Retained {
     }
 }
 
+// Part sets are scoped to their resource, not the visible route. The server
+// echoes a playlist ID and continuation token, not our local request identity.
+#[derive(Default)]
+struct ReadScope {
+    observed: Option<PlaylistSummary>,
+    unconfirmed_direct: bool,
+    unavailable: bool,
+    staged: Option<Retained>,
+    pull: Pull,
+    expected_sync: Option<Command>,
+    repairing: bool,
+}
+
 /// Account-owned state. Keep it across reconnects, call `disconnected` on
 /// retirement, and `clear` on account change. Never pass old-epoch input.
 #[derive(Default)]
@@ -462,6 +475,7 @@ pub struct Replica {
     unconfirmed_direct: bool,
     unavailable: bool,
     details: VecDeque<Retained>,
+    background: HashMap<String, ReadScope>,
     staged: Option<Retained>,
     pull: Pull,
     expected_sync: Option<Command>,
@@ -489,15 +503,13 @@ impl Replica {
     /// Recheck a queued sync at the transport boundary: navigation, repair,
     /// or a newer continuation may already have superseded it.
     pub fn accepts_sync(&self, command: &Command) -> bool {
-        let Some(
-            expected @ Command::SyncPlaylist {
-                local_request: pending,
-                ..
-            },
-        ) = self.expected_sync.as_ref()
-        else {
-            return false;
+        let Command::SyncPlaylist { playlist_id, .. } = command else { return false; };
+        let expected = if self.desired.as_deref() == Some(playlist_id) {
+            self.expected_sync.as_ref()
+        } else {
+            self.background.get(playlist_id).and_then(|p| p.expected_sync.as_ref())
         };
+        let Some(expected @ Command::SyncPlaylist { local_request: pending, .. }) = expected else { return false; };
         self.ready
             && expected == command
             && matches!(command, Command::SyncPlaylist { local_request, .. } if Arc::ptr_eq(pending, local_request))
@@ -628,6 +640,52 @@ impl Replica {
         self.reset_pull();
     }
 
+    pub(crate) fn retire_background(&mut self, id: &str) {
+        self.background.remove(id);
+    }
+
+    fn take_read(&mut self) -> ReadScope {
+        ReadScope {
+            observed: self.observed.take(),
+            unconfirmed_direct: std::mem::take(&mut self.unconfirmed_direct),
+            unavailable: std::mem::take(&mut self.unavailable),
+            staged: self.staged.take(),
+            pull: std::mem::take(&mut self.pull),
+            expected_sync: self.expected_sync.take(),
+            repairing: std::mem::take(&mut self.repairing),
+        }
+    }
+
+    fn restore_read(&mut self, scope: ReadScope) {
+        self.observed = scope.observed;
+        self.unconfirmed_direct = scope.unconfirmed_direct;
+        self.unavailable = scope.unavailable;
+        self.staged = scope.staged;
+        self.pull = scope.pull;
+        self.expected_sync = scope.expected_sync;
+        self.repairing = scope.repairing;
+    }
+
+    pub(crate) fn watch_shared(&mut self, id: Option<String>) -> Option<Command> {
+        let id = id.filter(|id| id_ok(id));
+        if self.desired == id { return None; }
+        let parked = id.as_ref().and_then(|id| self.background.remove(id));
+        // Bound abandoned reads even if the peer never finishes them. This
+        // does not limit the number of durably saved detail projections.
+        if self.pull == Pull::Required && self.background.len() < MAX_DETAILS
+            && let Some(previous) = self.desired.clone()
+        {
+            let read = self.take_read();
+            self.background.insert(previous, read);
+        }
+        if let Some(parked) = parked {
+            self.desired = id;
+            self.restore_read(parked);
+            return None;
+        }
+        self.watch(id)
+    }
+
     pub fn watch(&mut self, id: Option<String>) -> Option<Command> {
         let id = id.filter(|id| id_ok(id));
         if self.desired == id {
@@ -648,6 +706,7 @@ impl Replica {
 
     pub fn disconnected(&mut self) {
         self.ready = false;
+        self.background.clear();
         self.unavailable |= self.unconfirmed_direct;
         self.unconfirmed_direct = false;
         self.reset_pull();
@@ -676,6 +735,32 @@ impl Replica {
         update: Update,
         mut accept: impl FnMut(AcceptedPlaylist<'_>),
     ) -> Result<Option<Command>, PersonalError> {
+        let resource = match &update {
+            Update::Part(p) => Some(p.summary.id.as_str()),
+            Update::Change(c) => c.playlist.as_ref().map(|p| p.id.as_str()),
+            _ => None,
+        };
+        if let Update::Change(c) = &update && let Some(id) = &c.deleted {
+            self.background.remove(id);
+        }
+        if let Some(id) = resource.filter(|id| self.desired.as_deref() != Some(*id))
+            && let Some(parked) = self.background.remove(id)
+        {
+            let id = id.to_owned();
+            let visible = self.desired.replace(id.clone());
+            let visible_read = self.take_read();
+            self.restore_read(parked);
+            let result = match update {
+                Update::Part(p) if self.ready => self.receive_part(p, &mut accept),
+                Update::Change(c) if self.ready => self.receive_change(c, &mut accept),
+                _ => Ok(None),
+            };
+            let updated = self.take_read();
+            if result.is_ok() && updated.expected_sync.is_some() { self.background.insert(id, updated); }
+            self.desired = visible;
+            self.restore_read(visible_read);
+            return result;
+        }
         match update {
             Update::Snapshot(s) => {
                 let command = self.install_snapshot(s)?;
@@ -780,6 +865,7 @@ impl Replica {
         {
             return Err(PersonalError);
         }
+        self.background.clear();
         if self.ready {
             self.invalidate_details();
         }

@@ -96,6 +96,44 @@ fn parse_config<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     serde_json::from_slice(bytes).ok()
 }
 
+const MANUAL_MODE: &str = "offline-mode-v2.json";
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManualMode {
+    manual_offline: bool,
+}
+
+#[cfg(not(test))]
+pub(crate) fn manual_offline() -> bool {
+    config_path(MANUAL_MODE).is_some_and(|path| manual_mode_at(&path))
+}
+
+pub(crate) fn manual_mode_at(path: &Path) -> bool {
+    // A missing preference means the default. Unreadable existing state is
+    // not permission to start networking.
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        _ => load(path, parse_config::<ManualMode>).is_none_or(|mode| mode.manual_offline),
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn save_manual_offline(manual_offline: bool) -> io::Result<()> {
+    let path = config_path(MANUAL_MODE).ok_or(io::ErrorKind::NotFound)?;
+    save_manual_mode_at(&path, manual_offline)
+}
+
+pub(crate) fn save_manual_mode_at(path: &Path, manual_offline: bool) -> io::Result<()> {
+    save(path, &ManualMode { manual_offline })?;
+    let parent = path.parent().ok_or(io::ErrorKind::NotFound)?;
+    File::open(parent)?.sync_all()?;
+    if let Some(config) = parent.parent() {
+        File::open(config)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn parse_density(bytes: &[u8]) -> Option<Density> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

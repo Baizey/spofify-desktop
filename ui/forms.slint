@@ -9,10 +9,12 @@ export component SignInView inherits Rectangle {
     in property <bool> error;
     in property <bool> busy;
     in property <bool> restoring;
+    in property <bool> offline;
+    callback go-online();
     in-out property <bool> keep-signed-in;
     in property <string> auth-notice;
     property <bool> reveal-password;
-    property <bool> ready: !root.busy && root.origin != "" && root.username != "" && root.password != "";
+    property <bool> ready: !root.busy && !root.offline && root.origin != "" && root.username != "" && root.password != "";
     callback server-edited();
     callback username-edited();
     callback sign-in();
@@ -48,6 +50,12 @@ export component SignInView inherits Rectangle {
                         spacing: 8px;
                         Action { text: root.restoring ? "Restoring session…" : root.busy ? "Signing in…" : "Sign in"; primary: true; enabled: root.ready; clicked => { root.reveal-password = false; root.sign-in(); } }
                         if root.busy: Action { text: "Cancel"; accessible-label: "Cancel sign in"; clicked => { root.cancel(); } }
+                    }
+                    if root.offline && !root.busy: HorizontalLayout {
+                        spacing: 8px;
+                        Caption { text: "Offline Mode"; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Action { text: "Go online"; clicked => { root.go-online(); } }
                     }
                     if root.status != "": Notice { text: root.status; error: root.error; }
                     if root.auth-notice != "": Notice { text: root.auth-notice; }

@@ -6,14 +6,14 @@
 //! are persisted. A download grants no player/coordinator authority.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt,
     fs::File,
     future::{Future, pending},
     io::{Read, Write},
     mem::MaybeUninit,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -46,8 +46,21 @@ const PROJECTION_DISK_STALL: Duration = Duration::from_secs(10);
 static PROJECTION_SLOTS: Semaphore = Semaphore::const_new(2);
 // A failed payload never modifies downloads. Suppress only the exact scoped
 // file identity, until the recording is replaced or this process ends.
-static DAMAGED_RECORDS: Mutex<VecDeque<(String, Stat)>> = Mutex::new(VecDeque::new());
-const MAX_DAMAGED_RECORDS: usize = 64;
+/// Validates a *new* use of an already hashed recording. A currently audible
+/// run may finish on its existing descriptor after removal.
+#[derive(Debug)]
+pub(crate) struct SavedProof {
+    root: Arc<OwnedFd>,
+    name: String,
+    stat: Stat,
+}
+
+impl SavedProof {
+    pub(crate) fn current(&self) -> bool {
+        fs::statat(&self.root, self.name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|after| unchanged_entry(&self.stat, &after))
+    }
+}
 const MAX_HEADER: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"SPOFDL01";
 const PREFIX_BYTES: usize = 12;
@@ -622,6 +635,11 @@ impl OfflineStore {
         Ok(downloads)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install(&self, api: &Api, session: &Session, id: &str, bytes: &[u8]) {
+        tests::install(self, &Scope::new(api, session).unwrap(), id, bytes).unwrap();
+    }
+
     /// Read and verify one test record without a caller-owned cancellation fence.
     #[cfg(test)]
     pub fn read(
@@ -679,28 +697,49 @@ impl OfflineStore {
         while remaining != 0 {
             check()?;
             let chunk = &mut buffer[..remaining.min(IO_CHUNK as u64) as usize];
-            file.read_exact(chunk).map_err(|_| Error::Damaged)?;
+            if file.read_exact(chunk).is_err() {
+                self.retire_damaged(&name, &stat, check);
+                return Err(Error::Damaged);
+            }
             hash.update(chunk);
             remaining -= chunk.len() as u64;
         }
         check()?;
-        if file.read(&mut [0]).map_err(|_| Error::Damaged)? != 0
+        if !matches!(file.read(&mut [0]), Ok(0))
             || header.audio_hash != hex(hash.finish().as_ref())
         {
-            let mut failed = DAMAGED_RECORDS.lock().expect("failed recording inventory");
-            failed.retain(|(key, _)| key != &name);
-            failed.push_back((name, stat));
-            if failed.len() > MAX_DAMAGED_RECORDS {
-                failed.pop_front();
-            }
+            self.retire_damaged(&name, &stat, check);
             return Err(Error::Damaged);
         }
         check()?;
+        let proof = SavedProof { root: self.root.clone(), name, stat };
+        if !proof.current() { return Err(Error::RecordingChanged); }
         Ok(PlaybackInput {
             item: header.track.item(),
-            source: AudioInput::verified_saved(file, offset, header.bytes),
+            source: AudioInput::verified_saved(file, offset, header.bytes, proof),
             recording: actual_recording,
         })
+    }
+
+    fn retire_damaged(&self, name: &str, checked: &Stat, live: impl Fn() -> Result<(), Error>) {
+        // Remove only the exact corrupt publication, never a concurrent
+        // replacement. Its absence is durable and permits a clean redownload.
+        let result = (|| {
+            let dir = self.lock_dir(true)?;
+            let removed = {
+                let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+                live()?;
+                let same = fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|current| unchanged_entry(checked, &current));
+                if same { storage(fs::unlinkat(&dir, name, AtFlags::empty()))?; }
+                same
+            };
+            if removed { storage(fs::fsync(&dir))?; }
+            Ok::<_, Error>(())
+        })();
+        if let Err(error) = result {
+            eprintln!("Unable to retire damaged download: {error}");
+        }
     }
 
     fn project_records(
@@ -761,11 +800,6 @@ impl OfflineStore {
             live()?;
             if fs::statat(&dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .is_ok_and(|after| unchanged_entry(&before, &after))
-                && !DAMAGED_RECORDS
-                    .lock()
-                    .expect("failed recording inventory")
-                    .iter()
-                    .any(|(key, stat)| key == &name && unchanged_entry(stat, &before))
             {
                 records.insert(download.item.id.clone(), download);
             }
@@ -1515,7 +1549,7 @@ mod tests {
             disc_number: 1,
         }
     }
-    fn install(
+    pub(super) fn install(
         store: &OfflineStore,
         scope: &Scope,
         id: &str,
@@ -1870,14 +1904,15 @@ mod tests {
         assert!(matches!(result, Err(Error::Damaged)));
         let after_failure = downloads
             .verified_records_with(None, {
-                let store = store.clone();
-                move || Ok(Some(store))
+                let reopened = fixture.store();
+                move || Ok(Some(reopened))
             })
             .await
             .unwrap();
         assert!(!after_failure.contains_key("changed"));
         assert!(after_failure.contains_key("huge"));
-        stdfs::remove_file(fixture.root().join(scope.name("changed").unwrap())).unwrap();
+        assert!(!fixture.root().join(scope.name("changed").unwrap()).exists(),
+            "a new process must not depend on a memory-only list of corrupt files");
         install(&store, &scope, "changed", b"replacement").unwrap();
         let replacement = downloads
             .verified_records_with(None, move || Ok(Some(store)))
@@ -2300,17 +2335,18 @@ mod tests {
             }),
             Err(Error::Cancelled)
         ));
+        let input = store.read(&api, &session, "large").unwrap();
         checks.set(0);
-        let input = store
-            .read_live(&api, &session, "large", || {
-                if bump() == 3 {
-                    // During the hash pass, replace the pathname with a different file.
-                    assert!(store.remove(&api, &session, "large").unwrap());
-                    install(&store, &scope, "large", b"different recording").unwrap();
-                }
-                Ok(())
-            })
-            .unwrap();
+        assert!(matches!(store.read_live(&api, &session, "large", || {
+            if bump() == 3 {
+                // Replacement during verification invalidates a new admission.
+                assert!(store.remove(&api, &session, "large").unwrap());
+                install(&store, &scope, "large", b"different recording").unwrap();
+            }
+            Ok(())
+        }), Err(Error::RecordingChanged)));
+        assert!(!input.source.may_start());
+        // The descriptor remains readable for a run already admitted.
         assert_eq!(input.source.len(), len);
         let mut reader = input.source.reader();
         assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), len - 2);

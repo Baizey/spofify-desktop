@@ -88,7 +88,6 @@ fn clear(ui: &AppWindow) {
     ui.set_playing(false);
     ui.set_can_control(false);
     ui.set_can_seek(false);
-    ui.set_manual_offline(false);
 }
 fn main() -> Result<(), slint::PlatformError> {
     if std::env::args_os()
@@ -340,7 +339,7 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
         let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
         ui.on_sign_in(move || {
             let Some(ui) = w.upgrade() else { return };
-            if ui.get_busy() || ui.get_signed_in() {
+            if ui.get_busy() || ui.get_signed_in() || ui.get_manual_offline() {
                 return;
             }
             let command = AuthCommand::Login {
@@ -361,6 +360,14 @@ fn bind_auth(ui: &AppWindow, tx: &mpsc::UnboundedSender<AuthCommand>, epoch: &Ar
                 ui.set_restoring_login(false);
                 ui.set_error(true);
                 ui.set_status("Sign-in is unavailable. Reopen the desktop and try again.".into());
+            }
+        });
+    }
+    {
+        let (w, tx, epoch) = (ui.as_weak(), tx.clone(), epoch.clone());
+        ui.on_signed_out_go_online(move || {
+            if w.upgrade().is_some_and(|ui| !ui.get_busy() && !ui.get_signed_in() && ui.get_manual_offline()) {
+                let _ = tx.send(AuthCommand::GoOnline(epoch.load(Ordering::SeqCst)));
             }
         });
     }

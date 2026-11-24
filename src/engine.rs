@@ -15,7 +15,7 @@ use crate::{
     audio::{Audio, MasterGain},
     auth::{self, Kind, Retention, Success, Write, Writer},
     desk::Access,
-    login_store::{LoginProfile, LoginStore, StagedMode, StoreError},
+    login_store::{LoginProfile, LoginStore, StoreError},
     mode::ModeControl,
     offline::{self, OfflineStore, PlaybackInput},
     output_identity::Installation,
@@ -52,6 +52,7 @@ pub enum AuthCommand {
     },
     Accept(u64),
     Cancel(u64),
+    GoOnline(u64),
     Logout(u64),
     Shutdown,
 }
@@ -159,6 +160,8 @@ struct Engine {
     epoch: u64,
     shared_epoch: Arc<AtomicU64>,
     mode: ModeControl,
+    #[cfg(test)]
+    manual_mode_path: Option<std::path::PathBuf>,
     access: watch::Sender<Option<Access>>,
     results: mpsc::Sender<Reply>,
     window: slint::Weak<AppWindow>,
@@ -373,6 +376,7 @@ impl Engine {
     fn login_view(&self, busy: bool, error: bool, status: &'static str) {
         let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
         let signed = self.account.is_some();
+        let manual_offline = self.offline;
         let _ = slint::invoke_from_event_loop(move || {
             if shared.load(Ordering::SeqCst) == epoch
                 && let Some(ui) = weak.upgrade()
@@ -383,6 +387,7 @@ impl Engine {
                     ui.set_busy(false);
                 }
                 ui.set_signed_in(signed);
+                ui.set_manual_offline(manual_offline);
                 if !signed {
                     ui.set_busy(busy);
                     ui.set_restoring_login(false);
@@ -502,12 +507,10 @@ impl Engine {
             self.recover_at = None;
             if desired {
                 self.set_offline(true);
-                self.save_mode(true, None);
+                self.save_mode(true);
             } else {
-                let was_manual = std::mem::replace(&mut self.offline, false);
-                if was_manual {
-                    self.save_mode(false, None);
-                }
+                if self.offline && !self.save_mode(false) { return; }
+                self.offline = false;
                 self.online.superseded = false;
                 if self.account.as_ref().is_some_and(|a| a.session.is_offline()) {
                     self.start_reconnect(serial);
@@ -721,20 +724,18 @@ impl Engine {
             self.connect();
         }
     }
-    fn save_mode(&self, offline: bool, staged: Option<StagedMode>) {
-        let (Some(retained), Some(account)) = (&self.retained, &self.account) else {
-            return;
-        };
-        // Network state and the persisted manual preference differ. Publish
-        // only explicit choices, scoped to the exact keyring slot.
-        let staged = staged.or_else(|| {
-            let profile = retained.profile()?;
-            self.login_store.as_ref().ok()?.stage_mode(&profile).ok()
+    fn save_mode(&mut self, offline: bool) -> bool {
+        // Device preference only: a remembered identity is neither needed
+        // nor changed by toggling this network gate.
+        #[cfg(not(test))]
+        let result = crate::api::preferences::save_manual_offline(offline);
+        #[cfg(test)]
+        let result = self.manual_mode_path.as_deref().map_or(Ok(()), |path| {
+            crate::api::preferences::save_manual_mode_at(path, offline)
         });
-        self.write_auth(
-            self.epoch,
-            Write::preference(retained.clone(), account.session.clone(), offline, staged),
-        );
+        if result.is_ok() { return true; }
+        self.action_status = "Offline Mode preference couldn't be saved.";
+        false
     }
     fn auth_transport_expired(&mut self) {
         let Some(session) = self.account.as_ref().map(|a| a.session.clone()) else {
@@ -785,6 +786,12 @@ impl Engine {
         }
     }
     fn start_restore(&mut self) {
+        #[cfg(not(test))]
+        let manual_offline = crate::api::preferences::manual_offline();
+        #[cfg(test)]
+        let manual_offline = self.manual_mode_path.as_deref().is_some_and(crate::api::preferences::manual_mode_at);
+        self.offline = manual_offline;
+        if manual_offline { self.mode.block_updates(); }
         let (epoch, current, results) =
             (self.epoch, self.shared_epoch.clone(), self.results.clone());
         let store = self.login_store.clone();
@@ -795,6 +802,7 @@ impl Engine {
                 store,
                 epoch,
                 &current,
+                manual_offline,
                 || mode.resolve_update_startup(epoch, &current),
                 move |origin, username| async move {
                     let _ = prefill.send(Reply::Prefill(epoch, origin, username)).await;
@@ -820,6 +828,15 @@ impl Engine {
         match command {
             AuthCommand::Shutdown => return false,
             AuthCommand::Accept(epoch) => self.accept_login(epoch),
+            AuthCommand::GoOnline(epoch) if epoch == self.epoch && self.current() && self.account.is_none() && self.login.is_none() => {
+                if self.save_mode(false) {
+                    self.offline = false;
+                    self.mode.allow_updates(epoch, &self.shared_epoch);
+                    self.login_view(false, false, "");
+                } else {
+                    self.login_view(false, true, self.action_status);
+                }
+            }
             AuthCommand::Logout(epoch) => {
                 // This intent must not get skipped if another auth intent is
                 // already queued. The persistence worker orders it with saves.
@@ -853,7 +870,12 @@ impl Engine {
                 remember,
             } if epoch == self.shared_epoch.load(Ordering::SeqCst) => {
                 self.retire_pending(false);
-                // Explicit sign-in goes online; retire the old account first.
+                if self.offline {
+                    self.reset(epoch);
+                    self.offline = true;
+                    self.login_view(false, false, "Go online to sign in.");
+                    return true;
+                }
                 self.reset(epoch);
                 let (current, results) = (self.shared_epoch.clone(), self.results.clone());
                 self.login = Some(tokio::spawn(async move {
@@ -1362,7 +1384,6 @@ impl Engine {
     fn accept_login(&mut self, epoch: u64) {
         if !self.current()
             || epoch != self.epoch
-            || self.offline
             || self
                 .auth_ready
                 .as_ref()
@@ -1468,10 +1489,12 @@ impl Engine {
             self.write_auth(self.epoch, Write::Forget(Some(profile)));
         }
         let (weak, shared, epoch) = (self.window.clone(), self.shared_epoch.clone(), self.epoch);
+        let manual_offline = self.offline;
         let _ = slint::invoke_from_event_loop(move || {
             if shared.load(Ordering::SeqCst) == epoch
                 && let Some(ui) = weak.upgrade()
             {
+                ui.set_manual_offline(manual_offline);
                 ui.set_busy(false);
                 ui.set_restoring_login(false);
                 ui.set_error(!fallback.status.is_empty());
@@ -1492,7 +1515,7 @@ impl Engine {
                 result,
             } => self.finish_reconnect(epoch, serial, result),
             Reply::Prefill(epoch, origin, username)
-                if epoch == self.epoch && !self.offline && self.login.is_some() =>
+                if epoch == self.epoch && self.login.is_some() =>
             {
                 let (weak, shared) = (self.window.clone(), self.shared_epoch.clone());
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1505,7 +1528,7 @@ impl Engine {
                 });
             }
             Reply::Login(epoch, outcome)
-                if epoch == self.epoch && !self.offline && self.login.is_some() =>
+                if epoch == self.epoch && self.login.is_some() =>
             {
                 self.login = None;
                 match outcome {
@@ -2128,6 +2151,8 @@ pub fn start(
                 epoch: 0,
                 shared_epoch: epoch,
                 mode,
+                #[cfg(test)]
+                manual_mode_path: None,
                 access,
                 results,
                 window,
@@ -2346,6 +2371,7 @@ mod tests {
             epoch: 7,
             shared_epoch: Arc::new(AtomicU64::new(7)),
             mode: ModeControl::default(),
+            manual_mode_path: None,
             access,
             results,
             window: slint::Weak::default(),
@@ -2839,7 +2865,7 @@ mod tests {
         e.cancel_reconnect();
     }
     #[tokio::test]
-    async fn explicit_sign_in_leaves_offline_even_if_the_new_origin_is_invalid() {
+    async fn explicit_sign_in_requires_going_online_first() {
         let mut e = engine();
         e.command(Command::Offline(true).scoped(7));
         e.auth_command(AuthCommand::Logout(7));
@@ -2852,8 +2878,47 @@ mod tests {
             password: "test".into(),
             remember: false,
         });
-        assert!(!e.offline && e.epoch == 8 && e.socket.is_none());
+        assert!(e.offline && e.epoch == 8 && e.socket.is_none() && e.login.is_none());
+        e.auth_command(AuthCommand::GoOnline(8));
+        assert!(!e.offline);
     }
+
+    #[tokio::test]
+    async fn manual_preference_survives_no_remember_sign_in_and_quit_without_granting_access() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(uuid::Uuid::new_v4().to_string());
+        let path = root.join("spofify-desktop/offline-mode-v2.json");
+        let mut e = engine();
+        e.manual_mode_path = Some(path.clone());
+        let origin = crate::api::Origin::parse("http://127.0.0.1:1").unwrap();
+        let api = Arc::new(Api::new(origin.clone()).unwrap());
+        let session = api.test_session();
+        e.auth_ready = Some((7, Success {
+            api, session: session.clone(), origin, kind: Kind::Password { remember: false }, manual_offline: false,
+        }));
+        e.accept_login(7);
+        assert!(e.account.is_some() && e.retained.is_none());
+        let access = e.access.borrow().as_ref().unwrap().clone();
+        e.mode.request(&access, true);
+        e.apply_mode();
+        assert!(session.is_offline() && e.socket.is_none());
+        assert!(crate::api::preferences::manual_mode_at(&path));
+        e.shutdown().await;
+
+        let mut reopened = engine();
+        reopened.manual_mode_path = Some(path.clone());
+        reopened.start_restore();
+        let task = reopened.login.take().unwrap();
+        task.await.unwrap();
+        assert!(reopened.offline && reopened.account.is_none() && reopened.access.borrow().is_none());
+        assert!(reopened.socket.is_none() && reopened.reconnect.is_none());
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert!(*reopened.mode.update_network().borrow() == crate::mode::UpdateNetwork::Offline);
+        reopened.auth_command(AuthCommand::GoOnline(7));
+        assert!(!reopened.offline && !crate::api::preferences::manual_mode_at(&path));
+        assert!(reopened.account.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn shared_fences_retire_even_if_mode_or_logout_command_never_arrives() {
         let mut e = engine();

@@ -516,9 +516,11 @@ enum Update {
     ReadGap,
     CatalogAppend(u64, Option<Result<pages::CatalogBatch, ApiError>>),
     LocalRead(u64, Result<Page, ApiError>),
+    Availability(u64, Result<Page, ApiError>),
+    VerifyUnavailable(u64, Vec<String>),
     Storage(Result<String, ApiError>),
     Changed(Result<Option<Route>, ApiError>),
-    Local(Result<Command, ApiError>),
+    Local(String, Result<Command, ApiError>),
     CollectionSaved(Result<crate::collections::SaveSummary, ApiError>),
     PinChanged(Result<(), ApiError>),
 }
@@ -3182,6 +3184,7 @@ impl Browser {
             }
             let result = if local_action {
                 Update::Local(
+                    row.as_ref().map_or_else(String::new, |row| row.id.clone()),
                     local_playback(&a, &route, &page, idx, local_target, &known, op == "queue")
                         .await,
                 )
@@ -3221,6 +3224,39 @@ impl Browser {
             let _ = tx.send(Delivery { serial, result }).await;
         }));
     }
+    fn check_availability(&mut self) {
+        if self.task.is_some() || self.writing { return; }
+        let Some(access) = self.access.clone().filter(Access::usable) else { return; };
+        let route = self.route.clone();
+        if !(route == Route::Offline || access.local() && matches!(route, Route::Playlist(_) | Route::History)) { return; }
+        let mode = *access.session.network_changes().borrow();
+        let (serial, tx) = (self.serial, self.results.clone());
+        self.task = Some(tokio::spawn(async move {
+            let page = if route == Route::Offline {
+                downloads_page(&access).await.map(|mut page| { page.local_audio = true; page })
+            } else {
+                cached_local_page(&access, &route).await
+            };
+            let _ = tx.send(Delivery { serial, result: Update::Availability(mode, page) }).await;
+        }));
+    }
+
+    fn verify_unavailable(&mut self, id: String) {
+        let Some(access) = self.access.clone().filter(Access::usable) else { return; };
+        let ids: HashSet<_> = self.page.rows.iter().filter(|r| r.local_recording.is_some())
+            .filter(|r| id.is_empty() || r.id == id).map(|r| r.id.clone()).collect();
+        if ids.is_empty() { self.check_availability(); return; }
+        let mode = *access.session.network_changes().borrow();
+        let (serial, tx) = (self.serial, self.results.clone());
+        self.task = Some(tokio::spawn(async move {
+            let missing = match crate::collections::browse_tracks(&access, ids.clone()).await {
+                Ok(records) => ids.into_iter().filter(|id| !records.contains_key(id)).collect(),
+                Err(_) => Vec::new(),
+            };
+            let _ = tx.send(Delivery { serial, result: Update::VerifyUnavailable(mode, missing) }).await;
+        }));
+    }
+
     fn result(&mut self, d: Delivery) {
         if d.serial != self.serial
             || !self
@@ -3241,6 +3277,37 @@ impl Browser {
             && !saved_route(&self.route)
             && self.access.as_ref().is_some_and(Access::local)
         {
+            return;
+        }
+        if let Update::VerifyUnavailable(mode, ids) = d.result {
+            self.task = None;
+            if !ids.is_empty() && self.access.as_ref().is_some_and(|a| a.usable() && *a.session.network_changes().borrow() == mode) {
+                let page = Arc::make_mut(&mut self.page);
+                if self.route == Route::Offline {
+                    page.rows.retain(|r| !ids.contains(&r.id));
+                    page.total = Some(page.rows.len() as u64);
+                } else {
+                    for row in page.rows.iter_mut().filter(|r| ids.contains(&r.id)) {
+                        row.local_recording = None;
+                        row.playable = false;
+                        row.detail = pages::join_labels(&row.detail, "Not downloaded");
+                    }
+                    page.local_collection_playable &= page.rows.iter().any(|r| r.playable);
+                }
+                self.render(true);
+                self.check_availability();
+            }
+            return;
+        }
+        if let Update::Availability(mode, result) = d.result {
+            self.task = None;
+            if self.access.as_ref().is_some_and(|a| a.usable() && *a.session.network_changes().borrow() == mode)
+                && let Ok(page) = result && *self.page != page
+            {
+                self.cache.saved_changed();
+                self.page = Arc::new(page);
+                self.render(true);
+            }
             return;
         }
         if let Update::CatalogAppend(mode, result) = d.result {
@@ -3280,7 +3347,7 @@ impl Browser {
         self.error = false;
         self.message.clear();
         match d.result {
-            Update::CatalogAppend(..) => unreachable!("handled above"),
+            Update::CatalogAppend(..) | Update::Availability(..) | Update::VerifyUnavailable(..) => unreachable!("handled above"),
             Update::Read(Ok(page), _) => {
                 let changed = *self.page != page;
                 self.page = Arc::new(page);
@@ -3422,7 +3489,7 @@ impl Browser {
                 self.message = msg;
                 self.render(false);
             }
-            Update::Local(Ok(command)) => {
+            Update::Local(_, Ok(command)) => {
                 self.playback(command);
                 if std::mem::take(&mut self.saved_reload_due) && self.page.local_audio {
                     self.visit(Navigation::Untracked(self.route.clone()));
@@ -3430,10 +3497,12 @@ impl Browser {
                     self.render(false);
                 }
             }
-            Update::Local(Err(e)) => {
+            Update::Local(id, Err(e)) => {
                 self.message = readable(&e);
                 self.error = true;
+                self.cache.saved_changed();
                 self.render(false);
+                self.verify_unavailable(id);
             }
         }
     }
@@ -4470,6 +4539,8 @@ pub fn start(
             let initial = access.borrow_and_update().clone();
             let mut personal_updates = initial.as_ref().map(|a| a.personal.changes());
             b.access_changed(initial);
+            let mut availability = tokio::time::interval(Duration::from_secs(2));
+            availability.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let quick_due = b.access.as_ref().and_then(|a| a.personal.quick_view(a.epoch, |view| view.due));
                 let due=b.personal_due.into_iter().chain(b.pending.as_ref().map(|p| p.due)).chain(quick_due).min();
@@ -4486,6 +4557,7 @@ pub fn start(
                     _=async { match &mut personal_updates { Some(w) => { let _ = w.changed().await; }, None => std::future::pending().await } }=>b.personal_changed(false),
                     Ok(())=pin_updates.changed()=>b.pins_changed(pin_updates.borrow_and_update().clone()),
                     Some(u)=updates.recv()=>b.result(u),
+                    _=availability.tick()=>b.check_availability(),
                     input=inputs.recv()=>{let Some(i)=input else{break;};b.input(i);},
                     Ok(())=demands.changed()=>{
                         let demand = demands.borrow_and_update().clone();

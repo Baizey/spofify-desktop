@@ -85,16 +85,18 @@ pub(crate) async fn restore<F>(
     store: Result<Arc<LoginStore>, StoreError>,
     epoch: u64,
     current: &AtomicU64,
+    manual_offline: bool,
     online_preference_known: impl Fn(),
     prefill: impl FnOnce(String, String) -> F,
 ) -> Outcome
 where
     F: Future<Output = ()>,
 {
-    restore_with(
+    restore_with_mode(
         store,
         epoch,
         current,
+        Some(manual_offline),
         online_preference_known,
         prefill,
         async |store, profile| store.restore(profile).await,
@@ -102,6 +104,7 @@ where
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn restore_with<F>(
     store: Result<Arc<LoginStore>, StoreError>,
     epoch: u64,
@@ -112,6 +115,20 @@ pub(crate) async fn restore_with<F>(
 ) -> Outcome
 where
     F: Future<Output = ()>,
+{
+    restore_with_mode(store, epoch, current, None, online_preference_known, prefill, lookup).await
+}
+
+async fn restore_with_mode<F>(
+    store: Result<Arc<LoginStore>, StoreError>,
+    epoch: u64,
+    current: &AtomicU64,
+    manual_offline: Option<bool>,
+    online_preference_known: impl Fn(),
+    prefill: impl FnOnce(String, String) -> F,
+    lookup: impl AsyncFn(&LoginStore, &LoginProfile) -> Result<Option<RememberedLogin>, StoreError>,
+) -> Outcome
+where F: Future<Output = ()>,
 {
     let unreadable = |_| Fallback {
         notice: PREFILL,
@@ -130,7 +147,7 @@ where
     let profile = store.profile().map_err(unreadable)?;
     // Disk prefill alone never records Work offline. If a slot is active,
     // only its typed keyring record can resolve the startup preference.
-    if profile.as_ref().is_none_or(|profile| !profile.remembered) {
+    if manual_offline != Some(true) && profile.as_ref().is_none_or(|profile| !profile.remembered) {
         online_preference_known();
     }
     let Some(profile) = profile else {
@@ -142,12 +159,9 @@ where
     }
     let (api, session, manual_offline) =
         with_restore_backoff(epoch, current, &RESTORE_BACKOFF, || {
-            restore_once(
-                lookup(&store, &profile),
-                &profile,
-                epoch,
-                current,
-                &online_preference_known,
+            restore_once_with_mode(
+                lookup(&store, &profile), &profile, epoch, current,
+                manual_offline, &online_preference_known,
             )
         })
         .await?;
@@ -165,11 +179,23 @@ enum RestoreFailure {
     Final(Fallback),
 }
 
+#[cfg(test)]
 async fn restore_once(
     lookup: impl Future<Output = Result<Option<RememberedLogin>, StoreError>>,
     profile: &LoginProfile,
     epoch: u64,
     current: &AtomicU64,
+    online_preference_known: &impl Fn(),
+) -> Result<(Arc<Api>, Session, bool), RestoreFailure> {
+    restore_once_with_mode(lookup, profile, epoch, current, None, online_preference_known).await
+}
+
+async fn restore_once_with_mode(
+    lookup: impl Future<Output = Result<Option<RememberedLogin>, StoreError>>,
+    profile: &LoginProfile,
+    epoch: u64,
+    current: &AtomicU64,
+    manual_offline: Option<bool>,
     online_preference_known: &impl Fn(),
 ) -> Result<(Arc<Api>, Session, bool), RestoreFailure> {
     // Re-check the original login slot on each attempt. A changed profile
@@ -197,11 +223,14 @@ async fn restore_once(
             let (api, session) = grant
                 .admit(&profile.origin, &profile.username)
                 .map_err(|_| RestoreFailure::Final(stale(profile.clone())))?;
-            let manual = grant.manual_offline();
+            let manual = manual_offline.unwrap_or_else(|| grant.manual_offline());
             if !manual {
                 online_preference_known();
             }
             return Ok((Arc::new(api), session, manual));
+        }
+        RememberedLogin::Online(_) if manual_offline == Some(true) => {
+            return Err(RestoreFailure::Final(Fallback::default()));
         }
         RememberedLogin::Online(credential) => credential,
     };

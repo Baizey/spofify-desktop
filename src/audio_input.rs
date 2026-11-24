@@ -49,7 +49,7 @@ enum Backing {
     File {
         file: Arc<File>,
         offset: u64,
-        verified_saved: bool,
+        saved: Option<Arc<crate::offline::SavedProof>>,
     },
     Online(Arc<Progress>),
     #[cfg(test)]
@@ -84,20 +84,20 @@ impl Drop for FailUnlessComplete {
 
 impl AudioInput {
     pub fn file(file: File, offset: u64, len: u64) -> Self {
-        Self::file_input(file, offset, len, false)
+        Self::file_input(file, offset, len, None)
     }
 
     /// Only for the exact Saved descriptor after its full payload is verified.
-    pub(crate) fn verified_saved(file: File, offset: u64, len: u64) -> Self {
-        Self::file_input(file, offset, len, true)
+    pub(crate) fn verified_saved(file: File, offset: u64, len: u64, proof: crate::offline::SavedProof) -> Self {
+        Self::file_input(file, offset, len, Some(Arc::new(proof)))
     }
 
-    fn file_input(file: File, offset: u64, len: u64, verified_saved: bool) -> Self {
+    fn file_input(file: File, offset: u64, len: u64, saved: Option<Arc<crate::offline::SavedProof>>) -> Self {
         Self {
             backing: Backing::File {
                 file: Arc::new(file),
                 offset,
-                verified_saved,
+                saved,
             },
             _transfer: None,
             len,
@@ -205,7 +205,7 @@ impl AudioInput {
             || matches!(
                 &self.backing,
                 Backing::File {
-                    verified_saved: true,
+                    saved: Some(_),
                     ..
                 }
             ))
@@ -220,6 +220,17 @@ impl AudioInput {
             })),
             _transfer: None, len,
         }
+    }
+
+    pub(crate) fn may_start(&self) -> bool {
+        match &self.backing {
+            Backing::File { saved: Some(proof), .. } => proof.current(),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn is_saved(&self) -> bool {
+        matches!(&self.backing, Backing::File { saved: Some(_), .. })
     }
 
     pub(crate) fn is_stream(&self) -> bool {

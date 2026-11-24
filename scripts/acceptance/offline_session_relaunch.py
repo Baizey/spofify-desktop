@@ -314,7 +314,7 @@ def closeable_desktop(binary, root, env, pixels, mcp_port):
         displays = [p for p in Path(env["XDG_RUNTIME_DIR"]).glob("wayland-*") if p.is_socket()]
         check(len(displays) == 1, "expected one owned Cage display socket")
         close_toplevel(displays[0])  # Genuine Wayland CloseRequested; signals are cleanup only.
-        code = process.wait(timeout=5)
+        code = process.wait(timeout=10)
         if code != 0:
             log = (root / "cage.log").read_bytes()[-2048:].decode(errors="replace").splitlines()
             raise Failure(f"owned Cage/desktop exited {code} after CloseRequested: {' | '.join(log[-8:])}")
@@ -546,6 +546,10 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
     metadata = json.dumps(dict(version=1, origin=origin, username=SEEDED_USER, active=SEEDED_SLOT))
     profile.touch(mode=0o600, exist_ok=False)
     profile.write_text(metadata)
+    preference = Path(env["XDG_CONFIG_HOME"]) / "spofify-desktop" / "offline-mode-v2.json"
+    preference.parent.mkdir(mode=0o700)
+    preference.touch(mode=0o600, exist_ok=False)
+    preference.write_text(json.dumps(dict(manual_offline=True)))
     audio = seed_saved_track(env, origin, SEEDED_ACCOUNT, duration=34)
     seed_personal_cache(env, origin, SEEDED_ACCOUNT)
 
@@ -599,9 +603,10 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         wait("both plays after a clean cold restart", lambda: play_count(window) == 2)
         quiet(receipt, 0, "qualified offline play relaunch")
         print("PASS distinct same-track plays survive a clean offline relaunch", flush=True)
-        audio.unlink()
         window.click(SAVED)
         window.section(SAVED)
+        window.find(action, roles=("Button",))
+        audio.unlink()
         window.title("Nothing saved yet")
         window.absent(action, roles=("Button",))
         print("PASS a deleted audio file is no longer available in Downloads", flush=True)
@@ -616,6 +621,7 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         disabled_login(window, origin, SEEDED_USER)
         quiet(receipt, 0, "seeded sign-out relaunch")
         window.absent(SAVED, roles=("Button",))
+        window.find("Go online", roles=("Button",))
     check(not receipt.events() and keyring() == ["lookup", "lookup", "clear"],
           "signed-out relaunch touched the private keyring or receipt listener")
     print("PASS seeded cold offline Sign out deletes the active item; relaunch stays signed out", flush=True)
@@ -632,16 +638,96 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         disabled_login(window)
         quiet(receipt, 0, "corrupt disk profile")
         window.absent(SAVED, roles=("Button",))
+        window.find("Go online", roles=("Button",))
+        if pixels:
+            window.pixels("04-signed-out-offline-mode")
     check(not receipt.events() and keyring() == ["lookup", "lookup", "clear"],
           "disk-only or corrupt profile reached the receipt listener or obtained a secret")
     print("PASS missing keyring item and corrupt metadata grant neither access nor observed wire traffic", flush=True)
+
+    profile.write_text(json.dumps(dict(version=1, origin=origin, username=SEEDED_USER)))
+    with closeable_desktop(binary, root, env, pixels, mcp_port) as window:
+        disabled_login(window, origin, SEEDED_USER)
+        window.find("Go online", roles=("Button",))
+        window.absent(SAVED, roles=("Button",))
+        quiet(receipt, 0, "manual mode with only non-remembered prefill")
+    check(keyring() == ["lookup", "lookup", "clear"], "non-remembered prefill must not probe the keyring")
+    print("PASS device preference alone remains offline and does not sign in", flush=True)
+
+
+@contextmanager
+def opt_out_login_fixture(port):
+    """Serve only non-remembered sign-in; playback service stays unavailable."""
+    receipt = Receipt()
+
+    class Handler(http_server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            receipt.record(self.command, self.path == LOGIN)
+            if self.path == LOGIN and self.headers.get("X-Spofify-Login") == "1" and not self.headers.get(MODE):
+                size = int(self.headers.get("Content-Length", "0"))
+                if 0 < size <= 1024 and json.loads(self.rfile.read(size)) == {
+                    "username": SEEDED_USER, "password": "disposable-password"
+                }:
+                    data = json.dumps(dict(accountId=SEEDED_ACCOUNT, username=SEEDED_USER,
+                                           role="user", csrfToken="a" * 64)).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Set-Cookie", "spofify_session=" + "b" * 64 + "; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+            self.send_error(503)
+
+        def do_GET(self):
+            receipt.record(self.command, False)
+            self.send_error(503)
+
+    with http_server.ThreadingHTTPServer(("127.0.0.1", port), Handler) as listener:
+        thread = Thread(target=listener.serve_forever, name="opt-out-login-fixture")
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{listener.server_address[1]}", receipt
+        finally:
+            listener.shutdown()
+            thread.join()
+
+
+def opt_out_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port):
+    preference = Path(env["XDG_CONFIG_HOME"]) / "spofify-desktop" / "offline-mode-v2.json"
+    with closeable_desktop(binary, root, env, pixels, mcp_port) as window:
+        disabled_login(window)
+        window.fill(SERVER, origin)
+        window.fill("Username", SEEDED_USER)
+        window.fill("Password", "disposable-password")
+        window.click("Sign in")
+        window.section("History")
+        window.click("Settings")
+        window.click("Work offline")
+        window.find("Go online", roles=("Button",))
+        wait("durable device Offline Mode", lambda: preference.exists() and json.loads(preference.read_text())["manual_offline"])
+        check(not store_metadata(env).get("active") and not keyring(), "opt-out sign-in acquired a remembered identity")
+        mark = len(receipt.events())
+        quiet(receipt, mark, "manual mode after opt-out sign-in")
+    with closeable_desktop(binary, root, env, pixels, mcp_port) as window:
+        disabled_login(window, origin, SEEDED_USER)
+        window.find("Go online", roles=("Button",))
+        window.absent(SAVED, roles=("Button",))
+        quiet(receipt, mark, "manual mode after opt-out relaunch")
+    check(receipt.events().count(("POST", True)) == 1 and not keyring(), "expected exactly one opt-out sign-in")
+    print("PASS non-remembered sign-in → manual toggle → quit → quiet signed-out relaunch", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--desktop", required=True, type=Path, help="prebuilt debug Slint desktop")
-    parser.add_argument("--seeded-offline", action="store_true",
-                        help="seed a test grant; only check cold offline UI, local sign-out and observed wire silence")
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument("--seeded-offline", action="store_true",
+                         help="seed a test grant; check cold offline UI, local sign-out and observed wire silence")
+    profile.add_argument("--no-remember-offline", action="store_true",
+                         help="use a login-only HTTP fixture; verify manual persistence without retaining a session")
     parser.add_argument("--scratch-dir", type=Path, help="existing disposable scratch base (e.g. /dev/shm)")
     parser.add_argument("--pixels-dir", type=Path, help="existing directory for new synthetic native PNGs")
     parser.add_argument("--wire-port", type=int, default=0,
@@ -666,6 +752,10 @@ def main():
             with offline_receipt(args.wire_port) as (origin, receipt), \
                     private_keyring(root, env, python, seed_origin=origin) as (env, keyring):
                 seeded_offline(binary, root, env, origin, receipt, keyring, pixels, args.mcp_port)
+        elif args.no_remember_offline:
+            with opt_out_login_fixture(args.wire_port) as (origin, receipt), \
+                    private_keyring(root, env, python) as (env, keyring):
+                opt_out_offline(binary, root, env, origin, receipt, keyring, pixels, args.mcp_port)
         else:
             with private_keyring(root, env, python) as (env, keyring), \
                     recorded_wire(args.wire_port) as (ready, receipt):

@@ -193,13 +193,23 @@ impl State {
 
     fn watch(&mut self, id: Option<String>) -> (bool, Option<PersonalCommand>) {
         let before = self.replica.watched_playlist().map(str::to_owned);
+        let tick = Instant::now();
+        if let Some(id) = id.as_ref().filter(|id| before.as_ref() != Some(id))
+            && self.detail_attempts.get(id).is_some_and(|attempt| tick >= attempt.until)
+        {
+            self.replica.retire_background(id);
+        }
         if self.cache_binding.is_some() && !self.quick.searching()
             && let Some(detail) = id.as_ref().and_then(|id| self.cache.details.get(id))
         {
             self.replica.seed_detail(detail.playlist.clone());
         }
-        let command = self.replica.watch(id);
-        let command = self.prepare_detail(command, personal_cache::now_ms(), Instant::now());
+        let command = if self.cache_binding.is_some() {
+            self.replica.watch_shared(id)
+        } else {
+            self.replica.watch(id)
+        };
+        let command = self.prepare_detail(command, personal_cache::now_ms(), tick);
         let changed = before.as_deref() != self.replica.watched_playlist();
         if changed {
             self.status.playlist_detail = self.status.playlist_detail.wrapping_add(1);
@@ -722,7 +732,10 @@ impl PersonalAccess {
         if !state.accepts_playlist_sync(epoch, generation, command) || !start() {
             return false;
         }
-        if state.replica.playlist().is_none_or(|p| p.stale) {
+        if matches!(command, PersonalCommand::SyncPlaylist { playlist_id, .. }
+            if state.replica.watched_playlist() == Some(playlist_id))
+            && state.replica.playlist().is_none_or(|p| p.stale)
+        {
             state.quick.started_read(generation, command);
         }
         true
@@ -1067,6 +1080,7 @@ impl PersonalHub {
         }
         let snapshot = matches!(&update, PersonalUpdate::Snapshot(_));
         let part = matches!(&update, PersonalUpdate::Part(_));
+        let background = matches!(&update, PersonalUpdate::Part(p) if state.replica.watched_playlist() != Some(p.summary.id.as_str()));
         let now = Instant::now();
         state.expire_quick_read(now);
         if snapshot && state.status.link != Link::Ready && state.quick.searching() {
@@ -1181,8 +1195,10 @@ impl PersonalHub {
                 let progressed = matches!(command, Some(PersonalCommand::SyncPlaylist { offset, .. }) if offset > 0);
                 // A valid part at the deadline is evidence, not a timeout.
                 // Reduce it before ticking the optional Search read budget.
-                state.quick_read(command.as_ref(), progressed, now);
-                state.quick_tick(now);
+                if !background {
+                    state.quick_read(command.as_ref(), progressed, now);
+                    state.quick_tick(now);
+                }
                 if let Some(candidate) = &command
                     && !state.replica.accepts_sync(candidate)
                 {
@@ -1197,7 +1213,8 @@ impl PersonalHub {
                     }
                 }
                 if let Some((id, token)) = &final_part
-                    && state.replica.playlist().is_some_and(|p| !p.stale && p.summary.id == *id && p.token == *token)
+                    && cache_changed
+                    && state.cache.details.get(id).is_some_and(|d| d.playlist.token == *token)
                 {
                     state.detail_attempts.remove(id);
                 }
@@ -1504,10 +1521,26 @@ mod tests {
         let PersonalUpdate::Part(part) = part else { unreachable!() };
         let (generation, refresh) = schedule().unwrap();
         assert!(schedule().is_none());
-        assert!(personal.quick_watch(1, false, None).is_none());
+        let (b_generation, b) = personal.watch_playlist(1, Some("second".into())).unwrap();
         assert!(personal.inspect_playlist_sync(1, generation, &refresh, |_| true).unwrap());
-        assert!(personal.quick_watch(1, false, Some("mix".into())).is_none());
-        hub.receive(1, 2, PersonalUpdate::Part(part.clone())).unwrap();
+        assert!(schedule().is_none(), "A→B→A must share the original A request");
+        assert!(personal.inspect_playlist_sync(1, b_generation, &b, |_| true).unwrap());
+        let next_a = hub.receive(1, 2, PersonalUpdate::Part(Part {
+            more: true, rows: part.rows[..1].to_vec(), ..part.clone()
+        })).unwrap().unwrap();
+        assert!(matches!(&next_a, PersonalCommand::SyncPlaylist { playlist_id, offset: 1, .. } if playlist_id == "mix"));
+        assert!(personal.cached_page(1, &route).is_none());
+        assert!(personal.watch_playlist(1, Some("second".into())).is_none());
+        assert!(personal.inspect_playlist_sync(1, generation, &next_a, |_| true).unwrap());
+        let mut second = part.clone();
+        second.summary.id = "second".into();
+        second.summary.name = "Second".into();
+        hub.receive(1, 2, PersonalUpdate::Part(second)).unwrap();
+        assert!(personal.cached_page(1, &route).is_none(), "B must not consume or publish A's staged rows");
+        hub.receive(1, 2, PersonalUpdate::Part(Part {
+            offset: 1, rows: part.rows[1..].to_vec(), ..part.clone()
+        })).unwrap();
+        assert!(schedule().is_none());
         let projection = personal.cached_page(1, &route).unwrap();
         assert_eq!(projection.rows.len(), 2);
         assert_ne!(projection.rows[0].key, projection.rows[1].key);

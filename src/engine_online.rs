@@ -1235,6 +1235,51 @@ mod tests {
         data.into()
     }
 
+    #[tokio::test]
+    async fn same_account_reducer_reset_rejects_queued_reply_for_the_same_media_slot() {
+        let mut e = crate::engine::tests::engine();
+        let api = Arc::new(connection("http://127.0.0.1:1").unwrap());
+        let session = api.test_session();
+        let mut audio = Audio::new_account_scoped(session.clone(), e.shared_epoch.clone(), e.epoch, e.master_gain.clone());
+        let (mixer, _) = rodio::mixer::mixer(1, 8000);
+        audio.use_test_output(mixer, "unrelated".into(), wav());
+        e.audio = Some(audio);
+        e.account = Some(Account { api, session: session.clone() });
+        let state: State = serde_json::from_value(serde_json::json!({
+            "queue":[{"key":1,"order":1,"id":"x","name":"X","intent":"low","duration":1.0}],
+            "cursor":{"key":1,"occurrence":"visit","positionMs":0,"desiredPlaying":true},
+            "repeat":"off","shuffle":false
+        })).unwrap();
+        let opening = |e: &mut Engine, generation: u64| {
+            let (socket, peer) = socket::Socket::test_peer(session.clone(), generation);
+            e.socket = Some(socket);
+            let snap = socket::Snapshot {
+                session_id: format!("room-{generation}"), connection_id: format!("connection-{generation}"),
+                revision: 1, owner: socket::Owner { generation, device_id: Some(e.device_id.clone()) },
+                devices: vec![], player: state.clone(), observation: None, server_time_ms: now_ms(),
+            };
+            peer.set_opening_snapshot(&snap, true);
+            e.tick_with_event(Some(Event { generation, kind: EventKind::Snapshot(snap), personal_stamp: None }));
+            peer
+        };
+        let _old_peer = opening(&mut e, 11);
+        let old = e.online.primary.as_ref().unwrap().0.clone();
+        let epoch = e.epoch;
+        e.stop();
+        let _new_peer = opening(&mut e, 12);
+        let new = e.online.primary.as_ref().unwrap().0.clone();
+        assert_eq!(e.epoch, epoch);
+        assert_eq!((&old.id, old.preview, old.portable_only), (&new.id, new.preview, new.portable_only));
+        assert_ne!(old, new);
+        e.reply(crate::engine::Reply::Media { epoch, request: old, source: Some(wav().into()) });
+        assert_eq!(e.online.primary.as_ref().unwrap().0, new);
+        assert!(e.audio.as_ref().unwrap().run_identity().is_none());
+        e.online.primary.as_ref().unwrap().1.abort();
+        e.reply(crate::engine::Reply::Media { epoch, request: new, source: Some(wav().into()) });
+        assert!(e.online.primary.is_none());
+        assert!(e.audio.as_ref().unwrap().run_identity().is_some());
+    }
+
     async fn hello_then_local_pause(wins: bool, drops: bool) {
         let dir = Fixture(
             std::env::temp_dir()

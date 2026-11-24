@@ -103,6 +103,7 @@ export component AppWindow inherits Window {
     in property <float> elapsed;
     in property <float> duration;
     callback sign-in();
+    callback signed-out-go-online();
     callback sign-out();
     callback cancel-sign-in();
     callback server-edited();
@@ -373,6 +374,8 @@ export component AppWindow inherits Window {
         keep-signed-in <=> root.keep-signed-in;
         status: root.status; error: root.error; busy: root.busy;
         restoring: root.restoring-login; auth-notice: root.auth-notice;
+        offline: root.manual-offline;
+        go-online => { root.signed-out-go-online(); }
         server-edited => { root.server-edited(); } username-edited => { root.username-edited(); }
         sign-in => { root.sign-in(); } cancel => { root.cancel-sign-in(); }
     }

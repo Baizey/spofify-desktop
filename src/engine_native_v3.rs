@@ -114,7 +114,6 @@ pub(crate) struct NativeV3 {
     // of ordinary results so an already-performed operation always has a receipt.
     applied_conditional: Option<Settlement>,
     media: Vec<Media>,
-    next_request: u64,
     stream_handoff: bool,
     skip_remaining: usize,
     fade: Option<(u64, String)>,
@@ -706,11 +705,7 @@ impl NativeV3 {
             .iter_mut()
             .filter_map(|m| m.request.take().map(Work::Cancel))
             .collect();
-        let serial = self.next_request;
-        *self = Self {
-            next_request: serial,
-            ..Self::default()
-        };
+        *self = Self::default();
         work
     }
 
@@ -745,11 +740,7 @@ impl NativeV3 {
                         work.push(Work::Cancel(request));
                     }
                 }
-                let serial = self.next_request;
-                *self = Self {
-                    next_request: serial,
-                    ..Self::default()
-                };
+                *self = Self::default();
                 audio.clear();
                 false
             }
@@ -789,7 +780,9 @@ impl NativeV3 {
                     for slot in &mut self.media {
                         slot.source = slot.source.take().and_then(|s| {
                             s.stop_transfer();
-                            (!s.is_stream()).then(|| s.isolated()).flatten()
+                            // A preview opened under the old network mode is
+                            // not a new offline playback admission.
+                            (!s.is_stream() && !s.is_saved()).then(|| s.isolated()).flatten()
                         });
                         if let Some(request) = slot.request.take() {
                             work.push(Work::Cancel(request));
@@ -997,20 +990,27 @@ impl NativeV3 {
                 slot.source = None;
                 slot.failed = Some(detached);
             }
+            if (a.phase == Phase::Waiting && is_current || !is_current)
+                && slot.source.as_ref().is_some_and(|source| !source.may_start())
+            {
+                slot.source = None;
+            }
             if slot.failed == Some(true) && !detached {
                 slot.failed = None;
             }
             if slot.source.is_none() && slot.request.is_none() && slot.failed.is_none() {
-                let available = audio.cached(id).filter(|s| !s.is_failed());
+                let available = audio.cached(id).filter(|s| !s.is_failed() && (a.phase == Phase::Running && is_current || s.may_start()));
                 slot.source = if detached {
                     available.filter(|s| !s.is_stream()).and_then(|s| s.isolated())
                 } else {
                     available
                 };
                 if slot.source.is_none() {
-                    self.next_request += 1;
+                    // Queued worker replies can outlive any reducer or room
+                    // reset, even when the account epoch is unchanged.
+                    static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let request = MediaRequest {
-                        token: self.next_request,
+                        token: REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         id: id.clone(),
                         preview: !is_current,
                         portable_only: detached,
@@ -1408,6 +1408,40 @@ mod tests {
         );
         audio.use_test_output(mixer, "a".into(), wav());
         (NativeV3::default(), state(), audio, output)
+    }
+
+    #[tokio::test]
+    async fn deleted_online_preview_cannot_start_after_manual_mode() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir().canonicalize().unwrap().join(uuid::Uuid::new_v4().to_string());
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let store = crate::offline::OfflineStore::open(&root).unwrap();
+        let api = crate::engine::connection("http://127.0.0.1:1").unwrap();
+        let session = api.test_session();
+        store.test_install(&api, &session, "b", &wav());
+        let (mut native, shared, mut audio, mut output) = setup();
+        let opening = Context { snapshot: true, ..context() };
+        let request = preview(&native.reconcile(&shared, opening, &mut audio));
+        let input = store.read(&api, &session, "b").unwrap();
+        assert!(input.source.may_start());
+        native.complete(&shared, opening, &mut audio, &request, Some(input.source.clone()));
+        assert!((0..40).any(|_| output.next().is_some_and(|sample| sample != 0.0)));
+        assert!(store.remove(&api, &session, "b").unwrap());
+        assert!(!input.source.may_start(), "the pinned inode is no longer the named download");
+        session.set_offline(true);
+        let offline = Context { mode: Mode::Detached, report: false, ..context() };
+        let work = native.act_detached(Action::Next, &shared, offline, &mut audio);
+        let replacement = work.iter().find_map(|w| match w {
+            Work::Prepare(r) if !r.preview && r.id == "b" => Some(r.clone()),
+            _ => None,
+        }).expect("a fresh local admission, not the retired preview");
+        assert!(matches!(store.read(&api, &session, "b"), Err(crate::offline::Error::NotDownloaded)));
+        native.complete(&shared, offline, &mut audio, &replacement, None);
+        assert_eq!(native.cursor().unwrap().key, 2);
+        assert!(!native.cursor().unwrap().desired_playing);
+        assert!(!audio.facts().playing);
+        assert!(store.list(&api, &session).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

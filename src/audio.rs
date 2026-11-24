@@ -296,6 +296,9 @@ impl Audio {
         if !self.current() || !authority.may_start() {
             return Err(Status::Rejected);
         }
+        if !input.may_start() {
+            return Err(Status::Load);
+        }
         let pcm = Arc::new(State::new(*format));
         let fence_authority = if let Some(account) = &self.account {
             let account = account.clone();
@@ -479,6 +482,7 @@ impl Audio {
             || outgoing.sink.is_paused()
             || outgoing.pcm.failure().is_some()
             || !fade.incoming.can_continue()
+            || !fade.cached.1.may_start()
             || (fade.attenuation > 0.0 && fade.incoming.pcm.buffering())
             || (fade.incoming_gain == 0.0 && !fade.incoming.authority.may_start())
         {
@@ -542,6 +546,7 @@ impl Audio {
         }
         let fade = self.crossfade.as_ref().unwrap();
         if fade.incoming_gain == 0.0
+            || !fade.cached.1.may_start()
             || !fade.incoming.can_continue()
             || fade.incoming.pcm.buffering()
         {
