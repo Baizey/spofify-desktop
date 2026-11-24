@@ -115,6 +115,8 @@ pub(crate) struct NativeV3 {
     applied_conditional: Option<Settlement>,
     media: Vec<Media>,
     next_request: u64,
+    stream_handoff: bool,
+    skip_remaining: usize,
     fade: Option<(u64, String)>,
     last_sent: Option<(u64, ObservationStatus, u64)>,
     sent_advance: Option<u64>,
@@ -408,6 +410,18 @@ impl NativeV3 {
             .iter_mut()
             .find(|slot| slot.request.as_ref() == Some(request))
         {
+            if self.stream_handoff && request.portable_only && !request.preview {
+                self.stream_handoff = false;
+                if let Some(input) = source.as_ref().and_then(AudioInput::isolated)
+                    && let Some(active) = self.active.as_mut().filter(|a| a.track_id.as_deref() == Some(request.id.as_str()) && a.cursor.desired_playing)
+                {
+                    let facts = audio.facts();
+                    if audio.play(request.id.clone(), input, facts.elapsed, facts.duration, Authority::offline()) == crate::player::Status::Ok {
+                        active.phase = Phase::Running;
+                        active.run = audio.run_identity();
+                    }
+                }
+            }
             slot.request = None;
             slot.source = source.filter(|s| !s.is_failed());
             if request.portable_only || matches!(cx.mode, Mode::Detached) {
@@ -450,6 +464,10 @@ impl NativeV3 {
         }
         let before = self.active.as_ref().unwrap().cursor.clone();
         self.natural(cx, audio);
+        if matches!(action, Action::Next | Action::Previous | Action::Jump { .. } | Action::Pause | Action::Seek { .. } | Action::Resume) {
+            self.skip_remaining = 0;
+            self.stream_handoff = false;
+        }
         let a = self.active.as_ref().unwrap();
         if matches!(action, Action::Next | Action::Seek { .. }) && before != a.cursor {
             self.drive(cx, audio, &mut work);
@@ -743,6 +761,8 @@ impl NativeV3 {
                         return false;
                     }
                     self.reset_reports();
+                    self.stream_handoff = false;
+                    self.skip_remaining = 0;
                     self.binding = Some(connection_id.to_owned());
                     for slot in &mut self.media {
                         if let Some(request) = slot.request.take() {
@@ -760,8 +780,17 @@ impl NativeV3 {
                     if let (Some(state), Some(active)) = (&mut self.confirmed, &self.active) {
                         state.cursor = active.cursor.clone();
                     }
+                    self.stream_handoff = self.active.as_ref()
+                        .and_then(|a| a.track_id.as_deref())
+                        .and_then(|id| audio.cached(id))
+                        .is_some_and(|s| { s.stop_transfer(); s.is_stream() });
+                    audio.cancel_crossfade();
+                    self.fade = None;
                     for slot in &mut self.media {
-                        slot.source = slot.source.take().and_then(|s| s.isolated());
+                        slot.source = slot.source.take().and_then(|s| {
+                            s.stop_transfer();
+                            (!s.is_stream()).then(|| s.isolated()).flatten()
+                        });
                         if let Some(request) = slot.request.take() {
                             work.push(Work::Cancel(request));
                         }
@@ -922,6 +951,8 @@ impl NativeV3 {
             });
             self.sent_advance = None;
         } else if let Some(state) = &mut self.confirmed {
+            self.stream_handoff = false;
+            self.skip_remaining = if next == 0 { 0 } else { state.queue.len() - 1 };
             state.cursor = target;
         }
     }
@@ -972,7 +1003,7 @@ impl NativeV3 {
             if slot.source.is_none() && slot.request.is_none() && slot.failed.is_none() {
                 let available = audio.cached(id).filter(|s| !s.is_failed());
                 slot.source = if detached {
-                    available.and_then(|s| s.isolated())
+                    available.filter(|s| !s.is_stream()).and_then(|s| s.isolated())
                 } else {
                     available
                 };
@@ -1019,6 +1050,26 @@ impl NativeV3 {
             a.phase = Phase::Failed;
             audio.cancel_crossfade();
             self.fade = None;
+        }
+        if detached && a.phase == Phase::Failed && a.cursor.desired_playing && !self.stream_handoff {
+            if self.skip_remaining > 0
+                && let Some(key) = successor(state, a.cursor.key, false).filter(|&key| key != 0)
+                && let Some(row) = row(state, key).cloned()
+            {
+                self.skip_remaining -= 1;
+                let target = new_visit(key);
+                self.confirmed.as_mut().unwrap().cursor = target.clone();
+                self.land(target, Some(&row), 0, false, audio);
+                return;
+            }
+            self.skip_remaining = 0;
+            a.cursor.desired_playing = false;
+            a.cursor.position_ms = position_ms(audio.facts());
+            self.confirmed.as_mut().unwrap().cursor = a.cursor.clone();
+            return;
+        }
+        if a.phase == Phase::Running && !self.stream_handoff && audio.has_started() {
+            self.skip_remaining = 0;
         }
         let want_fade = cx.crossfade
             && a.phase == Phase::Running

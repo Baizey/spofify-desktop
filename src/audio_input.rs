@@ -212,6 +212,26 @@ impl AudioInput {
         .then(|| self.decoder_input())
     }
 
+    #[cfg(test)]
+    pub(crate) fn failed_stream(file: File, len: u64, written: u64) -> Self {
+        Self {
+            backing: Backing::Online(Arc::new(Progress {
+                file, written: AtomicU64::new(written), state: AtomicU8::new(FAILED),
+            })),
+            _transfer: None, len,
+        }
+    }
+
+    pub(crate) fn is_stream(&self) -> bool {
+        matches!(&self.backing, Backing::Online(_))
+    }
+
+    pub(crate) fn stop_transfer(&self) {
+        if let Some(transfer) = &self._transfer {
+            transfer.0.abort();
+        }
+    }
+
     pub(crate) fn is_failed(&self) -> bool {
         matches!(&self.backing, Backing::Online(progress) if progress.state.load(Ordering::Acquire) == FAILED)
     }
@@ -296,11 +316,13 @@ fn wait_for<T>(
     loop {
         check_live(live)?;
         let state = progress.state.load(Ordering::Acquire);
-        if state == FAILED {
-            return Err(io::Error::other("audio transfer did not complete"));
-        }
+        // A failed transfer can still satisfy reads into its written prefix.
+        // The incomplete tail must remain an error, never natural EOF.
         if let Some(value) = value(state) {
             return Ok(value);
+        }
+        if state == FAILED {
+            return Err(io::Error::other("audio transfer did not complete"));
         }
         // This wait is worker-only. No lock can be held by a disk writer or
         // awaited by the mixer. Poll at a fixed interval when missing bytes.

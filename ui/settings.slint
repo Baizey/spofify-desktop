@@ -178,7 +178,7 @@ export component Settings inherits Rectangle {
                     status-color: root.reconnecting ? Theme.tertiary : root.offline ? Theme.subtle : Theme.primary;
                     detail: root.offline ? "Downloaded music only" : "";
                     SettingsAction {
-                        text: root.reconnecting ? "Stay offline" : root.offline ? "Go online" : "Work offline";
+                        text: root.offline ? "Go online" : "Work offline";
                         primary: root.offline;
                         focus-origin: root.origin; focused(y, h) => { root.focused(y, h); }
                         clicked => { root.toggle-offline(); }

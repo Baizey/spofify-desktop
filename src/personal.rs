@@ -614,9 +614,17 @@ impl Replica {
         self.details.push_back(detail);
     }
 
-    // Only a caller holding a fresh complete projection may suppress this pull.
-    pub(crate) fn use_cached_detail(&mut self, playlist: Playlist) {
-        self.seed_detail(playlist);
+    // The v3 detail protocol can answer a conditional read with silence.
+    // v2 refreshes use an unconditional first part: freshness can only be
+    // advanced by an explicit, complete response.
+    pub(crate) fn read_full_detail(&mut self) -> Option<Command> {
+        let id = self.desired.clone()?;
+        if !self.ready || self.unavailable { return None; }
+        self.reset_pull();
+        Some(self.sync(id, None, 0))
+    }
+
+    pub(crate) fn defer_detail(&mut self) {
         self.reset_pull();
     }
 
@@ -768,6 +776,7 @@ impl Replica {
             || s.recent.len() > MAX_RECENT
             || !unique_ids(s.playlists.iter().map(|p| p.id.as_str()))
             || !unique_recent(&s.recent)
+            || self.ready && s.playlists.iter().any(|p| self.summary(&p.id).is_some_and(|old| old.revision > p.revision))
         {
             return Err(PersonalError);
         }

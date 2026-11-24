@@ -57,7 +57,7 @@ const STAGE: &str = ".partial";
 // These are not audio records. This app never opens or deletes them.
 const LEGACY_CACHE_INDEX: &str = ".playback-cache-v1";
 const LEGACY_CACHE_STAGE: &str = ".playback-cache-partial";
-const ROOT_DIR: &str = "spofify-downloads-v1";
+const ROOT_DIR: &str = "spofify-downloads-v2";
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 const FILE_FLAGS: OFlags = OFlags::NOFOLLOW
     .union(OFlags::CLOEXEC)
@@ -413,11 +413,24 @@ impl OfflineStore {
 
     /// Manual operation only. No prefetch, eviction or coordinator state mutation.
     /// Only one download per store is admitted at a time, including its fetch.
-    pub async fn download(
+    #[cfg(test)]
+    pub async fn download(&self, api: &Api, session: &Session, item: &Item) -> Result<Download, Error> {
+        self.download_scoped(api, session, item, None).await
+    }
+
+    pub async fn download_for_access(&self, access: &crate::desk::Access, item: &Item) -> Result<Download, Error> {
+        let epoch = access.personal.account_fence(access.epoch);
+        #[cfg(not(test))]
+        if epoch.is_none() { return Err(Error::Cancelled); }
+        self.download_scoped(&access.api, &access.session, item, epoch).await
+    }
+
+    async fn download_scoped(
         &self,
         api: &Api,
         session: &Session,
         item: &Item,
+        epoch: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
     ) -> Result<Download, Error> {
         let scope = Scope::new(api, session)?;
         let mut network = session.network_changes();
@@ -428,7 +441,14 @@ impl OfflineStore {
         Track::validate_item(item)?;
         let track = Track::from(item);
         let name = scope.name(&track.id)?;
-        let live = download_liveness(session.clone(), network.clone(), generation);
+        let mode_live = download_liveness(session.clone(), network.clone(), generation);
+        let live = move || {
+            mode_live()?;
+            if epoch.as_ref().is_some_and(|(current, admitted)| current.load(Ordering::SeqCst) != *admitted) {
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        };
         in_download_mode(&mut network, async {
             let admission = self
                 .admit_download(name, live.clone(), DOWNLOAD_DISK_STALL)
@@ -931,13 +951,17 @@ impl OfflineStore {
         let dir = self.lock_dir(true)?;
         live()?;
         reject_existing(&dir, &name)?;
-        // As in v1, check just before entering the commit syscall. Never make
-        // mode changes wait for rename (or directory fsync) to return.
         live()?;
-        match fs::renameat_with(&dir, STAGE, &dir, name.as_str(), RenameFlags::NOREPLACE) {
-            Ok(()) => partial.published = true,
-            Err(Errno::EXIST) => return Err(Error::AlreadyDownloaded),
-            Err(err) => return Err(storage_error(err)),
+        {
+            // Serialize only the commit point with account/mode retirement.
+            // Never hold this gate while transferring, hashing, or syncing.
+            let _publication = crate::playlist_pin_store::PUBLICATION_GATE.lock().unwrap();
+            live()?;
+            match fs::renameat_with(&dir, STAGE, &dir, name.as_str(), RenameFlags::NOREPLACE) {
+                Ok(()) => partial.published = true,
+                Err(Errno::EXIST) => return Err(Error::AlreadyDownloaded),
+                Err(err) => return Err(storage_error(err)),
+            }
         }
         progress();
         if let Err(err) = fs::fsync(&dir) {

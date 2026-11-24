@@ -21,6 +21,7 @@ use crate::{
     output_identity::Installation,
     personal::Command as PersonalCommand,
     personal_bridge::{PersonalHub, Status as PersonalStatus},
+    personal_cache::Listening,
     player::{self, Action, Authority, Change, LocalQueue, LocalTrack, Status},
     quick_add::Ticket as QuickAddTicket,
     socket::{self, Link},
@@ -37,6 +38,7 @@ use std::{
 use tokio::{
     sync::{Semaphore, mpsc, watch},
     task::JoinHandle,
+    time::Instant,
 };
 
 // Auth intents must not compete for admission with the bounded playback queue.
@@ -168,6 +170,9 @@ struct Engine {
     login_store: Result<Arc<LoginStore>, StoreError>,
     retained: Option<Retention>,
     reconnect: Option<Reconnect>,
+    recover_at: Option<Instant>,
+    listening: Listening,
+    saved_skip: usize,
     logouts: Vec<JoinHandle<()>>,
     account: Option<Account>,
     offline: bool,
@@ -196,11 +201,17 @@ impl Engine {
     fn current(&self) -> bool {
         self.epoch == self.shared_epoch.load(Ordering::SeqCst)
     }
+    fn private_audio(&self) -> bool {
+        self.local_store.is_some() || self.online.detached_owner
+    }
+    fn local_transport(&self) -> bool {
+        self.private_audio() || self.online_generation().is_none()
+    }
     fn room_token(&self) -> Option<String> {
         if !self.current() || !self.account.as_ref()?.session.can_access_local() {
             return None;
         }
-        if self.online_generation().is_none() {
+        if self.local_transport() {
             if self.local_store.is_some() || !self.online.detached {
                 return Some(format!(
                     "local:{}:{}:{}",
@@ -227,7 +238,7 @@ impl Engine {
         ))
     }
     fn lyric_seek_before_ms(&self) -> i32 {
-        if self.online_generation().is_none() {
+        if self.local_transport() {
             return 0;
         }
         let Some(state) = self.online.visible() else {
@@ -246,7 +257,7 @@ impl Engine {
     }
     fn can_queue_saved(&self) -> bool {
         self.current()
-            && self.online_generation().is_none()
+            && self.local_transport()
             && !self.online.detached
             && self
                 .account
@@ -254,7 +265,7 @@ impl Engine {
                 .is_some_and(|a| a.session.can_access_local())
     }
     fn queue_order_token(&self) -> Option<String> {
-        let order = if self.online_generation().is_none() && !self.online.detached {
+        let order = if self.local_transport() && !self.online.detached {
             let upcoming = &self.local.entries[self.local.upcoming_start()..];
             (upcoming.len() > 1).then_some(self.local_revision)?
         } else {
@@ -292,7 +303,7 @@ impl Engine {
         if !self.offline && self.socket.as_ref().is_some_and(|s| !s.events.is_empty()) {
             return;
         }
-        let local = self.online_generation().is_none() && !self.online.detached;
+        let local = self.local_transport() && !self.online.detached;
         if self.queue_order_token().as_deref() != Some(basis) {
             return;
         }
@@ -399,6 +410,7 @@ impl Engine {
     }
     fn reset(&mut self, epoch: u64) {
         self.cancel_reconnect();
+        self.recover_at = None;
         self.cancel_login();
         self.clear_output();
         if let Some(retained) = self.retained.take() {
@@ -459,6 +471,8 @@ impl Engine {
         self.socket = None;
         self.online = Online::default();
         self.local = LocalQueue::default();
+        self.listening = Listening::default();
+        self.saved_skip = 0;
         self.local_store = None;
         self.local_status = Status::Ok;
         self.action_status = "";
@@ -485,31 +499,27 @@ impl Engine {
         let mode = self.mode.clone();
         mode.apply(self.epoch, |desired, serial| {
             self.cancel_reconnect();
+            self.recover_at = None;
             if desired {
-                self.persist_fallback();
+                self.set_offline(true);
+                self.save_mode(true, None);
             } else {
+                let was_manual = std::mem::replace(&mut self.offline, false);
+                if was_manual {
+                    self.save_mode(false, None);
+                }
                 self.online.superseded = false;
-                if self.offline
-                    || self
-                        .account
-                        .as_ref()
-                        .is_some_and(|a| a.session.is_offline())
-                {
-                    self.set_offline(true);
+                if self.account.as_ref().is_some_and(|a| a.session.is_offline()) {
                     self.start_reconnect(serial);
                 } else {
                     self.connect();
                 }
             }
         });
-        if !self.offline
-            && self.reconnect.is_none()
-            && self
-                .account
-                .as_ref()
-                .is_some_and(|a| a.session.is_offline() && !a.session.is_local_only())
+        if !self.offline && self.reconnect.is_none() && self.recover_at.is_none()
+            && self.account.as_ref().is_some_and(|a| a.session.is_offline() && !a.session.is_local_only())
         {
-            self.persist_fallback();
+            self.automatic_fallback();
         }
     }
     fn cancel_reconnect(&mut self) {
@@ -539,6 +549,15 @@ impl Engine {
         let store = self.login_store.clone();
         self.action_status = "";
         let task = tokio::spawn(async move {
+            // The manual preference write must settle before reading the cold
+            // grant. Keep the network fence closed until validation succeeds.
+            if let Some(prior_writes) = prior_writes {
+                tokio::select! {
+                    biased;
+                    _ = mode.cancelled(serial) => return,
+                    done = prior_writes => if done.is_err() { return },
+                }
+            }
             let result = if cold {
                 let (Some(profile), Ok(store)) = (profile, store) else {
                     return;
@@ -594,17 +613,6 @@ impl Engine {
                 result.map(|r| r.map(|()| Rejoined::Existing))
             };
             if let Some(result) = result {
-                // A preceding Work offline write must not reactivate its slot
-                // after we open networking. Drain through that intent first.
-                if result.is_ok()
-                    && let Some(prior_writes) = prior_writes
-                {
-                    tokio::select! {
-                        biased;
-                        _ = mode.cancelled(serial) => return,
-                        done = prior_writes => if done.is_err() { return },
-                    }
-                }
                 let _ = replies
                     .send(Reply::Reconnect {
                         epoch,
@@ -634,35 +642,13 @@ impl Engine {
                     if !self.current() {
                         return;
                     }
-                    let cold = matches!(&rejoined, Rejoined::Cold(..));
-                    let was_manual = self.offline;
-                    let profile = match &rejoined {
-                        Rejoined::Cold(_, profile) => Some(profile.clone()),
-                        Rejoined::Existing => self.retained.as_ref().and_then(Retention::profile),
-                    };
-                    let mut staged = None;
-                    if was_manual
-                        && self.retained.is_some()
-                        && (profile.is_some() || self.login_store.is_ok())
-                    {
-                        match self
-                            .login_store
-                            .as_deref()
-                            .map_err(|e| *e)
-                            .and_then(|store| store.stage_active_mode(profile.as_ref()))
-                        {
-                            Ok(mode) if !cold || mode.is_some() => staged = mode,
-                            Ok(_) | Err(StoreError::InvalidCredential) if cold => {
-                                self.expire();
-                                return;
-                            }
-                            _ => {
-                                self.action_status = "Working offline";
-                                return;
-                            }
+                    self.recover_at = None;
+                    if let Rejoined::Cold(account, profile) = rejoined {
+                        let profile = self.retained.as_ref().and_then(Retention::profile).unwrap_or(profile);
+                        if !self.slot_active(&profile) {
+                            self.expire();
+                            return;
                         }
-                    }
-                    if let Rejoined::Cold(account, _) = rejoined {
                         if let Some(audio) = &mut self.audio {
                             audio.rebind_account_session(account.session.clone());
                         }
@@ -671,9 +657,6 @@ impl Engine {
                         }
                     }
                     self.set_offline(false);
-                    if was_manual {
-                        self.save_mode(false, staged);
-                    }
                 });
             }
             Err(e)
@@ -685,15 +668,21 @@ impl Engine {
             {
                 self.expire();
             }
-            Err(_) => self.persist_fallback(),
+            Err(_) => self.automatic_fallback(),
         }
     }
-    fn persist_fallback(&mut self) {
-        if self.offline && self.socket.is_none() {
+    fn automatic_fallback(&mut self) {
+        if self.offline || self.account.is_none() {
             return;
         }
-        self.set_offline(true);
-        self.save_mode(true, None);
+        if let Some(a) = &self.account {
+            a.session.set_offline(true);
+        }
+        self.cancel_login();
+        self.leave_link();
+        self.socket = None;
+        self.recover_at = Some(Instant::now() + Duration::from_secs(15));
+        self.publish_access();
     }
     fn set_offline(&mut self, offline: bool) {
         self.offline = offline;
@@ -737,7 +726,7 @@ impl Engine {
             return;
         };
         // Network state and the persisted manual preference differ. Publish
-        // only explicit choices (or exhaustion), scoped to the exact keyring slot.
+        // only explicit choices, scoped to the exact keyring slot.
         let staged = staged.or_else(|| {
             let profile = retained.profile()?;
             self.login_store.as_ref().ok()?.stage_mode(&profile).ok()
@@ -922,7 +911,7 @@ impl Engine {
         // offline visit. Serialize it ahead of an opening snapshot queued
         // concurrently; any resulting cursor is eligible for claim repair,
         // never reinterpreted as a new command sent to another owner.
-        let local_transport = self.online_generation().is_none()
+        let local_transport = self.local_transport()
             && match &command {
                 Command::GuardedToggle(token)
                 | Command::Guarded(
@@ -965,6 +954,7 @@ impl Engine {
                 if self.local.replace(queue, index, false) == Change::Start {
                     self.online.detached = false;
                     self.online.detached_owner = false;
+                    self.saved_skip = 0;
                     self.cancel_work();
                     self.stop();
                     self.local_store = Some(store);
@@ -1041,7 +1031,7 @@ impl Engine {
         }
     }
     fn wants_pause(&self) -> bool {
-        if self.online_generation().is_some() {
+        if !self.local_transport() {
             self.online.wants_pause()
         } else if self.local_store.is_some() {
             self.local.desired
@@ -1054,6 +1044,14 @@ impl Engine {
                     .is_some_and(|c| c.desired_playing)
         }
     }
+    fn retire_private_audio(&mut self) {
+        self.cancel_work();
+        self.stop();
+        self.online.detached = false;
+        self.online.detached_owner = false;
+        self.local = LocalQueue::default();
+        self.local_store = None;
+    }
     fn toggle(&mut self) {
         self.action(if self.wants_pause() {
             Action::Pause
@@ -1062,7 +1060,12 @@ impl Engine {
         });
     }
     fn action(&mut self, action: Action) {
-        if self.online_generation().is_some() {
+        let explicit_online = self.online_generation().is_some() && matches!(action,
+            Action::Play { .. } | Action::Enqueue { .. } | Action::SelectDevice(_) | Action::RenameDevice { .. });
+        if explicit_online && self.private_audio() && !matches!(action, Action::Enqueue { .. } | Action::RenameDevice { .. }) {
+            self.retire_private_audio();
+        }
+        if explicit_online || !self.local_transport() {
             if !self.online.reconciling_claim()
                 || matches!(
                     action,
@@ -1074,6 +1077,7 @@ impl Engine {
             return;
         }
         if self.local_store.is_some() || (!self.online.detached && !self.local.entries.is_empty()) {
+            self.saved_skip = 0;
             if self.local.desired
                 && self.local.current().is_some()
                 && let Some(audio) = &self.audio
@@ -1086,15 +1090,63 @@ impl Engine {
             self.detached_action(action);
         }
     }
+    fn record_local_listening(&mut self) {
+        use crate::api::{catalog::{CatalogItem, CatalogKind, Coverage}, library::HistoryEntry};
+        let Some(audio) = &self.audio else { return };
+        let (event_id, origin, id, title, album_id, album_name, artists, duration) = if self.local_store.is_some() {
+            let (Some(entry), Some(visit)) = (self.local.current(), self.local.occurrence.as_ref()) else { return };
+            let track = &entry.track;
+            let artists = track.music.credits.iter().map(|c| crate::api::catalog::ArtistCredit {
+                id: match &c.target { Some(crate::pages::Route::Artist(id)) => id.clone(), _ => String::new() },
+                name: c.name.clone(),
+            }).collect();
+            let album_id = track.music.album.as_ref().and_then(|c| match &c.target { Some(crate::pages::Route::Album(id)) => Some(id.clone()), _ => None }).unwrap_or_default();
+            (visit.clone(), "offline", track.id.clone(), track.title.clone(), album_id, track.album_name.clone(), artists, track.duration)
+        } else if self.online.detached {
+            let (Some(state), Some(cursor)) = (self.online.native.state(), self.online.native.cursor()) else { return };
+            let Some(visit) = &cursor.occurrence else { return };
+            let Some(track) = state.queue.iter().find(|row| row.key == cursor.key) else { return };
+            // Match the server event for the same already-shared visit.
+            let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+            hash.update(self.online.projection.session_id().unwrap_or_default().as_bytes());
+            hash.update(b"\0");
+            hash.update(visit.as_bytes());
+            let digest: String = hash.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            let artists = track.artists.iter().map(|a| crate::api::catalog::ArtistCredit {
+                id: a.id.clone().unwrap_or_default(), name: a.name.clone(),
+            }).collect();
+            (format!("v3:{digest}"), "online", track.id.clone(), track.name.clone(), track.album_id.clone(), track.album_name.clone(), artists, track.duration)
+        } else {
+            self.listening.suspend();
+            return;
+        };
+        let facts = audio.facts();
+        let sample = audio.run_identity().map(|run| (run, (facts.elapsed * 1_000.0) as u64));
+        if self.listening.observe(&event_id, sample) {
+            self.personal.record_local(self.epoch, HistoryEntry {
+                id: event_id,
+                played_at: time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).expect("UTC timestamp"),
+                origin: Some(origin.into()), received_at: None, metadata_missing: false,
+                track: CatalogItem {
+                    kind: CatalogKind::Track, id, name: title, artists, genres: vec![], album_id, album_name,
+                    album_type: String::new(), release_date: String::new(), relation: String::new(),
+                    duration_ms: (duration * 1_000.0) as u64, disc_number: 0, track_number: 0,
+                    has_audio: true, coverage: Coverage::default(),
+                }
+            });
+        }
+    }
+
     fn tick_saved(&mut self) {
         if self.local.desired && self.media.is_none() && self.audio.is_some() {
             let audio = self.audio.as_mut().unwrap();
             if let Some(status) = audio.failure() {
                 self.local.elapsed = audio.facts().elapsed;
-                self.local.desired = false;
-                self.local_status = status;
-                self.stop_local();
+                self.saved_failure(status);
                 return;
+            }
+            if audio.has_started() {
+                self.saved_skip = 0;
             }
             self.tick_saved_crossfade();
             let facts = self.audio.as_ref().unwrap().facts();
@@ -1104,6 +1156,20 @@ impl Engine {
             }
         }
     }
+    fn saved_failure(&mut self, status: Status) {
+        if self.saved_skip > 0 {
+            self.saved_skip -= 1;
+            if self.local.advance(false) == Change::Start {
+                self.local_change(Change::Start);
+                return;
+            }
+        }
+        self.saved_skip = 0;
+        self.local.desired = false;
+        self.local_status = status;
+        self.stop_local();
+    }
+
     fn local_change(&mut self, change: Change) {
         if change != Change::Invalid {
             self.local_revision = self.local_revision.wrapping_add(1);
@@ -1252,6 +1318,7 @@ impl Engine {
             .take()
             .and_then(crossfade::Lookahead::into_playing);
         let change = self.local.advance(true);
+        self.saved_skip = if change == Change::Start { self.local.entries.len() - 1 } else { 0 };
         if change == Change::Start
             && self.crossfade_enabled.load(Ordering::Acquire)
             && overlap.is_some()
@@ -1459,8 +1526,7 @@ impl Engine {
                 if let Some(input) = input {
                     self.start_saved(Some(input));
                 } else {
-                    self.local.desired = false;
-                    self.local_status = Status::Load;
+                    self.saved_failure(Status::Load);
                 }
             }
             Reply::Media {
@@ -1498,10 +1564,6 @@ impl Engine {
     }
     fn explicit_offline(&self) -> bool {
         self.offline
-            || self
-                .account
-                .as_ref()
-                .is_some_and(|a| a.session.is_offline())
     }
     fn tick_with_event(&mut self, event: Option<socket::Event>) {
         let requested_epoch = self.shared_epoch.load(Ordering::SeqCst);
@@ -1525,12 +1587,21 @@ impl Engine {
                 return;
             }
         }
+        if !self.offline && self.reconnect.is_none()
+            && self.recover_at.is_some_and(|at| Instant::now() >= at)
+        {
+            self.recover_at = None;
+            if let Some(serial) = self.mode.begin_automatic(self.epoch) {
+                self.start_reconnect(serial);
+            }
+        }
+        self.record_local_listening();
         self.tick_online(event);
     }
     fn publish(&self) {
         let mut p = PlayerView {
             offline: self.offline,
-            local_playback: self.online_generation().is_none(),
+            local_playback: self.local_transport(),
             reconnecting: self.reconnect.is_some()
                 || (!self.offline
                     && !self.online.superseded
@@ -1950,6 +2021,11 @@ where
         if attempt == AUTH_ATTEMPTS || !result.as_ref().is_err_and(|e| e.can_retry_restore()) {
             return Some(result);
         }
+        tokio::select! {
+            biased;
+            _ = &mut cancelled => return None,
+            _ = tokio::time::sleep(Duration::from_millis(250 << (attempt - 1))) => {},
+        }
     }
     unreachable!("authentication attempts must be positive")
 }
@@ -2063,6 +2139,9 @@ pub fn start(
                 login_store,
                 retained: None,
                 reconnect: None,
+                recover_at: None,
+                listening: Listening::default(),
+                saved_skip: 0,
                 logouts: vec![],
                 account: None,
                 offline: false,
@@ -2278,6 +2357,9 @@ mod tests {
             login_store: Err(StoreError::Config),
             retained: None,
             reconnect: None,
+            recover_at: None,
+            listening: Listening::default(),
+            saved_skip: 0,
             logouts: vec![],
             account: None,
             offline: false,
@@ -2722,7 +2804,7 @@ mod tests {
                 status: 401,
             }),
         });
-        assert!(e.offline && e.account.is_none() && e.socket.is_none());
+        assert!(!e.offline && e.account.is_none() && e.socket.is_none());
         assert!(e.access.borrow().is_none());
         assert!(session.is_offline()); // never reopened the expired internet credential
     }
@@ -2784,7 +2866,7 @@ mod tests {
         e.login = Some(tokio::spawn(std::future::pending()));
         session.set_offline(true); // simulate UI fence with a full command queue
         e.tick();
-        assert!(e.offline && e.socket.is_none() && e.login.is_none());
+        assert!(!e.offline && e.socket.is_none() && e.login.is_none());
         assert!(e.access.borrow().as_ref().unwrap().offline);
         e.shared_epoch.store(8, Ordering::SeqCst); // logout message was never delivered
         e.tick();
@@ -2837,7 +2919,7 @@ mod tests {
         assert!(!e.offline && session.is_offline());
         e.mode.request(&access, false);
         e.tick();
-        assert!(e.offline && session.is_offline() && e.socket.is_none());
+        assert!(!e.offline && session.is_offline() && e.socket.is_none());
         let serial = e.reconnect.as_ref().unwrap().serial;
         e.reply(Reply::Reconnect {
             epoch: 7,
@@ -2890,6 +2972,7 @@ mod tests {
             assert_eq!(e.room_token(), token);
             assert_eq!(e.local.current().unwrap().track.id, "saved");
             assert!(session.is_offline() && session.can_access_local() && e.socket.is_none());
+            assert!(!e.offline && e.recover_at.is_some());
             assert!(e.retained.as_ref().unwrap().profile().is_some());
             assert!(e.access.borrow().as_ref().unwrap().offline);
         }

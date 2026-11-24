@@ -45,12 +45,15 @@ mod pages;
 mod personal;
 #[path = "../src/personal_bridge.rs"]
 mod personal_bridge;
+#[path = "../src/personal_cache.rs"]
+mod personal_cache;
 #[path = "../src/playback_sync.rs"]
 mod playback_sync;
 #[path = "../src/player.rs"]
 mod player;
 #[path = "../src/playlist_browser.rs"]
 mod playlist_browser;
+#[cfg(test)]
 #[path = "../src/playlist_observations.rs"]
 mod playlist_observations;
 #[path = "../src/playlist_pin_store.rs"]

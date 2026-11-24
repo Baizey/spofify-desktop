@@ -37,7 +37,7 @@ use crate::{
 // Bound each response, not the total number of membership occurrences. Audio
 // storage and playback limits are independent of collection metadata.
 const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
-const ROOT: &str = "spofify-collections-v1";
+const ROOT: &str = "spofify-collections-v2";
 const INDEX: &str = "index.json";
 const STAGE: &str = ".partial";
 const ADMISSION: &str = ".save-lock";
@@ -124,12 +124,14 @@ pub async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> {
 
 /// Legacy v1 collections omit the source ID. Only callers with a known source
 /// may recover its membership, using its exact account-scoped playlist key.
+#[cfg(test)]
 pub(crate) struct LegacyPlaylist {
     pub(crate) title: String,
     pub(crate) kind: PlaylistKind,
     pub(crate) tracks: Vec<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn legacy_playlist(
     access: &Access,
     playlist_key: &str,
@@ -142,6 +144,7 @@ pub(crate) fn legacy_playlist(
 
 /// Load the legacy snapshots of already identified source playlists in one
 /// index read. Keys are exact account-scoped hashes, not lookup labels.
+#[cfg(test)]
 pub(crate) fn legacy_playlists(
     access: &Access,
     source_by_key: &HashMap<String, String>,
@@ -403,7 +406,7 @@ pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSum
                 for item in &tracks {
                     if !item.has_audio || !seen.insert(&item.id) { continue; }
                     check_live(access)?;
-                    if let Err(err) = store.download(&access.api, &access.session, item).await {
+                    if let Err(err) = store.download_for_access(access, item).await {
                         handle_track_error(err)?;
                     }
                 }
@@ -1447,7 +1450,7 @@ impl ManifestState<PlaylistTracks> {
                     Err(offline::Error::NotDownloaded) => {
                         // Only absence permits a transfer. A winner of the
                         // no-overwrite download race must still pass the read.
-                        let download = store.download(&access.api, &access.session, item).await;
+                        let download = store.download_for_access(access, item).await;
                         live()?;
                         match download {
                             Ok(_) => (), // Download already verified, probed and committed.
@@ -1495,6 +1498,7 @@ struct StoredCollection {
     tracks: Vec<String>,
 }
 impl StoredCollection {
+    #[cfg(test)]
     fn into_playlist(self) -> Option<LegacyPlaylist> {
         let kind = match self.kind {
             Kind::Manual => PlaylistKind::Manual,
@@ -1529,6 +1533,7 @@ impl Index {
             .into_iter()
             .filter(move |entry| entry.scope == scope)
     }
+    #[cfg(test)]
     fn playlist(self, scope: &str, playlist_key: &str) -> Option<LegacyPlaylist> {
         self.in_scope(scope)
             .find(|entry| entry.key == playlist_key)?

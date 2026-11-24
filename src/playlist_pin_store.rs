@@ -30,7 +30,7 @@ use crate::{
 /// Serializes the final publication check and rename with external epoch/network changes.
 pub(crate) static PUBLICATION_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const ROOT: &str = "spofify-playlist-pins-v1";
+const ROOT: &str = "spofify-playlist-pins-v2";
 const STAGE: &str = ".partial";
 const VERSION: u8 = 1;
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);

@@ -146,7 +146,7 @@ pub async fn page(access: &Access) -> Result<Page, ApiError> {
         })
         .collect::<Vec<_>>();
     Ok(Page {
-        title: "Saved".into(),
+        title: "Downloads".into(),
         kind: "offline".into(),
         total: Some(rows.len() as u64),
         rows,
@@ -170,7 +170,7 @@ pub async fn save(access: &Access, row: &Row) -> Result<(), ApiError> {
         _ = network.changed() => Err(error(offline::Error::Offline)),
         result = async {
             let store = OfflineStore::open_for_download(OfflineStore::open_default).await.map_err(error)?;
-            match store.download(&access.api, &access.session, item).await {
+            match store.download_for_access(access, item).await {
                 Ok(_) | Err(offline::Error::AlreadyDownloaded) => Ok(()),
                 Err(err) => Err(error(err)),
             }

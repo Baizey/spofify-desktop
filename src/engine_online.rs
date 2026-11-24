@@ -276,20 +276,15 @@ impl Engine {
                     .account
                     .as_ref()
                     .is_some_and(|a| !a.session.is_revoked());
-            self.online.detached_owner =
-                eligible && !self.online.gap && !demoted && self.online.is_owner(&self.device_id);
-            self.online.detached = self.online.detached_owner
-                && self.local_store.is_none()
-                && self
-                    .online
-                    .native
-                    .state()
-                    .is_some_and(|state| !state.queue.is_empty());
-            if !eligible {
-                self.retire_saved_claim();
-                self.stop();
-            } else if !self.online.detached_owner {
-                self.isolate_confirmed_follower();
+            if eligible && !self.private_audio() {
+                self.online.detached_owner = !self.online.gap && !demoted && self.online.is_owner(&self.device_id)
+                    && self.online.native.state().is_some_and(|state| !state.queue.is_empty());
+                self.online.detached = self.online.detached_owner;
+                if !self.online.detached_owner {
+                    self.isolate_confirmed_follower();
+                }
+            } else if !eligible && !self.account.as_ref().is_some_and(|a| !a.session.is_revoked() && self.private_audio()) {
+                self.retire_private_audio();
             }
         }
         self.online.projection.clear_pending();
@@ -321,12 +316,16 @@ impl Engine {
         if let EventKind::ClaimRequested(reply) = event.kind {
             if self.network_allowed() {
                 self.drive_native(NativeEvent::Tick);
-                let _ = reply.send(self.current_claim());
+                // Recovery reopens data services, not the private playback
+                // queue. Never export offline commands or cursor/queue edits.
+                let _ = reply.send(if self.private_audio() || self.online.detached {
+                    Claim { local: None, reattach_basis: None }
+                } else { self.current_claim() });
             }
             return;
         }
         if self.link() != Link::Connected(generation) {
-            if self.link() != Link::Superseded
+            if self.link() != Link::Superseded && !self.private_audio()
                 && self
                     .account
                     .as_ref()
@@ -377,8 +376,11 @@ impl Engine {
                 self.online.gap = false;
                 self.online.repair_sent = false;
                 self.online.refresh_at = None;
-                self.online.detached = false;
-                self.online.detached_owner = false;
+                let private = self.private_audio();
+                if !private {
+                    self.online.detached = false;
+                    self.online.detached_owner = false;
+                }
                 if fresh {
                     self.disconnect_personal();
                     self.online.transport = Some(generation);
@@ -389,6 +391,10 @@ impl Engine {
                     self.personal.begin(self.epoch, generation);
                 }
                 self.update_bulk_device();
+                if private {
+                    if fresh { self.publish_access(); }
+                    return;
+                }
                 if let Some(cursor) = newer_cursor
                     && self.begin_claim_reconcile(generation, &snapshot, cursor)
                 {
@@ -466,6 +472,7 @@ impl Engine {
                 // Acceptance means we can assume the role, not that audio can
                 // start. Native initialization opens devices only after commit.
                 if self.network_allowed()
+                    && !self.private_audio()
                     && self.audio.is_some()
                     && let Some(socket) = &self.socket
                 {
@@ -642,15 +649,14 @@ impl Engine {
                 }
             }
             Link::Exhausted => {
-                self.persist_fallback();
+                self.automatic_fallback();
             }
             Link::Superseded => {
                 self.online.superseded = true;
-                self.online.detached = false;
-                self.online.detached_owner = false;
                 self.socket = None;
-                self.cancel_work();
-                self.stop();
+                if !self.private_audio() {
+                    self.retire_private_audio();
+                }
                 self.publish_access();
             }
             _ => {}
@@ -680,6 +686,14 @@ impl Engine {
                 .flatten()
             {
                 self.apply_media(request, source);
+            }
+        }
+        if let Some(generation) = self.transport_generation() {
+            if self.personal.account_refresh_due(self.epoch, generation) && let Some(socket) = &self.socket {
+                let _ = socket.sync(generation);
+            }
+            if let Some(command) = self.personal.refresh_due(self.epoch, generation) {
+                self.send_personal(self.epoch, generation, &command);
             }
         }
         if self.online.gap
@@ -796,10 +810,10 @@ impl Engine {
         } else {
             action
         };
-        if self.online.detached
-            && self.online_generation().is_none()
+        if self.online.detached && self.local_transport()
             && let Some(action) = action.wire()
         {
+            self.online.detached_owner = true;
             self.drive_native(NativeEvent::Detached(action));
         }
     }
@@ -842,7 +856,8 @@ impl Engine {
         if self.local_store.is_some() || self.online.claim_pending.is_some() {
             return;
         }
-        let connected = self.online_generation();
+        if self.private_audio() && !matches!(event, NativeEvent::Tick | NativeEvent::Detached(_) | NativeEvent::Media(..)) { return; }
+        let connected = if self.private_audio() { None } else { self.online_generation() };
         let known_demoted = connected
             .and_then(|generation| self.socket.as_ref()?.last_owner(generation))
             == Some(false);
@@ -1121,7 +1136,7 @@ impl Engine {
         }
         if self.online.detached || self.online.is_owner(&self.device_id) {
             if p.status.is_empty() && self.online.native.failed() {
-                p.status = "Audio could not start on this desktop.";
+                p.status = if self.online.detached { "Audio unavailable offline." } else { "Audio could not start on this desktop." };
             }
             if let Some(audio) = &self.audio
                 && self.online.native.cursor().is_some_and(|actual| {
@@ -1280,11 +1295,10 @@ mod tests {
             kind: EventKind::ClaimRequested(tx),
             personal_stamp: None,
         }));
-        let hello = rx.await.unwrap().local.unwrap();
-        assert!(hello.cursor.desired_playing);
-        // The user tapped Pause on the local view before the opening
-        // snapshot became available to the actor.
+        let hello = rx.await.unwrap();
+        assert!(hello.local.is_none() && hello.reattach_basis.is_none());
         let room = e.room_token().unwrap();
+        let run = e.audio.as_ref().unwrap().run_identity();
         let mut snapshot = socket::Snapshot {
             session_id: "room".into(),
             connection_id: "test-connection".into(),
@@ -1298,7 +1312,7 @@ mod tests {
                 }),
             },
             devices: vec![],
-            player: hello,
+            player: e.saved_claim().unwrap(),
             observation: None,
             server_time_ms: 100,
         };
@@ -1306,100 +1320,37 @@ mod tests {
             snapshot.player.cursor.occurrence = Some("other-visit".into());
         }
         peer.set_opening_snapshot(&snapshot, wins);
-        let deliver = |e: &mut Engine, snapshot: socket::Snapshot| {
-            e.tick_with_event(Some(Event {
-                generation: 11,
-                kind: EventKind::Snapshot(snapshot),
-                personal_stamp: None,
-            }))
-        };
-        peer.events
-            .try_send(Event {
-                generation: 11,
-                kind: EventKind::Snapshot(snapshot.clone()),
-                personal_stamp: None,
-            })
-            .unwrap();
         if drops {
             peer.link.send_replace(Link::Disconnected);
-            e.tick();
-            assert!(e.online.detached);
-            assert_eq!(
-                e.online.native.cursor().unwrap().occurrence.as_deref(),
-                Some("other-visit")
-            );
-            assert!(!e.online.native.cursor().unwrap().desired_playing);
-            assert!(e.local_store.is_none());
-            assert!(!e.audio.as_ref().unwrap().facts().playing);
-            assert!(peer.read().is_none());
-            return;
         }
+        e.tick_with_event(Some(Event {
+            generation: 11,
+            kind: EventKind::Snapshot(snapshot),
+            personal_stamp: None,
+        }));
+        assert_eq!(e.audio.as_ref().unwrap().run_identity(), run);
+        assert!(e.audio.as_ref().unwrap().facts().playing);
+        assert!(e.local_store.is_some() && e.online.claim_pending.is_none());
+        if !drops { assert!(e.online_generation().is_some()); }
         e.command(crate::engine::Command::GuardedToggle(room).scoped(e.epoch));
         assert!(!e.audio.as_ref().unwrap().facts().playing);
-        assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
-        let frames: Vec<_> = std::iter::from_fn(|| peer.read()).collect();
-        let reconciles: Vec<_> = frames
-            .iter()
-            .filter(|f| f["type"] == "reconcileClaim")
-            .collect();
-        if wins {
-            assert_eq!(reconciles.len(), 1);
-            assert_eq!(reconciles[0]["basis"]["revision"], 1);
-            assert_eq!(reconciles[0]["cursor"]["desiredPlaying"], false);
-            assert!(!e.wants_pause()); // no flash of a stale playing view
-            assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
-            assert!(e.online.claim_pending.is_some());
-            snapshot.revision += 1;
-            snapshot.player.cursor =
-                serde_json::from_value(reconciles[0]["cursor"].clone()).unwrap();
-            deliver(&mut e, snapshot);
-            assert!(e.online.claim_pending.is_none());
-            assert!(
-                !e.online
-                    .projection
-                    .confirmed()
-                    .unwrap()
-                    .cursor
-                    .desired_playing
-            );
-            assert!(
-                e.online.primary.is_none(),
-                "the accepted pause must not start a decoder"
-            );
-            assert!(!std::iter::from_fn(|| peer.read()).any(|f| f["type"] == "reconcileClaim"));
-        } else {
-            assert!(reconciles.is_empty());
-            assert!(e.online.claim_pending.is_none());
-            assert!(
-                e.online
-                    .projection
-                    .confirmed()
-                    .unwrap()
-                    .cursor
-                    .desired_playing
-            );
-            assert_eq!(
-                e.online.projection.owner().unwrap().device_id.as_deref(),
-                Some("other")
-            );
-        }
-        assert!(e.local_store.is_none());
-        assert_eq!(e.audio.as_ref().unwrap().run_identity(), None);
+        assert!(!e.wants_pause());
         assert!(samples.by_ref().take(320).all(|v| v == 0.0));
+        assert!(!std::iter::from_fn(|| peer.read()).any(|f| f["type"] == "reconcileClaim" || f["action"]["type"] == "pause"));
     }
 
     #[tokio::test]
-    async fn winning_claim_reconciles_pause_from_delayed_snapshot_without_restarting() {
+    async fn shared_owner_snapshot_does_not_restart_private_pcm_or_replay_pause() {
         hello_then_local_pause(true, false).await;
     }
 
     #[tokio::test]
-    async fn losing_claim_discards_post_hello_pause_and_never_sends_it() {
+    async fn remote_owner_snapshot_does_not_retire_private_playback() {
         hello_then_local_pause(false, false).await;
     }
 
     #[tokio::test]
-    async fn losing_initial_snapshot_fences_saved_pcm_even_if_link_already_dropped() {
+    async fn disconnected_opening_snapshot_does_not_retire_private_playback() {
         hello_then_local_pause(false, true).await;
     }
 
@@ -1430,25 +1381,8 @@ mod tests {
             api,
             session: session.clone(),
         });
-        e.local_store = Some(OfflineStore::open(&dir.0).unwrap());
-        assert_eq!(
-            e.local.replace(
-                vec![LocalTrack {
-                    id: "offline-a".into(),
-                    duration: 1.0,
-                    ..Default::default()
-                }],
-                0,
-                false
-            ),
-            Change::Start
-        );
         let (socket, mut peer) = socket::Socket::test_peer(session, 12);
         e.socket = Some(socket);
-        assert_eq!(
-            e.current_claim().local.unwrap().current().unwrap().id,
-            "offline-a"
-        );
         let state = State {
             queue: vec![socket::Track {
                 id: "shared-b".into(),

@@ -828,7 +828,7 @@ fn collection(context: &Arc<PlaybackContext>) -> PlaybackSelection {
     }
 }
 
-fn track_selection(id: &str, context: Option<&Arc<PlaybackContext>>) -> PlaybackSelection {
+pub(crate) fn track_selection(id: &str, context: Option<&Arc<PlaybackContext>>) -> PlaybackSelection {
     PlaybackSelection::Track {
         track: TrackSelection {
             id: id.into(),

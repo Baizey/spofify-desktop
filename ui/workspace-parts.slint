@@ -64,7 +64,7 @@ export component WorkspaceRail inherits Rectangle {
             Divider { }
             Eyebrow { text: "ON THIS DEVICE"; color: Theme.muted; height: root.short ? 19px : 25px; letter-spacing: root.compact ? 0.6px : 1.2px; }
             saved := Action {
-                text: "Saved offline"; icon: root.compact && Theme.density > 1.05 ? "" : "↓"; leading: true; quiet: true; min-width: 0px;
+                text: "Downloads"; icon: root.compact && Theme.density > 1.05 ? "" : "↓"; leading: true; quiet: true; min-width: 0px;
                 selected: root.kind == "offline" || root.kind == "saved-collection";
                 accessible-description: self.selected ? "Current section" : "Music saved on this device";
                 enabled: !root.locked; clicked => { root.navigate("offline"); }

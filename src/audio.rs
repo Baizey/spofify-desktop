@@ -98,7 +98,7 @@ impl Run {
         self.pcm.fenced_out.load(Ordering::Acquire)
     }
     fn ended(&self) -> bool {
-        self.sink.empty() && self.pcm.exhausted.load(Ordering::Acquire)
+        self.sink.empty() && self.pcm.exhausted.load(Ordering::Acquire) && self.pcm.failure().is_none()
     }
     fn can_continue(&self) -> bool {
         self.authority.is_valid()
@@ -1238,6 +1238,28 @@ mod tests {
         assert_eq!(audio.failure(), None);
         assert!(audio.facts().ended && audio.has_started());
         assert_eq!(audio.facts().elapsed, duration);
+    }
+
+    #[test]
+    fn disconnected_stream_drains_written_audio_then_reports_failure_not_eof() {
+        let mut file = fixture_file();
+        let frames = RATE * 3;
+        let prefix = RATE;
+        file.write_all(&wav_header(frames)).unwrap();
+        file.write_all(&8192i16.to_le_bytes().repeat(prefix as usize)).unwrap();
+        let source = AudioInput::failed_stream(file, 44 + u64::from(frames) * 2, 44 + u64::from(prefix) * 2);
+        let (mut audio, mut output) = async_output(1);
+        assert_eq!(audio.play("fenced".into(), source, 0.0, 3.0, Authority::offline()), Status::Ok);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut audible = false;
+        while audio.failure().is_none() && Instant::now() < deadline {
+            audible |= pump(&mut output, 10) != 0.0;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(audible);
+        assert!(audio.facts().elapsed > 0.5);
+        assert!(!audio.facts().ended);
+        assert_eq!(audio.failure(), Some(Status::Load));
     }
 
     #[test]

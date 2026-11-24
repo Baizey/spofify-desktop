@@ -36,7 +36,9 @@ sys.dont_write_bytecode = True
 import wire_ui
 from audio_smoke import child
 from fixture import Failure, check, private_env, stop
-from native import REMEMBER_LOGIN, SAVED, Window, login_options, mcp_class, wait
+from native import REMEMBER_LOGIN, Window, login_options, mcp_class, wait
+
+SAVED = "Downloads"
 from remember_login import SERVER, disabled_login, interrupted, sign_out, store_metadata
 from remember_login_output import close_toplevel
 from workspace_checks import open_manual, open_playlists
@@ -319,8 +321,8 @@ def closeable_desktop(binary, root, env, pixels, mcp_port):
 
 
 def seed_saved_track(env, origin, account):
-    """An existing v1 download in the fixture’s private data directory."""
-    root = Path(env["XDG_DATA_HOME"]) / "spofify-downloads-v1"
+    """A v2 download using the existing server audio representation."""
+    root = Path(env["XDG_DATA_HOME"]) / "spofify-downloads-v2"
     root.mkdir(mode=0o700, exist_ok=True)
     pcm = BytesIO()
     with wave.open(pcm, "wb") as stream:
@@ -510,12 +512,40 @@ def offline_receipt(port):
             thread.join()
 
 
+def seed_personal_cache(env, origin, account):
+    root = Path(env["XDG_DATA_HOME"]) / "spofify-personal-v2"
+    root.mkdir(mode=0o700, exist_ok=True)
+    scope = sha256(origin.encode() + b"\0" + account.encode()).hexdigest()
+    capabilities = dict(editMetadata=True, editEntries=True, editDefinition=False, play=True,
+                        copyToManual=False, delete=True, addTracks=True)
+    summary = dict(id="fixture-mix", name="Fixture Mix", description="", kind="manual",
+                   countState="exact", evaluationState=None, trackCount=3, availableCount=3,
+                   capabilities=capabilities, revision=1, updatedAt="2026-01-01T00:00:00Z")
+    unsaved = dict(summary, id="fixture-unsaved", name="Unopened Mix", trackCount=5)
+    song = dict(kind="track", id=wire_ui.TRACK["id"], name=wire_ui.TRACK_NAME, genres=[],
+                artists=[dict(id="", name="Synthetic Artist")], album_id="", album_name="Synthetic Album",
+                album_type="", release_date="", relation="", duration_ms=1000, disc_number=1, track_number=1,
+                has_audio=True, coverage=dict(tracks=0, inLibrary=0, albums=0))
+    rows = [dict(id=f"entry_{i}", position=i, track=track) for i, track in enumerate([
+        song, dict(song, id="missing", name="Unavailable Track"), song])]
+    event = dict(id="event-fixture", played_at="2026-01-01T00:00:00Z", track=song, origin="offline",
+                 received_at=None, metadata_missing=False)
+    record = dict(snapshot=dict(playlists=[summary, unsaved], recent=[]), snapshot_at=1,
+                  details={summary["id"]: dict(playlist=dict(summary=summary, definition=None, token="fixture",
+                                                             rows=rows, stale=False), refreshed_at=1)},
+                  local_recent=[event])
+    with os.fdopen(os.open(root / scope, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
+        json.dump(record, file)
+
+
 def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port):
     profile = Path(env["XDG_CONFIG_HOME"]) / "spofify-desktop-login-v1" / "login.json"
     profile.parent.mkdir(mode=0o700)
     metadata = json.dumps(dict(version=1, origin=origin, username=SEEDED_USER, active=SEEDED_SLOT))
     profile.touch(mode=0o600, exist_ok=False)
     profile.write_text(metadata)
+    seed_saved_track(env, origin, SEEDED_ACCOUNT)
+    seed_personal_cache(env, origin, SEEDED_ACCOUNT)
 
     print("SEEDED OFFLINE: cold admission, visual evidence and observed wire silence only; "
           "not Work offline persistence or Go online", flush=True)
@@ -529,8 +559,23 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         check(keyring() == ["lookup"], "cold seeded launch did not read exactly one active grant")
         if pixels:
             window.pixels("01-seeded-cold-offline-account")
+        window.click("History")
+        window.section("History")
+        window.title(wire_ui.TRACK_NAME)
+        window.click("Playlists")
+        window.section("Playlists")
+        window.click("Unopened Mix")
+        window.title("Unopened Mix")
+        window.find("Playlist details not saved on this device.", roles=("Text",))
+        window.click("Playlists")
+        window.click("Fixture Mix")
+        window.title("Fixture Mix")
+        window.title("Unavailable Track")
+        if pixels:
+            window.pixels("02-seeded-local-playlist-mixed-availability")
         window.click(SAVED)
         window.section(SAVED)
+        window.title(wire_ui.TRACK_NAME)
         window.absent("Offline mode", roles=("Text",))
         if pixels:
             window.pixels("02-seeded-cold-saved-offline")

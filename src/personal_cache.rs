@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, BufReader, BufWriter, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -44,6 +44,42 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+// Matches the server's v3 per-visit rule: over 30 seconds of actual
+// media progress. A seek or decoder replacement is never counted as progress.
+#[derive(Default)]
+pub(crate) struct Listening {
+    event: String,
+    prior: Option<(u64, u64)>,
+    listened_ms: u64,
+    credited: bool,
+}
+
+impl Listening {
+    pub fn observe(&mut self, event: &str, sample: Option<(u64, u64)>) -> bool {
+        if self.event != event {
+            *self = Self {
+                event: event.into(),
+                ..Self::default()
+            };
+        }
+        if let (Some((old_run, before)), Some((run, now))) = (self.prior, sample)
+            && old_run == run
+        {
+            self.listened_ms = self.listened_ms.saturating_add(now.saturating_sub(before));
+        }
+        self.prior = sample;
+        if self.listened_ms > 30_000 && !self.credited {
+            self.credited = true;
+            return true;
+        }
+        false
+    }
+
+    pub fn suspend(&mut self) {
+        self.prior = None;
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Cache {
     pub snapshot: Option<Arc<Snapshot>>,
@@ -69,6 +105,14 @@ impl Detail {
 }
 
 impl Cache {
+    pub fn snapshot_fresh(&self, now: u64, ttl: Duration) -> bool {
+        self.snapshot.is_some()
+            && self.snapshot_at != 0
+            && now
+                .checked_sub(self.snapshot_at)
+                .is_some_and(|elapsed| elapsed < ttl.as_millis() as u64)
+    }
+
     pub fn projection(&self, route: &Route) -> Option<Page> {
         match route {
             Route::History if self.snapshot.is_some() || !self.local_recent.is_empty() => Some(
@@ -144,6 +188,22 @@ impl Cache {
             }
             true
         });
+    }
+
+    pub fn record(&mut self, play: HistoryEntry) -> bool {
+        let same_event = |p: &HistoryEntry| p.id == play.id && p.origin == play.origin;
+        if self.local_recent.iter().any(same_event)
+            || self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.recent.iter().any(same_event))
+        {
+            return false;
+        }
+        let events = Arc::make_mut(&mut self.local_recent);
+        events.insert(0, play);
+        events.truncate(40);
+        true
     }
 
     pub fn recent(&self, online: &[HistoryEntry]) -> Vec<HistoryEntry> {
@@ -244,13 +304,21 @@ impl Scope {
 #[derive(Clone)]
 pub(crate) struct Writer {
     live: Arc<AtomicBool>,
+    session: Arc<Mutex<crate::api::Session>>,
     updates: watch::Sender<Option<(u64, Cache)>>,
-    written: watch::Receiver<u64>,
+    written: watch::Receiver<(u64, bool)>,
 }
 impl Writer {
-    pub fn start(scope: Scope, epoch: u64, current: Arc<AtomicU64>) -> Self {
+    pub fn start(
+        scope: Scope,
+        epoch: u64,
+        current: Arc<AtomicU64>,
+        session: crate::api::Session,
+    ) -> Self {
+        let session = Arc::new(Mutex::new(session));
+        let admitted = session.clone();
         let (updates, mut rx) = watch::channel::<Option<(u64, Cache)>>(None);
-        let (done, written) = watch::channel(0);
+        let (done, written) = watch::channel((0, true));
         let live = Arc::new(AtomicBool::new(true));
         let running = live.clone();
         tokio::spawn(async move {
@@ -258,10 +326,17 @@ impl Writer {
                 let Some((serial, cache)) = rx.borrow_and_update().clone() else {
                     continue;
                 };
-                let (scope, current, running) = (scope.clone(), current.clone(), running.clone());
+                let (scope, current, running, admitted) = (
+                    scope.clone(),
+                    current.clone(),
+                    running.clone(),
+                    admitted.clone(),
+                );
                 let result = tokio::task::spawn_blocking(move || {
                     let live = || {
-                        running.load(Ordering::SeqCst) && current.load(Ordering::SeqCst) == epoch
+                        running.load(Ordering::SeqCst)
+                            && current.load(Ordering::SeqCst) == epoch
+                            && !admitted.lock().unwrap().is_revoked()
                     };
                     if !live() {
                         return Ok(());
@@ -269,20 +344,26 @@ impl Writer {
                     scope.write(&storage::open_default(ROOT)?, &cache, live)
                 })
                 .await;
-                if !matches!(result, Ok(Ok(()))) {
+                let saved = matches!(result, Ok(Ok(())));
+                if !saved {
                     eprintln!("Unable to persist the account library cache");
                 }
-                done.send_replace(serial);
+                done.send_replace((serial, saved));
             }
         });
         Self {
             live,
+            session,
             updates,
             written,
         }
     }
+    pub fn rebind(&self, session: crate::api::Session) {
+        *self.session.lock().unwrap() = session;
+    }
+
+    /// Caller holds PUBLICATION_GATE before the hub state lock.
     pub fn retire(&self) {
-        let _publication = PUBLICATION_GATE.lock().unwrap();
         self.live.store(false, Ordering::SeqCst);
     }
     pub fn publish(&self, cache: &Cache) {
@@ -291,13 +372,16 @@ impl Writer {
             *state = Some((serial, cache.clone()));
         });
     }
-    pub async fn flush(mut self) {
+    pub async fn flush(mut self) -> bool {
         let target = self
             .updates
             .borrow()
             .as_ref()
             .map_or(0, |(serial, _)| *serial);
-        let _ = self.written.wait_for(|serial| *serial >= target).await;
+        self.written
+            .wait_for(|(serial, _)| *serial >= target)
+            .await
+            .is_ok_and(|done| done.1)
     }
 }
 
@@ -320,6 +404,19 @@ mod tests {
             .unwrap(),
             metadata_missing: true,
         }
+    }
+
+    #[test]
+    fn qualification_counts_only_movement_within_one_decoder_run() {
+        let mut progress = Listening::default();
+        assert!(!progress.observe("one", Some((1, 1_000))));
+        assert!(!progress.observe("one", Some((1, 11_000))));
+        progress.suspend();
+        assert!(!progress.observe("one", Some((2, 90_000))));
+        assert!(!progress.observe("one", Some((2, 110_000))));
+        assert!(progress.observe("one", Some((2, 110_001))));
+        assert!(!progress.observe("one", Some((2, 120_000))));
+        assert!(!progress.observe("two", Some((2, 120_010))));
     }
 
     #[test]

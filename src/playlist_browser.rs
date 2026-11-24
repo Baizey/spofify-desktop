@@ -1,34 +1,39 @@
-//! Offline projection for the normal Playlists and Saved routes. Observations
-//! describe the source; pin intent and saved snapshots never stand in for it.
+//! Downloaded collection manifests. Normal playlist browsing uses personal_cache.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 use crate::{
-    api::{
-        ApiError,
-        library::{PlaylistCapabilities, PlaylistKind},
-    },
-    collections::{self, LegacyPlaylist},
+    api::{ApiError, library::PlaylistKind},
+    collections,
     desk::Access,
-    offline::Download,
-    pages::{self, Page, PlaylistMetadata, Route, Row, RowKey},
-    playlist_observations::{self, Membership, Summary},
+    pages::{Page, Route, Row, RowKey},
     playlist_pin_store::{Provenance, Record, Store, Target},
     playlist_pins::Controller,
 };
 
+#[cfg(test)]
+use crate::{
+    api::library::PlaylistCapabilities, collections::LegacyPlaylist, offline::Download,
+    pages::{self, PlaylistMetadata}, playlist_observations::{self, Membership, Summary},
+};
+
+#[cfg(test)]
 const UNAVAILABLE: ApiError = ApiError {
     message: "This playlist isn't available offline.",
     status: 404,
     expired: false,
 };
 
+#[cfg(test)]
 const MODE_CHANGED: ApiError = ApiError {
     message: "The connection mode changed.",
     status: 0,
     expired: false,
 };
 
+#[cfg(test)]
 const READ_ONLY: PlaylistCapabilities = PlaylistCapabilities {
     edit_metadata: false,
     edit_entries: false,
@@ -39,6 +44,7 @@ const READ_ONLY: PlaylistCapabilities = PlaylistCapabilities {
     add_tracks: false,
 };
 
+#[cfg(test)]
 pub(crate) async fn offline_page(access: &Access, route: &Route) -> Result<Page, ApiError> {
     let mode = access.session.network_changes();
     let generation = *mode.borrow();
@@ -95,6 +101,7 @@ pub(crate) async fn offline_page(access: &Access, route: &Route) -> Result<Page,
     Ok(page)
 }
 
+#[cfg(test)]
 async fn apply_list_playability(
     access: &Access,
     observed: &playlist_observations::ObservedPlaylists,
@@ -151,17 +158,20 @@ async fn apply_list_playability(
     Ok(page)
 }
 
+#[cfg(test)]
 fn list_candidates(members: &[Members<'_>]) -> HashSet<String> {
     let unique: HashSet<_> = members.iter().flat_map(Members::track_ids).collect();
     unique.into_iter().map(str::to_owned).collect()
 }
 
+#[cfg(test)]
 fn mark_playable(page: &mut Page, members: &[Members<'_>], available: &HashMap<String, Download>) {
     for (row, membership) in page.rows.iter_mut().zip(members) {
         row.playable = membership.has_local_track(available);
     }
 }
 
+#[cfg(test)]
 async fn list_legacy(
     access: &Access,
     eligible: Vec<String>,
@@ -185,10 +195,12 @@ async fn list_legacy(
     .await
 }
 
+#[cfg(test)]
 fn allows_legacy(id: &str, pin: Option<&Record>) -> bool {
     pin.is_none_or(|r| r.wanted && r.target.id == id && r.committed.is_none())
 }
 
+#[cfg(test)]
 async fn compatibility(
     access: &Access,
     id: &str,
@@ -213,6 +225,7 @@ async fn compatibility(
     .await
 }
 
+#[cfg(test)]
 fn list_projection<'a>(
     summaries: impl Iterator<Item = &'a Summary>,
     is_deleted: impl Fn(&str) -> bool,
@@ -248,6 +261,7 @@ fn list_projection<'a>(
     }
 }
 
+#[cfg(test)]
 fn display_title(name: &str) -> String {
     let label = pages::ui_text(name);
     if label.is_empty() {
@@ -257,6 +271,7 @@ fn display_title(name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn playlist_row(id: &str, name: &str, count: Option<u64>) -> Row {
     Row {
         id: id.into(),
@@ -269,6 +284,7 @@ fn playlist_row(id: &str, name: &str, count: Option<u64>) -> Row {
     }
 }
 
+#[cfg(test)]
 fn read_only_metadata(summary: &Summary) -> PlaylistMetadata {
     PlaylistMetadata {
         id: summary.id.clone(),
@@ -282,12 +298,14 @@ fn read_only_metadata(summary: &Summary) -> PlaylistMetadata {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct Observation<'a> {
     summary: Option<&'a Summary>,
     complete: Option<&'a Membership>,
     deleted: bool,
 }
 
+#[cfg(test)]
 enum Members<'a> {
     Observed(&'a Membership, PlaylistKind),
     Saved {
@@ -325,6 +343,7 @@ fn apply_saved_provenance(page: &mut Page, id: &str, kind: PlaylistKind, source:
     }
 }
 
+#[cfg(test)]
 impl Members<'_> {
     fn track_ids(&self) -> impl Iterator<Item = &str> {
         let (observed, saved) = match self {
@@ -390,14 +409,17 @@ impl Members<'_> {
     }
 }
 
+#[cfg(test)]
 fn needs_compatibility(summary: Option<&Summary>, complete: Option<&Membership>) -> bool {
     !summary.is_some_and(|s| known_empty(s) || complete.is_some_and(|m| usable_membership(s, m)))
 }
 
+#[cfg(test)]
 fn known_empty(summary: &Summary) -> bool {
     summary.kind == PlaylistKind::Manual && summary.track_count == Some(0)
 }
 
+#[cfg(test)]
 fn usable_membership(summary: &Summary, membership: &Membership) -> bool {
     if membership.revision > summary.revision {
         return false;
@@ -413,6 +435,7 @@ fn usable_membership(summary: &Summary, membership: &Membership) -> bool {
         || summary.track_count == Some(0)
 }
 
+#[cfg(test)]
 fn source_members<'a>(
     id: &str,
     summary: Option<&'a Summary>,
@@ -456,6 +479,7 @@ fn source_members<'a>(
     Members::Unknown
 }
 
+#[cfg(test)]
 fn detail_projection<'a>(
     id: &str,
     observed: Observation<'a>,
@@ -558,7 +582,7 @@ fn merge(legacy: Vec<Row>, pins: Vec<Record>) -> Vec<Row> {
 pub(crate) async fn saved_rows(access: &Access) -> Result<(Vec<Row>, Option<ApiError>), ApiError> {
     let disk_access = access.clone();
     let pins = disk(move || Store::open_default(&disk_access)?.scan(&disk_access)).await;
-    let legacy = collections::list(access, pins.is_ok()).await;
+    let legacy = collections::list(access, false).await;
     access.api.authenticated_account(&access.session)?;
     let mut warning = legacy.as_ref().err().copied();
     let mut legacy = legacy.unwrap_or_default();
@@ -602,13 +626,10 @@ pub(crate) async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> 
         }
         page
     } else {
-        match collections::detail(access, id).await {
-            Err(e) if e.status == 404 => Page {
-                title: target.title.clone(),
-                kind: "saved-collection".into(),
-                ..Page::default()
-            },
-            other => other?,
+        Page {
+            title: target.title.clone(),
+            kind: "saved-collection".into(),
+            ..Page::default()
         }
     };
     page.saved_pin = Some(target);

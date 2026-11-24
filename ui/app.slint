@@ -285,7 +285,7 @@ export component AppWindow inherits Window {
     property <bool> is-settings: page-kind == "appearance" || page-kind == "settings" || page-kind == "account";
     property <bool> is-now: page-kind == "now";
     property <bool> saved-view: page-kind == "offline" || page-kind == "saved-collection";
-    property <bool> local-mode: manual-offline || reconnecting || local-playback;
+    property <bool> local-mode: manual-offline || reconnecting;
     out property <bool> can-seek-lyrics: signed-in && can-seek && !local-mode
         && !editor-open && !compact-queue-open && is-now && lyric-seek-before-ms > 0;
     property <bool> queue-controls: local-playback ? queue-rows.length > 0 : !local-mode && remote-controls;
@@ -304,7 +304,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    function flip-offline() { root.page-action("offline", root.reconnecting || !root.manual-offline ? "on" : "off"); }
+    function flip-offline() { root.page-action("offline", root.manual-offline ? "off" : "on"); }
     function edit-form(mode: string) {
         root.form-return = mode;
         root.form-name = "";
@@ -941,7 +941,7 @@ export component AppWindow inherits Window {
                             if !root.playlist-detail && root.page-status != "": Notice { text: root.page-status; error: root.page-error; }
                             if !root.playlist-detail && root.page-busy && root.page-status == "": Caption { text: "Loading…"; }
                             if root.is-settings: Settings {
-                                account: root.account-label; offline: root.local-mode; reconnecting: root.reconnecting;
+                                account: root.account-label; offline: root.manual-offline; reconnecting: root.reconnecting;
                                 crossfade-enabled: root.crossfade-enabled; crossfade-status: root.crossfade-status;
                                 music-storage: root.music-storage;
                                 open-downloads => { shell.route("offline"); }
@@ -962,7 +962,8 @@ export component AppWindow inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error:
+                            if !root.is-history && !root.is-settings && root.browse-rows.length == 0 && !root.page-busy && !root.page-error
+                                && (!root.playlist-detail || root.page-status == ""):
                                 EmptyState {
                                     glyph: Copy.mark(root.page-kind);
                                     title: root.is-search && root.query == "" ? "What would you like to hear?"
@@ -1557,7 +1558,7 @@ export component AppWindow inherits Window {
             waveform: root.waveform;
             can-seek: root.can-seek && (!root.local-mode || root.local-playback);
             playing: root.wants-pause; can-toggle: root.can-control && (!root.local-mode || root.local-playback);
-            can-skip: root.local-mode ? root.local-playback && root.can-control : root.remote-controls;
+            can-skip: root.local-playback ? root.can-control : root.remote-controls;
             on-now-page: root.is-now; queue-open: root.queue-shown; offline: root.local-mode;
             layered: root.compact;
             shuffle: root.shuffle; repeat-mode: root.repeat-mode; modes-enabled: root.queue-controls;

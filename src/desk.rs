@@ -965,9 +965,8 @@ fn row_actions(
             if can_use_account && r.playable && r.playback.is_some() {
                 v.insert(0, "queue");
             }
-            if !pinned && can_use_account {
-                v.push("pin-playlist");
-            }
+            // Download the playlist from its detail page, after the complete
+            // projection is available for offline browsing.
             if can_use_account {
                 v.extend(
                     PLAYLIST_EDITS
@@ -2102,28 +2101,17 @@ impl Browser {
             return;
         }
         let route = self.route.clone();
-        let cached = a.personal.cached_page(a.epoch, &route);
-        let (status, next, detail_live, unavailable) = a.personal.read(|status, replica| {
-            let detail_live = replica.playlist().is_some_and(|p| !p.stale);
-            let page = (status.epoch == a.epoch)
-                .then(|| pages::personal_projection(&route, replica))
-                .flatten();
-            (
-                status,
-                page,
-                detail_live,
-                matches!(route, Route::Playlist(_)) && replica.playlist_unavailable(),
-            )
-        });
+        let crate::personal_bridge::BrowseView { status, page, live, detail_live, unavailable, confirmed } =
+            a.personal.browse_view(a.epoch, &route, self.pending.as_ref().map(|p| (p.before, &p.effect)));
         let prior = self.personal_view.replace(status);
         let online = !a.offline && !a.session.is_offline();
         let prior_ready = self.personal_ready;
         self.personal_ready = online
             && status.epoch == a.epoch
             && status.link == Link::Ready
-            && next.is_some()
+            && live
             && (!matches!(route, Route::Playlist(_)) || detail_live);
-        let models_changed = if let Some(next) = cached.or(next) {
+        let models_changed = if let Some(next) = page {
             if *self.page == next {
                 false
             } else {
@@ -2168,12 +2156,13 @@ impl Browser {
                 self.personal_write_error_render(message.into(), render_models);
                 return;
             }
-            if let Some(observed) = a.personal.observed(before, &pending.effect) {
+            if let Some(observed) = confirmed {
+                let ordering = matches!(pending.effect, Effect::Move { .. });
                 self.pending = None;
                 self.writing = false;
                 self.busy = false;
                 self.edit_basis = None;
-                self.scoped_ui(clear_form_owned);
+                if !ordering { self.scoped_ui(clear_form_owned); }
                 if let Some(next) = observed {
                     self.trail.landed(&next);
                     self.visit(Navigation::Untracked(next));
@@ -2220,7 +2209,7 @@ impl Browser {
                 )
             } else if refused && !self.personal_ready {
                 (
-                    "The playlist request was not sent. Open it again to retry.",
+                    "The playlist couldn't refresh.",
                     true,
                 )
             } else if self.personal_ready {
@@ -2232,14 +2221,14 @@ impl Browser {
                 )
             } else if status.link == Link::Disconnected {
                 (
-                    "The account library is disconnected. Reconnect to refresh it.",
+                    "The account library is offline.",
                     true,
                 )
             } else if self.personal_due.is_some() {
                 ("Waiting for the account library…", false)
             } else {
                 (
-                    "The account library did not finish loading. Open this page again to retry.",
+                    "The account library couldn't refresh.",
                     true,
                 )
             };
@@ -2519,7 +2508,7 @@ impl Browser {
                     .is_err()
             {
                 self.error = true;
-                self.message = "The playlist request was not sent. Open it again to retry.".into();
+                self.message = "The playlist couldn't refresh.".into();
             }
         }
         self.personal_due = None;
@@ -2642,10 +2631,11 @@ impl Browser {
             && !self.page.kind.is_empty()
             && !matches!(&next, Route::Search(query) if query.trim().is_empty());
         if !retain_view {
-            self.page = Arc::new(Page {
-                local_audio: true,
-                ..Page::default()
-            });
+            let mut page = access.personal.cached_page(access.epoch, &next).unwrap_or_default();
+            page.local_audio = true;
+            page.playback = None;
+            for row in &mut page.rows { row.playable = false; }
+            self.page = Arc::new(page);
         }
         // The old source is already fenced. Keep its last painted view only
         // until the local projection is ready, then publish once rather than
@@ -3011,7 +3001,7 @@ impl Browser {
             return; // The previous online projection may still be painted, but is inert.
         }
         let saved_action = saved_route(&route) && matches!(op.as_str(), "play" | "queue");
-        let local_action = saved_action || page.local_audio && offline && matches!(op.as_str(), "play" | "queue");
+        let local_action = offline && (saved_action || page.local_audio && matches!(op.as_str(), "play" | "queue"));
         if route.personal()
             && !self.personal_ready
             && !(unpin
@@ -3076,7 +3066,7 @@ impl Browser {
                 return;
             }
             let selection = match row {
-                Some(r) => r.playback,
+                Some(r) => r.playback.or_else(|| (saved_action && r.kind == "track").then(|| pages::track_selection(&r.id, None))),
                 None => page.playback.clone(),
             };
             if let Some(s) = selection {
@@ -3111,7 +3101,12 @@ impl Browser {
             self.render(false);
             let (tx, serial) = (self.results.clone(), self.serial);
             self.task = Some(tokio::spawn(async move {
-                let result = Update::PinChanged(pins.set(&a, target, wanted).await);
+                let saved = !wanted || a.personal.save_playlist_details(a.epoch, &target.id).await;
+                let result = Update::PinChanged(if saved {
+                    pins.set(&a, target, wanted).await
+                } else {
+                    Err(unavailable("Playlist details could not be saved on this device."))
+                });
                 let _ = tx.send(Delivery { serial, result }).await;
             }));
             return;
@@ -3176,6 +3171,13 @@ impl Browser {
             known.push((route.clone(), page.clone()));
         }
         self.task = Some(tokio::spawn(async move {
+            if save && let Route::Playlist(id) = &route
+                && !a.personal.save_playlist_details(a.epoch, id).await
+            {
+                let result = Update::Changed(Err(unavailable("Playlist details could not be saved on this device.")));
+                let _ = tx.send(Delivery { serial, result }).await;
+                return;
+            }
             let result = if local_action {
                 Update::Local(
                     local_playback(&a, &route, &page, idx, local_target, &known, op == "queue")
@@ -4252,7 +4254,7 @@ mod tests {
         let row = &list.rows[0];
         assert_eq!(
             row_actions(&list, row, false, true, false),
-            ["queue", "pin-playlist", "rename", "rules", "delete"]
+            ["queue", "rename", "rules", "delete"]
         );
         assert_eq!(
             row_actions(&list, row, false, true, true),
@@ -4270,10 +4272,7 @@ mod tests {
         unavailable.capabilities.edit_definition = false;
         unavailable.capabilities.delete = false;
         let list = pages::personal_list(&Route::Playlists, &[unavailable]);
-        assert_eq!(
-            row_actions(&list, &list.rows[0], false, true, false),
-            ["pin-playlist"]
-        );
+        assert!(row_actions(&list, &list.rows[0], false, true, false).is_empty());
     }
 
     #[test]

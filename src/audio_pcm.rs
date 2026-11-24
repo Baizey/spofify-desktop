@@ -33,6 +33,7 @@ const DECODING: u8 = 0;
 const EOF: u8 = 1;
 const MEDIA: u8 = 2;
 const LOAD: u8 = 3;
+const DRAIN_LOAD: u8 = 4;
 
 #[derive(Clone, Copy)]
 pub(super) struct Format {
@@ -132,6 +133,7 @@ impl State {
         match self.terminal.load(Ordering::Acquire) {
             MEDIA => Some(Status::Media),
             LOAD => Some(Status::Load),
+            DRAIN_LOAD if self.exhausted.load(Ordering::Acquire) => Some(Status::Load),
             _ => None,
         }
     }
@@ -278,10 +280,6 @@ impl State {
             if !live() {
                 return;
             }
-            if source_failed() {
-                self.publish(LOAD);
-                return;
-            }
             // Backpressure is worker-only, checked before any further decoder I/O.
             if bounded && self.queue.lock().unwrap().len() > chunk_len * (QUEUE_CHUNKS - 1) {
                 thread::sleep(POLL);
@@ -292,7 +290,7 @@ impl State {
             if !live() {
                 return;
             }
-            if source_failed() {
+            if source_failed() && !input.is_stream() {
                 self.publish(LOAD);
                 return;
             }
@@ -308,7 +306,7 @@ impl State {
                 // Some containers finish decoding before the HTTP body/trailer.
                 // Keep EOF provisional until the transfer has really succeeded.
                 let terminal = if input.await_complete(&live).is_err() || source_failed() {
-                    LOAD
+                    if input.is_stream() { DRAIN_LOAD } else { LOAD }
                 } else if partial_frame != 0
                     || (!wrote_pcm && !seek_to_end)
                     || minimum_wave_samples.is_some_and(|minimum| decoded_samples.get() < minimum)
@@ -514,7 +512,7 @@ impl Iterator for Pcm {
                 // protects PCM copies; the decoder and source I/O are outside it.
                 if let Ok(mut queue) = state.queue.try_lock() {
                     let available = queue.len().min(state.format.chunk_len());
-                    if available == 0 && terminal == EOF {
+                    if available == 0 && matches!(terminal, EOF | DRAIN_LOAD) {
                         state.exhausted.store(true, Ordering::Release);
                         return None;
                     }
