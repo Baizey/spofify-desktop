@@ -1146,6 +1146,15 @@ impl PersonalHub {
             let playlist = detail.playlist.clone();
             state.replica.seed_detail(playlist);
         }
+        // A summary update can supersede an individual part set. Release its
+        // retry reservation only when that exact resource request was retired.
+        let pending_before: Vec<_> = if snapshot {
+            state.detail_attempts.keys().filter_map(|id| {
+                Some((id.clone(), state.replica.pending_sync_for(id)?.clone()))
+            }).collect()
+        } else {
+            Vec::new()
+        };
         let at = personal_cache::now_ms();
         let State { replica, quick, cache, .. } = &mut *state;
         let mut cache_changed = false;
@@ -1165,6 +1174,11 @@ impl PersonalHub {
             Ok(mut command) => {
                 quick.observe_scoped(replica);
                 if snapshot {
+                    for (id, previous) in pending_before {
+                        if !state.replica.accepts_sync(&previous) {
+                            state.detail_attempts.remove(&id);
+                        }
+                    }
                     state.status.link = Link::Ready;
                     state.cache.snapshot_at = at;
                     state.account_attempt = None;
@@ -1176,7 +1190,7 @@ impl PersonalHub {
                     }
                     if state.detail_visible || state.cache_binding.is_none() || state.quick.searching() {
                         command = state.prepare_detail(command, at, now);
-                    } else {
+                    } else if command.is_some() {
                         state.replica.defer_detail();
                         command = None;
                     }
@@ -1497,7 +1511,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_complete_detail_refresh_is_fresh_and_mode_fenced() {
-        use crate::{api::{Api, Origin}, pages::Route, personal::{Change, Part}};
+        use crate::{api::{Api, Origin}, pages::Route, personal::{Change, Part, Snapshot}};
         let hub = PersonalHub::default();
         let personal = hub.access();
         let api = Arc::new(Api::new(Origin::parse("http://127.0.0.1:1").unwrap()).unwrap());
@@ -1519,6 +1533,13 @@ mod tests {
                 {"id":"b","position":1,"track":{"kind":"track","id":"same","name":"Song","hasAudio":true,"coverage":{"tracks":1,"inLibrary":1,"albums":1}}}]
         }})).unwrap();
         let PersonalUpdate::Part(part) = part else { unreachable!() };
+        let mut second = part.clone();
+        second.summary.id = "second".into();
+        second.summary.name = "Second".into();
+        let snapshot = |summary: &PlaylistSummary| PersonalUpdate::Snapshot(Snapshot {
+            playlists: vec![part.summary.clone(), summary.clone()], recent: vec![],
+        });
+        hub.receive(1, 2, snapshot(&second.summary)).unwrap();
         let (generation, refresh) = schedule().unwrap();
         assert!(schedule().is_none());
         let (b_generation, b) = personal.watch_playlist(1, Some("second".into())).unwrap();
@@ -1529,14 +1550,27 @@ mod tests {
             more: true, rows: part.rows[..1].to_vec(), ..part.clone()
         })).unwrap().unwrap();
         assert!(matches!(&next_a, PersonalCommand::SyncPlaylist { playlist_id, offset: 1, .. } if playlist_id == "mix"));
-        assert!(personal.cached_page(1, &route).is_none());
+        assert!(personal.cached_page(1, &route).unwrap().rows.is_empty());
         assert!(personal.watch_playlist(1, Some("second".into())).is_none());
         assert!(personal.inspect_playlist_sync(1, generation, &next_a, |_| true).unwrap());
-        let mut second = part.clone();
-        second.summary.id = "second".into();
-        second.summary.name = "Second".into();
+        assert!(hub.receive(1, 2, snapshot(&second.summary)).unwrap().is_none());
+        assert!(personal.inspect_playlist_sync(1, generation, &next_a, |_| true).unwrap());
+        assert!(personal.inspect_playlist_sync(1, b_generation, &b, |_| true).unwrap());
+        // Change only B, while both resources have staged parts. The parked
+        // A continuation stays valid, and B can restart before its old timer.
+        let b_part = hub.receive(1, 2, PersonalUpdate::Part(Part {
+            more: true, rows: second.rows[..1].to_vec(), ..second.clone()
+        })).unwrap().unwrap();
+        let retired_b = Part { offset: 1, rows: second.rows[1..].to_vec(), ..second.clone() };
+        second.summary.revision += 1;
+        let replacement = hub.receive(1, 2, snapshot(&second.summary)).unwrap().unwrap();
+        assert!(matches!(&replacement, PersonalCommand::SyncPlaylist { playlist_id, known: None, offset: 0, .. } if playlist_id == "second"));
+        assert!(personal.inspect_playlist_sync(1, b_generation, &b_part, |_| true).is_none());
+        assert!(personal.inspect_playlist_sync(1, generation, &next_a, |_| true).unwrap());
+        assert!(hub.receive(1, 2, PersonalUpdate::Part(retired_b)).unwrap().is_none());
+        assert!(personal.cached_page(1, &Route::Playlist("second".into())).unwrap().rows.is_empty());
         hub.receive(1, 2, PersonalUpdate::Part(second)).unwrap();
-        assert!(personal.cached_page(1, &route).is_none(), "B must not consume or publish A's staged rows");
+        assert!(personal.cached_page(1, &route).unwrap().rows.is_empty(), "B must not consume or publish A's staged rows");
         hub.receive(1, 2, PersonalUpdate::Part(Part {
             offset: 1, rows: part.rows[1..].to_vec(), ..part.clone()
         })).unwrap();

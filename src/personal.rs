@@ -519,6 +519,14 @@ impl Replica {
         self.expected_sync.as_ref()
     }
 
+    pub(crate) fn pending_sync_for(&self, id: &str) -> Option<&Command> {
+        if self.desired.as_deref() == Some(id) {
+            self.pending_sync()
+        } else {
+            self.background.get(id)?.expected_sync.as_ref()
+        }
+    }
+
     /// The watched playlist was deleted, or the transport ended while an
     /// unconfirmed direct lookup was outstanding. Go has no not-found frame;
     /// this is a display state, not proof that the account lacks the playlist.
@@ -865,20 +873,32 @@ impl Replica {
         {
             return Err(PersonalError);
         }
-        self.background.clear();
-        if self.ready {
-            self.invalidate_details();
-        }
         let capped = Self::summaries_capped(&s.playlists);
+        let previous = self.snapshot.as_ref();
+        let compatible = |id: &str, staged: Option<&Retained>, observed: Option<&PlaylistSummary>| {
+            let before = previous.and_then(|s| s.playlists.iter().find(|p| p.id == id)).or(observed);
+            match s.playlists.iter().find(|p| p.id == id) {
+                Some(current) => staged.map_or_else(
+                    || before.is_none_or(|p| p == current),
+                    |part| part.playlist.summary == *current,
+                ),
+                None => capped || before.is_none() && staged.is_none(),
+            }
+        };
+        self.background.retain(|id, read| compatible(id, read.staged.as_ref(), read.observed.as_ref()));
+        let keep_visible_pull = self.ready && self.expected_sync.is_some()
+            && self.desired.as_deref().is_some_and(|id| compatible(id, self.staged.as_ref(), self.observed.as_ref()));
         if let Some(id) = self.desired.as_deref() {
             let listed = s.playlists.iter().any(|p| p.id == id);
             self.unavailable = !listed
-                && (self.unavailable
-                    || self.unconfirmed_direct
-                    || (!capped && (self.summary(id).is_some() || self.cached(id).is_some())));
+                && (self.unavailable || !keep_visible_pull && (self.unconfirmed_direct
+                    || (!capped && (self.summary(id).is_some() || self.cached(id).is_some()))));
         }
-        self.observed = None;
-        self.unconfirmed_direct = false;
+        if !keep_visible_pull {
+            self.observed = None;
+            self.unconfirmed_direct = false;
+            self.reset_pull();
+        }
         self.details.retain_mut(|d| {
             let Some(p) = s.playlists.iter().find(|p| p.id == d.playlist.summary.id) else {
                 return capped;
@@ -895,9 +915,8 @@ impl Replica {
         });
         sort(&mut s.playlists);
         self.snapshot = Some(s);
-        self.reset_pull();
         self.ready = true;
-        Ok(self.start_watch())
+        Ok(if keep_visible_pull { None } else { self.start_watch() })
     }
 
     fn receive_part(

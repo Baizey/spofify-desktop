@@ -545,7 +545,7 @@ fn navigation_retains_bounded_details_and_ignores_unwatched_parts() {
 }
 
 #[test]
-fn disconnect_and_repair_snapshot_keep_rows_but_force_unknown_token() {
+fn disconnect_invalidates_detail_token_but_unchanged_live_snapshot_retains_it() {
     let mut r = Replica::default();
     watch(&mut r, "p");
     initial(&mut r, 1);
@@ -574,7 +574,7 @@ fn disconnect_and_repair_snapshot_keep_rows_but_force_unknown_token() {
         vec![raw_entry("new", 0)],
         false,
     );
-    assert_eq!(initial(&mut r, 1), sync("p", None, 0));
+    assert_eq!(initial(&mut r, 1), sync("p", Some("v2"), 0));
     assert_eq!(row_ids(&r), ["new"]);
     send(&mut r, json!({"snapshot":{"playlists":[],"recent":[]}}));
     assert!(r.playlist().is_none());

@@ -2578,7 +2578,11 @@ impl Browser {
         self.busy = true;
         self.silent_read = have;
         self.render(changed || !have || !Arc::ptr_eq(&prior_page, &self.page));
+        let known = if saved_route(&next) { self.cache.catalog_pages() } else { Vec::new() };
+        let previous = self.page.clone();
         self.task = Some(tokio::spawn(async move {
+            let history = saved_route(&next).then(|| retained_history(&a)).flatten();
+            let known: Vec<_> = known.iter().map(|(route, page)| (route, page.as_ref())).collect();
             if matches!(next, Route::Search(_)) {
                 tokio::time::sleep(SEARCH_DELAY).await;
             }
@@ -2591,8 +2595,9 @@ impl Browser {
                     Route::SavedCollection(id) => playlist_browser::detail(&a, id).await,
                     _ => pages::load(&a, &next).await,
                 }
-                .map(|mut page| {
-                    page.local_audio = saved_route(&next);
+                .map(|page| if saved_route(&next) {
+                    project_local_page(&next, page, &known, history.as_ref(), Some(&previous))
+                } else {
                     page
                 });
                 let retry = read_retry(attempt, &result);
@@ -2675,27 +2680,7 @@ impl Browser {
                 }
                 _ => Ok(Page::default()),
             }
-            .map(|mut page| {
-                page.local_audio = true;
-                if matches!(
-                    next,
-                    Route::Playlist(_) | Route::SavedCollection(_) | Route::Offline
-                ) {
-                    let items = page
-                        .rows
-                        .iter()
-                        .filter_map(|row| row.item.as_ref())
-                        .map(|item| (item.id.clone(), item.clone()))
-                        .collect();
-                    crate::local_catalog::attach_track_links(
-                        &mut page.rows,
-                        &items,
-                        &known,
-                        history.as_ref(),
-                    );
-                }
-                page
-            });
+            .map(|page| project_local_page(&next, page, &known, history.as_ref(), previous.as_deref()));
             let _ = tx
                 .send(Delivery {
                     serial,
@@ -3231,12 +3216,16 @@ impl Browser {
         if !(route == Route::Offline || access.local() && matches!(route, Route::Playlist(_) | Route::History)) { return; }
         let mode = *access.session.network_changes().borrow();
         let (serial, tx) = (self.serial, self.results.clone());
+        let known = self.cache.catalog_pages();
+        let previous = self.page.clone();
         self.task = Some(tokio::spawn(async move {
+            let history = retained_history(&access);
+            let known: Vec<_> = known.iter().map(|(route, page)| (route, page.as_ref())).collect();
             let page = if route == Route::Offline {
-                downloads_page(&access).await.map(|mut page| { page.local_audio = true; page })
+                downloads_page(&access).await
             } else {
                 cached_local_page(&access, &route).await
-            };
+            }.map(|page| project_local_page(&route, page, &known, history.as_ref(), Some(&previous)));
             let _ = tx.send(Delivery { serial, result: Update::Availability(mode, page) }).await;
         }));
     }
@@ -3584,6 +3573,33 @@ fn catalog_page(
     for row in page.rows.iter_mut().filter(|row| row.item.is_some()) {
         row.local_recording = records.get(&row.id).map(|record| record.recording);
     }
+    page
+}
+
+fn project_local_page(
+    route: &Route,
+    mut page: Page,
+    known: &[(&Route, &Page)],
+    history: Option<&Page>,
+    previous: Option<&Page>,
+) -> Page {
+    page.local_audio = true;
+    if !matches!(route, Route::Playlist(_) | Route::SavedCollection(_) | Route::Offline) {
+        return page;
+    }
+    if let Some(previous) = previous.filter(|p| p.local_audio) {
+        let rows: HashMap<_, _> = previous.rows.iter().filter(|r| r.item.is_some()).map(|r| (&r.key, r)).collect();
+        for row in &mut page.rows {
+            if let Some(old) = rows.get(&row.key).filter(|old| old.item == row.item) {
+                // A verified inventory row has no typed catalog IDs. Keep
+                // already resolved links if the catalog source was evicted.
+                row.music = old.music.clone();
+            }
+        }
+    }
+    let items = page.rows.iter().filter_map(|row| row.item.as_ref())
+        .map(|item| (item.id.clone(), item.clone())).collect();
+    crate::local_catalog::attach_track_links(&mut page.rows, &items, known, history);
     page
 }
 
@@ -4016,6 +4032,38 @@ mod tests {
         );
         position.resolve_keys(&[album]);
         assert_eq!((position.anchor, position.row), (0, -1));
+    }
+
+    #[test]
+    fn downloads_poll_keeps_enriched_navigation_and_does_not_replace_an_unchanged_view() {
+        let track = |id: &str| {
+            let item = crate::api::Item {
+                id: id.into(), name: id.into(), kind: "track".into(),
+                artists: "Artist".into(), album_name: "Album".into(), has_audio: true,
+                duration_ms: 1000, disc_number: 1, track_number: 1,
+            };
+            pages::Row {
+                id: id.into(), key: RowKey::Track(id.into()), kind: "track".into(),
+                item: Some(item), playable: true, ..pages::Row::default()
+            }
+        };
+        let lost = track("deleted");
+        let keep = track("survives");
+        let mut enriched = keep.clone();
+        enriched.music.album = Some(pages::Credit { name: "Album".into(), target: Some(Route::Album("album-id".into())) });
+        enriched.music.credits.push(pages::Credit { name: "Artist".into(), target: Some(Route::Artist("artist-id".into())) });
+        let old_page = project_local_page(&Route::Offline, Page {
+            kind: "offline".into(), total: Some(2), rows: vec![lost.clone(), enriched.clone()], ..Page::default()
+        }, &[], None, None);
+        let raw = Page { rows: vec![lost, keep.clone()], ..old_page.clone() };
+        let unchanged = project_local_page(&Route::Offline, raw, &[], None, Some(&old_page));
+        assert!(unchanged == old_page, "no-op poll must not replace the focused row model");
+        let raw = Page { rows: vec![keep.clone()], total: Some(1), ..old_page.clone() };
+        let changed = project_local_page(&Route::Offline, raw, &[], None, Some(&old_page));
+        assert_eq!(changed.rows.len(), 1);
+        assert_eq!(changed.rows[0].key, keep.key);
+        assert_eq!(track_album(&changed.rows[0]), ("album-id", "Album"));
+        assert_eq!(changed.rows[0].music.credits, enriched.music.credits);
     }
 
     fn step(route: &mut Route, trail: &mut Trail, navigation: Navigation) {
