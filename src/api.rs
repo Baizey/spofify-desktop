@@ -680,7 +680,6 @@ impl Api {
             // No ticket in the URL or upgrade headers: the framing worker sends it in hello.
             let key = generate_key();
             let expected_accept = derive_accept_key(key.as_bytes());
-            let protocol = crate::socket::SUBPROTOCOL;
             let request = self
                 .request_with_method(
                     reqwest::Method::GET,
@@ -691,15 +690,14 @@ impl Api {
                 .header(header::CONNECTION, "Upgrade")
                 .header(header::UPGRADE, "websocket")
                 .header(header::SEC_WEBSOCKET_VERSION, "13")
-                .header(header::SEC_WEBSOCKET_KEY, key)
-                .header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+                .header(header::SEC_WEBSOCKET_KEY, key);
             let response = self
                 .send_inner(request, Some(session), false, true, network_error)
                 .await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 return Err(INVALID_RESPONSE);
             }
-            validate_websocket_upgrade(&response, &expected_accept, protocol)?;
+            validate_websocket_upgrade(&response, &expected_accept)?;
             let upgraded = tokio::time::timeout(SOCKET_TIMEOUT, response.upgrade())
                 .await
                 .map_err(|_| NETWORK)?
@@ -1282,11 +1280,7 @@ impl Api {
     }
 }
 
-fn validate_websocket_upgrade(
-    response: &Response,
-    expected_accept: &str,
-    protocol: &str,
-) -> Result<(), ApiError> {
+fn validate_websocket_upgrade(response: &Response, expected_accept: &str) -> Result<(), ApiError> {
     let headers = response.headers();
     let connection_upgrade = headers.get_all(header::CONNECTION).iter().any(|value| {
         value.to_str().is_ok_and(|value| {
@@ -1299,8 +1293,8 @@ fn validate_websocket_upgrade(
         || !connection_upgrade
         || !single_header(headers, header::UPGRADE)
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
-        || single_header(headers, header::SEC_WEBSOCKET_PROTOCOL).map(HeaderValue::as_bytes)
-            != Some(protocol.as_bytes())
+        // RFC 6455: the server cannot select a subprotocol the client did not offer.
+        || headers.contains_key(header::SEC_WEBSOCKET_PROTOCOL)
         || single_header(headers, header::SEC_WEBSOCKET_ACCEPT).map(HeaderValue::as_bytes)
             != Some(expected_accept.as_bytes())
         || headers.contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
@@ -2372,9 +2366,8 @@ mod tests {
         use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
         let key = request.header("sec-websocket-key").unwrap();
         let accept = derive_accept_key(key.as_bytes());
-        let protocol = crate::socket::SUBPROTOCOL;
         format!(
-            "HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: {protocol}\r\n{extra}\r\n"
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
         ).into_bytes()
     }
 
@@ -2406,10 +2399,9 @@ mod tests {
         assert_eq!(ticket.header("x-csrf-token"), Some("synthetic"));
         assert_eq!(ticket.header("content-type"), Some("application/json"));
         assert_eq!(socket.first_line, "GET /api/me/player/socket HTTP/1.1");
-        assert_eq!(
-            socket.header("sec-websocket-protocol"),
-            Some("spofify.account-state.v3")
-        );
+        assert_eq!(socket.header("connection"), Some("Upgrade"));
+        assert_eq!(socket.header("upgrade"), Some("websocket"));
+        assert!(socket.header("sec-websocket-protocol").is_none());
         assert_eq!(socket.header("sec-websocket-version"), Some("13"));
         assert!(socket.body.is_empty());
         assert!(socket.header("x-csrf-token").is_none());
@@ -2423,6 +2415,54 @@ mod tests {
             assert_eq!(request.header("cookie"), Some("spofify_session=synthetic"));
             assert_eq!(request.header("origin"), Some(wire.origin.as_str()));
         }
+    }
+
+    #[test]
+    fn account_upgrade_checks_headerless_rfc_handshake() {
+        let response = hyper::Response::builder()
+            .version(hyper::Version::HTTP_11)
+            .status(101)
+            .header("Connection", "keep-alive, UpGrAdE")
+            .header("Upgrade", "WebSocket")
+            .header("Sec-WebSocket-Accept", "expected")
+            .body("")
+            .unwrap();
+        let check = |response: hyper::Response<&'static str>| {
+            validate_websocket_upgrade(&response.into(), "expected")
+        };
+        assert_eq!(check(response.clone()), Ok(()));
+
+        let mut http10 = response.clone();
+        *http10.version_mut() = hyper::Version::HTTP_10;
+        assert_eq!(check(http10), Err(INVALID_RESPONSE));
+        for name in [
+            header::CONNECTION,
+            header::UPGRADE,
+            header::SEC_WEBSOCKET_ACCEPT,
+        ] {
+            let mut missing = response.clone();
+            missing.headers_mut().remove(&name);
+            assert_eq!(check(missing), Err(INVALID_RESPONSE), "missing {name}");
+        }
+        for (name, value) in [
+            (header::SEC_WEBSOCKET_PROTOCOL, "unsolicited"),
+            (header::SEC_WEBSOCKET_EXTENSIONS, "permessage-deflate"),
+            (header::SEC_WEBSOCKET_ACCEPT, "expected"),
+            (header::CONTENT_LENGTH, "0"),
+            (header::TRANSFER_ENCODING, "chunked"),
+        ] {
+            let mut extra = response.clone();
+            extra
+                .headers_mut()
+                .append(&name, HeaderValue::from_static(value));
+            assert_eq!(check(extra), Err(INVALID_RESPONSE), "extra {name}");
+        }
+        let mut wrong_accept = response;
+        wrong_accept.headers_mut().insert(
+            header::SEC_WEBSOCKET_ACCEPT,
+            HeaderValue::from_static("wrong"),
+        );
+        assert_eq!(check(wrong_accept), Err(INVALID_RESPONSE));
     }
 
     #[tokio::test]
@@ -2439,25 +2479,7 @@ mod tests {
         let ticket = json(&format!(r#"{{"ticket":"{SOCKET_TICKET}"}}"#));
         let wire = Wire::with_responder(vec![ticket.clone(), Vec::new()], |request, response| {
             if response.is_empty() {
-                socket_reply(request, "Sec-WebSocket-Extensions: permessage-deflate\r\n")
-            } else {
-                response
-            }
-        });
-        let api = wire.api();
-        let session = api.test_session();
-        assert_eq!(
-            failure(api.account_upgrade(&session).await),
-            INVALID_RESPONSE
-        );
-        assert_eq!(wire.recorded().len(), 2);
-
-        let wire = Wire::with_responder(vec![ticket.clone(), Vec::new()], |request, response| {
-            if response.is_empty() {
-                String::from_utf8(socket_reply(request, ""))
-                    .unwrap()
-                    .replace("spofify.account-state.v3", "spofify.account-state.v1")
-                    .into_bytes()
+                socket_reply(request, "Sec-WebSocket-Protocol: unsolicited\r\n")
             } else {
                 response
             }

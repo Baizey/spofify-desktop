@@ -594,6 +594,7 @@ def login_options(window, *, required=False):
 
 @contextmanager
 def native_observer(api):
+    """Historical v1 playback observer, not usable against the v3 socket."""
     # Go pings every five seconds and closes an unresponsive socket. Keep the
     # real read-only peer reading (and replying) while the main thread drives UI.
     with Peer(api) as peer:

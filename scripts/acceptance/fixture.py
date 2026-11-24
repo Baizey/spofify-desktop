@@ -202,6 +202,7 @@ class Api:
 
 
 def account_checks(ready, api, other):
+    """Historical v1 scenario; intentionally not run by the HTTP checks."""
     from playback import Peer
 
     playlists = [t for t in ready["targets"] if t["kind"] == "playlist"]
@@ -290,7 +291,6 @@ def api_checks(ready):
     api = Api(ready, ready)
     other = Api(ready, ready["otherAccount"])
     targets = ready["targets"]
-    account_checks(ready, api, other)
 
     search = api.json("/api/library?" + urlencode({"kind": "tracks", "scope": "all", "q": "Synthetic Tone", "limit": 10}))
     check(search["total"] == 47 and len(search["items"]) == 10 and

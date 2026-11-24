@@ -86,7 +86,7 @@ class Receipt:
 
 
 class Frames:
-    """Read complete text messages from a passive copy of a WebSocket stream."""
+    """Historical v1 recorder; not valid evidence for the v3 account socket."""
     def __init__(self, receipt, *, client):
         self.receipt = receipt
         self.client = client

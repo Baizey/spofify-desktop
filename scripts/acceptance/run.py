@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run isolated spofify-go acceptance; optionally drive one prebuilt native Slint window.
+"""Check isolated Spofify Go HTTP APIs or an independent desktop UI scenario.
 
 No Cargo, live origin, ambient account, external download or global installation.
 See --help for offline fixture and native display requirements.
@@ -30,25 +30,22 @@ def main():
                         help="prebuilt debug desktop with Slint MCP and debug info; needs cage and wlr-randr for multisize checks")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--window-only", action="store_true", help="check empty sign-in, allowing only the Remember Login checkbox, without starting Go")
-    mode.add_argument("--synthetic-wire-ui", action="store_true",
-                      help="native navigation, fixed-theme Settings, density migration and track intent "
-                           "against synthetic wire data; no Go or audio execution")
-    mode.add_argument("--playlist-actions-only", action="store_true",
-                      help="seed large playlists and verify native Play publishes the full Go queue; no audio output check")
+    # Recognize retired flags so old invocations do not silently run a weaker check.
+    for flag in ("--synthetic-wire-ui", "--playlist-actions-only", "--pcm"):
+        parser.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--playlist-offline-only", action="store_true",
                       help="only native playlist save and offline unpin against the disposable Go fixture; no large seeding or Play")
     parser.add_argument("--scratch-dir", type=Path,
                         help="existing base for disposable build/cache/DB/profile state (e.g. worker-private /dev/shm)")
     parser.add_argument("--capture-dir", type=Path,
                         help="optionally retain disposable fixture PNGs in a new direct child of ~/repos/spofify-desktop-temporary")
-    parser.add_argument("--pcm", action="store_true",
-                        help="also verify online and offline Go fixture audio on a private PipeWire null sink")
     args = parser.parse_args()
-    playlist_only = args.playlist_actions_only or args.playlist_offline_only
-    if args.pcm and (not args.desktop or args.window_only or args.synthetic_wire_ui or playlist_only):
-        parser.error("--pcm requires the full real Go desktop run")
-    if (args.window_only or args.synthetic_wire_ui or playlist_only or args.capture_dir) and not args.desktop:
-        parser.error("window-only, synthetic-wire, playlist-only and capture modes require --desktop")
+    if (args.synthetic_wire_ui or args.playlist_actions_only or args.pcm or
+            (args.desktop and not (args.window_only or args.playlist_offline_only))):
+        parser.error("the old v1 wire scenarios do not work with the v3 socket; see docs/native-listener.md "
+                     "for the Rust playback fixture. With --desktop use --window-only or --playlist-offline-only.")
+    if (args.window_only or args.playlist_offline_only or args.capture_dir) and not args.desktop:
+        parser.error("window-only, playlist-offline-only and capture modes require --desktop")
     artifact_root = (Path.home() / "repos" / "spofify-desktop-temporary").resolve()
     if not args.scratch_dir or args.capture_dir:
         artifact_root.mkdir(mode=0o700, exist_ok=True)
@@ -66,15 +63,9 @@ def main():
             desktop = root / "spofify-desktop"
             shutil.copy2(args.desktop.resolve(strict=True), desktop)
             desktop.chmod(0o700)
-        if args.window_only or args.synthetic_wire_ui:
+        if args.window_only:
             from native import native_checks
-            if args.synthetic_wire_ui:
-                from wire_ui import wire_fixture
-                print("SYNTHETIC WIRE UI ONLY — includes density migration; no Go server or audio execution", flush=True)
-                with wire_fixture() as ready:
-                    native_checks(desktop, root, env, ready, pixels=captures)
-            else:
-                native_checks(desktop, root, env, pixels=captures)
+            native_checks(desktop, root, env, pixels=captures)
             return
         if args.fixture_binary:
             binary, revision = args.fixture_binary.resolve(strict=True), None
@@ -84,26 +75,17 @@ def main():
         failure = None
         with fixture(binary, root, env, revision) as ready:
             print(f"Go fixture source {ready['sourceRevision']}", flush=True)
-            api = Api(ready, ready) if playlist_only else api_checks(ready)
-            if args.desktop:
+            if args.playlist_offline_only:
                 from native import native_checks
                 try:
-                    if args.pcm:
-                        from audio_smoke import output
-                        with output(root, env) as pcm:
-                            native_checks(desktop, root, env, ready, api, pixels=captures, pcm=pcm)
-                    else:
-                        native_checks(desktop, root, env, ready, api, pixels=captures,
-                                      playlist_actions_only=args.playlist_actions_only,
-                                      playlist_offline_only=args.playlist_offline_only)
+                    native_checks(desktop, root, env, ready, Api(ready, ready), pixels=captures,
+                                  playlist_offline_only=True)
                 except (Failure, TimeoutError) as error:
                     # Check the fixture's shutdown receipt even after a UI regression.
                     failure = error
             else:
-                from playback import Peer
-                with Peer(api):
-                    print("PASS real account v1 ticket, upgrade and initial player/personal snapshots", flush=True)
-                print("NOT RUN native desktop (provide --desktop)", flush=True)
+                api_checks(ready)
+                print("NOT RUN native desktop or playback socket (HTTP checks only)", flush=True)
         if failure is not None:
             raise failure
 

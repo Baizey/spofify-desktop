@@ -14,7 +14,7 @@ Install stable Rust (at least the `rust-version` in `Cargo.toml`), a C/C++ toolc
 cargo run --release --locked
 ```
 
-Use the root URL of a Spofify server implementing `spofify.account-state.v3`, such as `https://music.example.com`, and sign in with an existing listener or admin account. The desktop client is for listening; server administration stays in the Go dashboard. Both `http://` and `https://` addresses work directly, including hostnames with a port. Use HTTPS on untrusted networks; HTTP sends credentials unencrypted. Do not enter a path, credentials, query, or fragment in the server field.
+Use the root URL of a Spofify server that supports the account WebSocket with v3 playback JSON and no WebSocket subprotocol, such as `https://music.example.com`, and sign in with an existing listener or admin account. The desktop client is for listening; server administration stays in the Go dashboard. Both `http://` and `https://` addresses work directly, including hostnames with a port. Use HTTPS on untrusted networks; HTTP sends credentials unencrypted. Do not enter a path, credentials, query, or fragment in the server field.
 
 After a successful sign-in the app remembers the server and username. Select **Keep me signed in** to reopen the app without typing your password. This uses an unlocked Linux desktop keyring that provides the Secret Service interface and a server session, not a saved password. Sign out to stop automatic sign-in on this computer.
 
@@ -28,7 +28,7 @@ After a successful sign-in the app remembers the server and username. Select **K
 - Enable **Crossfade** in Settings to blend up to five seconds at natural track endings on this desktop. It is off by default and stored in `playback.json` alongside `appearance.json`. It does not affect another selected output or change the shared queue. If the next track cannot be prepared in time or either track is too short, playback advances normally.
 - **Settings → Music storage** shows the current account’s downloaded audio on this device. Desktop has no persistent automatic music cache. **Settings → Density** applies to this computer only. The local density file is `$XDG_CONFIG_HOME/spofify-desktop/appearance.json` (default `~/.config`). Private saved audio lives under `$XDG_DATA_HOME/spofify-downloads-v1` (default `~/.local/share`). Downloads use available disk space without a per-track size limit. Online playback uses temporary private disk space; it does not add tracks to Saved.
 
-This build targets the account WebSocket introduced in Go `08bb99e`. It does not negotiate the retired playback protocol or fall back to personal-library HTTP endpoints. See [shared state](docs/shared-state.md) for the transport boundary and the [protocol review](docs/account-protocol-review.md) for known server limitations.
+See [shared state](docs/shared-state.md) for the desktop/server transport and ownership rules.
 
 ## Install in the desktop menu
 
@@ -59,11 +59,13 @@ With a provisioned Cargo cache you can add `--offline` to the build/test command
 
 The default build does not enable Slint's inspection server. For development with **disposable accounts only**, build with `SLINT_EMIT_DEBUG_INFO=1 cargo build --locked --features slint/mcp`, then launch that **debug binary** with `SLINT_MCP_PORT` on an unused unprivileged loopback port. Never expose an inspection session containing real credentials. `scripts/inspect-native.py` captures only the opt-in Slint app window and accessibility tree.
 
-For a disposable acceptance run, see the options in `python3 scripts/acceptance/run.py --help`. Point `--desktop` at that exact MCP-enabled debug binary. With `--desktop`, the default harness builds the Go checkout’s test fixture and drives a private Cage Wayland session, using `wlr-randr` to exercise both wide and compact windows. Linux workers with a mediated filesystem can use `--scratch-dir /dev/shm` for the disposable fixture, including the Go linker and SQLite. `--synthetic-wire-ui` instead exercises native rendering and navigation against a synthetic search and account-socket fixture; it is **not** a real-Go playback test. `scripts/acceptance/audio_smoke.py` independently checks PCM output, pause/resume, natural completion, and lease loss against a synthetic account-state peer and private null sink. Run `python3 scripts/acceptance/delayed_local_play.py --desktop /path/to/mcp-enabled/spofify-desktop` to additionally measure first PCM before delayed Play resolution and output grant, verify continuous playback across confirmation, and check that Desktop stays silent or yields on authority corrections.
+For v3 playback interoperability, use the [Rust cross-native tests](docs/native-listener.md) with the disposable Go fixture. The older [Python v1 wire scenarios](scripts/acceptance/README.md) do not work against the v3 socket.
 
-To verify offline relaunch with a private synthetic server and keyring, run `python3 -B scripts/acceptance/offline_session_relaunch.py --desktop /path/to/mcp-enabled/spofify-desktop --scratch-dir /dev/shm`. Add `--seeded-offline` to exercise only native cold admission and local sign-out without using the HTTP test peer.
+`python3 scripts/acceptance/run.py --help` lists the disposable Go HTTP checks, window-only sign-in screen check, and real-Go playlist save/unpin check. For either window check, point `--desktop` at the MCP-enabled debug binary. On a mediated Linux worker, use `--scratch-dir /dev/shm` for disposable fixture state.
 
-To capture native reorder motion and exact move commands against a disposable wire peer, run `python3 -B scripts/acceptance/reorder.py target/debug/spofify-desktop` with the MCP-enabled build above. Without loopback, build `cargo build --locked --example reorder_preview` and run `target/debug/examples/reorder_preview scripts/acceptance/reorder-motion.events <new-frame-directory> soft` in a private Cage session on a 1280×720 output. Use `line` to compare the alternative cue or `reorder-edges.events` to exercise the long list and keyboard. The offline fixture drives the same native window with synthetic projections; it does not test the wire.
+For offline relaunch without a playback socket peer, use `python3 -B scripts/acceptance/offline_session_relaunch.py --seeded-offline --desktop /path/to/mcp-enabled/spofify-desktop --scratch-dir /dev/shm`.
+
+To capture native reorder motion without a playback socket peer, build `cargo build --locked --example reorder_preview` and run `target/debug/examples/reorder_preview scripts/acceptance/reorder-motion.events <new-frame-directory> soft` in a private Cage session on a 1280×720 output. Use `line` to compare the alternative cue or `reorder-edges.events` to exercise the long list and keyboard.
 
 ## Credits
 

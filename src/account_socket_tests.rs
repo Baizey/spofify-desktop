@@ -223,7 +223,6 @@ fn large_hello_has_a_separate_budget_without_truncating_rows() {
 
 #[test]
 fn exact_v3_frame_shapes_and_incompatible_values() {
-    assert_eq!(SUBPROTOCOL, "spofify.account-state.v3");
     let command = Command {
         id: format!("{NEW}:2"),
         issued_at_ms: 54000,

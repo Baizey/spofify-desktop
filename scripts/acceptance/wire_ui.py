@@ -96,7 +96,6 @@ NEGATIVE_PLAYLISTS = (
 PLAYLISTS = {summary["id"]: (summary, rows, definition) for summary, rows, definition in
              ((SUMMARY, ENTRIES, None), LARGE_MANUAL, LARGE_RULE, *NEGATIVE_PLAYLISTS)}
 PLAYLIST_PART_ROWS = 64
-PROTOCOL = "spofify.account-state.v1"
 SOCKET_PATH = "/api/me/player/socket"
 TICKET_PATH = "/api/me/player/connect"
 
@@ -111,7 +110,7 @@ def diagnostic_path(path):
 
 
 class AccountWire:
-    """Bounded account replica and Play request probe, not an audio executor."""
+    """Historical v1 fixture; its JSON does not work with the v3 account socket."""
 
     def __init__(self, handler, consume_ticket, writes, record_play):
         self.handler = handler
@@ -368,7 +367,7 @@ def wire_fixture():
             if (not valid_key or self.headers.get("Upgrade", "").casefold() != "websocket"
                     or "upgrade" not in self.headers.get("Connection", "").casefold().replace(" ", "").split(",")
                     or self.headers.get("Sec-WebSocket-Version") != "13"
-                    or self.headers.get("Sec-WebSocket-Protocol") != PROTOCOL
+                    or "Sec-WebSocket-Protocol" in self.headers
                     or self.headers.get("Origin") != ready["origin"]):
                 violations.append("invalid account WebSocket upgrade")
                 return self.error(400)
@@ -378,7 +377,6 @@ def wire_fixture():
             self.send_header("Upgrade", "websocket")
             self.send_header("Connection", "Upgrade")
             self.send_header("Sec-WebSocket-Accept", accept.decode())
-            self.send_header("Sec-WebSocket-Protocol", PROTOCOL)
             self.end_headers()
             try:
                 AccountWire(self, consume_ticket, violations, record_play).serve()

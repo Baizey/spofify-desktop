@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 import wave
 
 from fixture import Failure, check
-from playback import CONNECT, PROTOCOL, SOCKET, WS_GUID
+from playback import CONNECT, SOCKET, WS_GUID
 
 TRACK_ID, TITLE, SECONDS = "synthetic-audio-smoke", "Synthetic Audio Smoke Tone", 12
 ARTISTS = [{"id": "synthetic-audio-artist", "name": "Synthetic oscillator"}]
@@ -315,13 +315,13 @@ def audio_fixture(*, wav=None, peer_class=Peer, port=0, accepted_connections=Non
             if (self.headers.get("Origin") != ready["origin"] or not key or
                     self.headers.get("Upgrade", "").lower() != "websocket" or
                     self.headers.get("Sec-WebSocket-Version") != "13" or
-                    self.headers.get("Sec-WebSocket-Protocol") != PROTOCOL):
+                    "Sec-WebSocket-Protocol" in self.headers):
                 return self.reply(status=400)
             accept = b64encode(sha1((key + WS_GUID).encode()).digest()).decode()
             self.protocol_version = "HTTP/1.1"
             self.send_response(101)
             for name, value in (("Upgrade", "websocket"), ("Connection", "Upgrade"),
-                                ("Sec-WebSocket-Protocol", PROTOCOL), ("Sec-WebSocket-Accept", accept)):
+                                ("Sec-WebSocket-Accept", accept)):
                 self.send_header(name, value)
             self.end_headers()
             peer = peer_class(self)

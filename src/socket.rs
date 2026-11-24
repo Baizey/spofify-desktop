@@ -1,4 +1,4 @@
-//! Authenticated account-state.v3 links. Playback writes are socket-scoped and never replayed.
+//! Authenticated account sockets using v3 JSON. Playback writes are socket-scoped and never replayed.
 
 #[path = "account_wire.rs"]
 mod wire;
@@ -48,7 +48,6 @@ use crate::{
 };
 use wire::{Incoming, Outgoing};
 
-pub(crate) const SUBPROTOCOL: &str = "spofify.account-state.v3";
 const MAX_INBOUND: usize = 5 << 20;
 const MAX_OUTBOUND: usize = 64 << 10;
 const MAX_STATE: usize = 2 << 20;

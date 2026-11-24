@@ -1,4 +1,4 @@
-"""Bounded loopback observer and test client for Go's account-state socket."""
+"""Historical v1 test observer; its JSON does not work with the v3 account socket."""
 from base64 import b64encode
 import hashlib
 import json
@@ -10,7 +10,6 @@ from uuid import uuid4
 
 from fixture import Failure, check
 
-PROTOCOL = "spofify.account-state.v1"
 CONNECT = "/api/me/player/connect"
 SOCKET = "/api/me/player/socket"
 MAX_FRAME = (2 << 20) + (64 << 10)
@@ -32,7 +31,7 @@ class Peer:
             key = b64encode(os.urandom(16)).decode()
             self.sock.sendall((f"GET {SOCKET} HTTP/1.1\r\nHost: 127.0.0.1:{api.port}\r\n"
                                f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                               f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {PROTOCOL}\r\n"
+                               "Sec-WebSocket-Version: 13\r\n"
                                f"Origin: {api.origin}\r\nCookie: {api.cookie}\r\n\r\n").encode("ascii"))
             while b"\r\n\r\n" not in self.buffer:
                 check(len(self.buffer) <= 16 * 1024, "account upgrade exceeded bound")
@@ -45,7 +44,7 @@ class Peer:
             headers = dict((k.lower(), v.strip()) for k, v in (line.split(b":", 1) for line in response[1:]))
             accept = b64encode(hashlib.sha1((key + WS_GUID).encode()).digest())
             check(headers.get(b"sec-websocket-accept") == accept and
-                  headers.get(b"sec-websocket-protocol") == PROTOCOL.encode(), "account upgrade mismatch")
+                  b"sec-websocket-protocol" not in headers, "account upgrade mismatch")
             self.send(dict(type="hello", ticket=ticket, name=name, deviceId=self.device_id, canPlay=can_play))
             first = self.message()
             self.apply(first)

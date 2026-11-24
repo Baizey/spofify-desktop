@@ -1,6 +1,6 @@
 # Shared state on desktop
 
-Desktop and Go use `spofify.account-state.v3`. The session cookie authenticates a same-origin ticket request; the single-use ticket admits an account socket. Desktop does not negotiate or fall back to the old playback protocol.
+Desktop and Go use v3 playback JSON on the account WebSocket, without a `Sec-WebSocket-Protocol` header. The session cookie authenticates a same-origin ticket request; the single-use ticket admits the socket in the first JSON frame. There is no legacy playback fallback.
 
 | State | Authority |
 | --- | --- |
