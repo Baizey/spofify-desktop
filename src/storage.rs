@@ -79,9 +79,14 @@ fn open_data_dir(base: &Path, app_dir: &str, create: bool) -> Result<OwnedFd> {
         fs::fsync(&dir)?;
         dir = child;
     }
-    let dir = open_child(&dir, leaf, create)?;
-    private_dir(&dir)?;
-    Ok(dir)
+    let root = open_child(&dir, leaf, create)?;
+    private_dir(&root)?;
+    if create {
+        // A durable record inside the root is not sufficient if the newly
+        // created root itself can disappear after a crash.
+        fs::fsync(&dir)?;
+    }
+    Ok(root)
 }
 
 /// Explicit fixture path: no alias resolution, including at its ancestors.

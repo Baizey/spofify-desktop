@@ -147,6 +147,7 @@ struct State {
     status: Status,
     detail_attempts: HashMap<String, Attempt>,
     account_attempt: Option<Attempt>,
+    detail_visible: bool,
     cache: Cache,
     cache_binding: Option<CacheBinding>,
     replica: Replica,
@@ -174,6 +175,7 @@ impl Default for State {
             cache_binding: None,
             detail_attempts: HashMap::new(),
             account_attempt: None,
+            detail_visible: false,
             replica: Replica::default(),
             quick: QuickAdd::default(),
             observations: VecDeque::new(),
@@ -371,6 +373,7 @@ impl PersonalAccess {
         if state.status.epoch != epoch {
             return None;
         }
+        state.detail_visible = id.is_some();
         let (changed, command) = state.watch(id);
         if changed {
             self.signal();
@@ -395,8 +398,15 @@ impl PersonalAccess {
         }
         let mode_changed = state.quick.searching() != searching;
         state.quick.set_searching(searching);
+        state.detail_visible = detail.is_some();
         let (watch_changed, command) = if searching {
             state.quick_watch()
+        } else if !mode_changed && detail.is_none() && state.cache_binding.is_some()
+            && state.replica.pending_sync().is_some()
+        {
+            // Leaving for a list/history does not retire the shared read. A
+            // revisit can consume that same part set, with or without rows yet.
+            (false, None)
         } else {
             state.watch(detail)
         };
@@ -1150,7 +1160,12 @@ impl PersonalHub {
                             state.replica.seed_detail(playlist);
                         }
                     }
-                    command = state.prepare_detail(command, at, now);
+                    if state.detail_visible || state.cache_binding.is_none() || state.quick.searching() {
+                        command = state.prepare_detail(command, at, now);
+                    } else {
+                        state.replica.defer_detail();
+                        command = None;
+                    }
                 }
                 if (cache_changed || observation.is_some()) && let Some(snapshot) = state.replica.snapshot() {
                     state.cache.snapshot = Some(Arc::new(snapshot.clone()));
@@ -1240,7 +1255,7 @@ impl PersonalHub {
 
     pub(crate) fn refresh_due(&self, epoch: u64, generation: u64) -> Option<PersonalCommand> {
         let mut state = self.0.state.lock().expect("personal state");
-        if !state.scoped(epoch, generation) || state.status.link != Link::Ready || state.quick.searching()
+        if !state.scoped(epoch, generation) || state.status.link != Link::Ready || state.quick.searching() || !state.detail_visible
             || !state.cache_binding.as_ref().is_some_and(|b| b.network(epoch))
         { return None; }
         let id = state.replica.watched_playlist()?.to_owned();
@@ -1487,8 +1502,11 @@ mod tests {
                 {"id":"b","position":1,"track":{"kind":"track","id":"same","name":"Song","hasAudio":true,"coverage":{"tracks":1,"inLibrary":1,"albums":1}}}]
         }})).unwrap();
         let PersonalUpdate::Part(part) = part else { unreachable!() };
-        assert!(schedule().is_some());
+        let (generation, refresh) = schedule().unwrap();
         assert!(schedule().is_none());
+        assert!(personal.quick_watch(1, false, None).is_none());
+        assert!(personal.inspect_playlist_sync(1, generation, &refresh, |_| true).unwrap());
+        assert!(personal.quick_watch(1, false, Some("mix".into())).is_none());
         hub.receive(1, 2, PersonalUpdate::Part(part.clone())).unwrap();
         let projection = personal.cached_page(1, &route).unwrap();
         assert_eq!(projection.rows.len(), 2);

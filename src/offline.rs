@@ -269,8 +269,8 @@ async fn read_verified_inner(
     }
 }
 
-/// Structurally verified download metadata in a single explicit-offline
-/// interval. Keep one handle per interval and fence late results in the caller.
+/// Structurally verified download metadata in a single network-mode interval.
+/// Keep one handle per interval and fence late results in the caller.
 /// Browsing does not read audio bytes; playback verifies the digest separately.
 #[derive(Clone)]
 pub(crate) struct VerifiedDownloads {
@@ -281,19 +281,25 @@ pub(crate) struct VerifiedDownloads {
 }
 
 impl VerifiedDownloads {
+    #[cfg(test)]
     pub(crate) fn new(api: Arc<Api>, session: Session) -> Result<Self, Error> {
         let mut mode = session.network_changes();
         let generation = *mode.borrow_and_update();
         if generation & 1 == 0 {
             return Err(Error::Offline);
         }
+        Self::with_mode(api, session, mode, generation)
+    }
+
+    pub(crate) fn for_browsing(api: Arc<Api>, session: Session) -> Result<Self, Error> {
+        let mut mode = session.network_changes();
+        let generation = *mode.borrow_and_update();
+        Self::with_mode(api, session, mode, generation)
+    }
+
+    fn with_mode(api: Arc<Api>, session: Session, mode: watch::Receiver<u64>, generation: u64) -> Result<Self, Error> {
         api.authenticated_account(&session)?;
-        Ok(Self {
-            api,
-            session,
-            mode,
-            generation,
-        })
+        Ok(Self { api, session, mode, generation })
     }
 
     fn check_live(&self) -> Result<(), Error> {

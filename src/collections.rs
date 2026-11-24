@@ -210,23 +210,11 @@ pub(crate) async fn browse_tracks(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    if access.offline {
-        return offline::VerifiedDownloads::new(access.api.clone(), access.session.clone())
-            .map_err(audio_error)?
-            .verified_records(Some(ids.into_iter().collect()))
-            .await
-            .map_err(audio_error);
-    }
-    let access = access.clone();
-    blocking(move || {
-        let Some(store) = OfflineStore::open_existing().map_err(audio_error)? else {
-            return Ok(HashMap::new());
-        };
-        let mut tracks = available_tracks(&access, &store)?;
-        tracks.retain(|id, _| ids.contains(id));
-        Ok(tracks)
-    })
-    .await
+    offline::VerifiedDownloads::for_browsing(access.api.clone(), access.session.clone())
+        .map_err(audio_error)?
+        .verified_records(Some(ids.into_iter().collect()))
+        .await
+        .map_err(audio_error)
 }
 
 fn list_row(entry: StoredCollection, available: &HashMap<String, Download>) -> Row {

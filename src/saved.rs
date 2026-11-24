@@ -70,7 +70,7 @@ fn error(err: offline::Error) -> ApiError {
 }
 
 pub(crate) async fn inventory(access: &Access) -> Result<HashMap<String, Download>, ApiError> {
-    offline::VerifiedDownloads::new(access.api.clone(), access.session.clone())
+    offline::VerifiedDownloads::for_browsing(access.api.clone(), access.session.clone())
         .map_err(error)?
         .verified_records(None)
         .await
@@ -110,23 +110,8 @@ fn storage_label(count: usize, bytes: u64) -> String {
 }
 
 pub async fn page(access: &Access) -> Result<Page, ApiError> {
-    let api = access.api.clone();
-    let session = access.session.clone();
-    let items = if access.offline || access.session.is_offline() {
-        let mut items: Vec<_> = inventory(access).await?.into_values().collect();
-        items.sort_unstable_by(|a, b| {
-            a.item
-                .name
-                .cmp(&b.item.name)
-                .then_with(|| a.item.id.cmp(&b.item.id))
-        });
-        items
-    } else {
-        tokio::task::spawn_blocking(move || OfflineStore::open_default()?.list(&api, &session))
-            .await
-            .map_err(|_| STORAGE)?
-            .map_err(error)?
-    };
+    let mut items: Vec<_> = inventory(access).await?.into_values().collect();
+    items.sort_unstable_by(|a, b| a.item.name.cmp(&b.item.name).then_with(|| a.item.id.cmp(&b.item.id)));
     let rows = items
         .into_iter()
         .map(|download| {

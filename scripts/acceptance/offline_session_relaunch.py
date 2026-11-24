@@ -320,14 +320,14 @@ def closeable_desktop(binary, root, env, pixels, mcp_port):
             raise Failure(f"owned Cage/desktop exited {code} after CloseRequested: {' | '.join(log[-8:])}")
 
 
-def seed_saved_track(env, origin, account):
+def seed_saved_track(env, origin, account, duration=1):
     """A v2 download using the existing server audio representation."""
     root = Path(env["XDG_DATA_HOME"]) / "spofify-downloads-v2"
     root.mkdir(mode=0o700, exist_ok=True)
     pcm = BytesIO()
     with wave.open(pcm, "wb") as stream:
-        stream.setparams((1, 2, 8000, 8000, "NONE", "not compressed"))
-        stream.writeframes(b"\0\0" * 8000)
+        stream.setparams((1, 2, 8000, 8000 * duration, "NONE", "not compressed"))
+        stream.writeframes(b"\0\0" * 8000 * duration)
     audio = pcm.getvalue()
     identity = sha256(b"spofify-download-scope-v1\0")
     for field in (origin, account):
@@ -337,11 +337,12 @@ def seed_saved_track(env, origin, account):
     track_id = wire_ui.TRACK["id"]
     header = json.dumps(dict(scope=scope, bytes=len(audio), audio_hash=sha256(audio).hexdigest(),
                              track=dict(id=track_id, name=wire_ui.TRACK_NAME, artists="Synthetic Artist",
-                                        album_name="Synthetic Album", duration_ms=1000,
+                                        album_name="Synthetic Album", duration_ms=1000 * duration,
                                         track_number=1, disc_number=1))).encode()
     path = root / f"{scope}.{sha256(track_id.encode()).hexdigest()}"
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as file:
         file.write(b"SPOFDL01" + len(header).to_bytes(4, "little") + header + audio)
+    return path
 
 
 def scenarios(binary, root, env, ready, receipt, keyring, pixels, mcp_port=0):
@@ -520,11 +521,12 @@ def seed_personal_cache(env, origin, account):
                         copyToManual=False, delete=True, addTracks=True)
     summary = dict(id="fixture-mix", name="Fixture Mix", description="", kind="manual",
                    countState="exact", evaluationState=None, trackCount=3, availableCount=3,
-                   capabilities=capabilities, revision=1, updatedAt="2026-01-01T00:00:00Z")
+                   capabilities=capabilities, revision=1, createdAt="2026-01-01T00:00:00Z",
+                   updatedAt="2026-01-01T00:00:00Z")
     unsaved = dict(summary, id="fixture-unsaved", name="Unopened Mix", trackCount=5)
     song = dict(kind="track", id=wire_ui.TRACK["id"], name=wire_ui.TRACK_NAME, genres=[],
                 artists=[dict(id="", name="Synthetic Artist")], album_id="", album_name="Synthetic Album",
-                album_type="", release_date="", relation="", duration_ms=1000, disc_number=1, track_number=1,
+                album_type="", release_date="", relation="", duration_ms=34000, disc_number=1, track_number=1,
                 has_audio=True, coverage=dict(tracks=0, inLibrary=0, albums=0))
     rows = [dict(id=f"entry_{i}", position=i, track=track) for i, track in enumerate([
         song, dict(song, id="missing", name="Unavailable Track"), song])]
@@ -544,7 +546,7 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
     metadata = json.dumps(dict(version=1, origin=origin, username=SEEDED_USER, active=SEEDED_SLOT))
     profile.touch(mode=0o600, exist_ok=False)
     profile.write_text(metadata)
-    seed_saved_track(env, origin, SEEDED_ACCOUNT)
+    audio = seed_saved_track(env, origin, SEEDED_ACCOUNT, duration=34)
     seed_personal_cache(env, origin, SEEDED_ACCOUNT)
 
     print("SEEDED OFFLINE: cold admission, visual evidence and observed wire silence only; "
@@ -561,28 +563,50 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
             window.pixels("01-seeded-cold-offline-account")
         window.click("History")
         window.section("History")
-        window.title(wire_ui.TRACK_NAME)
+        window.find(f"Play track: {wire_ui.TRACK_NAME}", roles=("Button",))
         window.click("Playlists")
         window.section("Playlists")
-        window.click("Unopened Mix")
+        window.click("Open Unopened Mix")
         window.title("Unopened Mix")
         window.find("Playlist details not saved on this device.", roles=("Text",))
         window.click("Playlists")
-        window.click("Fixture Mix")
+        window.click("Open Fixture Mix")
         window.title("Fixture Mix")
-        window.title("Unavailable Track")
+        window.find("Unavailable Track", roles=("Text",))
+        window.absent("Play track: Unavailable Track", roles=("Button",))
         if pixels:
             window.pixels("02-seeded-local-playlist-mixed-availability")
         window.click(SAVED)
         window.section(SAVED)
-        window.title(wire_ui.TRACK_NAME)
-        window.absent("Offline mode", roles=("Text",))
+        action = f"Play track: {wire_ui.TRACK_NAME}"
+        window.click_element(window.find(action, roles=("Button",)), double=True)
+        window.find("Pause", roles=("Button",))
+        window.click("History")
+        window.section("History")
+
+        def play_count(window):
+            return sum(window.matches(e, action) and e.get("accessibleRole") == "Button" for e in window.elements())
+
+        wait("qualifying offline play alongside the seeded play of the same track",
+             lambda: play_count(window) == 2, 42)
         if pixels:
-            window.pixels("02-seeded-cold-saved-offline")
-        quiet(receipt, 0, "seeded cold admission")
-        print("PASS seeded native cold admission shows same synthetic account; no observed connections", flush=True)
+            window.pixels("03-seeded-cold-recently-played")
+        quiet(receipt, 0, "seeded cold admission and local playback")
+        print("PASS cold library, mixed availability and qualified download playback without connections", flush=True)
+
+    with closeable_desktop(binary, root, env, pixels, mcp_port) as window:
+        window.section("History")
+        wait("both plays after a clean cold restart", lambda: play_count(window) == 2)
+        quiet(receipt, 0, "qualified offline play relaunch")
+        print("PASS distinct same-track plays survive a clean offline relaunch", flush=True)
+        audio.unlink()
+        window.click(SAVED)
+        window.section(SAVED)
+        window.title("Nothing saved yet")
+        window.absent(action, roles=("Button",))
+        print("PASS a deleted audio file is no longer available in Downloads", flush=True)
         sign_out(window)
-        wait("seeded active slot cleared", lambda: keyring() == ["lookup", "clear"]
+        wait("seeded active slot cleared", lambda: keyring() == ["lookup", "lookup", "clear"]
              and not {"active", "cleanup"} & store_metadata(env).keys())
         disabled_login(window, origin, SEEDED_USER)
         quiet(receipt, 0, "seeded direct offline sign-out")
@@ -592,7 +616,7 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         disabled_login(window, origin, SEEDED_USER)
         quiet(receipt, 0, "seeded sign-out relaunch")
         window.absent(SAVED, roles=("Button",))
-    check(not receipt.events() and keyring() == ["lookup", "clear"],
+    check(not receipt.events() and keyring() == ["lookup", "lookup", "clear"],
           "signed-out relaunch touched the private keyring or receipt listener")
     print("PASS seeded cold offline Sign out deletes the active item; relaunch stays signed out", flush=True)
 
@@ -608,7 +632,7 @@ def seeded_offline(binary, root, env, origin, receipt, keyring, pixels, mcp_port
         disabled_login(window)
         quiet(receipt, 0, "corrupt disk profile")
         window.absent(SAVED, roles=("Button",))
-    check(not receipt.events() and keyring() == ["lookup", "clear"],
+    check(not receipt.events() and keyring() == ["lookup", "lookup", "clear"],
           "disk-only or corrupt profile reached the receipt listener or obtained a secret")
     print("PASS missing keyring item and corrupt metadata grant neither access nor observed wire traffic", flush=True)
 

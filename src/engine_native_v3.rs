@@ -1410,6 +1410,33 @@ mod tests {
         (NativeV3::default(), state(), audio, output)
     }
 
+    #[test]
+    fn detached_natural_advance_skips_missing_but_direct_selection_stops_there() {
+        let (mut native, mut shared, mut audio, mut output) = setup();
+        shared.repeat = Repeat::All;
+        native.reconcile(&shared, Context { snapshot: true, ..context() }, &mut audio);
+        let offline = Context { mode: Mode::Detached, report: false, ..context() };
+        let work = native.tick(&shared, offline, &mut audio);
+        let missing = preview(&work);
+        assert_eq!(missing.id, "b");
+        native.complete(&shared, offline, &mut audio, &missing, None);
+        consume_eof(&mut output, &audio);
+        native.tick(&shared, offline, &mut audio);
+        assert_eq!(native.cursor().unwrap().key, 3);
+        native.tick(&shared, offline, &mut audio);
+        assert!(native.cursor().unwrap().desired_playing);
+
+        let work = native.act_detached(Action::Jump { key: 2 }, &shared, offline, &mut audio);
+        let primary = work.iter().find_map(|w| match w {
+            Work::Prepare(r) if !r.preview => Some(r.clone()),
+            _ => None,
+        }).unwrap();
+        native.complete(&shared, offline, &mut audio, &primary, None);
+        assert_eq!(native.cursor().unwrap().key, 2);
+        assert!(!native.cursor().unwrap().desired_playing);
+        assert!(native.failed());
+    }
+
     fn report(work: &[Work]) -> &Report {
         work.iter()
             .find_map(|w| {

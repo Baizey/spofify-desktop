@@ -641,7 +641,7 @@ fn label(route: &Route) -> &'static str {
         Route::Search(_) => "Search",
         Route::Playlists => "Playlists",
         Route::Picker(_) => "Add to a playlist",
-        Route::Offline => "Saved on this device",
+        Route::Offline => "Downloads",
         Route::Appearance => "Settings",
         Route::Now => "Now playing",
         Route::Queue => "Queue",
@@ -1224,8 +1224,10 @@ impl Browser {
             .access
             .as_ref()
             .map_or_else(|| shared.load(Ordering::SeqCst), |a| a.epoch);
+        let session = self.access.as_ref().map(|a| a.session.clone());
         let _ = slint::invoke_from_event_loop(move || {
             if shared.load(Ordering::SeqCst) == epoch
+                && session.as_ref().is_none_or(|s| !s.is_revoked())
                 && let Some(ui) = ui.upgrade()
             {
                 f(ui);
