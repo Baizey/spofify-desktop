@@ -1,72 +1,51 @@
 # Spofify Desktop
 
-A native Linux music player for your [Spofify server](../spofify-go). Rust owns the session, music library and playback; Slint renders the desktop window and Rodio sends audio to the default output. The server and its music library run separately.
+Spofify Desktop is a Linux client for listening to music from a running, self-hosted [Spofify Server](https://github.com/Baizey/spofify-server). Use it with your own server or with a listener account from someone who hosts one. Set up and administer the server separately.
 
-![Album detail and the playing mini-player, captured through Slint MCP against the Go test library](docs/images/native-album.png)
+## Install
 
-[Compact Now Playing screenshot](docs/images/native-player-compact.png)
+The prebuilt release is for **Linux x86-64**, built and tested on Ubuntu 24.04 (glibc 2.39 baseline). Use a Wayland or X11 desktop with ALSA, fontconfig, and working audio.
 
-## Run
+1. Download `spofify-desktop-VERSION-linux-x86_64.tar.gz` from [GitHub Releases](https://github.com/Baizey/spofify-desktop/releases). The asset named `spofify-desktop-linux-x86_64` is the bare executable used by the updater, not the installer.
+2. Extract the archive and run `bash install.sh` inside the extracted folder. It installs for your user; no root access or Rust is needed.
+3. Open **Spofify** from your app menu.
 
-Install stable Rust (at least the `rust-version` in `Cargo.toml`), a C/C++ toolchain, `pkg-config`, and development headers for fontconfig and ALSA. On Debian/Ubuntu the native packages include `build-essential pkg-config libfontconfig1-dev libasound2-dev`. For playback you need a working audio output and a Wayland or X11 desktop session.
+Release installs verify and install updates in the background while online. When an update is ready, quit and reopen Spofify. To update manually, close the app and run the installer from a newer release. See [Desktop releases](docs/desktop-release.md) for update verification and packaging.
 
-```sh
-cargo run --release --locked
-```
+## Sign in
 
-Use the root URL of a Spofify server that supports the account WebSocket with v3 playback JSON and no WebSocket subprotocol, such as `https://music.example.com`, and sign in with an existing listener or admin account. The desktop client is for listening; server administration stays in the Go dashboard. Both `http://` and `https://` addresses work directly, including hostnames with a port. Use HTTPS on untrusted networks; HTTP sends credentials unencrypted. Do not enter a path, credentials, query, or fragment in the server field.
+Enter the server's configured **Server address**, such as `https://music.example.com`, and sign in with an existing listener or admin account. Include the scheme and any non-default port, but no path. Use the server's [configured LAN or HTTPS address](https://github.com/Baizey/spofify-server#remote-and-local-network-access) to connect from another machine. HTTP sends credentials unencrypted.
 
-After a successful sign-in the app remembers the server and username. Select **Keep me signed in** to reopen the app without typing your password. This uses an unlocked Linux desktop keyring that provides the Secret Service interface and a server session, not a saved password. Sign out to stop automatic sign-in on this computer.
+Online playback requires [playback sync v3](docs/shared-state.md). If you use a reverse proxy, it must preserve the configured Host and pass WebSocket upgrades.
 
-## Listening
+**Keep me signed in** stores a session in an unlocked Linux keyring that supports Secret Service, not your password. Enable it while online if you want to reopen the app offline later.
 
-- Start in **History**, or open your **Playlists** from the library navigation. Search the catalog with `Ctrl+F`. Results come from the server’s unified search index, in ranked order; the desktop doesn’t download a catalog to search it. Select an artist or album to open its page, then use Back to return to your results.
-- Play a whole collection or start from a particular occurrence. Use a track’s `…` menu to queue it, save it offline, or add it to a playlist. Use a manual or rule playlist’s **Save offline** action to download it in the background. **Saved offline** shows progress and resumes pending downloads when you’re back online with the same account. Use **Work offline** to play a download queue in its saved order. When this desktop owns playback in a connected account queue, it uses a verified download before requesting the audio from the server.
-- Use **Edit order** on the queue or an editable manual playlist. In the queue, press and drag a song in Up Next to its new position, then release to place it. In a playlist, hold the row briefly before dragging. With the keyboard, use ↑/↓ to select a row, Space or Enter to lift it, ↑/↓ or Home/End to choose its destination, and Space or Enter to place it. Escape cancels a lift. GNOME and KDE animation preferences are read at launch; `SPOFIFY_REDUCED_MOTION=1` also disables reorder animations.
-- Select the current track’s artwork or title to open **Now playing**. Queue and output controls stay at the right of the mini-player. The selected output is shared with other connected listeners on your account. The desktop can control another output or play through its own default audio device. Linux desktop environments can use MPRIS media keys for play/pause, next and previous.
-- **Work offline** switches the same browsing, Search, and playback controls to music available on this device. Known playlists open normally and keep their downloaded tracks in order, including repeats. Offline actions are not replayed as online commands or counted as online history. An unowned room can adopt a nonempty local queue when you reconnect; a live owner keeps its shared queue. Saved music survives restarting the application. A remembered account can open locally with your unlocked keyring. **Go online** validates the same account before connecting; saved files alone cannot unlock an account.
-- Enable **Crossfade** in Settings to blend up to five seconds at natural track endings on this desktop. It is off by default and stored in `playback.json` alongside `appearance.json`. It does not affect another selected output or change the shared queue. If the next track cannot be prepared in time or either track is too short, playback advances normally.
-- **Settings → Music storage** shows the current account’s downloaded audio on this device. Desktop has no persistent automatic music cache. **Settings → Density** applies to this computer only. The local density file is `$XDG_CONFIG_HOME/spofify-desktop/appearance.json` (default `~/.config`). Private saved audio lives under `$XDG_DATA_HOME/spofify-downloads-v1` (default `~/.local/share`). Downloads use available disk space without a per-track size limit. Online playback uses temporary private disk space; it does not add tracks to Saved.
+## Listen
 
-See [shared state](docs/shared-state.md) for the desktop/server transport and ownership rules.
+- Search the server's tracks, albums, and artists, or pick up from **History**. Create and edit manual and rule-based playlists.
+- Play albums and playlists, reorder the queue, and switch playback between connected devices on the same account. Desktop also supports Linux media keys and optional crossfade for local playback.
+- Select the mini-player's artwork or player icon to open **Now playing** for waveforms and lyrics, including synced lyrics where available.
 
-## Install in the desktop menu
+[See the album and queue view](docs/images/native-album.png).
 
-```sh
-make build
-make install PREFIX="$HOME/.local"
-```
+## Listen offline
 
-Ensure `$HOME/.local/bin` is on the desktop session's `PATH`. To remove the binary and launcher, use `make uninstall PREFIX="$HOME/.local"`. This does not delete personal data. Distributors can stage the same files with `DESTDIR`; `BINARY` can point to an already-built executable. No root access or user service is required for a per-user install.
+While connected, choose **Save offline** on tracks, albums, artists, or playlists. Open **Saved offline** to see saved music and check playlist download progress. Streaming alone doesn't save a track. For offline listening, choose **Settings → Work offline** to search and play only downloaded music. Downloads stay on this computer and are tied to the account that saved them. Lyrics aren't available offline, and offline listens aren't added to server history. Choose **Go online** to reconnect.
 
-## Install a GitHub release
+## Build and test
 
-On Linux x86-64 (Ubuntu 24.04 or newer, or an equivalent desktop with glibc 2.39+, ALSA and fontconfig), download the installer archive from [official GitHub Releases](https://github.com/Baizey/spofify-desktop/releases), extract it, and run `bash install.sh`. Then open **Spofify** from the app menu. No Rust installation is needed. If you used `make install` before, use the app menu rather than an older `spofify-desktop` on your shell `PATH`.
+On Linux, use stable Rust with `rustfmt` (see the minimum version in [`Cargo.toml`](Cargo.toml)), a native toolchain, `pkg-config`, and ALSA and fontconfig development headers. On Ubuntu or Debian, install `build-essential`, `pkg-config`, `libasound2-dev`, and `libfontconfig1-dev`.
 
-Spofify checks for and installs verified updates in the background when it starts, even before sign-in. It does not check in **Work offline**. When the top notice says an update is ready, quit and reopen Spofify to use it. To update manually, close Spofify and rerun `install.sh` from the latest official release. Either way, your settings, sign-in, and saved music stay in place.
-
-See [desktop releases](docs/desktop-release.md) for how updates are verified or how to publish a package.
-
-## Development
+From the checkout:
 
 ```sh
 cargo fmt --all -- --check
 cargo test --locked
-cargo build --locked
+cargo run --locked
 ```
 
-With a provisioned Cargo cache you can add `--offline` to the build/test commands. If native libraries were installed with Linuxbrew rather than the system package manager, expose them to the build with `export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"`.
+To add a launcher from source, run `make build` and `make install PREFIX="$HOME/.local"`. Keep `$HOME/.local/bin` on your desktop session's `PATH`. This install doesn't use the release updater.
 
-The default build does not enable Slint's inspection server. For development with **disposable accounts only**, build with `SLINT_EMIT_DEBUG_INFO=1 cargo build --locked --features slint/mcp`, then launch that **debug binary** with `SLINT_MCP_PORT` on an unused unprivileged loopback port. Never expose an inspection session containing real credentials. `scripts/inspect-native.py` captures only the opt-in Slint app window and accessibility tree.
+See the [desktop implementation and test notes](docs/native-listener.md) and the [HTTP and desktop UI checks](scripts/acceptance/README.md). Cross-client playback checks need a separate runner and a disposable Go fixture.
 
-For v3 playback interoperability, use the [Rust cross-native tests](docs/native-listener.md) with the disposable Go fixture. The older [Python v1 wire scenarios](scripts/acceptance/README.md) do not work against the v3 socket.
-
-`python3 scripts/acceptance/run.py --help` lists the disposable Go HTTP checks, window-only sign-in screen check, and real-Go playlist save/unpin check. For either window check, point `--desktop` at the MCP-enabled debug binary. On a mediated Linux worker, use `--scratch-dir /dev/shm` for disposable fixture state.
-
-For offline relaunch without a playback socket peer, use `python3 -B scripts/acceptance/offline_session_relaunch.py --seeded-offline --desktop /path/to/mcp-enabled/spofify-desktop --scratch-dir /dev/shm`.
-
-To capture native reorder motion without a playback socket peer, build `cargo build --locked --example reorder_preview` and run `target/debug/examples/reorder_preview scripts/acceptance/reorder-motion.events <new-frame-directory> soft` in a private Cage session on a 1280×720 output. Use `line` to compare the alternative cue or `reorder-edges.events` to exercise the long list and keyboard.
-
-## Credits
-
-The waveform icon follows the Spofify mobile mark. [JetBrains Mono 2.304](https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304) is bundled unmodified under the [SIL Open Font License](assets/JetBrainsMono-OFL.txt).
+The bundled [JetBrains Mono font](assets/JetBrainsMono-OFL.txt) is distributed under the SIL Open Font License.
