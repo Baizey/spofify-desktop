@@ -692,7 +692,7 @@ pub fn personal_projection(route: &Route, replica: &personal::Replica) -> Option
     }
 }
 
-fn recent(entries: &[library::HistoryEntry]) -> Page {
+pub(crate) fn recent(entries: &[library::HistoryEntry]) -> Page {
     Page {
         kind: "history".into(),
         title: "History".into(),
@@ -747,6 +747,13 @@ pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
     if summaries.len() == 100 {
         page.status = "The account snapshot shows up to 100 playlists.".into();
     }
+    page
+}
+
+pub(crate) fn unsaved_playlist(summary: &PlaylistSummary) -> Page {
+    let mut page = Page::default();
+    apply_playlist_summary(&mut page, summary);
+    page.status = "Playlist details not saved on this device.".into();
     page
 }
 

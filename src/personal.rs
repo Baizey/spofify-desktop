@@ -168,13 +168,13 @@ impl Command {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub playlists: Vec<PlaylistSummary>,
     pub recent: Vec<HistoryEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Playlist {
     pub summary: PlaylistSummary,
     pub definition: Option<RuleDefinition>,
@@ -586,6 +586,38 @@ impl Replica {
         self.reset_pull();
         self.mark_stale(&id);
         Some(self.sync(id, None, 0))
+    }
+
+    pub(crate) fn seed_detail(&mut self, playlist: Playlist) {
+        let id = &playlist.summary.id;
+        if self.cached(id).is_some_and(|d| {
+            !d.playlist.stale || d.playlist.summary.revision > playlist.summary.revision
+        }) {
+            return;
+        }
+        if let Some(i) = self.cache_index(id) {
+            self.details.remove(i);
+        }
+        let mut detail = Retained {
+            playlist,
+            bytes: 0,
+            tracks: HashMap::new(),
+            staged_entries: HashSet::new(),
+        };
+        let rows = detail.playlist.rows.clone();
+        for row in rows.iter() {
+            detail.bytes = detail.bytes.saturating_add(row_bytes(row));
+            if detail.playlist.summary.kind == PlaylistKind::Manual {
+                detail.add_track(&row.track.id);
+            }
+        }
+        self.details.push_back(detail);
+    }
+
+    // Only a caller holding a fresh complete projection may suppress this pull.
+    pub(crate) fn use_cached_detail(&mut self, playlist: Playlist) {
+        self.seed_detail(playlist);
+        self.reset_pull();
     }
 
     pub fn watch(&mut self, id: Option<String>) -> Option<Command> {

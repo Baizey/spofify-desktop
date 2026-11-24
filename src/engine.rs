@@ -356,7 +356,7 @@ impl Engine {
             personal: self.personal.access(),
         });
         self.personal
-            .bind_observations(access.as_ref(), &self.shared_epoch);
+            .bind_cache(access.as_ref(), &self.shared_epoch);
         self.access.send_replace(access);
     }
     fn login_view(&self, busy: bool, error: bool, status: &'static str) {
@@ -419,12 +419,8 @@ impl Engine {
         if self.current() {
             self.apply_mode();
         }
-        // Flush already accepted catalog observations without waiting indefinitely.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            self.personal.flush_observations(),
-        )
-        .await;
+        // Finish the accepted last-good projection before retiring this account.
+        self.personal.flush_cache().await;
         let epoch = crate::advance_account_epoch(&self.shared_epoch);
         let account = self.account.take();
         let retained = self.retained.take();
@@ -730,9 +726,11 @@ impl Engine {
             }
             a.session.set_offline(false);
             self.mode.allow_updates(self.epoch, &self.shared_epoch);
-            self.connect();
         }
         self.publish_access();
+        if !offline {
+            self.connect();
+        }
     }
     fn save_mode(&self, offline: bool, staged: Option<StagedMode>) {
         let (Some(retained), Some(account)) = (&self.retained, &self.account) else {

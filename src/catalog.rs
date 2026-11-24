@@ -10,14 +10,14 @@
 use std::collections::HashSet;
 
 use reqwest::{StatusCode, header};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Url;
 
 use super::{
     Api, ApiError, INVALID_INPUT, INVALID_RESPONSE, Session, decode, valid_id, valid_text,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CatalogKind {
     Artist,
@@ -58,14 +58,14 @@ impl Default for PageRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtistCredit {
     /// Empty for a name-only credit; it is not a navigation target.
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Coverage {
     pub tracks: u64,
@@ -74,7 +74,7 @@ pub struct Coverage {
 }
 
 /// Positive presentation projection only; no filesystem paths or external URLs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogItem {
     pub kind: CatalogKind,
     pub id: String,

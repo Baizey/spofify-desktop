@@ -10,14 +10,14 @@ use super::catalog::{
 };
 use super::{ApiError, INVALID_INPUT, INVALID_RESPONSE, valid_id};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaylistKind {
     Manual,
     Derived,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CountState {
     Exact,
@@ -25,7 +25,7 @@ pub enum CountState {
     Pending,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvaluationState {
     Pending,
@@ -34,7 +34,7 @@ pub enum EvaluationState {
     Error,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistCapabilities {
     pub edit_metadata: bool,
@@ -46,7 +46,7 @@ pub struct PlaylistCapabilities {
     pub add_tracks: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistSummary {
     pub id: String,
@@ -64,7 +64,7 @@ pub struct PlaylistSummary {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
     pub played_at: String,
@@ -74,7 +74,7 @@ pub struct HistoryEntry {
     pub metadata_missing: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManualEntry {
     /// Playlist entry identity, not track identity or a derived occurrence ID.
     pub id: String,

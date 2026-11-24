@@ -20,6 +20,7 @@ mod output_identity;
 mod pages;
 mod personal;
 mod personal_bridge;
+mod personal_cache;
 mod playback_sync;
 mod player;
 mod playlist_browser;

@@ -4698,6 +4698,7 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "url",

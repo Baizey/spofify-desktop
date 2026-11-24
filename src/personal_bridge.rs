@@ -5,7 +5,9 @@ use crate::{
     api::library::{PlaylistKind, PlaylistSummary, RuleDefinition},
     desk::Access,
     personal::{AcceptedPlaylist, PersonalCommand, PersonalUpdate, Replica},
+    personal_cache::{self, Cache, FRESHNESS},
     playlist_observations::Writer,
+    playlist_pin_store::PUBLICATION_GATE,
     quick_add::{self, BulkEnd, BulkTicket, BulkWrite, QuickAdd, Ticket},
 };
 use std::{
@@ -109,8 +111,29 @@ struct Observation {
     emptied_recent: bool,
 }
 
+struct CacheBinding {
+    scope: personal_cache::Scope,
+    session: crate::api::Session,
+    current_epoch: Arc<AtomicU64>,
+    mode: Option<u64>,
+    writer: personal_cache::Writer,
+}
+
+impl CacheBinding {
+    fn local(&self, epoch: u64) -> bool {
+        self.current_epoch.load(Ordering::SeqCst) == epoch && self.session.can_access_local()
+    }
+
+    fn network(&self, epoch: u64) -> bool {
+        self.local(epoch) && !self.session.is_expired()
+            && self.mode == Some(*self.session.network_changes().borrow()) && !self.session.is_offline()
+    }
+}
+
 struct State {
     status: Status,
+    cache: Cache,
+    cache_binding: Option<CacheBinding>,
     replica: Replica,
     quick: QuickAdd,
     observations: VecDeque<Observation>,
@@ -130,6 +153,8 @@ impl Default for State {
                 playlist_detail: 0,
                 sequence: 0,
             },
+            cache: Cache::default(),
+            cache_binding: None,
             replica: Replica::default(),
             quick: QuickAdd::default(),
             observations: VecDeque::new(),
@@ -145,12 +170,34 @@ impl State {
 
     fn watch(&mut self, id: Option<String>) -> (bool, Option<PersonalCommand>) {
         let before = self.replica.watched_playlist().map(str::to_owned);
+        if let Some(detail) = id.as_ref().and_then(|id| self.cache.details.get(id)) {
+            self.replica.seed_detail(detail.playlist.clone());
+        }
         let command = self.replica.watch(id);
+        let command = self.use_fresh_detail(command, personal_cache::now_ms());
         let changed = before.as_deref() != self.replica.watched_playlist();
         if changed {
             self.status.playlist_detail = self.status.playlist_detail.wrapping_add(1);
         }
         (changed, command)
+    }
+
+    fn use_fresh_detail(&mut self, command: Option<PersonalCommand>, now: u64) -> Option<PersonalCommand> {
+        if let Some(PersonalCommand::SyncPlaylist { playlist_id, offset: 0, .. }) = &command
+            && let Some(detail) = self.cache.details.get(playlist_id)
+            && detail.fresh(now, FRESHNESS)
+        {
+            self.replica.use_cached_detail(detail.playlist.clone());
+            return None;
+        }
+        command
+    }
+
+    fn retire_cache(&mut self) {
+        if let Some(binding) = self.cache_binding.take() {
+            binding.writer.retire();
+        }
+        self.cache = Cache::default();
     }
 
     fn quick_watch(&mut self) -> (bool, Option<PersonalCommand>) {
@@ -253,6 +300,14 @@ impl PersonalAccess {
         let state = self.state.lock().expect("personal state");
         let writer = state.observation_writer.as_ref()?;
         (state.status.epoch == access.epoch && writer.matches(access)).then(|| writer.clone())
+    }
+
+    pub(crate) fn cached_page(&self, epoch: u64, route: &crate::pages::Route) -> Option<crate::pages::Page> {
+        let state = self.state.lock().expect("personal state");
+        if state.status.epoch != epoch || !state.cache_binding.as_ref()?.local(epoch) {
+            return None;
+        }
+        state.cache.projection(route)
     }
 
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
@@ -755,8 +810,42 @@ impl PersonalHub {
     pub fn access(&self) -> PersonalAccess {
         self.0.clone()
     }
-    /// Bind before publishing Access. Neither binding nor accepting frames
-    /// opens storage. Retire same-epoch writers too when a grant disappears.
+    /// Load last-good disk projections before publishing Access or opening the
+    /// account transport. A successful reconnect can rebind the same scope.
+    pub(crate) fn bind_cache(&self, access: Option<&Access>, current_epoch: &Arc<AtomicU64>) {
+        if let Some(access) = access {
+            self.reset(access.epoch);
+        }
+        let mut state = self.0.state.lock().expect("personal state");
+        if let Some(access) = access.filter(|a| a.epoch == state.status.epoch)
+            && let Some(scope) = personal_cache::Scope::new(access)
+        {
+            if let Some(binding) = state.cache_binding.as_mut().filter(|b| b.scope == scope) {
+                binding.session = access.session.clone();
+                return;
+            }
+            state.retire_cache();
+            state.cache = scope.load();
+            state.cache_binding = Some(CacheBinding {
+                writer: personal_cache::Writer::start(scope.clone(), access.epoch, current_epoch.clone()),
+                scope,
+                session: access.session.clone(),
+                current_epoch: current_epoch.clone(),
+                mode: None,
+            });
+        } else {
+            state.retire_cache();
+        }
+    }
+
+    pub(crate) async fn flush_cache(&self) {
+        let writer = self.0.state.lock().expect("personal state").cache_binding.as_ref().map(|b| b.writer.clone());
+        if let Some(writer) = writer {
+            writer.flush().await;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn bind_observations(
         &self,
         access: Option<&Access>,
@@ -807,6 +896,7 @@ impl PersonalHub {
     pub fn reset(&self, epoch: u64) {
         let mut state = self.0.state.lock().expect("personal state");
         if epoch > state.status.epoch {
+            state.retire_cache();
             *state = State::default();
             state.status.epoch = epoch;
             self.0.signal();
@@ -823,6 +913,9 @@ impl PersonalHub {
         }
         state.status.generation = generation;
         state.status.link = Link::Waiting;
+        if let Some(binding) = state.cache_binding.as_mut() {
+            binding.mode = Some(*binding.session.network_changes().borrow());
+        }
         state.observation_mode = state
             .observation_writer
             .as_ref()
@@ -856,7 +949,12 @@ impl PersonalHub {
         update: PersonalUpdate,
     ) -> Result<Option<PersonalCommand>, PersonalGap> {
         let mut state = self.0.state.lock().expect("personal state");
-        if !state.scoped(epoch, generation) || state.status.link == Link::Disconnected {
+        // Share the same linearization point as manual-offline, revocation and
+        // account changes. The disk worker only receives accepted projections.
+        let _publication = PUBLICATION_GATE.lock().unwrap();
+        if !state.scoped(epoch, generation) || state.status.link == Link::Disconnected
+            || state.cache_binding.as_ref().is_some_and(|b| !b.network(epoch))
+        {
             return Ok(None);
         }
         let snapshot = matches!(&update, PersonalUpdate::Snapshot(_));
@@ -919,8 +1017,18 @@ impl PersonalHub {
             None
         };
         let writer = state.observation_writer.clone().zip(state.observation_mode);
-        let State { replica, quick, .. } = &mut *state;
+        if let PersonalUpdate::Change(change) = &update
+            && let Some(detail) = change.playlist.as_ref().and_then(|p| state.cache.details.get(&p.id))
+        {
+            let playlist = detail.playlist.clone();
+            state.replica.seed_detail(playlist);
+        }
+        let at = personal_cache::now_ms();
+        let State { replica, quick, cache, .. } = &mut *state;
+        let mut cache_changed = false;
         let received = replica.receive_observed(update, |event| {
+            cache.accept(event, part.then_some(at));
+            cache_changed = true;
             if let Some((writer, mode)) = &writer {
                 writer.observe(*mode, event);
             }
@@ -934,6 +1042,14 @@ impl PersonalHub {
                 quick.observe_scoped(replica);
                 if snapshot {
                     state.status.link = Link::Ready;
+                    state.cache.snapshot_at = at;
+                    command = state.use_fresh_detail(command, at);
+                }
+                if (cache_changed || observation.is_some()) && let Some(snapshot) = state.replica.snapshot() {
+                    state.cache.snapshot = Some(Arc::new(snapshot.clone()));
+                    if let Some(binding) = &state.cache_binding {
+                        binding.writer.publish(&state.cache);
+                    }
                 }
                 if state.quick.searching()
                     && state.quick.watched() != state.replica.watched_playlist()

@@ -2095,9 +2095,14 @@ impl Browser {
             return;
         };
         if a.local() {
-            return; // Never republish server playback or rows into a local projection.
+            // The history overlay can change as a local visit qualifies.
+            if self.route == Route::History {
+                self.visit(Navigation::Untracked(Route::History));
+            }
+            return;
         }
         let route = self.route.clone();
+        let cached = a.personal.cached_page(a.epoch, &route);
         let (status, next, detail_live, unavailable) = a.personal.read(|status, replica| {
             let detail_live = replica.playlist().is_some_and(|p| !p.stale);
             let page = (status.epoch == a.epoch)
@@ -2118,7 +2123,7 @@ impl Browser {
             && status.link == Link::Ready
             && next.is_some()
             && (!matches!(route, Route::Playlist(_)) || detail_live);
-        let models_changed = if let Some(next) = next {
+        let models_changed = if let Some(next) = cached.or(next) {
             if *self.page == next {
                 false
             } else {
@@ -2664,12 +2669,12 @@ impl Browser {
                 .map(|(route, page)| (route, page.as_ref()))
                 .collect::<Vec<_>>();
             let result = match &next {
-                Route::Playlists | Route::Playlist(_) => {
-                    playlist_browser::offline_page(&access, &next).await
+                Route::Playlists | Route::Playlist(_) | Route::History => {
+                    cached_local_page(&access, &next).await
                 }
                 Route::Offline => downloads_page(&access).await,
                 Route::SavedCollection(id) => playlist_browser::detail(&access, id).await,
-                Route::History | Route::Search(_) | Route::Album(_) | Route::Artist(_) => {
+                Route::Search(_) | Route::Album(_) | Route::Artist(_) => {
                     saved::inventory(&access).await.map(|records| {
                         catalog_page(&next, &records, &known, history.as_ref(), false)
                     })
@@ -3006,13 +3011,7 @@ impl Browser {
             return; // The previous online projection may still be painted, but is inert.
         }
         let saved_action = saved_route(&route) && matches!(op.as_str(), "play" | "queue");
-        if saved_action && !offline {
-            // The room cannot reproduce a filtered downloaded queue exactly.
-            self.message = "Work offline to play this Saved queue.".into();
-            self.render(false);
-            return;
-        }
-        let local_action = page.local_audio && offline && matches!(op.as_str(), "play" | "queue");
+        let local_action = saved_action || page.local_audio && offline && matches!(op.as_str(), "play" | "queue");
         if route.personal()
             && !self.personal_ready
             && !(unpin
@@ -3068,6 +3067,8 @@ impl Browser {
             return;
         }
         if matches!(op.as_str(), "play" | "queue") && row.as_ref().is_some_and(|r| !r.playable) {
+            self.message = if offline { "This track isn't downloaded." } else { "This track cannot be played." }.into();
+            self.render(false);
             return;
         }
         if matches!(op.as_str(), "play" | "queue") && !local_action {
@@ -3436,11 +3437,27 @@ impl Browser {
 const SEARCH_DELAY: Duration = Duration::from_millis(240);
 
 fn retained_history(access: &Access) -> Option<Page> {
-    access.personal.read(|status, replica| {
-        (status.epoch == access.epoch)
-            .then(|| pages::personal_projection(&Route::History, replica))
-            .flatten()
-    })
+    access.personal.cached_page(access.epoch, &Route::History)
+}
+
+async fn cached_local_page(access: &Access, route: &Route) -> Result<Page, ApiError> {
+    let mut page = access.personal.cached_page(access.epoch, route).unwrap_or_else(|| match route {
+        Route::Playlists => pages::personal_list(route, &[]),
+        Route::History => pages::recent(&[]),
+        _ => Page { title: "Playlist".into(), status: "Playlist details not saved on this device.".into(), ..Page::default() },
+    });
+    page.local_audio = true;
+    page.playback = None;
+    let ids = page.rows.iter().filter(|row| row.item.is_some()).map(|row| row.id.clone()).collect();
+    let records = crate::collections::browse_tracks(access, ids).await?;
+    for row in &mut page.rows {
+        row.local_recording = records.get(&row.id).map(|record| record.recording);
+        row.playable = row.local_recording.is_some();
+        if row.item.is_some() && !row.playable {
+            row.detail = pages::join_labels(&row.detail, "Not downloaded");
+        }
+    }
+    Ok(page)
 }
 
 async fn local_playback(
@@ -3457,7 +3474,7 @@ async fn local_playback(
     }
     let route = target.as_ref().unwrap_or(route);
     let page = match route {
-        Route::Playlist(_) => playlist_browser::offline_page(access, route).await?,
+        Route::Playlist(_) => cached_local_page(access, route).await?,
         Route::SavedCollection(id) => playlist_browser::detail(access, id).await?,
         Route::Album(_) | Route::Artist(_) => {
             let records = saved::inventory(access).await?;
