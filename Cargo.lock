@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "spofify-desktop"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "cookie",
  "futures-util",
