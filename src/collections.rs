@@ -2452,13 +2452,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_digest_failure_never_advances_progress_or_overwrites_existing_audio() {
+    async fn a_digest_failure_never_advances_progress_and_removes_only_damaged_audio() {
         let access = account("https://fixture.invalid");
         access.session.set_offline(true);
         let scratch = Scratch::new();
         let root = scratch.0.join("audio");
         let store = OfflineStore::open(&root).unwrap();
-        install_audio(&root, &access, "repeat", b"good");
+        let healthy = install_audio(&root, &access, "repeat", b"good");
+        let healthy_bytes = stdfs::read(&healthy).unwrap();
         let path = install_audio(&root, &access, "track", b"four");
         let mut damaged = stdfs::read(&path).unwrap();
         *damaged.last_mut().unwrap() = b'!';
@@ -2480,7 +2481,12 @@ mod tests {
             .await;
         assert_eq!(result.err(), Some(audio_error(offline::Error::Damaged)));
         assert_eq!(milestones, [(0, 3), (2, 3)]);
-        assert_eq!(stdfs::read(path).unwrap(), damaged);
+        assert!(!path.exists());
+        assert_eq!(stdfs::read(healthy).unwrap(), healthy_bytes);
+        let reopened = OfflineStore::open(&root).unwrap();
+        let downloads = reopened.list(&access.api, &access.session).unwrap();
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].item.id, "repeat");
     }
 
     fn create_v1_fixture(path: &std::path::Path, fixture: &Value) {
