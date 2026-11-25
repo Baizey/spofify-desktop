@@ -1195,10 +1195,15 @@ impl PersonalHub {
                         command = None;
                     }
                 }
-                if (cache_changed || observation.is_some()) && let Some(snapshot) = state.replica.snapshot() {
-                    state.cache.snapshot = Some(Arc::new(snapshot.clone()));
-                    if let Some(binding) = &state.cache_binding {
-                        binding.writer.publish(&state.cache);
+                if cache_changed || observation.is_some() {
+                    let State { cache, replica, cache_binding, .. } = &mut *state;
+                    if let Some(snapshot) = replica.snapshot() {
+                        // Accepted playlist events maintain the durable list.
+                        // The wire replica's prefix is not a replacement for it.
+                        cache.sync_recent(&snapshot.recent);
+                        if let Some(binding) = cache_binding {
+                            binding.writer.publish(cache);
+                        }
                     }
                 }
                 if state.quick.searching()
@@ -1507,6 +1512,45 @@ mod tests {
         assert_ne!(after.playlist_detail, before.playlist_detail);
         assert!(!hub.admit_move(before, &order, || panic!("old observation submitted")));
         assert!(hub.admit_move(after, &order, || true));
+    }
+
+    #[test]
+    fn capped_account_snapshot_preserves_known_summaries_until_confirmed_deletion() {
+        use crate::{pages::Route, personal::{Change, Snapshot}};
+        let hub = PersonalHub::default();
+        let known: PlaylistSummary = serde_json::from_value(json!({
+            "id":"known","name":"Last known","description":"Detail not saved","kind":"manual",
+            "countState":"exact","trackCount":2,"availableCount":2,"revision":1,
+            "createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z",
+            "capabilities":{"editMetadata":true,"editEntries":true,"editDefinition":false,"play":true,
+                "copyToManual":false,"delete":true,"addTracks":true}
+        })).unwrap();
+        let capped: Vec<_> = (0..100).map(|n| PlaylistSummary {
+            id: format!("prefix-{n}"), updated_at: "2026-08-03T01:00:00Z".into(), ..known.clone()
+        }).collect();
+        let snapshot = |playlists| PersonalUpdate::Snapshot(Snapshot { playlists, recent: vec![] });
+        hub.begin(1, 2);
+        hub.receive(1, 2, snapshot(vec![known.clone()])).unwrap();
+        hub.receive(1, 2, snapshot(capped.clone())).unwrap();
+        let route = Route::Playlist(known.id.clone());
+        {
+            let state = hub.0.state.lock().unwrap();
+            assert_eq!(state.replica.snapshot().unwrap().playlists.len(), 100);
+            let durable: Cache = serde_json::from_slice(&serde_json::to_vec(&state.cache).unwrap()).unwrap();
+            assert_eq!(durable.projection(&Route::Playlists).unwrap().rows.len(), 101);
+            let detail = durable.projection(&route).unwrap();
+            assert_eq!(detail.title, "Last known");
+            assert!(!detail.status.is_empty());
+            assert!(detail.rows.is_empty());
+        }
+        let edited = PlaylistSummary { name: "Confirmed edit".into(), revision: 2, ..known.clone() };
+        hub.receive(1, 2, PersonalUpdate::Change(Change { playlist: Some(edited), ..Change::default() })).unwrap();
+        assert_eq!(hub.0.state.lock().unwrap().cache.projection(&route).unwrap().title, "Confirmed edit");
+        hub.receive(1, 2, PersonalUpdate::Change(Change { deleted: Some(known.id), ..Change::default() })).unwrap();
+        hub.receive(1, 2, snapshot(capped)).unwrap();
+        let state = hub.0.state.lock().unwrap();
+        assert_eq!(state.cache.projection(&Route::Playlists).unwrap().rows.len(), 100);
+        assert!(state.cache.projection(&route).is_none());
     }
 
     #[tokio::test]

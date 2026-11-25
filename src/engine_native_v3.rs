@@ -233,10 +233,14 @@ impl NativeV3 {
                 {
                     anchor = position_ms(audio.facts());
                 }
+                if !same_scope && self.active.is_some() {
+                    self.retire_primary(&mut work);
+                    audio.discard_cache();
+                }
                 if execution.is_some() || !same_scope {
                     self.retry_media(id);
                 }
-                self.land(current.clone(), row, anchor, false, audio);
+                self.land(current.clone(), row, anchor, false, audio, &mut work);
                 if let Some(c) = execution {
                     self.waiting = Some(c.id.clone());
                 }
@@ -266,7 +270,7 @@ impl NativeV3 {
         if conditional_committed {
             // Consume buffered EOF against the commit's revision in
             // this turn. The actor may process another transport update next.
-            self.natural(cx, audio);
+            self.natural(cx, audio, &mut work);
         }
         self.drive(cx, audio, &mut work);
         self.make_report(cx, audio, &mut work);
@@ -277,7 +281,7 @@ impl NativeV3 {
         let mut work = Vec::new();
         if self.enter(cx, audio, &mut work) && self.confirmed.is_some() {
             if matches!(cx.mode, Mode::Detached) || self.same_scope(cx) {
-                self.natural(cx, audio);
+                self.natural(cx, audio, &mut work);
                 self.drive(cx, audio, &mut work);
                 self.make_report(cx, audio, &mut work);
             }
@@ -303,7 +307,7 @@ impl NativeV3 {
         };
         // Sample here as well as on tick. An EOF between ticks must not let
         // either action target a visit that has already ended.
-        self.natural(cx, audio);
+        self.natural(cx, audio, &mut work);
         if !self.receipts.contains(&c.id) {
             self.remember(&c.id);
             let source = self
@@ -368,7 +372,7 @@ impl NativeV3 {
                     if matches!(c.action, Action::Seek { .. }) {
                         self.retry_media(track.map(|r| r.id.as_str()));
                     }
-                    self.land(target.clone(), track, anchor, false, audio);
+                    self.land(target.clone(), track, anchor, false, audio, &mut work);
                 }
                 self.pending = Some(Pending {
                     origin: state.cursor.clone(),
@@ -404,6 +408,11 @@ impl NativeV3 {
         {
             return work;
         }
+        let detached = matches!(cx.mode, Mode::Detached);
+        let source = source.filter(|s| !s.is_failed() && (!detached || !s.is_stream()));
+        if detached {
+            self.natural(cx, audio, &mut work);
+        }
         if let Some(slot) = self
             .media
             .iter_mut()
@@ -422,7 +431,7 @@ impl NativeV3 {
                 }
             }
             slot.request = None;
-            slot.source = source.filter(|s| !s.is_failed());
+            slot.source = source;
             if request.portable_only || matches!(cx.mode, Mode::Detached) {
                 slot.source = slot.source.take().and_then(|s| s.isolated());
             }
@@ -441,6 +450,18 @@ impl NativeV3 {
     /// Native visit and transport intent; actual position comes from Audio facts.
     pub(crate) fn cursor(&self) -> Option<&Cursor> {
         self.active.as_ref().map(|a| &a.cursor)
+    }
+
+    /// The room that admitted this visit, not a later reconnect projection.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.scope.as_ref().map(|(session, _)| session.as_str())
+    }
+
+    pub(crate) fn listening_run(&self, audio: &Audio) -> Option<u64> {
+        let active = self.active.as_ref()?;
+        (active.phase == Phase::Running && active.run == audio.run_identity())
+            .then_some(active.run)
+            .flatten()
     }
 
     pub(crate) fn failed(&self) -> bool {
@@ -462,7 +483,7 @@ impl NativeV3 {
             return work;
         }
         let before = self.active.as_ref().unwrap().cursor.clone();
-        self.natural(cx, audio);
+        self.natural(cx, audio, &mut work);
         if matches!(action, Action::Next | Action::Previous | Action::Jump { .. } | Action::Pause | Action::Seek { .. } | Action::Resume) {
             self.skip_remaining = 0;
             self.stream_handoff = false;
@@ -480,7 +501,7 @@ impl NativeV3 {
             state.collection_first = 0;
             state.shuffle = false;
             state.cursor = Cursor::default();
-            self.land(Cursor::default(), None, 0, false, audio);
+            self.land(Cursor::default(), None, 0, false, audio, &mut work);
             self.drive(cx, audio, &mut work);
             return work;
         }
@@ -572,7 +593,7 @@ impl NativeV3 {
         state.cursor = target.clone();
         let anchor = target.position_ms;
         self.retry_media(row.as_ref().map(|r| r.id.as_str()));
-        self.land(target, row.as_ref(), anchor, false, audio);
+        self.land(target, row.as_ref(), anchor, false, audio, &mut work);
         self.drive(cx, audio, &mut work);
         work
     }
@@ -660,6 +681,7 @@ impl NativeV3 {
             position_ms,
             false,
             audio,
+            &mut Vec::new(), // The actor has already retired all native media.
         );
         self.confirmed = Some(state);
     }
@@ -772,6 +794,7 @@ impl NativeV3 {
                         state.cursor = active.cursor.clone();
                     }
                     self.stream_handoff = self.active.as_ref()
+                        .filter(|a| a.phase == Phase::Running && a.run == audio.run_identity())
                         .and_then(|a| a.track_id.as_deref())
                         .and_then(|id| audio.cached(id))
                         .is_some_and(|s| { s.stop_transfer(); s.is_stream() });
@@ -817,17 +840,17 @@ impl NativeV3 {
         anchor: u64,
         exhausted: bool,
         audio: &mut Audio,
+        work: &mut Vec<Work>,
     ) {
-        self.pin_primary(audio);
-        self.fade = None;
-        audio.stop();
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| a.track_id.as_deref() != row.map(|r| r.id.as_str()))
-        {
+        if exhausted || self.active.as_ref().is_some_and(|a| {
+            !same_visit(&a.cursor, &cursor)
+                || a.track_id.as_deref() != row.map(|r| r.id.as_str())
+        }) {
+            self.retire_primary(work);
             audio.discard_cache();
         }
+        self.fade = None;
+        audio.stop();
         audio.anchor(
             anchor as f64 / 1000.0,
             row.map_or(0.0, |r| r.duration.max(0.0)),
@@ -851,22 +874,13 @@ impl NativeV3 {
         });
     }
 
-    fn pin_primary(&mut self, audio: &Audio) {
-        let Some(id) = self.active.as_ref().and_then(|a| a.track_id.as_ref()) else {
-            return;
-        };
-        if let Some(input) = audio.cached(id).and_then(|s| s.isolated()) {
-            if let Some(slot) = self.media.iter_mut().find(|m| m.track_id == *id) {
-                slot.source = Some(input);
-                slot.failed = None;
-            } else {
-                self.media.push(Media {
-                    track_id: id.clone(),
-                    source: Some(input),
-                    request: None,
-                    failed: None,
-                });
-            }
+    fn retire_primary(&mut self, work: &mut Vec<Work>) {
+        self.stream_handoff = false;
+        if let Some(id) = self.active.as_ref().and_then(|a| a.track_id.as_ref())
+            && let Some(index) = self.media.iter().position(|m| m.track_id == *id)
+            && let Some(request) = self.media.swap_remove(index).request
+        {
+            work.push(Work::Cancel(request));
         }
     }
 
@@ -883,7 +897,7 @@ impl NativeV3 {
         }
     }
 
-    fn natural(&mut self, cx: Context<'_>, audio: &mut Audio) {
+    fn natural(&mut self, cx: Context<'_>, audio: &mut Audio, work: &mut Vec<Work>) {
         let facts = audio.facts();
         if self.pending.is_some() || !facts.ended {
             return;
@@ -918,6 +932,7 @@ impl NativeV3 {
                 .is_some_and(|(key, id)| key == next && row.as_ref().is_some_and(|r| r.id == id))
             && audio.promote_crossfade();
         if promote {
+            self.retire_primary(work);
             self.active = Some(Active {
                 cursor: target.clone(),
                 track_id: row.map(|r| r.id),
@@ -925,7 +940,7 @@ impl NativeV3 {
                 run: audio.run_identity(),
             });
         } else {
-            self.land(target.clone(), row.as_ref(), 0, next == 0, audio);
+            self.land(target.clone(), row.as_ref(), 0, next == 0, audio, work);
         }
         if matches!(cx.mode, Mode::Owner { .. }) {
             let advance = Advance {
@@ -1059,7 +1074,7 @@ impl NativeV3 {
                 self.skip_remaining -= 1;
                 let target = new_visit(key);
                 self.confirmed.as_mut().unwrap().cursor = target.clone();
-                self.land(target, Some(&row), 0, false, audio);
+                self.land(target, Some(&row), 0, false, audio, work);
                 return;
             }
             self.skip_remaining = 0;
@@ -1075,7 +1090,11 @@ impl NativeV3 {
             && a.phase == Phase::Running
             && a.cursor.desired_playing
             && self.pending.is_none()
-            && next.as_ref().is_some_and(|(key, _)| *key != a.cursor.key);
+            // One media slot per recording: the primary's descriptor cannot
+            // also admit an upcoming occurrence of that recording.
+            && next.as_ref().is_some_and(|(key, id)| {
+                *key != a.cursor.key && a.track_id.as_ref() != Some(id)
+            });
         if !want_fade || self.fade.is_some() && self.fade != next {
             audio.cancel_crossfade();
             self.fade = None;
@@ -1441,6 +1460,82 @@ mod tests {
         assert!(!native.cursor().unwrap().desired_playing);
         assert!(!audio.facts().playing);
         assert!(store.list(&api, &session).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn streamed_visit() -> (NativeV3, State, Audio, MixerSource, Context<'static>) {
+        let (mut native, mut shared, mut audio, mut output) = setup();
+        shared.repeat = Repeat::One;
+        shared.queue.truncate(1);
+        audio.discard_cache();
+        let opening = Context { snapshot: true, ..context() };
+        let request = primary(&native.reconcile(&shared, opening, &mut audio));
+        let path = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        use std::os::unix::fs::FileExt;
+        let bytes = wav();
+        file.write_all_at(&bytes, 0).unwrap();
+        let source = AudioInput::completed_stream(file, bytes.len() as u64);
+        native.complete(&shared, opening, &mut audio, &request, Some(source));
+        assert!(audio.cached("a").unwrap().is_stream());
+        assert!(output.by_ref().take(40).any(|s| s != 0.0));
+        (native, shared, audio, output, opening)
+    }
+
+    fn primary(work: &[Work]) -> MediaRequest {
+        work.iter().find_map(|item| match item {
+            Work::Prepare(request) if !request.preview => Some(request.clone()),
+            _ => None,
+        }).expect("a fresh primary admission")
+    }
+
+    #[test]
+    fn detached_repeat_drains_only_the_current_completed_stream() {
+        let (mut native, shared, mut audio, mut output, _) = streamed_visit();
+        let run = audio.run_identity().unwrap();
+        let detached = Context { mode: Mode::Detached, report: false, ..context() };
+        let handoff = primary(&native.tick(&shared, detached, &mut audio));
+        assert!(handoff.portable_only);
+        assert_eq!(audio.run_identity(), Some(run));
+        assert!(output.by_ref().take(40).any(|s| s != 0.0));
+
+        consume_eof(&mut output, &audio);
+        let work = native.tick(&shared, detached, &mut audio);
+        let repeated = primary(&work);
+        assert!(repeated.portable_only);
+        assert_ne!(handoff.token, repeated.token);
+        assert!(work.iter().any(|w| matches!(w, Work::Cancel(r) if *r == handoff)));
+        assert_ne!(native.cursor().unwrap().occurrence, shared.cursor.occurrence);
+        native.complete(&shared, detached, &mut audio, &handoff, Some(wav().into()));
+        assert!(audio.run_identity().is_none(), "late handoff must not admit the repeat");
+        native.complete(&shared, detached, &mut audio, &repeated, None);
+        assert!(native.failed());
+        assert!(!native.cursor().unwrap().desired_playing);
+        assert!(native.tick(&shared, detached, &mut audio).is_empty(), "no repeat loop");
+    }
+
+    #[test]
+    fn online_replay_of_the_same_recording_readmits_a_new_download() {
+        use std::os::unix::fs::DirBuilderExt;
+        let (mut native, mut shared, mut audio, _, _) = streamed_visit();
+        let root = std::env::temp_dir().canonicalize().unwrap().join(uuid::Uuid::new_v4().to_string());
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let store = crate::offline::OfflineStore::open(&root).unwrap();
+        let api = crate::engine::connection("http://127.0.0.1:1").unwrap();
+        let session = api.test_session();
+        store.test_install(&api, &session, "a", &wav());
+
+        // A new shared occurrence of the same queue row still needs source admission.
+        shared.cursor = new_visit(1);
+        let next = Context { revision: 11, ..context() };
+        let readmit = primary(&native.reconcile(&shared, next, &mut audio));
+        assert_eq!(readmit.id, "a");
+        assert!(!readmit.portable_only);
+        assert!(audio.cached("a").is_none() && audio.run_identity().is_none());
+        let verified = store.read(&api, &session, "a").unwrap().source;
+        native.complete(&shared, next, &mut audio, &readmit, Some(verified));
+        assert!(audio.cached("a").unwrap().is_saved());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1852,6 +1947,7 @@ mod tests {
             ..context()
         };
         native.reconcile(&state, confirmed, &mut audio);
+        native.complete(&state, confirmed, &mut audio, &primary(&work), Some(wav().into()));
         assert!(output.nth(159).unwrap() > 0.0);
         let run = audio.run_identity();
         let work = native.execute(
@@ -2601,13 +2697,11 @@ mod tests {
                 );
             }
             consume_eof(&mut output, &audio);
+            let detached = Context { mode: Mode::Detached, ..context() };
             let work = native.act_detached(
                 Action::Seek { position_ms: 60 },
                 &state,
-                Context {
-                    mode: Mode::Detached,
-                    ..context()
-                },
+                detached,
                 &mut audio,
             );
             assert!(!work.iter().any(|w| matches!(w, Work::Report(_))));
@@ -2615,6 +2709,9 @@ mod tests {
             assert_eq!(actual.key, if repeat == Repeat::One { 1 } else { 2 });
             assert_ne!(actual.occurrence, state.cursor.occurrence);
             assert_eq!(actual.position_ms, 0);
+            if repeat == Repeat::One {
+                native.complete(&state, detached, &mut audio, &primary(&work), Some(wav().into()));
+            }
             assert!(output.nth(159).unwrap() > 0.0);
             assert_eq!(position_ms(audio.facts()), 20);
         }

@@ -177,17 +177,6 @@ impl AudioInput {
         self.len
     }
 
-    /// Safe to share with another run of this exact authenticated audio GET.
-    /// Saved records must be reopened and verified at every new admission.
-    pub(crate) fn reusable_online(&self) -> bool {
-        match &self.backing {
-            Backing::Online(_) => !self.is_failed(),
-            Backing::File { .. } => false,
-            #[cfg(test)]
-            Backing::Memory(_) => true,
-        }
-    }
-
     pub(crate) fn cacheable(&self) -> bool {
         match &self.backing {
             Backing::Online(progress) => progress.state.load(Ordering::Acquire) == COMPLETE,
@@ -210,6 +199,19 @@ impl AudioInput {
                 }
             ))
         .then(|| self.decoder_input())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_stream(file: File, len: u64) -> Self {
+        Self {
+            backing: Backing::Online(Arc::new(Progress {
+                file,
+                written: AtomicU64::new(len),
+                state: AtomicU8::new(COMPLETE),
+            })),
+            _transfer: None,
+            len,
+        }
     }
 
     #[cfg(test)]

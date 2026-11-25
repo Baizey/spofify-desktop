@@ -25,7 +25,7 @@ use crate::{
     api::library::{HistoryEntry, PlaylistSummary},
     desk::Access,
     pages::{self, Page, Route},
-    personal::{AcceptedPlaylist, Playlist, Replica, Snapshot},
+    personal::{AcceptedPlaylist, Playlist, Replica, Snapshot, sort_summaries},
     playlist_pin_store::PUBLICATION_GATE,
     storage,
 };
@@ -55,7 +55,9 @@ pub(crate) struct Listening {
 }
 
 impl Listening {
-    pub fn observe(&mut self, event: &str, sample: Option<(u64, u64)>) -> bool {
+    /// Collect progress online too, but publish a local event only if the
+    /// visit needs offline credit. Go is responsible for fully online visits.
+    pub fn observe(&mut self, event: &str, sample: Option<(u64, u64)>, local: bool) -> bool {
         if self.event != event {
             *self = Self {
                 event: event.into(),
@@ -68,7 +70,7 @@ impl Listening {
             self.listened_ms = self.listened_ms.saturating_add(now.saturating_sub(before));
         }
         self.prior = sample;
-        if self.listened_ms > 30_000 && !self.credited {
+        if local && self.listened_ms > 30_000 && !self.credited {
             self.credited = true;
             return true;
         }
@@ -78,6 +80,15 @@ impl Listening {
     pub fn suspend(&mut self) {
         self.prior = None;
     }
+}
+
+fn same_event(left: &HistoryEntry, right: &HistoryEntry) -> bool {
+    fn online(origin: Option<&str>) -> bool {
+        matches!(origin, None | Some("online"))
+    }
+    left.id == right.id
+        && (left.origin == right.origin
+            || left.id.starts_with("v3:") && online(left.origin.as_deref()) && online(right.origin.as_deref()))
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -145,7 +156,18 @@ impl Cache {
     pub fn accept(&mut self, event: AcceptedPlaylist<'_>, refreshed_at: Option<u64>) {
         match event {
             AcceptedPlaylist::Summaries(list) => {
-                self.reconcile(list, Replica::summaries_capped(list))
+                let capped = Replica::summaries_capped(list);
+                self.reconcile(list, capped);
+                let known = &mut self.snapshot_mut().playlists;
+                if capped {
+                    // A bounded prefix does not prove that an omitted playlist
+                    // is gone. Keep it until a complete list or a deletion.
+                    known.retain(|old| !list.iter().any(|current| current.id == old.id));
+                    known.extend_from_slice(list);
+                    sort_summaries(known);
+                } else {
+                    *known = list.to_vec();
+                }
             }
             AcceptedPlaylist::Summary {
                 summary,
@@ -155,8 +177,10 @@ impl Cache {
                     detail.playlist.summary = summary.clone();
                     detail.playlist.stale |= invalidates_membership;
                 }
+                self.upsert_summary(summary);
             }
             AcceptedPlaylist::Complete(playlist) => {
+                self.upsert_summary(&playlist.summary);
                 let id = playlist.summary.id.clone();
                 let refreshed_at = refreshed_at
                     .unwrap_or_else(|| self.details.get(&id).map_or(0, |d| d.refreshed_at));
@@ -170,7 +194,35 @@ impl Cache {
             }
             AcceptedPlaylist::Deleted(id) => {
                 self.details.remove(id);
+                self.snapshot_mut().playlists.retain(|p| p.id != id);
             }
+        }
+    }
+
+    fn snapshot_mut(&mut self) -> &mut Snapshot {
+        Arc::make_mut(self.snapshot.get_or_insert_with(Arc::default))
+    }
+
+    fn upsert_summary(&mut self, summary: &PlaylistSummary) {
+        let known = &mut self.snapshot_mut().playlists;
+        if let Some(old) = known.iter_mut().find(|p| p.id == summary.id) {
+            *old = summary.clone();
+        } else {
+            known.push(summary.clone());
+        }
+        sort_summaries(known);
+    }
+
+    pub fn sync_recent(&mut self, recent: &[HistoryEntry]) {
+        let unmatched = |local: &HistoryEntry| !recent.iter().any(|entry| same_event(entry, local));
+        if self.local_recent.iter().any(|local| !unmatched(local)) {
+            // Once Go has this visit, subsequent retention and deletion are
+            // authoritative. Keep only local events it hasn't observed.
+            Arc::make_mut(&mut self.local_recent).retain(unmatched);
+        }
+        let snapshot = self.snapshot_mut();
+        if snapshot.recent != recent {
+            snapshot.recent = recent.to_vec();
         }
     }
 
@@ -191,12 +243,12 @@ impl Cache {
     }
 
     pub fn record(&mut self, play: HistoryEntry) -> bool {
-        let same_event = |p: &HistoryEntry| p.id == play.id && p.origin == play.origin;
-        if self.local_recent.iter().any(same_event)
+        let matches_play = |p: &HistoryEntry| same_event(p, &play);
+        if self.local_recent.iter().any(matches_play)
             || self
                 .snapshot
                 .as_ref()
-                .is_some_and(|s| s.recent.iter().any(same_event))
+                .is_some_and(|s| s.recent.iter().any(matches_play))
         {
             return false;
         }
@@ -214,7 +266,7 @@ impl Cache {
             .filter(|local| {
                 !online
                     .iter()
-                    .any(|entry| entry.id == local.id && entry.origin == local.origin)
+                    .any(|entry| same_event(entry, local))
             })
             .chain(online)
             .collect();
@@ -409,14 +461,14 @@ mod tests {
     #[test]
     fn qualification_counts_only_movement_within_one_decoder_run() {
         let mut progress = Listening::default();
-        assert!(!progress.observe("one", Some((1, 1_000))));
-        assert!(!progress.observe("one", Some((1, 11_000))));
+        assert!(!progress.observe("one", Some((1, 1_000)), false));
+        assert!(!progress.observe("one", Some((1, 11_000)), false));
         progress.suspend();
-        assert!(!progress.observe("one", Some((2, 90_000))));
-        assert!(!progress.observe("one", Some((2, 110_000))));
-        assert!(progress.observe("one", Some((2, 110_001))));
-        assert!(!progress.observe("one", Some((2, 120_000))));
-        assert!(!progress.observe("two", Some((2, 120_010))));
+        assert!(!progress.observe("one", Some((2, 90_000)), true));
+        assert!(!progress.observe("one", Some((2, 110_000)), true));
+        assert!(progress.observe("one", Some((2, 110_001)), true));
+        assert!(!progress.observe("one", Some((2, 120_000)), true));
+        assert!(!progress.observe("two", Some((2, 120_010)), true));
     }
 
     #[test]
@@ -431,6 +483,26 @@ mod tests {
             cache.recent(std::slice::from_ref(&first)),
             vec![second, first]
         );
+    }
+
+    #[test]
+    fn v3_online_event_and_offline_completion_merge_with_omitted_origin() {
+        let mut local = play("v3:shared-visit", "2026-06-10T10:00:00Z");
+        local.origin = Some("online".into());
+        let server = play("v3:shared-visit", "2026-06-10T10:00:01Z");
+        let distinct = play("v3:another-visit", "2026-06-10T10:02:00Z");
+        let mut cache = Cache::default();
+        assert!(cache.record(local.clone()));
+        assert!(cache.record(distinct.clone()));
+        cache.sync_recent(std::slice::from_ref(&server));
+        assert!(!cache.record(server.clone()));
+        assert_eq!(cache.recent(std::slice::from_ref(&server)), vec![distinct.clone(), server]);
+        cache.sync_recent(&[]);
+        assert_eq!(cache.recent(&[]), vec![distinct]);
+
+        let mut local_only = play("v3:shared-visit", "2026-06-10T10:03:00Z");
+        local_only.origin = Some("offline".into());
+        assert!(cache.record(local_only));
     }
 
     #[test]

@@ -111,7 +111,7 @@ async fn online_large_wav_starts_before_tail_and_seeks_and_ends_on_one_body() {
     let startup = started_at.elapsed();
     assert!(audio.has_started() && audio.facts().elapsed > 0.0);
     assert!(!source.cacheable(), "the tail has not been sent");
-    assert!(source.reusable_online());
+    assert!(source.is_stream() && !source.is_failed());
     assert!(
         source.isolated().is_none(),
         "a written prefix is not enough"

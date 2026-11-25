@@ -2639,12 +2639,14 @@ impl Browser {
         let retain_view = current
             && !self.page.kind.is_empty()
             && !matches!(&next, Route::Search(query) if query.trim().is_empty());
+        let personal = matches!(next, Route::Playlists | Route::Playlist(_) | Route::History | Route::Picker(_));
+        let retire_admissions = retain_view && personal && !self.page.local_audio;
         if !retain_view {
             let mut page = access.personal.cached_page(access.epoch, &next).unwrap_or_default();
-            page.local_audio = true;
-            page.playback = None;
-            for row in &mut page.rows { row.playable = false; }
+            reset_local_admissions(&mut page);
             self.page = Arc::new(page);
+        } else if retire_admissions {
+            reset_local_admissions(Arc::make_mut(&mut self.page));
         }
         // The old source is already fenced. Keep its last painted view only
         // until the local projection is ready, then publish once rather than
@@ -2658,7 +2660,7 @@ impl Browser {
         let tx = self.results.clone();
         self.busy = true;
         self.silent_read = retain_view;
-        self.render(!retain_view);
+        self.render(!retain_view || retire_admissions);
         self.task = Some(tokio::spawn(async move {
             if matches!(next, Route::Search(_)) && !current {
                 tokio::time::sleep(SEARCH_DELAY).await;
@@ -3503,19 +3505,44 @@ fn retained_history(access: &Access) -> Option<Page> {
 }
 
 async fn cached_local_page(access: &Access, route: &Route) -> Result<Page, ApiError> {
-    let mut page = access.personal.cached_page(access.epoch, route).unwrap_or_else(|| match route {
+    let page = access.personal.cached_page(access.epoch, route).unwrap_or_else(|| match route {
         Route::Playlists => pages::personal_list(route, &[]),
         Route::History => pages::recent(&[]),
         _ => Page { title: "Playlist".into(), status: "Playlist details not saved on this device.".into(), ..Page::default() },
     });
+    let ids = page.rows.iter().filter(|row| row.item.is_some()).map(|row| row.id.clone()).collect();
+    apply_download_availability(page, crate::collections::browse_tracks(access, ids).await)
+}
+
+fn reset_local_admissions(page: &mut Page) {
     page.local_audio = true;
     page.playback = None;
-    let ids = page.rows.iter().filter(|row| row.item.is_some()).map(|row| row.id.clone()).collect();
-    let records = crate::collections::browse_tracks(access, ids).await?;
+    page.local_collection_playable = false;
     for row in &mut page.rows {
+        row.playable = false;
+        row.local_recording = None;
+    }
+}
+
+fn apply_download_availability(
+    mut page: Page,
+    records: Result<HashMap<String, crate::offline::Download>, ApiError>,
+) -> Result<Page, ApiError> {
+    reset_local_admissions(&mut page);
+    let records = match records {
+        Ok(records) => records,
+        Err(error) if error.expired => return Err(error),
+        Err(_) => {
+            // Availability is independent of cached metadata. Do not turn a
+            // failed verification into either an empty view or a missing file.
+            page.status = "Download availability couldn’t be checked.".into();
+            return Ok(page);
+        }
+    };
+    for row in page.rows.iter_mut().filter(|row| row.item.is_some()) {
         row.local_recording = records.get(&row.id).map(|record| record.recording);
         row.playable = row.local_recording.is_some();
-        if row.item.is_some() && !row.playable {
+        if !row.playable {
             row.detail = pages::join_labels(&row.detail, "Not downloaded");
         }
     }
@@ -4364,6 +4391,41 @@ mod tests {
             row.route = Some(Route::Album("unrelated".into()));
             assert!(row_actions(&page, &row, true, false, false).is_empty());
             page.local_audio = false;
+        }
+    }
+
+    #[test]
+    fn failed_download_lookup_keeps_cached_playlist_and_history_occurrences() {
+        use crate::api::library::{HistoryEntry, ManualEntry};
+        let track: crate::api::catalog::CatalogItem = serde_json::from_value(serde_json::json!({
+            "kind":"track", "id":"same-track", "name":"Song", "artists":[], "genres":[],
+            "album_id":"album", "album_name":"Album", "album_type":"", "release_date":"", "relation":"",
+            "duration_ms":60000, "disc_number":0, "track_number":0, "has_audio":true,
+            "coverage":{"tracks":1,"inLibrary":1,"albums":1}
+        })).unwrap();
+        let playlist = pages::personal_playlist(&editable_playlist(), None, &[
+            ManualEntry { id: "entry-a".into(), position: 0, track: track.clone() },
+            ManualEntry { id: "entry-b".into(), position: 1, track: track.clone() },
+        ]);
+        let history = pages::recent(&[
+            HistoryEntry { id: "play-a".into(), played_at: "2026-06-10T10:00:00Z".into(), track: track.clone(),
+                origin: None, received_at: None, metadata_missing: false },
+            HistoryEntry { id: "play-b".into(), played_at: "2026-06-10T10:01:00Z".into(), track,
+                origin: None, received_at: None, metadata_missing: false },
+        ]);
+        let failed = ApiError { message: "disk unavailable", status: 0, expired: false };
+        for page in [playlist, history] {
+            let unknown = apply_download_availability(page.clone(), Err(failed)).unwrap();
+            let missing = apply_download_availability(page.clone(), Ok(HashMap::new())).unwrap();
+            assert_eq!(unknown.title, page.title);
+            assert_eq!((unknown.rows.len(), unknown.total), (page.rows.len(), page.total));
+            assert!(!unknown.status.is_empty());
+            assert!(unknown.local_audio && unknown.playback.is_none());
+            for ((unknown, missing), original) in unknown.rows.iter().zip(&missing.rows).zip(&page.rows) {
+                assert_eq!((&unknown.key, &unknown.title, &unknown.detail), (&original.key, &original.title, &original.detail));
+                assert!(!unknown.playable && unknown.local_recording.is_none());
+                assert!(missing.detail.contains("Not downloaded"));
+            }
         }
     }
 

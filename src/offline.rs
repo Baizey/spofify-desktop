@@ -176,9 +176,8 @@ pub(crate) async fn online_media(
     session: &Session,
     slot: Arc<Semaphore>,
     id: &str,
-    cached: Option<AudioInput>,
 ) -> Result<OnlineMedia, ApiError> {
-    online_media_with_store(api, session, slot, id, cached, OfflineStore::open_existing).await
+    online_media_with_store(api, session, slot, id, OfflineStore::open_existing).await
 }
 
 async fn online_media_with_store(
@@ -186,7 +185,6 @@ async fn online_media_with_store(
     session: &Session,
     slot: Arc<Semaphore>,
     id: &str,
-    cached: Option<AudioInput>,
     open: impl FnOnce() -> Result<Option<OfflineStore>, Error> + Send + 'static,
 ) -> Result<OnlineMedia, ApiError> {
     api.with_authenticated_network(session, async {
@@ -198,10 +196,9 @@ async fn online_media_with_store(
             move || open()?.ok_or(Error::NotDownloaded),
         )
         .await;
-        let source = match (input, cached) {
-            (Ok((_, input)), _) => input.source,
-            (_, Some(source)) if source.reusable_online() => source,
-            _ => AudioInput::online(api.media(session, id).await?).await?,
+        let source = match input {
+            Ok((_, input)) => input.source,
+            Err(_) => AudioInput::online(api.media(session, id).await?).await?,
         };
         Ok(OnlineMedia { source })
     })
@@ -1579,15 +1576,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_download_wins_over_stream_reuse_while_online() {
+    async fn online_admission_uses_the_verified_download_without_network() {
         let fixture = Fixture::new();
         let api = Arc::new(api("https://one.invalid"));
         let session = api.test_session();
         let store = fixture.store();
         let own = Scope::new(&api, &session).unwrap();
-        let foreign = Scope::from_parts("https://one.invalid", "other-account");
         install(&store, &own, "saved", b"verified local bytes").unwrap();
-        install(&store, &foreign, "foreign", b"other user data").unwrap();
         let read = |id: &'static str| {
             let store = store.clone();
             online_media_with_store(
@@ -1595,12 +1590,11 @@ mod tests {
                 &session,
                 Arc::new(Semaphore::new(1)),
                 id,
-                Some(AudioInput::from(Arc::from(&b"reusable stream"[..]))),
                 move || Ok(Some(store)),
             )
         };
         let chosen = read("saved").await.unwrap();
-        assert!(!chosen.source.reusable_online());
+        assert!(chosen.source.is_saved());
         let mut actual = Vec::new();
         chosen.source.reader().read_to_end(&mut actual).unwrap();
         assert_eq!(actual, b"verified local bytes");
@@ -1613,16 +1607,7 @@ mod tests {
         actual.clear();
         isolated.reader().read_to_end(&mut actual).unwrap();
         assert_eq!(actual, b"verified local bytes");
-        local.set_offline(false);
-        for id in ["foreign", "missing"] {
-            let chosen = read(id).await.unwrap();
-            assert!(chosen.source.reusable_online());
-            actual.clear();
-            chosen.source.reader().read_to_end(&mut actual).unwrap();
-            assert_eq!(actual, b"reusable stream");
-        }
-        session.set_offline(true);
-        assert!(read("saved").await.is_err());
+        assert!(read("saved").await.is_err(), "manual mode retires online admission");
     }
 
     #[test]

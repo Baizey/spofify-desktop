@@ -168,7 +168,7 @@ impl Command {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub playlists: Vec<PlaylistSummary>,
     pub recent: Vec<HistoryEntry>,
@@ -913,7 +913,7 @@ impl Replica {
             }
             true
         });
-        sort(&mut s.playlists);
+        sort_summaries(&mut s.playlists);
         self.snapshot = Some(s);
         self.ready = true;
         Ok(if keep_visible_pull { None } else { self.start_watch() })
@@ -1162,11 +1162,11 @@ fn replace_summary(summaries: &mut Vec<PlaylistSummary>, p: PlaylistSummary) {
     } else {
         summaries.push(p);
     }
-    sort(summaries);
+    sort_summaries(summaries);
     summaries.truncate(MAX_PLAYLISTS);
 }
 
-fn sort(summaries: &mut [PlaylistSummary]) {
+pub(crate) fn sort_summaries(summaries: &mut [PlaylistSummary]) {
     // Go emits UTC RFC3339Nano; a whole second's trailing `Z` must sort
     // before any fractional value within that second.
     fn key(p: &PlaylistSummary) -> &str {

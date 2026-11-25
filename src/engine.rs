@@ -1115,8 +1115,13 @@ impl Engine {
     fn record_local_listening(&mut self) {
         use crate::api::{catalog::{CatalogItem, CatalogKind, Coverage}, library::HistoryEntry};
         let Some(audio) = &self.audio else { return };
+        let elapsed_ms = (audio.facts().elapsed * 1_000.0) as u64;
         let (event_id, origin, id, title, album_id, album_name, artists, duration) = if self.local_store.is_some() {
             let (Some(entry), Some(visit)) = (self.local.current(), self.local.occurrence.as_ref()) else { return };
+            let sample = audio.run_identity().map(|run| (run, elapsed_ms));
+            if !self.listening.observe(visit, sample, true) {
+                return;
+            }
             let track = &entry.track;
             let artists = track.music.credits.iter().map(|c| crate::api::catalog::ArtistCredit {
                 id: match &c.target { Some(crate::pages::Route::Artist(id)) => id.clone(), _ => String::new() },
@@ -1124,39 +1129,42 @@ impl Engine {
             }).collect();
             let album_id = track.music.album.as_ref().and_then(|c| match &c.target { Some(crate::pages::Route::Album(id)) => Some(id.clone()), _ => None }).unwrap_or_default();
             (visit.clone(), "offline", track.id.clone(), track.title.clone(), album_id, track.album_name.clone(), artists, track.duration)
-        } else if self.online.detached {
-            let (Some(state), Some(cursor)) = (self.online.native.state(), self.online.native.cursor()) else { return };
+        } else {
+            let (Some(state), Some(cursor)) = (self.online.native.state(), self.online.native.cursor()) else {
+                self.listening.suspend();
+                return;
+            };
             let Some(visit) = &cursor.occurrence else { return };
             let Some(track) = state.queue.iter().find(|row| row.key == cursor.key) else { return };
             // Match the server event for the same already-shared visit.
             let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-            hash.update(self.online.projection.session_id().unwrap_or_default().as_bytes());
+            let session_id = self.online.native.session_id().or_else(|| self.online.projection.session_id());
+            let Some(session_id) = session_id else { return };
+            hash.update(session_id.as_bytes());
             hash.update(b"\0");
             hash.update(visit.as_bytes());
             let digest: String = hash.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            let event_id = format!("v3:{digest}");
+            let sample = self.online.native.listening_run(audio).map(|run| (run, elapsed_ms));
+            if !self.listening.observe(&event_id, sample, self.online.detached) {
+                return;
+            }
             let artists = track.artists.iter().map(|a| crate::api::catalog::ArtistCredit {
                 id: a.id.clone().unwrap_or_default(), name: a.name.clone(),
             }).collect();
-            (format!("v3:{digest}"), "online", track.id.clone(), track.name.clone(), track.album_id.clone(), track.album_name.clone(), artists, track.duration)
-        } else {
-            self.listening.suspend();
-            return;
+            (event_id, "online", track.id.clone(), track.name.clone(), track.album_id.clone(), track.album_name.clone(), artists, track.duration)
         };
-        let facts = audio.facts();
-        let sample = audio.run_identity().map(|run| (run, (facts.elapsed * 1_000.0) as u64));
-        if self.listening.observe(&event_id, sample) {
-            self.personal.record_local(self.epoch, HistoryEntry {
-                id: event_id,
-                played_at: time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).expect("UTC timestamp"),
-                origin: Some(origin.into()), received_at: None, metadata_missing: false,
-                track: CatalogItem {
-                    kind: CatalogKind::Track, id, name: title, artists, genres: vec![], album_id, album_name,
-                    album_type: String::new(), release_date: String::new(), relation: String::new(),
-                    duration_ms: (duration * 1_000.0) as u64, disc_number: 0, track_number: 0,
-                    has_audio: true, coverage: Coverage::default(),
-                }
-            });
-        }
+        self.personal.record_local(self.epoch, HistoryEntry {
+            id: event_id,
+            played_at: time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).expect("UTC timestamp"),
+            origin: Some(origin.into()), received_at: None, metadata_missing: false,
+            track: CatalogItem {
+                kind: CatalogKind::Track, id, name: title, artists, genres: vec![], album_id, album_name,
+                album_type: String::new(), release_date: String::new(), relation: String::new(),
+                duration_ms: (duration * 1_000.0) as u64, disc_number: 0, track_number: 0,
+                has_audio: true, coverage: Coverage::default(),
+            }
+        });
     }
 
     fn tick_saved(&mut self) {

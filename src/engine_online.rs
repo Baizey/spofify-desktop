@@ -940,7 +940,7 @@ impl Engine {
                     let task = tokio::spawn(async move {
                         let id = request_for_task.id.clone();
                         let source = if connected {
-                            offline::online_media(&api, &session, verify_slot, &id, None)
+                            offline::online_media(&api, &session, verify_slot, &id)
                                 .await
                                 .ok()
                                 .map(|media| media.source)
