@@ -280,7 +280,12 @@ impl Engine {
                 self.online.detached_owner = !self.online.gap && !demoted && self.online.is_owner(&self.device_id)
                     && self.online.native.state().is_some_and(|state| !state.queue.is_empty());
                 self.online.detached = self.online.detached_owner;
-                if !self.online.detached_owner {
+                if self.online.detached_owner {
+                    // The current run still owns its final PCM sample here.
+                    // The very next detached tick (or a queued event) may
+                    // advance at EOF and replace that occurrence.
+                    self.record_local_listening();
+                } else {
                     self.isolate_confirmed_follower();
                 }
             } else if !eligible && !self.account.as_ref().is_some_and(|a| !a.session.is_revoked() && self.private_audio()) {
@@ -1215,7 +1220,11 @@ mod tests {
     }
 
     fn wav() -> Arc<[u8]> {
-        let samples = vec![1500_i16; 8000];
+        wav_seconds(1)
+    }
+
+    fn wav_seconds(seconds: usize) -> Arc<[u8]> {
+        let samples = vec![1500_i16; 8000 * seconds];
         let len = samples.len() as u32 * 2;
         let mut data = b"RIFF".to_vec();
         data.extend((len + 36).to_le_bytes());
@@ -1233,6 +1242,61 @@ mod tests {
             data.extend(sample.to_le_bytes());
         }
         data.into()
+    }
+
+    #[tokio::test]
+    async fn automatic_cutover_on_exact_pcm_eof_credits_the_same_visit() {
+        use crate::{desk::Access, pages::Route};
+        let mut e = crate::engine::tests::engine();
+        let api = Arc::new(connection("http://127.0.0.1:19431").unwrap());
+        let session = api.test_session();
+        let personal = e.personal.access();
+        e.personal.bind_cache(Some(&Access {
+            epoch: e.epoch, api: api.clone(), session: session.clone(), offline: false, personal: personal.clone(),
+        }), &e.shared_epoch);
+        let (mixer, mut samples) = rodio::mixer::mixer(1, 8000);
+        let mut audio = Audio::new_account_scoped(session.clone(), e.shared_epoch.clone(), e.epoch, e.master_gain.clone());
+        audio.use_test_output(mixer, "song".into(), wav_seconds(31));
+        e.audio = Some(audio);
+        e.account = Some(Account { api, session: session.clone() });
+        let generation = 11;
+        let (socket, peer) = socket::Socket::test_peer(session.clone(), generation);
+        e.socket = Some(socket);
+        let state: State = serde_json::from_value(serde_json::json!({
+            "queue":[{"key":1,"order":1,"id":"song","name":"Cutover","intent":"low","duration":31.0}],
+            "cursor":{"key":1,"occurrence":"same-visit","positionMs":0,"desiredPlaying":true},
+            "repeat":"off","shuffle":false
+        })).unwrap();
+        let snap = socket::Snapshot {
+            session_id: "eof-room".into(), connection_id: "eof-binding".into(), revision: 1,
+            owner: socket::Owner { generation, device_id: Some(e.device_id.clone()) }, devices: vec![],
+            player: state, observation: None, server_time_ms: now_ms(),
+        };
+        peer.set_opening_snapshot(&snap, true);
+        e.tick_with_event(Some(Event { generation, kind: EventKind::Snapshot(snap), personal_stamp: None }));
+        e.tick();
+        assert_eq!(samples.by_ref().take(8000).count(), 8000);
+        e.tick();
+        for _ in 0..28 * 8000 { let _ = samples.next(); }
+        e.tick();
+        assert!(personal.cached_page(e.epoch, &Route::History).is_none());
+        for _ in 0..3 * 8000 {
+            let _ = samples.next();
+            if e.audio.as_ref().unwrap().facts().ended { break; }
+        }
+        assert!(e.audio.as_ref().unwrap().facts().ended);
+        assert!(e.audio.as_ref().unwrap().facts().elapsed > 30.0);
+        peer.link.send_replace(Link::Disconnected);
+        e.tick();
+        assert!(e.online.detached_owner);
+        assert_eq!(e.audio.as_ref().unwrap().run_identity(), None, "the same tick consumed EOF");
+        e.tick();
+        let page = personal.cached_page(e.epoch, &Route::History).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].title, "Cutover");
+        let digest = ring::digest::digest(&ring::digest::SHA256, b"eof-room\0same-visit");
+        let id: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(page.rows[0].key, crate::pages::RowKey::HistoryEvent(format!("online:v3:{id}")));
     }
 
     #[tokio::test]
