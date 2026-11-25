@@ -2,6 +2,12 @@
 
 Do not use hmem. Use the current task brief and repository source, tests, and technical documentation. Never upload secrets or transcripts.
 
+## Repository change policy
+
+- Data: breakable (client-owned local data).
+- Contracts: breakable.
+- Behaviour: breakable.
+
 ## User-facing design and information
 
 This applies to every user-facing surface in Spofify, including admin tools, setup, settings, lists, dialogs, empty and error states, and notifications.
