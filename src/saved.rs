@@ -140,6 +140,12 @@ pub async fn page(access: &Access) -> Result<Page, ApiError> {
 }
 
 pub async fn save(access: &Access, row: &Row) -> Result<(), ApiError> {
+    let check_playlist = || match &row.key {
+        crate::pages::RowKey::DerivedOccurrence { playlist_id, occurrence_id }
+            if !access.personal.can_download_playlist_row(access.epoch, playlist_id, occurrence_id, &row.id) => Err(offline::Error::RecordingChanged),
+        _ => Ok(()),
+    };
+    check_playlist().map_err(error)?;
     let item = row
         .item
         .as_ref()
@@ -155,6 +161,7 @@ pub async fn save(access: &Access, row: &Row) -> Result<(), ApiError> {
         _ = network.changed() => Err(error(offline::Error::Offline)),
         result = async {
             let store = OfflineStore::open_for_download(OfflineStore::open_default).await.map_err(error)?;
+            check_playlist().map_err(error)?;
             match store.download_for_access(access, item).await {
                 Ok(_) | Err(offline::Error::AlreadyDownloaded) => Ok(()),
                 Err(err) => Err(error(err)),

@@ -1245,6 +1245,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captured_derived_play_and_queue_intents_cannot_send_while_detail_is_stale() {
+        use crate::personal::PersonalUpdate;
+        let mut e = crate::engine::tests::engine();
+        let api = Arc::new(connection("http://127.0.0.1:19433").unwrap());
+        let session = api.test_session();
+        e.account = Some(Account { api, session: session.clone() });
+        e.publish_access(); // Bind the local account cache before the socket opens.
+        let generation = 11;
+        let (socket, mut peer) = socket::Socket::test_peer(session, generation);
+        e.socket = Some(socket);
+        let snap = socket::Snapshot {
+            session_id: "room".into(), connection_id: "binding".into(), revision: 1,
+            owner: socket::Owner { generation, device_id: Some("other".into()) }, devices: vec![],
+            player: State::default(), observation: None, server_time_ms: now_ms(),
+        };
+        peer.set_opening_snapshot(&snap, false);
+        e.tick_with_event(Some(Event { generation, kind: EventKind::Snapshot(snap), personal_stamp: None }));
+        let personal = e.personal.access();
+        let ready = serde_json::json!({"id":"rules","name":"Rules","description":"","kind":"derived",
+            "countState":"exact","evaluationState":"ready","trackCount":1,"availableCount":1,"revision":1,
+            "createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z",
+            "capabilities":{"editMetadata":true,"editEntries":false,"editDefinition":true,"play":true,
+                "copyToManual":true,"delete":true,"addTracks":false}});
+        let receive = |e: &Engine, update| e.personal.receive(e.epoch, generation,
+            serde_json::from_value::<PersonalUpdate>(update).unwrap()).unwrap();
+        receive(&e, serde_json::json!({"snapshot":{"playlists":[ready.clone()],"recent":[]}}));
+        personal.watch_playlist(e.epoch, Some("rules".into())).unwrap();
+        let complete = |summary| serde_json::json!({"part":{"summary":summary,"token":"ready","offset":0,"more":false,
+            "definition":{"version":1,"sources":[{"kind":"allSaved","slotId":"root"}],"duplicates":"keep","sort":"sourceOrder"},
+            "rows":[{"id":"o1_ready","position":0,"track":{"kind":"track","id":"song","name":"Song","hasAudio":true,
+                "coverage":{"tracks":1,"inLibrary":1,"albums":1}}}]}});
+        receive(&e, complete(ready.clone()));
+        let selection = crate::player::Selection::collection(crate::player::Context::new("derived", "rules", "Rules"));
+        let play = || Action::Play { selection: selection.clone(), shuffle: false };
+        let queue = || Action::Enqueue { selection: selection.clone() };
+        assert!(e.admits_shared_selection(&play()) && e.admits_shared_selection(&queue()));
+
+        let mut stale = ready.clone();
+        stale["evaluationState"] = "error".into();
+        stale["countState"] = "stale".into();
+        receive(&e, serde_json::json!({"change":{"playlist":stale,"rowsInvalid":true}}));
+        assert!(!e.admits_shared_selection(&play()) && !e.admits_shared_selection(&queue()));
+        while peer.read().is_some() {}
+        e.action(play());
+        e.action(queue());
+        assert!(peer.read().is_none());
+
+        receive(&e, serde_json::json!({"change":{"playlist":ready.clone()}}));
+        assert!(!e.admits_shared_selection(&play()));
+        receive(&e, complete(ready));
+        assert!(e.admits_shared_selection(&play()) && e.admits_shared_selection(&queue()));
+    }
+
+    #[tokio::test]
     async fn automatic_cutover_on_exact_pcm_eof_credits_the_same_visit() {
         use crate::{desk::Access, pages::Route};
         let mut e = crate::engine::tests::engine();

@@ -225,6 +225,11 @@ pub enum RuleMembership {
 }
 
 impl PlaylistSummary {
+    pub(crate) fn evaluation_ready(&self) -> bool {
+        self.count_state == CountState::Exact
+            && (self.kind == PlaylistKind::Manual || self.evaluation_state == Some(EvaluationState::Ready))
+    }
+
     pub(crate) fn checked(
         self,
         id: Option<&str>,
@@ -247,8 +252,11 @@ impl PlaylistSummary {
                 }
                 _ => true,
             }
-            || (self.kind == PlaylistKind::Manual
-                && (self.count_state != CountState::Exact || self.evaluation_state.is_some()))
+            || match self.kind {
+                PlaylistKind::Manual => self.count_state != CountState::Exact || self.evaluation_state.is_some(),
+                PlaylistKind::Derived => self.evaluation_state.is_none()
+                    || (self.evaluation_state == Some(EvaluationState::Ready)) != (self.count_state == CountState::Exact),
+            }
         {
             return Err(INVALID_RESPONSE);
         }

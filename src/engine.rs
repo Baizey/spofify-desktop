@@ -1082,6 +1082,9 @@ impl Engine {
         });
     }
     fn action(&mut self, action: Action) {
+        // A rendered row can outlive an evaluation status update. Reject the
+        // intent before it can retire private playback or reach the socket.
+        if !self.admits_shared_selection(&action) { return; }
         let explicit_online = self.online_generation().is_some() && matches!(action,
             Action::Play { .. } | Action::Enqueue { .. } | Action::SelectDevice(_) | Action::RenameDevice { .. });
         if explicit_online && self.private_audio() && !matches!(action, Action::Enqueue { .. } | Action::RenameDevice { .. }) {
@@ -1112,6 +1115,19 @@ impl Engine {
             self.detached_action(action);
         }
     }
+    fn admits_shared_selection(&self, action: &Action) -> bool {
+        let context = match action {
+            Action::Play { selection, .. } | Action::Enqueue { selection } => match selection {
+                crate::player::Selection::Collection { context } => Some(context),
+                crate::player::Selection::Track { context, .. } => context.as_ref(),
+            },
+            _ => None,
+        };
+        context.filter(|context| context.kind == "derived").is_none_or(|context| {
+            self.online_generation().is_some() && self.personal.access().can_play_shared_playlist(self.epoch, &context.id)
+        })
+    }
+
     fn record_local_listening(&mut self) {
         use crate::api::{catalog::{CatalogItem, CatalogKind, Coverage}, library::HistoryEntry};
         let Some(audio) = &self.audio else { return };

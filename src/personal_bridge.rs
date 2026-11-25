@@ -280,6 +280,17 @@ impl State {
             && self.replica.accepts_sync(command)
     }
 
+    fn download_basis(&self, epoch: u64, id: &str) -> Option<&crate::personal::Playlist> {
+        if self.status.epoch != epoch || self.status.link != Link::Ready
+            || !self.cache_binding.as_ref()?.network(epoch) || !self.replica.can_play_shared_playlist(id)
+        {
+            return None;
+        }
+        let detail = &self.cache.details.get(id)?.playlist;
+        let live = self.replica.current_detail(id)?;
+        (!detail.stale && live.summary == detail.summary && live.rows == detail.rows).then_some(detail)
+    }
+
     fn quick_candidate(&self, id: &str) -> Option<&PlaylistSummary> {
         if self.status.link != Link::Ready {
             return None;
@@ -333,14 +344,36 @@ impl PersonalAccess {
         state.cache.projection(route)
     }
 
+    pub(crate) fn can_play_shared_playlist(&self, epoch: u64, id: &str) -> bool {
+        let state = self.state.lock().expect("personal state");
+        state.status.epoch == epoch && state.status.link == Link::Ready
+            && state.cache_binding.as_ref().is_none_or(|binding| binding.network(epoch))
+            && state.replica.can_play_shared_playlist(id)
+    }
+
+    pub(crate) fn can_download_playlist(&self, epoch: u64, id: &str) -> bool {
+        let state = self.state.lock().expect("personal state");
+        state.download_basis(epoch, id).is_some()
+    }
+
+    pub(crate) fn can_download_playlist_row(&self, epoch: u64, id: &str, occurrence: &str, track: &str) -> bool {
+        let state = self.state.lock().expect("personal state");
+        state.download_basis(epoch, id).is_some_and(|p| {
+            p.rows.iter().any(|row| row.id == occurrence && row.track.id == track && row.track.has_audio)
+        })
+    }
+
     pub(crate) async fn save_playlist_details(&self, epoch: u64, id: &str) -> bool {
-        let writer = {
+        let (writer, basis, generation) = {
             let state = self.state.lock().expect("personal state");
-            let Some(binding) = state.cache_binding.as_ref().filter(|b| b.local(epoch)) else { return false; };
-            if state.status.epoch != epoch || !state.cache.details.contains_key(id) { return false; }
-            binding.writer.clone()
+            let Some(basis) = state.download_basis(epoch, id) else { return false; };
+            (state.cache_binding.as_ref().unwrap().writer.clone(), basis.clone(), state.status.generation)
         };
-        tokio::time::timeout(Duration::from_secs(3), writer.flush()).await.unwrap_or(false)
+        if !tokio::time::timeout(Duration::from_secs(3), writer.flush()).await.unwrap_or(false) {
+            return false;
+        }
+        let state = self.state.lock().expect("personal state");
+        state.status.generation == generation && state.download_basis(epoch, id) == Some(&basis)
     }
 
     pub(crate) fn changes(&self) -> watch::Receiver<u64> {
@@ -742,14 +775,41 @@ impl PersonalAccess {
         let live_page = current.then(|| crate::pages::personal_projection(route, &state.replica)).flatten();
         let cached_page = state.cache_binding.as_ref().filter(|b| current && b.local(epoch))
             .and_then(|_| state.cache.projection(route));
-        let detail_live = state.replica.playlist().is_some_and(|p| !p.stale);
+        let detail_live = match route {
+            crate::pages::Route::Playlist(id) => state.replica.current_detail(id).is_some(),
+            _ => false,
+        };
+        let detail_nonready = matches!(route, crate::pages::Route::Playlist(id)
+            if state.replica.live_summary(id).is_some_and(|p| !p.evaluation_ready()));
+        let live = live_page.is_some();
+        let mut page = cached_page.or(live_page);
+        if let Some(page) = &mut page {
+            if matches!(route, crate::pages::Route::Playlist(id)
+                if page.playlist.as_ref().is_some_and(|p| p.kind == PlaylistKind::Derived)
+                    && !state.replica.can_play_shared_playlist(id))
+            {
+                crate::pages::withhold_shared_playlist_actions(page);
+            }
+            if matches!(route, crate::pages::Route::Playlists) {
+                for row in &mut page.rows {
+                    if let Some(meta) = row.playlist.as_mut().filter(|p| p.kind == PlaylistKind::Derived)
+                        && !state.replica.can_play_shared_playlist(&meta.id)
+                    {
+                        meta.capabilities.play = false;
+                        meta.capabilities.copy_to_manual = false;
+                        row.playable = false;
+                        row.playback = None;
+                    }
+                }
+            }
+        }
         let confirmed = pending.and_then(|(before, effect)| {
             if matches!(effect, Effect::Move { .. } | Effect::Remove { .. }) && !detail_live { return None; }
             Self::observed_in(&state, before, effect)
         });
         BrowseView {
-            status: state.status, live: live_page.is_some(), detail_live,
-            page: cached_page.or(live_page), confirmed,
+            status: state.status, live, detail_live, detail_nonready,
+            page, confirmed,
             unavailable: matches!(route, crate::pages::Route::Playlist(_)) && state.replica.playlist_unavailable(),
         }
     }
@@ -863,6 +923,7 @@ pub(crate) struct BrowseView {
     pub page: Option<crate::pages::Page>,
     pub live: bool,
     pub detail_live: bool,
+    pub detail_nonready: bool,
     pub unavailable: bool,
     pub confirmed: Option<Option<crate::pages::Route>>,
 }
@@ -1088,9 +1149,12 @@ impl PersonalHub {
         let State { replica, quick, cache, .. } = &mut *state;
         let mut cache_changed = false;
         let mut deleted = None;
+        let mut nonready = None;
         let received = replica.receive_observed(update, ingress, |event| {
-            if let AcceptedPlaylist::Deleted(id) = event {
-                deleted = Some(id.to_owned());
+            match event {
+                AcceptedPlaylist::Deleted(id) => deleted = Some(id.to_owned()),
+                AcceptedPlaylist::NotReady { summary, .. } => nonready = Some(summary.id.clone()),
+                _ => (),
             }
             cache.accept(event, part.then_some(at));
             cache_changed = true;
@@ -1126,6 +1190,12 @@ impl PersonalHub {
                 }
                 if let Some(id) = &deleted {
                     state.detail_attempts.remove(id);
+                }
+                if let Some(id) = &nonready {
+                    // Terminal evaluation is not freshness. Keep a cooldown
+                    // even when the request was an explicit probe.
+                    let attempt = state.detail_attempts.entry(id.clone()).or_insert(Attempt { count: 0, until: now });
+                    if attempt.until <= now { attempt.start(now); }
                 }
                 if cache_changed || observation.is_some() {
                     let State { cache, replica, cache_binding, .. } = &mut *state;
@@ -1175,6 +1245,7 @@ impl PersonalHub {
                 });
                 if snapshot
                     || watched_changed
+                    || nonready.as_deref().is_some_and(|id| state.replica.watched_playlist() == Some(id))
                     || final_part.is_some_and(|(id, token)| {
                         state
                             .replica
@@ -1523,6 +1594,123 @@ mod tests {
         assert!(!state.replica.accepts_sync(&read));
         assert!(state.replica.playlist_unavailable());
         assert_eq!(state.status.link, Link::Ready);
+    }
+
+    #[tokio::test]
+    async fn derived_rows_remain_last_ready_while_shared_actions_lose_authority() {
+        use crate::{api::{Api, Origin}, pages::Route, personal::Snapshot};
+        let hub = PersonalHub::default();
+        let personal = hub.access();
+        let api = Arc::new(Api::new(Origin::parse("http://127.0.0.1:19432").unwrap()).unwrap());
+        let access = Access { epoch: 5, session: api.test_session(), api, offline: false, personal: personal.clone() };
+        let epoch = Arc::new(AtomicU64::new(access.epoch));
+        hub.bind_cache(Some(&access), &epoch);
+        hub.begin(5, 7);
+        let make_part = |evaluation: &str, count: &str, revision, token: &str, id: Option<&str>| -> PersonalUpdate {
+            let total = (count != "pending").then_some(usize::from(id.is_some()));
+            let rows = id.into_iter().map(|id| json!({"id":id,"position":3,
+                "track":{"kind":"track","id":"song","name":"Song","hasAudio":true,
+                "coverage":{"tracks":1,"inLibrary":1,"albums":1}}})).collect::<Vec<_>>();
+            serde_json::from_value(json!({"part":{
+                "summary":{"id":"rules","name":"Rules","description":"","kind":"derived","countState":count,
+                    "evaluationState":evaluation,"trackCount":total,"availableCount":total,"revision":revision,
+                    "createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:00Z",
+                    "capabilities":{"editMetadata":true,"editEntries":false,"editDefinition":true,"play":true,
+                        "copyToManual":true,"delete":true,"addTracks":false}},
+                "definition":{"version":1,"sources":[{"kind":"allSaved","slotId":"root"}],"duplicates":"keep","sort":"sourceOrder"},
+                "token":token,"offset":0,"more":false,"rows":rows
+            }})).unwrap()
+        };
+        let route = Route::Playlist("rules".into());
+        let snapshot = |update: &PersonalUpdate| {
+            let PersonalUpdate::Part(p) = update else { unreachable!() };
+            PersonalUpdate::Snapshot(Snapshot { playlists: vec![p.summary.clone()], recent: vec![] })
+        };
+        let copy = PersonalCommand::CopyPlaylist { playlist_id: "rules".into(), name: "Copy".into(), description: String::new() };
+        let assert_authority = |allowed: bool| {
+            assert_eq!(personal.can_play_shared_playlist(5, "rules"), allowed);
+            assert_eq!(personal.can_download_playlist(5, "rules"), allowed);
+            if !allowed {
+                assert!(!personal.can_download_playlist_row(5, "rules", "o1_ready", "song"));
+            }
+            assert_eq!(hub.authorizes(5, 7, &copy), allowed);
+            let list = personal.browse_view(5, &Route::Playlists, None).page.unwrap();
+            assert_eq!(list.rows[0].playable, allowed);
+            assert_eq!(list.rows[0].playback.is_some(), allowed);
+        };
+        let pending = make_part("pending", "pending", 1, "pending", None);
+        hub.receive(5, 7, snapshot(&pending)).unwrap();
+        personal.watch_playlist(5, Some("rules".into())).unwrap();
+        hub.receive(5, 7, pending).unwrap();
+        let view = personal.browse_view(5, &route, None);
+        assert!(view.detail_nonready && !view.detail_live);
+        let page = view.page.unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.total, None, "unmaterialized pending is not an accepted empty detail");
+        assert!(!personal.state.lock().unwrap().cache.details.contains_key("rules"));
+        assert_authority(false);
+
+        let stored = make_part("stale", "stale", 2, "stored", Some("o1_stored"));
+        personal.refresh_playlist(5).unwrap();
+        hub.receive(5, 7, stored).unwrap();
+        let detail = personal.state.lock().unwrap().cache.details["rules"].clone();
+        assert_eq!(detail.refreshed_at, 0);
+        assert_eq!(detail.playlist.rows[0].id, "o1_stored");
+        assert!(detail.playlist.stale);
+        assert_authority(false);
+
+        let ready = make_part("ready", "exact", 3, "ready", Some("o1_ready"));
+        personal.refresh_playlist(5).unwrap();
+        hub.receive(5, 7, ready.clone()).unwrap();
+        assert_authority(true);
+        assert!(personal.can_download_playlist_row(5, "rules", "o1_ready", "song"));
+        let ready_at = personal.state.lock().unwrap().cache.details["rules"].refreshed_at;
+        assert_ne!(ready_at, 0);
+        for (i, (evaluation, count, row)) in [
+            ("stale", "stale", Some("o1_not_ready")),
+            ("error", "stale", None),
+            ("pending", "pending", None),
+        ].into_iter().enumerate() {
+            let update = make_part(evaluation, count, 4 + i, evaluation, row);
+            hub.receive(5, 7, snapshot(&update)).unwrap();
+            assert_authority(false);
+            personal.refresh_playlist(5).unwrap();
+            hub.receive(5, 7, update).unwrap();
+            let view = personal.browse_view(5, &route, None);
+            assert!(view.detail_nonready && !view.detail_live);
+            let page = view.page.unwrap();
+            assert_eq!(page.rows.len(), 1);
+            assert!(!page.rows[0].playable && page.rows[0].playback.is_none());
+            assert!(page.playback.is_none() && !page.playlist.unwrap().capabilities.copy_to_manual);
+            let detail = personal.state.lock().unwrap().cache.details["rules"].clone();
+            assert_eq!(detail.refreshed_at, ready_at);
+            assert_eq!(detail.playlist.rows[0].id, "o1_ready");
+            assert_eq!(detail.playlist.summary.revision, 3);
+            assert!(!detail.fresh(ready_at, FRESHNESS));
+            assert!(!personal.save_playlist_details(5, "rules").await);
+        }
+        let replacement = make_part("ready", "exact", 7, "fresh", Some("o1_replacement"));
+        hub.receive(5, 7, snapshot(&replacement)).unwrap();
+        assert_authority(false); // A ready summary by itself restores no authority.
+        personal.refresh_playlist(5).unwrap();
+        hub.receive(5, 7, replacement).unwrap();
+        assert_authority(true);
+        assert!(!personal.can_download_playlist_row(5, "rules", "o1_ready", "song"));
+        assert!(personal.can_download_playlist_row(5, "rules", "o1_replacement", "song"));
+        let detail = personal.state.lock().unwrap().cache.details["rules"].clone();
+        assert_eq!(detail.playlist.rows[0].id, "o1_replacement");
+        assert!(detail.refreshed_at >= ready_at && !detail.playlist.stale);
+
+        let empty = make_part("ready", "exact", 8, "empty", None);
+        personal.refresh_playlist(5).unwrap();
+        hub.receive(5, 7, empty).unwrap();
+        let empty_at = personal.state.lock().unwrap().cache.details["rules"].refreshed_at;
+        personal.refresh_playlist(5).unwrap();
+        hub.receive(5, 7, make_part("error", "stale", 9, "error-after-empty", Some("o1_stored"))).unwrap();
+        let detail = personal.state.lock().unwrap().cache.details["rules"].clone();
+        assert!(detail.playlist.rows.is_empty() && detail.playlist.stale);
+        assert_eq!(detail.refreshed_at, empty_at, "a ready empty membership also has continuity");
+        assert_authority(false);
     }
 
     #[tokio::test]

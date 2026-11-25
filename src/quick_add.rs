@@ -574,8 +574,9 @@ impl QuickAdd {
             }
             AcceptedPlaylist::Summary { summary, .. } => self.summary(summary),
             AcceptedPlaylist::Complete(playlist) => self.summary(&playlist.summary),
+            AcceptedPlaylist::NotReady { summary, .. } => self.summary(summary),
             AcceptedPlaylist::Deleted(deleted) if id == deleted => self.select(None),
-            AcceptedPlaylist::Deleted(_) => {}
+            AcceptedPlaylist::Deleted(_) | AcceptedPlaylist::DetailInvalidated(_) => {}
         }
     }
 

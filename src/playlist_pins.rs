@@ -29,6 +29,7 @@ use crate::{
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 const STALE: ApiError = error("The account or connection changed. Try again.");
 const OFFLINE: ApiError = error("Go online to save this playlist.");
+const DETAIL_CHANGED: ApiError = error("This playlist is still updating.");
 const UNAVAILABLE: ApiError = error("Saved playlists are unavailable. Try again.");
 
 const fn error(message: &'static str) -> ApiError {
@@ -833,11 +834,20 @@ async fn run(
                     let operation_scope = captured.clone();
                     let result = disk
                         .run(move |open| {
-                            let live = || operation_scope.check_set(&check, wanted);
+                            let live = || {
+                                operation_scope.check_set(&check, wanted)?;
+                                let access = &operation_scope.access;
+                                if wanted && target.kind == crate::api::library::PlaylistKind::Derived
+                                    && !access.personal.can_download_playlist(access.epoch, &target.id)
+                                {
+                                    return Err(DETAIL_CHANGED);
+                                }
+                                Ok(())
+                            };
                             live()?;
                             let store = open(&operation_scope.access)?;
                             store
-                                .set(&operation_scope.access, target, wanted, live)
+                                .set(&operation_scope.access, target.clone(), wanted, live)
                                 .map(Stored::from)
                         })
                         .await;

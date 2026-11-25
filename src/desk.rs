@@ -2105,7 +2105,7 @@ impl Browser {
             return;
         }
         let route = self.route.clone();
-        let crate::personal_bridge::BrowseView { status, page, live, detail_live, unavailable, confirmed } =
+        let crate::personal_bridge::BrowseView { status, page, live, detail_live, detail_nonready, unavailable, confirmed } =
             a.personal.browse_view(a.epoch, &route, self.pending.as_ref().map(|p| (p.before, &p.effect)));
         let prior = self.personal_view.replace(status);
         let online = !a.offline && !a.session.is_offline();
@@ -2195,7 +2195,8 @@ impl Browser {
         let waiting = online
             && matches!(status.link, Link::Waiting | Link::Ready)
             && !self.personal_ready
-            && !unavailable;
+            && !unavailable
+            && !detail_nonready;
         // Time out a stalled part, not a long playlist making progress.
         let progressing = matches!(route, Route::Playlist(_))
             && prior.is_some_and(|old| old.playlist_progress != status.playlist_progress);
@@ -2216,8 +2217,8 @@ impl Browser {
                     "The playlist couldn't refresh.",
                     true,
                 )
-            } else if self.personal_ready {
-                ("", false)
+            } else if self.personal_ready || detail_nonready {
+                ("", false) // Allow the accepted evaluation status to describe the retained rows.
             } else if status.link == Link::Gap {
                 (
                     "The account update was interrupted. Waiting for a fresh snapshot.",
@@ -3077,6 +3078,7 @@ impl Browser {
             let wanted = !unpin;
             let target = if wanted && !offline && pin.is_none() {
                 playlist_browser::target(&route, &page, row.as_ref())
+                    .filter(|target| a.personal.can_download_playlist(a.epoch, &target.id))
             } else if unpin {
                 pin
             } else {

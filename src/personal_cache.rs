@@ -108,6 +108,7 @@ pub(crate) struct Detail {
 impl Detail {
     pub fn fresh(&self, now: u64, ttl: Duration) -> bool {
         !self.playlist.stale
+            && self.playlist.summary.evaluation_ready()
             && self.refreshed_at != 0
             && now
                 .checked_sub(self.refreshed_at)
@@ -140,11 +141,7 @@ impl Cache {
                     .and_then(|s| s.playlists.iter().find(|p| p.id == *id));
                 if let Some(detail) = self.details.get(id) {
                     let p = &detail.playlist;
-                    Some(pages::personal_playlist(
-                        &p.summary,
-                        p.definition.as_ref(),
-                        &p.rows,
-                    ))
+                    Some(pages::retained_personal_playlist(summary.unwrap_or(&p.summary), p))
                 } else {
                     Some(pages::unsaved_playlist(summary?))
                 }
@@ -164,8 +161,10 @@ impl Cache {
                 invalidates_membership,
             } => {
                 if let Some(detail) = self.details.get_mut(&summary.id) {
-                    detail.playlist.summary = summary.clone();
-                    detail.playlist.stale |= invalidates_membership;
+                    if summary.kind == crate::api::library::PlaylistKind::Manual {
+                        detail.playlist.summary = summary.clone();
+                    }
+                    detail.playlist.stale |= invalidates_membership || !summary.evaluation_ready();
                 }
                 self.upsert_summary(summary);
             }
@@ -181,6 +180,19 @@ impl Cache {
                         refreshed_at,
                     },
                 );
+            }
+            AcceptedPlaylist::NotReady { summary, stored } => {
+                self.upsert_summary(summary);
+                if let Some(prior) = self.details.get_mut(&summary.id) {
+                    prior.playlist.stale = true;
+                } else if let Some(stored) = stored {
+                    self.details.insert(summary.id.clone(), Detail { playlist: stored.clone(), refreshed_at: 0 });
+                }
+            }
+            AcceptedPlaylist::DetailInvalidated(id) => {
+                if let Some(detail) = self.details.get_mut(id) {
+                    detail.playlist.stale = true;
+                }
             }
             AcceptedPlaylist::Deleted(id) => {
                 self.details.remove(id);
@@ -224,9 +236,11 @@ impl Cache {
             if detail.playlist.summary.kind != summary.kind {
                 return false;
             }
-            if detail.playlist.summary != *summary {
+            if detail.playlist.summary != *summary || !summary.evaluation_ready() {
                 detail.playlist.stale = true;
-                detail.playlist.summary = summary.clone();
+                if summary.kind == crate::api::library::PlaylistKind::Manual {
+                    detail.playlist.summary = summary.clone();
+                }
             }
             true
         });

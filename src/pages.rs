@@ -684,10 +684,14 @@ pub fn personal_projection(route: &Route, replica: &personal::Replica) -> Option
         Route::Playlists | Route::Picker(_) => replica
             .snapshot()
             .map(|s| personal_list(route, &s.playlists)),
-        Route::Playlist(id) => replica
-            .playlist()
-            .filter(|p| &p.summary.id == id)
-            .map(|p| personal_playlist(&p.summary, p.definition.as_ref(), &p.rows)),
+        Route::Playlist(id) => {
+            let summary = replica.live_summary(id);
+            if let Some(detail) = replica.playlist().filter(|p| &p.summary.id == id) {
+                Some(retained_personal_playlist(summary.unwrap_or(&detail.summary), detail))
+            } else {
+                summary.map(unsaved_playlist)
+            }
+        }
         _ => None,
     }
 }
@@ -747,10 +751,39 @@ pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
 }
 
 pub(crate) fn unsaved_playlist(summary: &PlaylistSummary) -> Page {
+    if !summary.evaluation_ready() {
+        return personal_playlist(summary, None, &[]);
+    }
     let mut page = Page::default();
     apply_playlist_summary(&mut page, summary);
+    page.total = summary.track_count;
     page.status = "Playlist details not saved on this device.".into();
     page
+}
+
+pub(crate) fn retained_personal_playlist(summary: &PlaylistSummary, detail: &personal::Playlist) -> Page {
+    let mut page = personal_playlist(summary, detail.definition.as_ref(), &detail.rows);
+    if summary.kind == PlaylistKind::Derived && (detail.stale || detail.summary != *summary) {
+        if summary.evaluation_ready() {
+            page.status = "Showing the last saved songs while this playlist updates.".into();
+        }
+        // The retained rows can differ from the latest server's result.
+        page.total = Some(detail.rows.len() as u64);
+        withhold_shared_playlist_actions(&mut page);
+    }
+    page
+}
+
+pub(crate) fn withhold_shared_playlist_actions(page: &mut Page) {
+    page.playback = None;
+    if let Some(meta) = &mut page.playlist {
+        meta.capabilities.play = false;
+        meta.capabilities.copy_to_manual = false;
+    }
+    for row in &mut page.rows {
+        row.playable = false;
+        row.playback = None;
+    }
 }
 
 pub fn personal_playlist(
@@ -761,9 +794,9 @@ pub fn personal_playlist(
     let mut page = Page::default();
     let metadata = apply_playlist_summary(&mut page, summary);
     page.definition = definition.cloned();
-    page.total = summary.track_count.or(Some(entries.len() as u64));
+    page.total = summary.track_count;
     let derived = metadata.kind == PlaylistKind::Derived;
-    let ready = playlist_ready(summary);
+    let ready = summary.evaluation_ready();
     let allow_play = ready && summary.capabilities.play;
     let context = playlist_context(summary, &page.title);
     page.playback = playlist_selection(summary, &context);
@@ -780,11 +813,13 @@ pub fn personal_playlist(
         .collect();
     if !ready {
         page.playlist_evaluation_failed = summary.evaluation_state == Some(EvaluationState::Error);
-        page.status = match summary.evaluation_state {
-            Some(EvaluationState::Error) => "Songs aren't available for this playlist right now.",
+        page.status = match (summary.evaluation_state, entries.is_empty()) {
+            (Some(EvaluationState::Error), false) => "This playlist couldn't update. Showing the last saved songs.",
+            (Some(EvaluationState::Error), true) => "Songs aren't available for this playlist right now.",
+            (_, false) => "Showing the last saved songs while this playlist updates.",
             _ => "This playlist is still updating.",
-        }
-        .into();
+        }.into();
+        withhold_shared_playlist_actions(&mut page);
     } else if summary.available_count.is_some_and(|count| count > 0) && !allow_play {
         page.status = "Playback isn’t available for this playlist.".into();
     } else if summary.available_count == Some(0) && summary.track_count.is_some_and(|n| n > 0) {
@@ -1014,10 +1049,10 @@ pub(crate) fn playlist_detail_copy(page: &Page) -> (String, String) {
     } else {
         ""
     };
-    let count = if page.local_audio {
+    let count = if page.local_audio && !page.rows.is_empty() {
         Some(page.rows.len() as u64)
     } else {
-        page.playlist.as_ref().and_then(|m| m.track_count)
+        page.total
     }
     .map(|n| count_label(n, "song", "songs"));
     let metadata = join_labels(kind, count.as_deref().unwrap_or(""));
@@ -1049,10 +1084,6 @@ fn playlist_subtitle(summary: &PlaylistSummary) -> String {
     )
 }
 
-fn playlist_ready(summary: &PlaylistSummary) -> bool {
-    summary.kind == PlaylistKind::Manual || summary.evaluation_state == Some(EvaluationState::Ready)
-}
-
 fn playlist_context(summary: &PlaylistSummary, name: &str) -> Arc<PlaybackContext> {
     let kind = match summary.kind {
         PlaylistKind::Manual => ContextKind::Playlist,
@@ -1067,7 +1098,7 @@ fn playlist_selection(
 ) -> Option<PlaybackSelection> {
     // The current account protocol resolves the complete canonical playlist by
     // kind and ID. Display rows/count limits are not selection credentials.
-    (playlist_ready(summary)
+    (summary.evaluation_ready()
         && summary.capabilities.play
         && summary.available_count.is_some_and(|count| count > 0))
     .then(|| collection(context))

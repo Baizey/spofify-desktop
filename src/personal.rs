@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{
     catalog::ArtistCredit,
     library::{
-        HistoryEntry, ManualEntry, PlaylistKind, PlaylistSummary, RuleDefinition, WireHistory,
+        CountState, HistoryEntry, ManualEntry, PlaylistKind, PlaylistSummary, RuleDefinition, WireHistory,
         WireManualEntry,
     },
 };
@@ -253,6 +253,11 @@ pub(crate) enum AcceptedPlaylist<'a> {
         invalidates_membership: bool,
     },
     Complete(&'a Playlist),
+    NotReady {
+        summary: &'a PlaylistSummary,
+        stored: Option<&'a Playlist>,
+    },
+    DetailInvalidated(&'a str),
     Deleted(&'a str),
 }
 
@@ -559,7 +564,9 @@ impl Replica {
             Command::CreatePlaylist { .. } | Command::ClearHistory => true,
             Command::RenamePlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.edit_metadata),
             Command::DeletePlaylist { playlist_id } => listed(playlist_id).is_some_and(|p| p.capabilities.delete),
-            Command::CopyPlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.copy_to_manual),
+            Command::CopyPlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| {
+                p.capabilities.copy_to_manual && self.can_play_shared_playlist(playlist_id)
+            }),
             Command::SetPlaylistRules { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.edit_definition),
             Command::AddEntry { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.add_tracks),
             Command::RemoveEntry { playlist_id, .. } | Command::MoveEntry { playlist_id, .. } => {
@@ -567,6 +574,22 @@ impl Replica {
             }
         };
         allowed.then_some(command)
+    }
+
+    pub(crate) fn live_summary(&self, id: &str) -> Option<&PlaylistSummary> {
+        self.ready.then(|| self.summary(id)).flatten()
+    }
+
+    pub(crate) fn current_detail(&self, id: &str) -> Option<&Playlist> {
+        let summary = self.live_summary(id)?;
+        let detail = &self.cached(id)?.playlist;
+        (summary.evaluation_ready() && !detail.stale && detail.summary == *summary).then_some(detail)
+    }
+
+    pub(crate) fn can_play_shared_playlist(&self, id: &str) -> bool {
+        self.live_summary(id).is_some_and(|summary| {
+            summary.capabilities.play && (summary.kind == PlaylistKind::Manual || self.current_detail(id).is_some())
+        })
     }
 
     pub(crate) fn watched_playlist(&self) -> Option<&str> {
@@ -946,10 +969,12 @@ impl Replica {
             if p.kind != d.playlist.summary.kind {
                 return false;
             }
-            if *p != d.playlist.summary {
+            if *p != d.playlist.summary || !p.evaluation_ready() {
                 d.playlist.stale = true;
                 d.playlist.token.clear();
-                d.playlist.summary = p.clone();
+                if p.kind == PlaylistKind::Manual {
+                    d.playlist.summary = p.clone();
+                }
             }
             true
         });
@@ -1035,16 +1060,11 @@ impl Replica {
         {
             return self.repair_part(id);
         }
-        // The manual summary counts the complete visible row set exactly.
-        // Derived evaluation can have a different live count.
+        // Go counts the exact visible membership, including stored stale rows.
+        // An unmaterialized evaluation has no rows at all, even as a prefix.
         let end = stage.playlist.rows.len().saturating_add(p.rows.len()) as u64;
-        if stage.playlist.summary.kind == PlaylistKind::Manual
-            && stage
-                .playlist
-                .summary
-                .track_count
-                .is_some_and(|total| end > total || p.more && end == total)
-        {
+        let expected = stage.playlist.summary.track_count.unwrap_or(0);
+        if end > expected || p.more && end == expected {
             return self.repair_part(id);
         }
         for row in &p.rows {
@@ -1063,6 +1083,9 @@ impl Replica {
             // A reply to a cache probe means the server has different rows.
             // Keep last-good rows visible but non-actionable until commit.
             self.mark_stale(&id);
+            if p.offset == 0 && stage.playlist.summary.kind == PlaylistKind::Derived {
+                accept(AcceptedPlaylist::DetailInvalidated(&id));
+            }
             self.staged = Some(stage);
             return Ok(Some(self.sync(id, Some(token), next_offset)));
         }
@@ -1071,9 +1094,25 @@ impl Replica {
         }
         stage.staged_entries = HashSet::new();
         self.reset_pull();
-        self.observed = Some(stage.playlist.summary.clone());
+        let summary = stage.playlist.summary.clone();
+        self.observed = Some(summary.clone());
         let snapshot = self.snapshot.as_mut().expect("ready snapshot");
-        replace_summary(&mut snapshot.playlists, stage.playlist.summary.clone());
+        replace_summary(&mut snapshot.playlists, summary.clone());
+        if !summary.evaluation_ready() {
+            // A terminal response settles the transfer, not the evaluation.
+            // Preserve even a previously ready empty membership. Stored rows
+            // are continuity for a cold view only, never a fresh admission.
+            self.mark_stale(&id);
+            stage.playlist.stale = true;
+            stage.playlist.token.clear();
+            let stored = (summary.count_state == CountState::Stale).then_some(stage);
+            accept(AcceptedPlaylist::NotReady { summary: &summary, stored: stored.as_ref().map(|d| &d.playlist) });
+            if let Some(stored) = stored.filter(|_| self.cached(&id).is_none()) {
+                self.details.push_back(stored);
+                self.evict_details();
+            }
+            return Ok(None);
+        }
         if let Some(i) = self.cache_index(&id) {
             self.details.remove(i);
         }
@@ -1163,18 +1202,21 @@ impl Replica {
         let mut repair = true;
         if let Some(i) = self.cache_index(&id) {
             let previous = &mut self.details[i];
-            repair = d.rows_invalid
-                || previous.playlist.stale
-                || !apply_entries(previous, &p, d.entries);
-            previous.playlist.summary = p;
+            if p.kind == PlaylistKind::Derived {
+                repair = d.rows_invalid || previous.playlist.stale
+                    || !p.evaluation_ready() || previous.playlist.summary != p;
+            } else {
+                repair = d.rows_invalid || previous.playlist.stale || !apply_entries(previous, &p, d.entries);
+                previous.playlist.summary = p.clone();
+            }
             previous.playlist.token.clear();
             previous.playlist.stale = repair;
             if !repair && observes_rows {
                 accept(AcceptedPlaylist::Complete(&previous.playlist));
             } else {
                 accept(AcceptedPlaylist::Summary {
-                    summary: &previous.playlist.summary,
-                    invalidates_membership: d.rows_invalid || observes_rows,
+                    summary: &p,
+                    invalidates_membership: repair,
                 });
             }
             self.evict_details();
@@ -1273,9 +1315,7 @@ fn apply_recent(
 }
 
 fn visible_count_matches(summary: &PlaylistSummary, len: usize) -> bool {
-    // Manual details contain precisely the visible (audio-associated) rows.
-    // Derived evaluation can be stale/pending with a different live count.
-    summary.kind == PlaylistKind::Derived || summary.track_count == Some(len as u64)
+    summary.track_count.unwrap_or(0) == len as u64
 }
 
 fn apply_entries(d: &mut Retained, p: &PlaylistSummary, edit: Option<EntryChange>) -> bool {

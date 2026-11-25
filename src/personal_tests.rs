@@ -310,7 +310,7 @@ fn manual_nonterminal_parts_cannot_reach_or_exceed_declared_total() {
 }
 
 #[test]
-fn empty_terminal_parts_work_for_empty_manual_and_derived_count_drift() {
+fn terminal_empty_manual_and_exact_stored_derived_memberships_are_distinct() {
     let mut r = Replica::default();
     initial(&mut r, 0);
     watch(&mut r, "p");
@@ -320,28 +320,19 @@ fn empty_terminal_parts_work_for_empty_manual_and_derived_count_drift() {
     );
     assert!(r.playlist().unwrap().rows.is_empty());
 
-    let mut p = raw_derived_summary("d", 0, 1);
+    let mut p = raw_derived_summary("d", 1, 1);
     p["countState"] = json!("stale");
+    p["evaluationState"] = json!("stale");
     send(&mut r, json!({"change":{"playlist":p}}));
     assert_eq!(watch(&mut r, "d"), sync("d", None, 0));
-    let definition = raw_definition();
-    assert_eq!(
-        send(
-            &mut r,
-            json!({"part":{"summary":p,"definition":definition,
-            "token":"v","offset":0,"rows":[raw_entry("o1_row", 0)],"more":true}})
-        ),
-        sync("d", Some("v"), 1)
-    );
-    assert_eq!(
-        send(
-            &mut r,
-            json!({"part":{"summary":p,"definition":definition,
-            "token":"v","offset":1,"rows":[],"more":false}})
-        ),
-        None
-    );
+    let detail = |rows| json!({"part":{"summary":p,"definition":raw_definition(),
+        "token":"v","offset":0,"rows":rows,"more":false}});
+    assert_eq!(send(&mut r, detail(vec![])), sync("d", None, 0));
+    assert!(r.playlist().is_none(), "a truncated stored result cannot be displayed");
+    assert_eq!(send(&mut r, detail(vec![raw_entry("o1_row", 0)])), None);
     assert_eq!(row_ids(&r), ["o1_row"]);
+    assert!(r.playlist().unwrap().stale);
+    assert!(!r.can_play_shared_playlist("d"));
 }
 
 #[test]
