@@ -201,6 +201,8 @@ pub struct Page {
     pub kind: String,
     pub description: String,
     pub definition: Option<RuleDefinition>,
+    /// Definition verified on the active binding, independent of evaluation rows.
+    pub(crate) live_rules: bool,
     pub playlist: Option<PlaylistMetadata>,
     pub playback: Option<PlaybackSelection>,
     /// This page's playable occurrences come from the local download store, not the account.

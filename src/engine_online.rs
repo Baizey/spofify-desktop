@@ -174,7 +174,8 @@ impl Engine {
                         .is_ok()
                     })
                 });
-        } else if !self.personal.authorizes(epoch, generation, command)
+        } else if matches!(command, PersonalCommand::SetPlaylistRules { .. })
+            || !self.personal.authorizes(epoch, generation, command)
             || !self
                 .socket
                 .as_ref()
@@ -204,6 +205,23 @@ impl Engine {
             access.quick_cancel(&ticket);
         }
     }
+    pub(super) fn send_rules_edit(
+        &self,
+        observed: super::PersonalStatus,
+        prior: &crate::personal::RulesBasis,
+        command: &PersonalCommand,
+    ) -> bool {
+        let generation = observed.generation;
+        let (Some(account), Some(socket)) = (&self.account, &self.socket) else { return false; };
+        if self.transport_generation() != Some(generation) || self.online.personal_generation != Some(generation) {
+            return false;
+        }
+        let mode = *account.session.network_changes().borrow();
+        self.personal.admit_rules_edit(observed.epoch, generation, prior, command, || {
+            socket.personal_order(generation, mode, command).is_ok()
+        })
+    }
+
     pub(super) fn send_playlist_order(
         &self,
         observed: super::PersonalStatus,

@@ -66,6 +66,11 @@ pub enum Command {
         command: PersonalCommand,
     },
     QuickAdd(QuickAddTicket),
+    EditPlaylistRules {
+        observed: PersonalStatus,
+        prior: crate::personal::RulesBasis,
+        command: PersonalCommand,
+    },
     ReorderPlaylist {
         observed: PersonalStatus,
         mode_stamp: u64,
@@ -907,6 +912,15 @@ impl Engine {
                     self.drain_online_events(None);
                 }
                 self.send_quick_add(ticket);
+            }
+            Command::EditPlaylistRules { observed, prior, command }
+                if observed.epoch == self.epoch && self.current() =>
+            {
+                self.apply_mode();
+                if !self.offline { self.drain_online_events(None); }
+                if !self.send_rules_edit(observed, &prior, &command) {
+                    self.personal.refused(observed.epoch, observed.generation);
+                }
             }
             Command::ReorderPlaylist {
                 observed,

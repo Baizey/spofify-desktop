@@ -210,7 +210,9 @@ impl State {
     fn prepare_detail(&mut self, command: Option<PersonalCommand>, now: u64, tick: Instant) -> Option<PersonalCommand> {
         if self.cache_binding.is_none() || self.quick.searching() { return command; }
         let Some(PersonalCommand::SyncPlaylist { playlist_id, offset: 0, .. }) = &command else { return command; };
-        if self.cache.details.get(playlist_id).is_some_and(|d| d.fresh(now, FRESHNESS)) {
+        if !self.replica.needs_rules_basis(playlist_id)
+            && self.cache.details.get(playlist_id).is_some_and(|d| d.fresh(now, FRESHNESS))
+        {
             self.replica.defer_detail();
             return None;
         }
@@ -784,6 +786,19 @@ impl PersonalAccess {
         let live = live_page.is_some();
         let mut page = cached_page.or(live_page);
         if let Some(page) = &mut page {
+            if let crate::pages::Route::Playlist(id) = route
+                && page.playlist.as_ref().is_some_and(|p| p.kind == PlaylistKind::Derived)
+            {
+                // This view is used by the editor. A retained definition is
+                // not a live witness, even if the last-good rows are visible.
+                let basis = state.replica.editable_rules(id).filter(|basis| {
+                    current && state.status.link == Link::Ready
+                        && page.playlist.as_ref().is_some_and(|p| p.revision == basis.revision)
+                        && state.cache_binding.as_ref().is_none_or(|b| b.network(epoch))
+                });
+                page.definition = basis.map(|basis| basis.definition.clone());
+                page.live_rules = basis.is_some();
+            }
             if matches!(route, crate::pages::Route::Playlist(id)
                 if page.playlist.as_ref().is_some_and(|p| p.kind == PlaylistKind::Derived)
                     && !state.replica.can_play_shared_playlist(id))
@@ -872,11 +887,8 @@ impl PersonalAccess {
                     definition,
                     revision,
                 } if matches_id(id, *revision) => {
-                    if state.replica.playlist().is_some_and(|p| {
-                        p.summary.id == *id
-                            && p.summary.revision > *revision
-                            && !p.stale
-                            && p.definition.as_ref() == Some(definition)
+                    if state.replica.editable_rules(id).is_some_and(|basis| {
+                        basis.revision > *revision && &basis.definition == definition
                     }) {
                         return Some(None);
                     }
@@ -1298,7 +1310,8 @@ impl PersonalHub {
         let id = state.replica.watched_playlist()?.to_owned();
         let now = personal_cache::now_ms();
         let tick = Instant::now();
-        if state.cache.details.get(&id).is_some_and(|d| d.fresh(now, FRESHNESS))
+        if (!state.replica.needs_rules_basis(&id)
+            && state.cache.details.get(&id).is_some_and(|d| d.fresh(now, FRESHNESS)))
             || state.detail_attempts.get(&id).is_some_and(|attempt| tick < attempt.until)
         { return None; }
         let command = state.replica.read_full_detail()?;
@@ -1387,6 +1400,23 @@ impl PersonalHub {
             return false;
         }
         send()
+    }
+
+    pub(crate) fn admit_rules_edit(
+        &self,
+        epoch: u64,
+        generation: u64,
+        prior: &crate::personal::RulesBasis,
+        command: &PersonalCommand,
+        send: impl FnOnce() -> bool,
+    ) -> bool {
+        let state = self.0.state.lock().expect("personal state");
+        let PersonalCommand::SetPlaylistRules { playlist_id, .. } = command else { return false; };
+        state.scoped(epoch, generation) && state.status.link == Link::Ready
+            && state.replica.watched_playlist() == Some(playlist_id)
+            && state.replica.editable_rules(playlist_id) == Some(prior)
+            && state.cache_binding.as_ref().is_none_or(|binding| binding.network(epoch))
+            && command.valid() && send()
     }
 
     pub fn authorizes(&self, epoch: u64, generation: u64, command: &PersonalCommand) -> bool {

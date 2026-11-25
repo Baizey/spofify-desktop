@@ -186,6 +186,12 @@ pub struct Playlist {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RulesBasis {
+    pub(crate) revision: u64,
+    pub(crate) definition: RuleDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
     pub summary: PlaylistSummary,
     pub definition: Option<RuleDefinition>,
@@ -489,6 +495,8 @@ pub struct Replica {
     observed: Option<PlaylistSummary>,
     unavailable: bool,
     details: VecDeque<Retained>,
+    // Live definitions are independent of rows and never seeded from disk.
+    rules: HashMap<String, RulesBasis>,
     background: HashMap<String, ReadScope>,
     staged: Option<Retained>,
     pull: Pull,
@@ -567,7 +575,7 @@ impl Replica {
             Command::CopyPlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| {
                 p.capabilities.copy_to_manual && self.can_play_shared_playlist(playlist_id)
             }),
-            Command::SetPlaylistRules { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.edit_definition),
+            Command::SetPlaylistRules { playlist_id, .. } => self.editable_rules(playlist_id).is_some(),
             Command::AddEntry { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.add_tracks),
             Command::RemoveEntry { playlist_id, .. } | Command::MoveEntry { playlist_id, .. } => {
                 listed(playlist_id).is_some_and(|p| p.capabilities.edit_entries)
@@ -578,6 +586,18 @@ impl Replica {
 
     pub(crate) fn live_summary(&self, id: &str) -> Option<&PlaylistSummary> {
         self.ready.then(|| self.summary(id)).flatten()
+    }
+
+    pub(crate) fn editable_rules(&self, id: &str) -> Option<&RulesBasis> {
+        let summary = self.live_summary(id)?;
+        let basis = self.rules.get(id)?;
+        (summary.kind == PlaylistKind::Derived && summary.capabilities.edit_definition
+            && summary.revision == basis.revision).then_some(basis)
+    }
+
+    pub(crate) fn needs_rules_basis(&self, id: &str) -> bool {
+        self.live_summary(id).is_some_and(|p| p.kind == PlaylistKind::Derived && p.capabilities.edit_definition)
+            && self.editable_rules(id).is_none()
     }
 
     pub(crate) fn current_detail(&self, id: &str) -> Option<&Playlist> {
@@ -771,6 +791,7 @@ impl Replica {
 
     pub fn disconnected(&mut self) {
         self.ready = false;
+        self.rules.clear();
         self.background.clear();
         self.reset_pull();
         self.invalidate_details();
@@ -978,6 +999,10 @@ impl Replica {
             }
             true
         });
+        self.rules.retain(|id, basis| s.playlists.iter().any(|p| {
+            p.id == *id && p.kind == PlaylistKind::Derived && p.revision == basis.revision
+                && p.capabilities.edit_definition
+        }));
         sort_summaries(&mut s.playlists);
         self.snapshot = Some(s);
         self.ready = true;
@@ -1095,6 +1120,11 @@ impl Replica {
         stage.staged_entries = HashSet::new();
         self.reset_pull();
         let summary = stage.playlist.summary.clone();
+        if let Some(definition) = stage.playlist.definition.as_ref().filter(|_| summary.capabilities.edit_definition) {
+            self.rules.insert(id.clone(), RulesBasis { revision: summary.revision, definition: definition.clone() });
+        } else {
+            self.rules.remove(&id);
+        }
         self.observed = Some(summary.clone());
         let snapshot = self.snapshot.as_mut().expect("ready snapshot");
         replace_summary(&mut snapshot.playlists, summary.clone());
@@ -1144,6 +1174,7 @@ impl Replica {
     fn delete_playlist(&mut self, id: &str) {
         self.snapshot.as_mut().expect("ready snapshot").playlists.retain(|p| p.id != id);
         self.details.retain(|d| d.playlist.summary.id != id);
+        self.rules.remove(id);
         self.background.remove(id);
         if self.desired.as_deref() == Some(id) {
             self.reset_pull();
@@ -1198,6 +1229,9 @@ impl Replica {
             p.clone(),
         );
         let id = p.id.clone();
+        if self.rules.get(&id).is_some_and(|basis| basis.revision != p.revision || !p.capabilities.edit_definition) {
+            self.rules.remove(&id);
+        }
         let observes_rows = d.entries.is_some();
         let mut repair = true;
         if let Some(i) = self.cache_index(&id) {

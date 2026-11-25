@@ -615,7 +615,7 @@ struct Browser {
     playlist_order_serial: u64,
     unconfirmed_orders: HashMap<String, UnconfirmedOrder>,
     pending: Option<Pending>,
-    edit_basis: Option<(String, String, u64)>, // form, playlist, original revision
+    edit_basis: Option<EditBasis>,
     row_editor: Option<RowEditor>,
     writing: bool,
     message: String,
@@ -878,6 +878,13 @@ fn can_edit_playlist(m: &pages::PlaylistMetadata, op: &str) -> bool {
         }
 }
 
+struct EditBasis {
+    op: String,
+    id: String,
+    revision: u64,
+    rules: Option<(u64, crate::personal::RulesBasis)>, // socket generation and exact prior definition
+}
+
 struct RowEditor {
     op: &'static str,
     id: String,
@@ -893,6 +900,10 @@ impl RowEditor {
             revision: m.revision,
         })
     }
+    fn ready(&self, page: &Page, rows_ready: bool) -> bool {
+        if self.op == "rules" { page.live_rules } else { rows_ready }
+    }
+
     fn matches(&self, route: &Route, page: &Page) -> bool {
         matches!(route, Route::Playlist(id) if id == &self.id)
             && page.playlist.as_ref().is_some_and(|m| {
@@ -1017,9 +1028,7 @@ fn playlist_detail_actions(
                     .unwrap_or("")
                     .into(),
                 rename: can_use_account && can_edit_playlist(m, "rename"),
-                rules: can_use_account
-                    && page.definition.is_some()
-                    && can_edit_playlist(m, "rules"),
+                rules: !page.local_audio && page.live_rules && can_edit_playlist(m, "rules"),
                 remove_action: if can_use_account && can_edit_playlist(m, "delete") {
                     "delete".into()
                 } else {
@@ -1990,12 +1999,18 @@ impl Browser {
     fn personal_mutation(&mut self, access: &Access, mutation: Mutation, op: &str) {
         let (before, draft_current) = access.personal.read(|status, replica| {
             let draft_current = !PLAYLIST_EDITS.contains(&op)
-                || self.edit_basis.as_ref().is_some_and(|(_, id, revision)| {
-                    replica.playlist().is_some_and(|detail| {
-                        !detail.stale
-                            && detail.summary.id == *id
-                            && detail.summary.revision == *revision
-                    })
+                || self.edit_basis.as_ref().is_some_and(|basis| {
+                    if op == "rules" {
+                        basis.rules.as_ref().is_some_and(|(generation, prior)| {
+                            status.generation == *generation
+                                && replica.watched_playlist() == Some(&basis.id)
+                                && replica.editable_rules(&basis.id) == Some(prior)
+                        })
+                    } else {
+                        replica.playlist().is_some_and(|detail| {
+                            !detail.stale && detail.summary.id == basis.id && detail.summary.revision == basis.revision
+                        })
+                    }
                 });
             (status, draft_current)
         });
@@ -2011,15 +2026,13 @@ impl Browser {
             self.scoped_ui(|ui| ui.set_form_error(STALE_PLAYLIST_FORM.into()));
             return;
         }
-        if self
-            .engine
-            .try_send(Command::Personal {
-                epoch: access.epoch,
-                generation: before.generation,
-                command: mutation.command,
-            })
-            .is_err()
-        {
+        let command = if op == "rules" {
+            let Some((_, prior)) = self.edit_basis.as_ref().and_then(|basis| basis.rules.clone()) else { return; };
+            Command::EditPlaylistRules { observed: before, prior, command: mutation.command }
+        } else {
+            Command::Personal { epoch: access.epoch, generation: before.generation, command: mutation.command }
+        };
+        if self.engine.try_send(command).is_err() {
             self.personal_write_error("The change was not sent. Please try again.".into());
             return;
         }
@@ -2192,11 +2205,11 @@ impl Browser {
                 || old.generation != status.generation
                 || old.interruption != status.interruption
         }) || prior_ready;
+        let waiting_for_editor = self.row_editor.as_ref().is_some_and(|editor| !editor.ready(&self.page, self.personal_ready));
         let waiting = online
             && matches!(status.link, Link::Waiting | Link::Ready)
-            && !self.personal_ready
             && !unavailable
-            && !detail_nonready;
+            && ((!self.personal_ready && !detail_nonready) || waiting_for_editor);
         // Time out a stalled part, not a long playlist making progress.
         let progressing = matches!(route, Route::Playlist(_))
             && prior.is_some_and(|old| old.playlist_progress != status.playlist_progress);
@@ -2241,9 +2254,8 @@ impl Browser {
             self.error = error;
         }
         self.render(render_models);
-        if self.personal_ready {
-            self.finish_row_editor();
-        } else if unavailable || self.personal_due.is_none() {
+        self.finish_row_editor();
+        if unavailable || self.personal_due.is_none() {
             self.row_editor = None;
         }
     }
@@ -2694,7 +2706,7 @@ impl Browser {
     }
 
     fn finish_row_editor(&mut self) {
-        if self.personal_ready
+        if self.row_editor.as_ref().is_some_and(|editor| editor.ready(&self.page, self.personal_ready))
             && let Some(editor) = self.row_editor.take()
         {
             if editor.matches(&self.route, &self.page) {
@@ -2719,6 +2731,20 @@ impl Browser {
         else {
             return;
         };
+        let rules = if op == "rules" {
+            if !self.page.live_rules { return; }
+            let Some(access) = self.access.as_ref().filter(|a| !a.local()) else { return; };
+            let Some(rules) = access.personal.read(|status, replica| {
+                let basis = replica.editable_rules(id)?;
+                (status.epoch == access.epoch && status.link == Link::Ready
+                    && replica.watched_playlist() == Some(id)
+                    && basis.revision == playlist.revision && self.page.definition.as_ref() == Some(&basis.definition))
+                    .then(|| (status.generation, basis.clone()))
+            }) else { return; };
+            Some(rules)
+        } else {
+            None
+        };
         let draft = if op == "delete" {
             Ok(actions::Draft::default())
         } else {
@@ -2726,7 +2752,7 @@ impl Browser {
         };
         match draft {
             Ok(draft) => {
-                self.edit_basis = Some((op.to_owned(), playlist.id.clone(), playlist.revision));
+                self.edit_basis = Some(EditBasis { op: op.to_owned(), id: playlist.id.clone(), revision: playlist.revision, rules });
                 let key = page_key(&self.route, Some(&self.page_keys));
                 let generation = self.generation.to_string();
                 let mode = op.to_owned();
@@ -2914,18 +2940,24 @@ impl Browser {
             return;
         }
         if let Some(mode) = op.strip_prefix("edit-") {
-            if !offline && self.personal_ready && PLAYLIST_EDITS.contains(&mode) {
+            if !offline && PLAYLIST_EDITS.contains(&mode) {
                 match (&route, row.as_ref()) {
-                    (Route::Playlists, Some(row)) => {
+                    (Route::Playlists, Some(row)) if self.personal_ready => {
                         if let Some(editor) = RowEditor::select(row, mode) {
                             self.visit(Navigation::Follow(Route::Playlist(editor.id.clone())));
-                            if self.personal_ready || self.personal_due.is_some() {
+                            if editor.op == "rules" && !editor.ready(&self.page, self.personal_ready)
+                                && self.personal_due.is_none()
+                            {
+                                self.personal_due = Some(tokio::time::Instant::now() + PERSONAL_READ_TIMEOUT);
+                            }
+                            if editor.ready(&self.page, self.personal_ready) || self.personal_due.is_some() {
                                 self.row_editor = Some(editor);
                                 self.finish_row_editor();
                             }
                         }
                     }
-                    (Route::Playlist(_), None) => self.open_playlist_editor(mode),
+                    (Route::Playlist(_), None)
+                        if self.personal_ready || mode == "rules" && page.live_rules => self.open_playlist_editor(mode),
                     _ => {}
                 }
             }
@@ -2997,6 +3029,7 @@ impl Browser {
         if route.personal()
             && !self.personal_ready
             && !(unpin
+                || op == "rules" && page.live_rules
                 || local_action
                 || matches!(op.as_str(), "album" | "artist")
                 || op == "open" && !matches!(route, Route::Picker(_)))
@@ -3510,6 +3543,7 @@ async fn cached_local_page(access: &Access, route: &Route) -> Result<Page, ApiEr
 
 fn reset_local_admissions(page: &mut Page) {
     page.local_audio = true;
+    page.live_rules = false;
     page.playback = None;
     page.local_collection_playable = false;
     for row in &mut page.rows {
@@ -4277,7 +4311,7 @@ mod tests {
                 add_tracks: true,
             },
         };
-        let basis = Some(("rename".to_string(), "p".to_string(), 7));
+        let basis = Some(EditBasis { op: "rename".into(), id: "p".into(), revision: 7, rules: None });
         let mut p = Page {
             playlist: Some(m.clone()),
             ..Default::default()
@@ -4466,9 +4500,11 @@ mod tests {
             }))
             .unwrap(),
         );
+        detail.live_rules = true;
         let pinned = playlist_detail_actions(&route, &detail, true, true);
         assert!(pinned.rules);
         assert_eq!(pinned.offline_action, "unpin-playlist");
+        detail.live_rules = false;
         let disconnected = playlist_detail_actions(&route, &detail, true, false);
         assert!(
             !disconnected.play
@@ -4575,6 +4611,79 @@ mod tests {
     }
 
     #[test]
+    fn direct_and_list_rule_editors_use_live_definition_without_ready_rows() {
+        use crate::personal::{Change, Part, PersonalCommand, PersonalUpdate, Snapshot};
+        let hub = crate::personal_bridge::PersonalHub::default();
+        let personal = hub.access();
+        let mut summary = editable_playlist();
+        let id = summary.id.clone();
+        let route = Route::Playlist(id.clone());
+        let definition = |slot: &str| -> crate::api::library::RuleDefinition {
+            serde_json::from_value(serde_json::json!({
+                "version":1,"sources":[{"kind":"allSaved","slotId":slot}],
+                "duplicates":"keep","sort":"sourceOrder"
+            })).unwrap()
+        };
+        let old = definition("old");
+        let current = definition("current");
+        let accepted = |summary, definition| PersonalUpdate::Part(Part {
+            summary, definition: Some(definition), token: "definition".into(), offset: 0, rows: vec![], more: false,
+        });
+        summary.track_count = Some(0);
+        summary.available_count = Some(0);
+        hub.begin(3, 17);
+        hub.receive(3, 17, PersonalUpdate::Snapshot(Snapshot { playlists: vec![summary.clone()], recent: vec![] })).unwrap();
+        personal.watch_playlist(3, Some(id.clone())).unwrap();
+        hub.receive(3, 17, accepted(summary.clone(), old.clone())).unwrap();
+        let (before_status, before) = personal.read(|status, replica| (status, replica.editable_rules(&id).unwrap().clone()));
+        personal.watch_playlist(3, None);
+
+        summary.revision += 1;
+        summary.evaluation_state = Some(crate::api::library::EvaluationState::Error);
+        summary.count_state = crate::api::library::CountState::Pending;
+        summary.track_count = None;
+        summary.available_count = None;
+        assert!(hub.receive(3, 17, PersonalUpdate::Change(Change {
+            playlist: Some(summary.clone()), rows_invalid: true, ..Change::default()
+        })).unwrap().is_none());
+        let list = personal.browse_view(3, &Route::Playlists, None).page.unwrap();
+        assert!(row_actions(&list, &list.rows[0], false, true, false).contains(&"rules"));
+        let ticket = RowEditor::select(&list.rows[0], "rules").unwrap();
+        let (_, read) = personal.watch_playlist(3, Some(ticket.id.clone())).unwrap();
+        let pending = personal.browse_view(3, &route, None).page.unwrap();
+        assert!(ticket.matches(&route, &pending));
+        assert!(!ticket.ready(&pending, false));
+        assert!(pending.definition.is_none());
+        assert!(!playlist_detail_actions(&route, &pending, false, false).rules);
+        assert!(personal.start_playlist_sync(3, 17, &read, || true));
+        hub.receive(3, 17, accepted(summary.clone(), current.clone())).unwrap();
+
+        let view = personal.browse_view(3, &route, None);
+        assert!(!view.detail_live && view.detail_nonready);
+        let page = view.page.unwrap();
+        let actions = playlist_detail_actions(&route, &page, false, false);
+        assert!(actions.rules && !actions.play && !actions.queue && actions.offline_action.is_empty());
+        assert!(ticket.ready(&page, false) && ticket.matches(&route, &page));
+        assert_eq!(page.definition.as_ref(), Some(&current));
+        assert_ne!(actions::prepare(&route, &page, "rules").unwrap().definition, "");
+        let prior = personal.read(|_, replica| replica.editable_rules(&id).unwrap().clone());
+        let command = PersonalCommand::SetPlaylistRules { playlist_id: id.clone(), definition: old };
+        let copy = PersonalCommand::CopyPlaylist { playlist_id: id.clone(), name: "Copy".into(), description: String::new() };
+        assert!(!hub.authorizes(3, 17, &copy));
+        assert!(!personal.can_download_playlist(3, &id));
+        assert!(!hub.admit_rules_edit(3, 17, &before, &command, || panic!("cached stale definition reached transport")));
+        assert!(hub.admit_rules_edit(3, 17, &prior, &command, || true));
+        let effect = Effect::Rules { id: id.clone(), definition: current, revision: before.revision };
+        assert_eq!(personal.observed(before_status, &effect), Some(None), "a verified definition can confirm a write even before its rows are ready");
+        hub.disconnect(3, 17);
+        assert!(!hub.admit_rules_edit(3, 17, &prior, &command, || panic!("retired binding reached transport")));
+        hub.begin(3, 18);
+        hub.receive(3, 18, PersonalUpdate::Snapshot(Snapshot { playlists: vec![summary], recent: vec![] })).unwrap();
+        assert!(!personal.browse_view(3, &route, None).page.unwrap().live_rules,
+            "matching metadata on a replacement binding does not verify a definition");
+    }
+
+    #[test]
     fn row_edit_tickets_must_match_the_loaded_playlist_revision_and_capability() {
         let mut summary = editable_playlist();
         let list = pages::personal_list(&Route::Playlists, &[summary.clone()]);
@@ -4595,10 +4704,13 @@ mod tests {
         assert!(RowEditor::select(&wrong, "delete").is_none());
     }
 }
-fn draft_matches(b: &Option<(String, String, u64)>, p: &Page, mode: &str) -> bool {
-    b.as_ref()
-        .zip(p.playlist.as_ref())
-        .is_some_and(|((op, id, rev), m)| op == mode && id == &m.id && *rev == m.revision)
+fn draft_matches(b: &Option<EditBasis>, p: &Page, mode: &str) -> bool {
+    b.as_ref().zip(p.playlist.as_ref()).is_some_and(|(basis, m)| {
+        basis.op == mode && basis.id == m.id && basis.revision == m.revision
+            && (mode != "rules" || p.live_rules && basis.rules.as_ref().is_some_and(|(_, prior)| {
+                p.definition.as_ref() == Some(&prior.definition)
+            }))
+    })
 }
 fn clear_form_owned(ui: AppWindow) {
     clear_form(&ui);
