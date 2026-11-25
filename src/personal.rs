@@ -90,7 +90,7 @@ pub enum Command {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
-fn id_ok(id: &str) -> bool {
+pub(crate) fn id_ok(id: &str) -> bool {
     !id.is_empty() && id.len() <= 512 && id.trim() == id && !id.chars().any(char::is_control)
 }
 fn token_ok(token: &str) -> bool {
@@ -238,6 +238,7 @@ pub enum Update {
     Snapshot(Snapshot),
     Part(Part),
     Change(Change),
+    Missing { playlist_id: String },
 }
 
 pub use Command as PersonalCommand;
@@ -261,6 +262,13 @@ struct WireUpdate {
     snapshot: Option<WireSnapshot>,
     part: Option<WirePart>,
     change: Option<WireChange>,
+    missing: Option<WireMissing>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WireMissing {
+    playlist_id: String,
 }
 
 #[derive(Deserialize)]
@@ -317,8 +325,8 @@ impl<'de> Deserialize<'de> for Update {
         let invalid = |_| serde::de::Error::custom("invalid personal projection");
         let summary = |p: PlaylistSummary| p.checked(None, None, None).map_err(invalid);
         let wire = WireUpdate::deserialize(de)?;
-        match (wire.snapshot, wire.part, wire.change) {
-            (Some(s), None, None) => Ok(Self::Snapshot(Snapshot {
+        match (wire.snapshot, wire.part, wire.change, wire.missing) {
+            (Some(s), None, None, None) => Ok(Self::Snapshot(Snapshot {
                 playlists: s
                     .playlists
                     .into_iter()
@@ -330,7 +338,7 @@ impl<'de> Deserialize<'de> for Update {
                     .map(|r| r.project().map_err(invalid))
                     .collect::<Result<_, _>>()?,
             })),
-            (None, Some(p), None) => {
+            (None, Some(p), None, None) => {
                 let summary = summary(p.summary)?;
                 let rows = p
                     .rows
@@ -346,7 +354,7 @@ impl<'de> Deserialize<'de> for Update {
                     more: p.more,
                 }))
             }
-            (None, None, Some(d)) => {
+            (None, None, Some(d), None) => {
                 let entries = d
                     .entries
                     .map(|e| -> Result<_, D::Error> {
@@ -383,6 +391,9 @@ impl<'de> Deserialize<'de> for Update {
                     recent,
                     rows_invalid: d.rows_invalid,
                 }))
+            }
+            (None, None, None, Some(m)) if id_ok(&m.playlist_id) => {
+                Ok(Self::Missing { playlist_id: m.playlist_id })
             }
             _ => Err(serde::de::Error::custom(
                 "expected exactly one personal update",
@@ -455,11 +466,11 @@ impl Retained {
 #[derive(Default)]
 struct ReadScope {
     observed: Option<PlaylistSummary>,
-    unconfirmed_direct: bool,
     unavailable: bool,
     staged: Option<Retained>,
     pull: Pull,
     expected_sync: Option<Command>,
+    sync_started_after: Option<u64>,
     repairing: bool,
 }
 
@@ -470,25 +481,20 @@ pub struct Replica {
     snapshot: Option<Snapshot>,
     ready: bool,
     desired: Option<String>,
-    // A scoped direct read can observe a playlist outside the summary bound.
     observed: Option<PlaylistSummary>,
-    unconfirmed_direct: bool,
     unavailable: bool,
     details: VecDeque<Retained>,
     background: HashMap<String, ReadScope>,
     staged: Option<Retained>,
     pull: Pull,
     expected_sync: Option<Command>,
+    sync_started_after: Option<u64>,
     repairing: bool,
 }
 
 impl Replica {
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
-    }
-
-    pub(crate) fn summaries_capped(list: &[PlaylistSummary]) -> bool {
-        list.len() == MAX_PLAYLISTS
     }
 
     pub fn playlist(&self) -> Option<&Playlist> {
@@ -515,6 +521,18 @@ impl Replica {
             && matches!(command, Command::SyncPlaylist { local_request, .. } if Arc::ptr_eq(pending, local_request))
     }
 
+    /// Called after the transport started the exact current request, under the
+    /// same admission guard. A queued or superseded request cannot admit a miss.
+    pub(crate) fn started_sync(&mut self, command: &Command, after: u64) {
+        debug_assert!(self.accepts_sync(command));
+        let Command::SyncPlaylist { playlist_id, .. } = command else { return; };
+        if self.desired.as_ref() == Some(playlist_id) {
+            self.sync_started_after = Some(after);
+        } else if let Some(read) = self.background.get_mut(playlist_id) {
+            read.sync_started_after = Some(after);
+        }
+    }
+
     pub(crate) fn pending_sync(&self) -> Option<&Command> {
         self.expected_sync.as_ref()
     }
@@ -527,16 +545,28 @@ impl Replica {
         }
     }
 
-    /// The watched playlist was deleted, or the transport ended while an
-    /// unconfirmed direct lookup was outstanding. Go has no not-found frame;
-    /// this is a display state, not proof that the account lacks the playlist.
+    /// The current account snapshot or a scoped missing reply confirmed absence.
     pub fn playlist_unavailable(&self) -> bool {
         self.unavailable
     }
 
     pub fn command(&self, command: Command) -> Option<Command> {
-        (self.ready && !matches!(command, Command::SyncPlaylist { .. }) && command.valid())
-            .then_some(command)
+        if !self.ready || !command.valid() { return None; }
+        let snapshot = self.snapshot.as_ref()?;
+        let listed = |id: &str| snapshot.playlists.iter().find(|p| p.id == id);
+        let allowed = match &command {
+            Command::SyncPlaylist { .. } => false,
+            Command::CreatePlaylist { .. } | Command::ClearHistory => true,
+            Command::RenamePlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.edit_metadata),
+            Command::DeletePlaylist { playlist_id } => listed(playlist_id).is_some_and(|p| p.capabilities.delete),
+            Command::CopyPlaylist { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.copy_to_manual),
+            Command::SetPlaylistRules { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.edit_definition),
+            Command::AddEntry { playlist_id, .. } => listed(playlist_id).is_some_and(|p| p.capabilities.add_tracks),
+            Command::RemoveEntry { playlist_id, .. } | Command::MoveEntry { playlist_id, .. } => {
+                listed(playlist_id).is_some_and(|p| p.capabilities.edit_entries)
+            }
+        };
+        allowed.then_some(command)
     }
 
     pub(crate) fn watched_playlist(&self) -> Option<&str> {
@@ -610,6 +640,11 @@ impl Replica {
 
     pub(crate) fn seed_detail(&mut self, playlist: Playlist) {
         let id = &playlist.summary.id;
+        // Disk can supply last-good rows, never account authority. At least
+        // the live summary must prove the exact revision before seeding rows.
+        if !self.ready || self.summary(id) != Some(&playlist.summary) {
+            return;
+        }
         if self.cached(id).is_some_and(|d| {
             !d.playlist.stale || d.playlist.summary.revision > playlist.summary.revision
         }) {
@@ -655,22 +690,22 @@ impl Replica {
     fn take_read(&mut self) -> ReadScope {
         ReadScope {
             observed: self.observed.take(),
-            unconfirmed_direct: std::mem::take(&mut self.unconfirmed_direct),
             unavailable: std::mem::take(&mut self.unavailable),
             staged: self.staged.take(),
             pull: std::mem::take(&mut self.pull),
             expected_sync: self.expected_sync.take(),
+            sync_started_after: self.sync_started_after.take(),
             repairing: std::mem::take(&mut self.repairing),
         }
     }
 
     fn restore_read(&mut self, scope: ReadScope) {
         self.observed = scope.observed;
-        self.unconfirmed_direct = scope.unconfirmed_direct;
         self.unavailable = scope.unavailable;
         self.staged = scope.staged;
         self.pull = scope.pull;
         self.expected_sync = scope.expected_sync;
+        self.sync_started_after = scope.sync_started_after;
         self.repairing = scope.repairing;
     }
 
@@ -701,7 +736,6 @@ impl Replica {
         }
         self.reset_pull();
         self.observed = None;
-        self.unconfirmed_direct = false;
         self.unavailable = false;
         self.desired = id;
         if let Some(i) = self.desired.as_deref().and_then(|id| self.cache_index(id)) {
@@ -715,8 +749,6 @@ impl Replica {
     pub fn disconnected(&mut self) {
         self.ready = false;
         self.background.clear();
-        self.unavailable |= self.unconfirmed_direct;
-        self.unconfirmed_direct = false;
         self.reset_pull();
         self.invalidate_details();
     }
@@ -735,22 +767,34 @@ impl Replica {
 
     #[cfg(test)]
     pub fn receive(&mut self, update: Update) -> Result<Option<Command>, PersonalError> {
-        self.receive_observed(update, |_| {})
+        self.receive_observed(update, Some(1), |_| {})
     }
 
     pub(crate) fn receive_observed(
         &mut self,
         update: Update,
+        ingress: Option<u64>,
         mut accept: impl FnMut(AcceptedPlaylist<'_>),
     ) -> Result<Option<Command>, PersonalError> {
+        if let Update::Missing { playlist_id } = &update {
+            let started = if self.desired.as_ref() == Some(playlist_id) {
+                self.sync_started_after
+            } else {
+                self.background.get(playlist_id).and_then(|read| read.sync_started_after)
+            };
+            // An already queued frame from a retired request cannot settle a
+            // newer local request even when both requests used the same ID.
+            if self.ready && started.zip(ingress).is_some_and(|(after, stamp)| stamp > after) {
+                self.delete_playlist(playlist_id);
+                accept(AcceptedPlaylist::Deleted(playlist_id));
+            }
+            return Ok(None);
+        }
         let resource = match &update {
             Update::Part(p) => Some(p.summary.id.as_str()),
             Update::Change(c) => c.playlist.as_ref().map(|p| p.id.as_str()),
             _ => None,
         };
-        if let Update::Change(c) = &update && let Some(id) = &c.deleted {
-            self.background.remove(id);
-        }
         if let Some(id) = resource.filter(|id| self.desired.as_deref() != Some(*id))
             && let Some(parked) = self.background.remove(id)
         {
@@ -792,14 +836,12 @@ impl Replica {
         if !self.ready || self.unavailable {
             return None;
         }
-        self.unconfirmed_direct = self.summary(&id).is_none();
-        // An unlisted route needs a positive reply, not a conditional
-        // request whose silence wouldn't confirm that the scope was read.
-        let known = self
-            .cached(&id)
-            .filter(|d| {
-                !self.unconfirmed_direct && !d.playlist.stale && !d.playlist.token.is_empty()
-            })
+        if self.summary(&id).is_none() {
+            self.unavailable = true;
+            return None;
+        }
+        let known = self.cached(&id)
+            .filter(|d| !d.playlist.stale && !d.playlist.token.is_empty())
             .map(|d| d.playlist.token.clone());
         Some(self.sync(id, known, 0))
     }
@@ -817,6 +859,7 @@ impl Replica {
             local_request: Arc::new(()),
         };
         self.expected_sync = Some(command.clone());
+        self.sync_started_after = None;
         command
     }
 
@@ -824,6 +867,7 @@ impl Replica {
         self.staged = None;
         self.pull = Pull::Idle;
         self.expected_sync = None;
+        self.sync_started_after = None;
         self.repairing = false;
     }
 
@@ -873,7 +917,6 @@ impl Replica {
         {
             return Err(PersonalError);
         }
-        let capped = Self::summaries_capped(&s.playlists);
         let previous = self.snapshot.as_ref();
         let compatible = |id: &str, staged: Option<&Retained>, observed: Option<&PlaylistSummary>| {
             let before = previous.and_then(|s| s.playlists.iter().find(|p| p.id == id)).or(observed);
@@ -882,7 +925,7 @@ impl Replica {
                     || before.is_none_or(|p| p == current),
                     |part| part.playlist.summary == *current,
                 ),
-                None => capped || before.is_none() && staged.is_none(),
+                None => false,
             }
         };
         self.background.retain(|id, read| compatible(id, read.staged.as_ref(), read.observed.as_ref()));
@@ -890,18 +933,15 @@ impl Replica {
             && self.desired.as_deref().is_some_and(|id| compatible(id, self.staged.as_ref(), self.observed.as_ref()));
         if let Some(id) = self.desired.as_deref() {
             let listed = s.playlists.iter().any(|p| p.id == id);
-            self.unavailable = !listed
-                && (self.unavailable || !keep_visible_pull && (self.unconfirmed_direct
-                    || (!capped && (self.summary(id).is_some() || self.cached(id).is_some()))));
+            self.unavailable = !listed;
         }
         if !keep_visible_pull {
             self.observed = None;
-            self.unconfirmed_direct = false;
             self.reset_pull();
         }
         self.details.retain_mut(|d| {
             let Some(p) = s.playlists.iter().find(|p| p.id == d.playlist.summary.id) else {
-                return capped;
+                return false;
             };
             if p.kind != d.playlist.summary.kind {
                 return false;
@@ -949,9 +989,6 @@ impl Replica {
         if current.is_some_and(|old| p.summary.revision < old.revision) {
             return self.repair_part(id);
         }
-        // A part proves the ID exists, even when the list couldn't advertise
-        // it. Later disconnects can safely rehydrate this watched scope.
-        self.unconfirmed_direct = false;
         let mut stage = if p.offset == 0 {
             if self
                 .staged
@@ -1065,6 +1102,17 @@ impl Replica {
         Ok(Some(self.sync(id, None, 0)))
     }
 
+    fn delete_playlist(&mut self, id: &str) {
+        self.snapshot.as_mut().expect("ready snapshot").playlists.retain(|p| p.id != id);
+        self.details.retain(|d| d.playlist.summary.id != id);
+        self.background.remove(id);
+        if self.desired.as_deref() == Some(id) {
+            self.reset_pull();
+            self.observed = None;
+            self.unavailable = true;
+        }
+    }
+
     fn receive_change(
         &mut self,
         d: Change,
@@ -1077,6 +1125,9 @@ impl Replica {
                 !id_ok(&p.id)
                     || d.deleted.as_deref() == Some(&p.id)
                     || (d.entries.is_some() && p.kind != PlaylistKind::Manual)
+                    || (snapshot.playlists.len() == MAX_PLAYLISTS
+                        && !snapshot.playlists.iter().any(|old| old.id == p.id)
+                        && !d.deleted.as_ref().is_some_and(|id| snapshot.playlists.iter().any(|old| &old.id == id)))
                     || self
                         .summary(&p.id)
                         .is_some_and(|before| p.kind != before.kind || p.revision < before.revision)
@@ -1093,14 +1144,7 @@ impl Replica {
             snapshot.recent = recent;
         }
         if let Some(id) = d.deleted {
-            snapshot.playlists.retain(|p| p.id != id);
-            self.details.retain(|d| d.playlist.summary.id != id);
-            if self.desired.as_deref() == Some(&id) {
-                self.reset_pull();
-                self.observed = None;
-                self.unconfirmed_direct = false;
-                self.unavailable = true;
-            }
+            self.delete_playlist(&id);
             accept(AcceptedPlaylist::Deleted(&id));
         }
         let Some(p) = d.playlist else {
@@ -1108,7 +1152,6 @@ impl Replica {
         };
         if self.desired.as_deref() == Some(&p.id) {
             self.observed = Some(p.clone());
-            self.unconfirmed_direct = false;
             self.unavailable = false;
         }
         replace_summary(
@@ -1163,7 +1206,6 @@ fn replace_summary(summaries: &mut Vec<PlaylistSummary>, p: PlaylistSummary) {
         summaries.push(p);
     }
     sort_summaries(summaries);
-    summaries.truncate(MAX_PLAYLISTS);
 }
 
 pub(crate) fn sort_summaries(summaries: &mut [PlaylistSummary]) {

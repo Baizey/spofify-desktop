@@ -30,7 +30,7 @@ const PROBE_AFTER: Duration = Duration::from_secs(8);
 const MAX_ATTEMPTS: usize = 4096;
 const READ_IDLE: Duration = Duration::from_secs(20);
 const READ_LIMIT: Duration = Duration::from_secs(120);
-// A capped Initial cannot prove that a remembered direct target still exists.
+// A current summary confirms existence, not a complete membership read.
 // A bad scoped read can close the whole Go connection, with no not-found frame.
 const MAX_UNVERIFIED_LINKS: u8 = 2;
 
@@ -296,10 +296,6 @@ impl QuickAdd {
 
     pub(crate) fn selected(&self) -> Option<&str> {
         self.target.as_ref().map(|p| p.id.as_str())
-    }
-
-    pub(crate) fn authorized_target(&self) -> Option<&PlaylistSummary> {
-        self.target.as_ref().filter(|_| self.authorized)
     }
 
     pub(crate) fn searching(&self) -> bool {
@@ -572,14 +568,8 @@ impl QuickAdd {
             AcceptedPlaylist::Summaries(list) => {
                 if let Some(p) = list.iter().find(|p| p.id == id) {
                     self.summary(p);
-                } else if !Replica::summaries_capped(list) {
-                    self.select(None);
                 } else {
-                    // Absence from Go's capped initial window is not deletion.
-                    // Keep the exact selection; revalidate it via its next scoped pull.
-                    self.authorized = false;
-                    self.cancel_unsent();
-                    self.abort_bulk(BulkEnd::Cancelled);
+                    self.select(None);
                 }
             }
             AcceptedPlaylist::Summary { summary, .. } => self.summary(summary),

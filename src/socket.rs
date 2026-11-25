@@ -129,6 +129,7 @@ pub(crate) enum SocketError {
     Invalid,
     NotConnected,
     Busy,
+    PlaylistMissing,
 }
 
 pub(crate) struct Socket {
@@ -821,7 +822,6 @@ type AccountWs = WebSocketStream<reqwest::Upgraded>;
 // window plus its Initial can therefore need 135 seconds without other
 // clients. Allow bounded headroom, while still limiting ingress separately.
 const BULK_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(180);
-const BULK_SCOPED_TIMEOUT: Duration = Duration::from_secs(45);
 const BULK_REPLY_FRAMES: usize = 256;
 
 /// A single-run, non-playing link. The primary socket alone feeds the shared
@@ -940,17 +940,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> BulkLink<S> {
         Ok(started)
     }
 
-    /// Return the target revision after this link's FIFO barrier. In the
-    /// bounded Initial list the target may be absent; a same-link, tokenless
-    /// offset-zero read then supplies its revision, without fetching more rows.
+    /// Return the target revision from the complete account snapshot after
+    /// this link's FIFO barrier, or stop the bulk operation if it was deleted.
     pub(crate) async fn checkpoint(&mut self, target: &str) -> Result<u64, SocketError> {
-        let part = PersonalCommand::SyncPlaylist {
-            playlist_id: target.into(),
-            known: None,
-            offset: 0,
-            local_request: Arc::new(()),
-        };
-        if !part.valid() || self.target.as_deref().is_some_and(|id| id != target) {
+        if !crate::personal::id_ok(target) || self.target.as_deref().is_some_and(|id| id != target) {
             return Err(SocketError::Invalid);
         }
         let sync = encode(&Outgoing::<()>::Sync)?;
@@ -963,7 +956,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> BulkLink<S> {
             // Go replies immediately with a playback Snapshot, then queues a
             // private personal Initial behind our writes. Only the latter can
             // confirm the FIFO ran; ordinary personal changes are broadcasts.
-            let revision = bulk_reply(
+            bulk_reply(
                 &mut ws,
                 &self.device_id,
                 &self.connection_id,
@@ -982,32 +975,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> BulkLink<S> {
                     )
                 },
             )
-            .await?;
-            if let Some(revision) = revision {
-                return Ok(revision);
-            }
-            let raw = encode(&Outgoing::Personal { command: &part }).map_err(|_| End::Protocol)?;
-            send_bulk(&mut ws, raw, &self.session, self.mode_stamp, |start| {
-                start()
-            })
-            .await?;
-            bulk_reply(
-                &mut ws,
-                &self.device_id,
-                &self.connection_id,
-                "part",
-                BULK_SCOPED_TIMEOUT,
-                |update| match update {
-                    PersonalUpdate::Part(part) if part.summary.id == target && part.offset == 0 => {
-                        Some(part.summary.revision)
-                    }
-                    _ => None,
-                },
-            )
             .await
         })
         .await
         .map_err(bulk_error)?;
+        let revision = revision.ok_or(SocketError::PlaylistMissing)?;
         self.ws = Some(ws);
         self.pending = 0;
         Ok(revision)
@@ -1026,7 +998,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> BulkLink<S> {
                         return Err(End::Protocol);
                     }
                     Incoming::Personal { update }
-                        if update.get("snapshot").is_some() || update.get("part").is_some() =>
+                        if update.get("snapshot").is_some() || update.get("part").is_some() || update.get("missing").is_some() =>
                     {
                         // No request is outstanding. Never silently leave an
                         // unsolicited private reply to a future checkpoint.
@@ -1253,6 +1225,7 @@ async fn send_playlist_read<S: AsyncRead + AsyncWrite + Unpin>(
     queued: Instant,
     session: &Session,
     mode_stamp: u64,
+    after: u64,
 ) -> Result<(), End> {
     // An obsolete read must not trip the generic queue-age failure before
     // we notice that its exact local scope retired.
@@ -1290,16 +1263,16 @@ async fn send_playlist_read<S: AsyncRead + AsyncWrite + Unpin>(
         let _publication = PUBLICATION_GATE.lock().expect("account publication gate");
         bulk_current(session, mode_stamp)?;
         read.personal
-            .start_playlist_sync(read.epoch, generation, &read.command, || {
+            .start_playlist_sync_after(read.epoch, generation, &read.command, after, || {
                 if !read.account_current() || session.is_expired() {
                     return false;
                 }
                 result = Pin::new(&mut *ws).start_send(Message::Text(raw.into()));
-                true
+                result.is_ok()
             })
     };
+    result.map_err(|_| End::Transport)?;
     if started {
-        result.map_err(|_| End::Transport)?;
         flush_scoped(ws).await?;
     }
     Ok(())
@@ -1607,7 +1580,8 @@ impl Connection {
                                     }
                                 }
                                 ScopedWrite::Playlist(read) => {
-                                    send_playlist_read(ws, frame.raw, read, self.generation, frame.at, session, mode_stamp).await?;
+                                    let after = signals.order_gate.lock().expect("socket order admission gate").personal;
+                                    send_playlist_read(ws, frame.raw, read, self.generation, frame.at, session, mode_stamp, after).await?;
                                 }
                             }
                             continue;

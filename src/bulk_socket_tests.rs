@@ -168,7 +168,7 @@ async fn bulk_initial_and_fifo_confirmation_ignore_player_and_broadcasts() {
 }
 
 #[tokio::test]
-async fn bulk_caps_started_window_and_resolves_omitted_target_with_one_scoped_part() {
+async fn bulk_caps_started_window_and_resets_after_authoritative_snapshot() {
     let (session, client, mut peer, snapshot) = links(4096).await;
     time::timeout(Duration::from_secs(2), async {
         let script = async {
@@ -179,11 +179,7 @@ async fn bulk_caps_started_window_and_resolves_omitted_target_with_one_scoped_pa
             }
             assert_eq!(next_frame(&mut peer).await, json!({"type":"sync"}));
             send_player(&mut peer).await;
-            initial(&mut peer, vec![summary("other", 100)]).await;
-            assert_eq!(next_frame(&mut peer).await,
-                json!({"type":"personal","command":{"type":"syncPlaylist","playlistId":TARGET}}));
-            reply(&mut peer, json!({"part":{"summary":summary("other",101),"token":"other-token","offset":0,"rows":[],"more":false}})).await;
-            reply(&mut peer, json!({"part":{"summary":summary(TARGET,19),"token":"token","offset":0,"rows":[],"more":true}})).await;
+            initial(&mut peer, vec![summary(TARGET, 19)]).await;
             assert_eq!(next_frame(&mut peer).await["command"]["trackId"], "next");
         };
         let run = async {
@@ -194,6 +190,27 @@ async fn bulk_caps_started_window_and_resolves_omitted_target_with_one_scoped_pa
             assert_eq!(link.add(&add("above cap"), |_| panic!("at cap")).await, Err(SocketError::Busy));
             assert_eq!(link.checkpoint(TARGET).await, Ok(19));
             assert!(link.add(&add("next"), |start| start()).await.unwrap());
+        };
+        tokio::join!(run, script);
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn bulk_checkpoint_stops_when_full_account_snapshot_omits_target() {
+    let (session, client, mut peer, snapshot) = links(65536).await;
+    time::timeout(Duration::from_secs(2), async {
+        let script = async {
+            initial(&mut peer, vec![summary(TARGET, 1)]).await;
+            assert_eq!(next_frame(&mut peer).await, json!({"type":"sync"}));
+            send_player(&mut peer).await;
+            initial(&mut peer, (0..100).map(|i| summary(&format!("other-{i}"), 2)).collect()).await;
+            // The client stops rather than asking for a part or sending another edit.
+            assert!(matches!(peer.next().await, None | Some(Err(_))));
+        };
+        let run = async {
+            let mut link = BulkLink::finish_open(client, snapshot, &session, 0, DEVICE).await.unwrap();
+            assert_eq!(link.checkpoint(TARGET).await, Err(SocketError::PlaylistMissing));
+            assert_eq!(link.add(&add("not sent"), |_| panic!("missing target" )).await, Err(SocketError::NotConnected));
         };
         tokio::join!(run, script);
     }).await.unwrap();

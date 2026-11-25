@@ -320,9 +320,10 @@ fn empty_terminal_parts_work_for_empty_manual_and_derived_count_drift() {
     );
     assert!(r.playlist().unwrap().rows.is_empty());
 
-    watch(&mut r, "d");
     let mut p = raw_derived_summary("d", 0, 1);
     p["countState"] = json!("stale");
+    send(&mut r, json!({"change":{"playlist":p}}));
+    assert_eq!(watch(&mut r, "d"), sync("d", None, 0));
     let definition = raw_definition();
     assert_eq!(
         send(

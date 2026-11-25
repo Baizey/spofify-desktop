@@ -511,7 +511,7 @@ impl Engine {
                     self.repair(generation);
                     return;
                 };
-                match self.personal.receive(self.epoch, generation, update) {
+                match self.personal.receive_stamped(self.epoch, generation, update, stamp) {
                     Ok(Some(command)) => self.send_personal(self.epoch, generation, &command),
                     Ok(None) => {}
                     Err(_) => self.repair(generation),

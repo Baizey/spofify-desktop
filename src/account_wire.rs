@@ -945,10 +945,10 @@ impl Incoming {
                 server_time_ms,
             } => counter(*client_time_ms) && counter(*server_time_ms),
             Self::Personal { update } => update.as_object().is_some_and(|o| {
-                let mut known = ["snapshot", "change", "part"]
-                    .into_iter()
-                    .filter_map(|key| o.get(key));
-                known.next().is_some_and(Value::is_object) && known.next().is_none()
+                o.len() == 1
+                    && ["snapshot", "change", "part", "missing"]
+                        .into_iter()
+                        .any(|key| o.get(key).is_some_and(Value::is_object))
             }),
         }
     }

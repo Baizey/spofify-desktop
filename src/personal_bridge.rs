@@ -289,13 +289,6 @@ impl State {
             .playlists
             .iter()
             .find(|p| p.id == id)
-            .or_else(|| {
-                self.replica
-                    .playlist()
-                    .filter(|p| !p.stale && p.summary.id == id)
-                    .map(|p| &p.summary)
-            })
-            .or_else(|| self.quick.authorized_target().filter(|p| p.id == id))
             .filter(|p| quick_add::editable(p))
     }
 }
@@ -421,25 +414,8 @@ impl PersonalAccess {
         if state.status.epoch != epoch || state.status.link != Link::Ready {
             return Vec::new();
         }
-        let mut targets: Vec<_> = state
-            .replica
-            .snapshot()
-            .into_iter()
-            .flat_map(|s| &s.playlists)
-            .filter(|p| quick_add::editable(p))
-            .cloned()
-            .collect();
-        for id in [state.replica.watched_playlist(), state.quick.selected()]
-            .into_iter()
-            .flatten()
-        {
-            if !targets.iter().any(|p| p.id == id)
-                && let Some(p) = state.quick_candidate(id)
-            {
-                targets.push(p.clone());
-            }
-        }
-        targets
+        state.replica.snapshot().into_iter().flat_map(|s| &s.playlists)
+            .filter(|p| quick_add::editable(p)).cloned().collect()
     }
 
     pub(crate) fn quick_select(
@@ -704,6 +680,7 @@ impl PersonalAccess {
             .then(|| check(state.quick.searching() || state.replica.is_catchup_sync()))
     }
 
+    #[cfg(test)]
     pub(crate) fn start_playlist_sync(
         &self,
         epoch: u64,
@@ -711,10 +688,22 @@ impl PersonalAccess {
         command: &PersonalCommand,
         start: impl FnOnce() -> bool,
     ) -> bool {
+        self.start_playlist_sync_after(epoch, generation, command, 0, start)
+    }
+
+    pub(crate) fn start_playlist_sync_after(
+        &self,
+        epoch: u64,
+        generation: u64,
+        command: &PersonalCommand,
+        after: u64,
+        start: impl FnOnce() -> bool,
+    ) -> bool {
         let mut state = self.state.lock().expect("personal state");
         if !state.accepts_playlist_sync(epoch, generation, command) || !start() {
             return false;
         }
+        state.replica.started_sync(command, after);
         if matches!(command, PersonalCommand::SyncPlaylist { playlist_id, .. }
             if state.replica.watched_playlist() == Some(playlist_id))
             && state.replica.playlist().is_none_or(|p| p.stale)
@@ -995,11 +984,22 @@ impl PersonalHub {
             self.0.signal();
         }
     }
+    #[cfg(test)]
     pub fn receive(
         &self,
         epoch: u64,
         generation: u64,
         update: PersonalUpdate,
+    ) -> Result<Option<PersonalCommand>, PersonalGap> {
+        self.receive_stamped(epoch, generation, update, Some(1))
+    }
+
+    pub(crate) fn receive_stamped(
+        &self,
+        epoch: u64,
+        generation: u64,
+        update: PersonalUpdate,
+        ingress: Option<u64>,
     ) -> Result<Option<PersonalCommand>, PersonalGap> {
         // Same order as socket admission: publication → reducer. Only
         // accepted projections reach the disk worker.
@@ -1012,18 +1012,17 @@ impl PersonalHub {
         }
         let snapshot = matches!(&update, PersonalUpdate::Snapshot(_));
         let part = matches!(&update, PersonalUpdate::Part(_));
-        let background = matches!(&update, PersonalUpdate::Part(p) if state.replica.watched_playlist() != Some(p.summary.id.as_str()));
+        let background = match &update {
+            PersonalUpdate::Part(p) => state.replica.watched_playlist() != Some(&p.summary.id),
+            PersonalUpdate::Missing { playlist_id } => state.replica.watched_playlist() != Some(playlist_id),
+            _ => false,
+        };
         let now = Instant::now();
         state.expire_quick_read(now);
-        if snapshot && state.status.link != Link::Ready && state.quick.searching() {
-            // Reappraise a direct target only while its selection has a
-            // revalidation budget. A capped snapshot can't clear that budget.
-            if state.replica.playlist_unavailable() {
-                state.watch(None);
-            }
-            state.quick_watch();
-        }
         if !snapshot && state.status.link != Link::Ready {
+            if matches!(update, PersonalUpdate::Missing { .. }) {
+                return Ok(None); // There cannot be a current scoped read yet.
+            }
             // A repair snapshot may be queued behind older in-flight updates.
             if state.status.link == Link::Gap {
                 return Ok(None);
@@ -1088,7 +1087,11 @@ impl PersonalHub {
         let at = personal_cache::now_ms();
         let State { replica, quick, cache, .. } = &mut *state;
         let mut cache_changed = false;
-        let received = replica.receive_observed(update, |event| {
+        let mut deleted = None;
+        let received = replica.receive_observed(update, ingress, |event| {
+            if let AcceptedPlaylist::Deleted(id) = event {
+                deleted = Some(id.to_owned());
+            }
             cache.accept(event, part.then_some(at));
             cache_changed = true;
             quick.observe(event);
@@ -1121,11 +1124,14 @@ impl PersonalHub {
                         command = None;
                     }
                 }
+                if let Some(id) = &deleted {
+                    state.detail_attempts.remove(id);
+                }
                 if cache_changed || observation.is_some() {
                     let State { cache, replica, cache_binding, .. } = &mut *state;
                     if let Some(snapshot) = replica.snapshot() {
-                        // Accepted playlist events maintain the durable list.
-                        // The wire replica's prefix is not a replacement for it.
+                        // Accepted playlist events maintain the durable list;
+                        // reconcile Recent independently with the live entries.
                         cache.sync_recent(&snapshot.recent);
                         if let Some(binding) = cache_binding {
                             binding.writer.publish(cache);
@@ -1164,10 +1170,8 @@ impl PersonalHub {
                     state.detail_attempts.remove(id);
                 }
                 let watched_changed = state.replica.watched_playlist().is_some_and(|id| {
-                    observation.as_ref().is_some_and(|item| {
-                        item.deleted.as_deref() == Some(id)
-                            || item.playlist.as_ref().is_some_and(|p| p.id == id)
-                    })
+                    deleted.as_deref() == Some(id)
+                        || observation.as_ref().is_some_and(|item| item.playlist.as_ref().is_some_and(|p| p.id == id))
                 });
                 if snapshot
                     || watched_changed
@@ -1339,6 +1343,11 @@ mod tests {
         serde_json::from_value(json!({"snapshot":{"playlists":[],"recent":[]}})).unwrap()
     }
 
+    fn snapshot_for_part(update: PersonalUpdate) -> PersonalUpdate {
+        let PersonalUpdate::Part(part) = update else { panic!("expected fixture part") };
+        PersonalUpdate::Snapshot(crate::personal::Snapshot { playlists: vec![part.summary], recent: vec![] })
+    }
+
     #[test]
     fn only_the_active_epoch_and_socket_generation_can_commit_or_send() {
         let hub = PersonalHub::default();
@@ -1369,9 +1378,7 @@ mod tests {
     fn only_accepted_continuations_signal_playlist_progress() {
         let hub = PersonalHub::default();
         hub.begin(1, 3);
-        hub.receive(1, 3, empty()).unwrap();
         let access = hub.access();
-        assert!(access.watch_playlist(1, Some("large".into())).is_some());
         let progress = || access.read(|status, _| status.playlist_progress);
         let part = || {
             serde_json::from_value(json!({"part": {
@@ -1386,6 +1393,8 @@ mod tests {
             }}))
             .unwrap()
         };
+        hub.receive(1, 3, snapshot_for_part(part())).unwrap();
+        assert!(access.watch_playlist(1, Some("large".into())).is_some());
         hub.receive(1, 2, part()).unwrap();
         assert_eq!(progress(), 0);
         assert!(matches!(
@@ -1404,8 +1413,6 @@ mod tests {
         let hub = PersonalHub::default();
         let access = hub.access();
         hub.begin(7, 3);
-        hub.receive(7, 3, empty()).unwrap();
-        assert!(access.watch_playlist(7, Some("mix".into())).is_some());
         let part = |token: &str, keys: [&str; 3]| {
             let rows: Vec<_> = keys.into_iter().enumerate().map(|(i, key)| json!({
                 "id":key, "position":i, "track":{"kind":"track","id":"same-song","name":"Song","artists":[],
@@ -1417,7 +1424,10 @@ mod tests {
                     "editDefinition":false,"play":true,"copyToManual":false,"delete":true,"addTracks":true}},
                 "token":token,"offset":0,"more":false,"rows":rows}})).unwrap()
         };
-        hub.receive(7, 3, part("first", ["a", "b", "c"])).unwrap();
+        let first: PersonalUpdate = part("first", ["a", "b", "c"]);
+        hub.receive(7, 3, snapshot_for_part(first.clone())).unwrap();
+        assert!(access.watch_playlist(7, Some("mix".into())).is_some());
+        hub.receive(7, 3, first).unwrap();
         let before = access.read(|s, _| s);
         let order = PersonalCommand::MoveEntry {
             playlist_id: "mix".into(),
@@ -1441,8 +1451,8 @@ mod tests {
     }
 
     #[test]
-    fn capped_account_snapshot_preserves_known_summaries_until_confirmed_deletion() {
-        use crate::{pages::Route, personal::{Change, Snapshot}};
+    fn full_account_snapshot_replaces_saved_summaries_and_details_at_quota() {
+        use crate::{pages::Route, personal::Snapshot};
         let hub = PersonalHub::default();
         let known: PlaylistSummary = serde_json::from_value(json!({
             "id":"known","name":"Last known","description":"Detail not saved","kind":"manual",
@@ -1451,32 +1461,68 @@ mod tests {
             "capabilities":{"editMetadata":true,"editEntries":true,"editDefinition":false,"play":true,
                 "copyToManual":false,"delete":true,"addTracks":true}
         })).unwrap();
-        let capped: Vec<_> = (0..100).map(|n| PlaylistSummary {
-            id: format!("prefix-{n}"), updated_at: "2026-08-03T01:00:00Z".into(), ..known.clone()
+        let full: Vec<_> = (0..100).map(|n| PlaylistSummary {
+            id: format!("playlist-{n}"), updated_at: "2026-08-03T01:00:00Z".into(), ..known.clone()
         }).collect();
         let snapshot = |playlists| PersonalUpdate::Snapshot(Snapshot { playlists, recent: vec![] });
         hub.begin(1, 2);
         hub.receive(1, 2, snapshot(vec![known.clone()])).unwrap();
-        hub.receive(1, 2, snapshot(capped.clone())).unwrap();
         let route = Route::Playlist(known.id.clone());
-        {
-            let state = hub.0.state.lock().unwrap();
-            assert_eq!(state.replica.snapshot().unwrap().playlists.len(), 100);
-            let durable: Cache = serde_json::from_slice(&serde_json::to_vec(&state.cache).unwrap()).unwrap();
-            assert_eq!(durable.projection(&Route::Playlists).unwrap().rows.len(), 101);
-            let detail = durable.projection(&route).unwrap();
-            assert_eq!(detail.title, "Last known");
-            assert!(!detail.status.is_empty());
-            assert!(detail.rows.is_empty());
-        }
-        let edited = PlaylistSummary { name: "Confirmed edit".into(), revision: 2, ..known.clone() };
-        hub.receive(1, 2, PersonalUpdate::Change(Change { playlist: Some(edited), ..Change::default() })).unwrap();
-        assert_eq!(hub.0.state.lock().unwrap().cache.projection(&route).unwrap().title, "Confirmed edit");
-        hub.receive(1, 2, PersonalUpdate::Change(Change { deleted: Some(known.id), ..Change::default() })).unwrap();
-        hub.receive(1, 2, snapshot(capped)).unwrap();
+        let (_, read) = hub.access().watch_playlist(1, Some(known.id.clone())).unwrap();
+        let prior = crate::personal::Part {
+            summary: PlaylistSummary { track_count: Some(0), available_count: Some(0), ..known.clone() },
+            definition: None, token: "accepted".into(), offset: 0, rows: vec![], more: false,
+        };
+        assert!(hub.access().start_playlist_sync(1, 2, &read, || true));
+        hub.receive(1, 2, PersonalUpdate::Part(prior)).unwrap();
+        let command = PersonalCommand::DeletePlaylist { playlist_id: known.id.clone() };
+        assert!(hub.authorizes(1, 2, &command));
+        hub.disconnect(1, 2);
+        hub.begin(1, 3);
+        assert!(!hub.authorizes(1, 3, &command), "cached data has no edit authority before refresh");
+        hub.receive(1, 3, snapshot(full)).unwrap();
+        assert!(!hub.authorizes(1, 3, &command));
         let state = hub.0.state.lock().unwrap();
-        assert_eq!(state.cache.projection(&Route::Playlists).unwrap().rows.len(), 100);
+        assert_eq!(state.replica.snapshot().unwrap().playlists.len(), 100);
+        let durable: Cache = serde_json::from_slice(&serde_json::to_vec(&state.cache).unwrap()).unwrap();
+        assert_eq!(durable.projection(&Route::Playlists).unwrap().rows.len(), 100);
+        assert!(durable.projection(&route).is_none());
+        assert!(!durable.details.contains_key(&known.id));
+    }
+
+    #[test]
+    fn scoped_missing_retires_saved_detail_without_a_personal_gap() {
+        use crate::{pages::Route, personal::Snapshot};
+        let hub = PersonalHub::default();
+        let personal = hub.access();
+        hub.begin(4, 7);
+        let playlist: PlaylistSummary = serde_json::from_value(json!({
+            "id":"mix","name":"Mix","description":"","kind":"manual","countState":"exact",
+            "trackCount":0,"availableCount":0,"revision":1,"createdAt":"2026-08-03T00:00:00Z",
+            "updatedAt":"2026-08-03T00:00:00Z","capabilities":{"editMetadata":true,"editEntries":true,
+                "editDefinition":false,"play":true,"copyToManual":false,"delete":true,"addTracks":true}
+        })).unwrap();
+        hub.receive(4, 7, PersonalUpdate::Snapshot(Snapshot { playlists: vec![playlist.clone()], recent: vec![] })).unwrap();
+        hub.0.state.lock().unwrap().cache.accept(AcceptedPlaylist::Complete(&crate::personal::Playlist {
+            summary: playlist, definition: None, token: "prior".into(), rows: Arc::default(), stale: false,
+        }), Some(1));
+        let (_, read) = personal.watch_playlist(4, Some("mix".into())).unwrap();
+        let decode = |id| serde_json::from_value(json!({"missing":{"playlistId":id}})).unwrap();
+        let route = Route::Playlist("mix".into());
+        let send = |epoch, generation, id, stamp| hub.receive_stamped(epoch, generation, decode(id), Some(stamp)).unwrap();
+        assert_eq!(send(4, 7, "mix", 9), None);
+        assert!(personal.start_playlist_sync_after(4, 7, &read, 9, || true));
+        assert_eq!(send(4, 7, "mix", 9), None);
+        assert_eq!(send(4, 6, "mix", 10), None);
+        assert_eq!(send(3, 7, "mix", 10), None);
+        assert_eq!(send(4, 7, "foreign-other", 10), None);
+        assert!(hub.0.state.lock().unwrap().cache.projection(&route).is_some());
+        assert_eq!(send(4, 7, "mix", 11), None);
+        let state = hub.0.state.lock().unwrap();
         assert!(state.cache.projection(&route).is_none());
+        assert!(!state.replica.accepts_sync(&read));
+        assert!(state.replica.playlist_unavailable());
+        assert_eq!(state.status.link, Link::Ready);
     }
 
     #[tokio::test]

@@ -892,60 +892,27 @@ fn quick_add_held_unsent_target_rights_route_and_account_are_fenced() {
 }
 
 #[test]
-fn quick_add_selects_current_editable_detail_beyond_the_summary_cap() {
-    let hub = PersonalHub::default();
-    let a = hub.access();
-    hub.begin(EPOCH, GENERATION);
-    let summaries: Vec<_> = (0..100)
-        .map(|i| summary(&format!("p{i:03}"), 0, 1))
-        .collect();
-    lists(&hub, GENERATION, summaries.clone());
-    assert!(a.quick_select(EPOCH, Some("z-outside")).is_none());
-    assert!(
-        a.quick_watch(EPOCH, false, Some("z-outside".into()))
-            .is_some()
-    );
-    part(
-        &hub,
-        GENERATION,
-        summary("z-outside", 0, 1),
-        "outside",
-        0,
-        vec![],
-        false,
-    );
-    assert_eq!(a.quick_targets(EPOCH).len(), 101);
-    assert!(a.quick_select(EPOCH, Some("z-outside")).is_none()); // Off Search: no second watch.
-    assert!(a.quick_watch(EPOCH, true, None).is_none()); // Same exact watched route.
-    hub.disconnect(EPOCH, GENERATION);
-    hub.begin(EPOCH, GENERATION + 1);
-    assert!(lists(&hub, GENERATION + 1, summaries).is_some());
-    a.quick_view(EPOCH, |v| {
-        assert_eq!(v.target.unwrap().id, "z-outside");
-        assert_eq!(v.row("song").membership, Membership::Unknown);
-    });
-    part(
-        &hub,
-        GENERATION + 1,
-        summary("z-outside", 0, 1),
-        "outside-2",
-        0,
-        vec![],
-        false,
-    );
-    assert!(a.quick_stage(EPOCH, 4, "z-outside", "song").is_some());
+fn quick_add_retires_target_omitted_by_full_account_snapshot() {
+    let (hub, a) = ready();
+    empty_a(&hub, &a);
+    let held = stage(&a, "a", "song");
+    let summaries = (0..100).map(|i| summary(&format!("p{i:03}"), 0, 1)).collect();
+    assert!(lists(&hub, GENERATION, summaries).is_none());
+    assert_eq!(a.quick_targets(EPOCH).len(), 100);
+    assert!(a.quick_select(EPOCH, Some("a")).is_none());
+    assert!(!hub.admit_quick_add(&held, || panic!("removed target reached socket")));
+    a.quick_view(EPOCH, |v| assert!(v.target.is_none()));
+    assert!(a.quick_watch(EPOCH, false, Some("a".into())).is_none());
 }
 
 #[test]
-fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
+fn quick_add_target_disconnects_are_bounded_until_scoped_completion() {
     let hub = PersonalHub::default();
     let a = hub.access();
     hub.begin(EPOCH, GENERATION);
-    let summaries: Vec<_> = (0..100)
-        .map(|i| summary(&format!("p{i:03}"), 0, 1))
-        .collect();
+    let target = "target";
+    let summaries = vec![summary(target, 0, 1)];
     lists(&hub, GENERATION, summaries.clone());
-    let target = "z-outside";
     assert!(a.quick_watch(EPOCH, false, Some(target.into())).is_some());
     part(
         &hub,
@@ -963,11 +930,9 @@ fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
     for generation in GENERATION + 1..=GENERATION + 2 {
         hub.begin(EPOCH, generation);
         let mut snapshot = summaries.clone();
-        if generation == GENERATION + 2 {
-            // A summary—even the exact stored identity and revision—is not
-            // a validated scoped result and cannot replenish the budget.
-            snapshot[99] = summary(target, 2, 2);
-        }
+        // A summary with the exact identity and revision does not prove
+        // complete membership and cannot replenish the read budget.
+        snapshot[0] = summary(target, 2, 2);
         let request = lists(&hub, generation, snapshot).expect("the bounded reconnect attempt");
         assert!(a.start_playlist_sync(EPOCH, generation, &request, || true));
         if generation == GENERATION + 1 {
@@ -987,7 +952,7 @@ fn quick_add_capped_target_disconnects_are_bounded_until_scoped_completion() {
             ));
             assert!(a.start_playlist_sync(EPOCH, generation, &continuation, || true));
         }
-        hub.disconnect(EPOCH, generation); // Go closes on an invalid scoped request; no error frame.
+        hub.disconnect(EPOCH, generation); // Connection loss proves nothing about membership.
     }
 
     for generation in GENERATION + 3..=GENERATION + 5 {

@@ -743,10 +743,6 @@ pub fn personal_list(route: &Route, summaries: &[PlaylistSummary]) -> Page {
             row
         })
         .collect();
-    // The wire carries no total, so 100 summaries is not proof there are more.
-    if summaries.len() == 100 {
-        page.status = "The account snapshot shows up to 100 playlists.".into();
-    }
     page
 }
 

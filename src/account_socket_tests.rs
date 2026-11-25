@@ -258,6 +258,15 @@ fn exact_v3_frame_shapes_and_incompatible_values() {
         ),
         Ok(Incoming::Observation(_))
     ));
+    let absent = json!({"type":"personal","update":{"missing":{"playlistId":"fixture-playlist"}}});
+    let Incoming::Personal { update } = decode(&absent.to_string(), DEVICE).unwrap() else {
+        panic!("expected scoped account reply");
+    };
+    assert_eq!(serde_json::from_value::<PersonalUpdate>(update).unwrap(),
+        PersonalUpdate::Missing { playlist_id: "fixture-playlist".into() });
+    for payload in [json!({"playlistId":""}), json!({"playlist_id":"p"}), json!({"playlistId":"p","offset":1})] {
+        assert!(serde_json::from_value::<PersonalUpdate>(json!({"missing":payload})).is_err());
+    }
     for invalid in [
         json!({"type":"player","player":{"cursor":cursor_json()}}),
         json!({"type":"grant","basis":1,"ms":15000,"handle":"legacy"}),
@@ -270,6 +279,8 @@ fn exact_v3_frame_shapes_and_incompatible_values() {
         json!({"type":"ownership","owner":{"generation":2,"deviceId":null},"devices":[]}),
         json!({"type":"result","id":"new-connection:0","status":"accepted","revision":1}),
         json!({"type":"personal","update":{"snapshot":{},"part":{}}}),
+        json!({"type":"personal","update":{"missing":{"playlistId":"p"},"part":null}}),
+        json!({"type":"personal","update":{"missing":null}}),
     ] {
         assert!(
             matches!(decode(&invalid.to_string(), DEVICE), Err(End::Protocol)),
@@ -1122,6 +1133,50 @@ async fn personal_order_admission_rejects_published_updates_and_retired_mode() {
         serde_json::from_str::<Value>(&written.try_recv().unwrap().raw).unwrap(),
         json!({"type":"personal","command":{"type":"moveEntry"}})
     );
+}
+
+#[tokio::test]
+async fn scoped_missing_goes_through_the_v3_socket_without_breaking_the_link() {
+    use crate::personal_bridge::PersonalHub;
+
+    let (mut socket, signals, mut input) = fixture();
+    let mut connection = Connection::begin(initial(NEW, None), DEVICE, &signals).unwrap();
+    let generation = connection.generation;
+    let session = socket.session.clone();
+    assert!(matches!(socket.events.try_recv().unwrap().kind, EventKind::Snapshot(_)));
+    let epoch = 7;
+    let hub = PersonalHub::default();
+    let personal = hub.access();
+    hub.begin(epoch, generation);
+    let first = json!({"snapshot":{"playlists":[quick_playlist("target")],"recent":[]}});
+    hub.receive(epoch, generation, serde_json::from_value(first).unwrap()).unwrap();
+    let (_, read) = personal.watch_playlist(epoch, Some("target".into())).unwrap();
+    hub.send_playlist_sync(epoch, generation, &read, || {
+        socket.personal_playlist_sync(epoch, generation, &read, personal.clone(), Arc::new(AtomicU64::new(epoch))).is_ok()
+    });
+    let (mut client, mut server) = peers().await;
+    let script = async {
+        assert_eq!(read_json(&mut server).await,
+            json!({"type":"personal","command":{"type":"syncPlaylist","playlistId":"target"}}));
+        for update in [json!({"missing":{"playlistId":"target"}}), json!({"change":{"playlist":quick_playlist("other")}})] {
+            server.send(Message::Text(json!({"type":"personal","update":update}).to_string().into())).await.unwrap();
+            let event = socket.events.recv().await.unwrap();
+            let EventKind::Personal(value) = event.kind else { panic!("expected personal ingress"); };
+            assert!(matches!(hub.receive_stamped(epoch, event.generation, serde_json::from_value(value).unwrap(), event.personal_stamp), Ok(None)));
+            socket.mark_personal_applied(event.personal_stamp.unwrap());
+        }
+        personal.read(|status, replica| {
+            assert_eq!(status.link, crate::personal_bridge::Link::Ready);
+            assert!(replica.playlist_unavailable());
+            assert_eq!(replica.snapshot().unwrap().playlists[0].id, "other");
+        });
+        assert!(!hub.authorizes(epoch, generation, &read));
+        drop(server);
+    };
+    let (ended, ()) = time::timeout(Duration::from_secs(2), async {
+        tokio::join!(connection.drive(&mut client, DEVICE, &mut input, &signals, &session, 0), script)
+    }).await.unwrap();
+    assert_eq!(ended, Err(End::Transport));
 }
 
 #[tokio::test]

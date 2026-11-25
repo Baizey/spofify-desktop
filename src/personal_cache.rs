@@ -25,7 +25,7 @@ use crate::{
     api::library::{HistoryEntry, PlaylistSummary},
     desk::Access,
     pages::{self, Page, Route},
-    personal::{AcceptedPlaylist, Playlist, Replica, Snapshot, sort_summaries},
+    personal::{AcceptedPlaylist, Playlist, Snapshot, sort_summaries},
     playlist_pin_store::PUBLICATION_GATE,
     storage,
 };
@@ -156,18 +156,8 @@ impl Cache {
     pub fn accept(&mut self, event: AcceptedPlaylist<'_>, refreshed_at: Option<u64>) {
         match event {
             AcceptedPlaylist::Summaries(list) => {
-                let capped = Replica::summaries_capped(list);
-                self.reconcile(list, capped);
-                let known = &mut self.snapshot_mut().playlists;
-                if capped {
-                    // A bounded prefix does not prove that an omitted playlist
-                    // is gone. Keep it until a complete list or a deletion.
-                    known.retain(|old| !list.iter().any(|current| current.id == old.id));
-                    known.extend_from_slice(list);
-                    sort_summaries(known);
-                } else {
-                    *known = list.to_vec();
-                }
+                self.reconcile(list);
+                self.snapshot_mut().playlists = list.to_vec();
             }
             AcceptedPlaylist::Summary {
                 summary,
@@ -226,10 +216,10 @@ impl Cache {
         }
     }
 
-    fn reconcile(&mut self, list: &[PlaylistSummary], capped: bool) {
+    fn reconcile(&mut self, list: &[PlaylistSummary]) {
         self.details.retain(|id, detail| {
             let Some(summary) = list.iter().find(|summary| summary.id == *id) else {
-                return capped;
+                return false;
             };
             if detail.playlist.summary.kind != summary.kind {
                 return false;
