@@ -1,8 +1,8 @@
 # Offline Mode v2
 
-**Applies to:** Spofify Desktop and Mobile. This is the target client behavior, not a description of what has shipped. It does not change the server's offline v1 API or require both clients to use the same storage or networking implementation.
+**Applies to:** Spofify Desktop and Mobile. Desktop, Mobile and Go upgrade in lockstep and use only the current protocols. The Go download routes are versioned `/api/me/offline/v1`; this label specifies the current download API, not a legacy client mode.
 
-Offline Mode v2 replaces the previous client offline mode. Backward compatibility with its behavior or stored state is not required.
+Offline Mode v2 replaces the previous client offline mode. Clients do not import v1 offline state or fall back to its behavior. The clients may use different storage and networking implementations.
 
 ## 1. Connectivity and mode
 
@@ -23,7 +23,7 @@ Offline Mode v2 replaces the previous client offline mode. Backward compatibilit
 
 ### Stored data
 
-- **Playlists:** Persist the playlist list and successfully fetched playlist details, including track order, duplicate occurrences, and metadata needed to render rows. Persist enough metadata for any playlist with downloaded tracks to open offline, even when only some tracks are downloaded. This does not require prefetching the track list of every playlist.
+- **Playlists:** Persist the playlist list and successfully fetched playlist details, including track order, duplicate occurrences, and metadata needed to render rows. A capped account summary does not prove that omitted playlists were deleted. Persist enough metadata for any playlist with downloaded tracks to open offline, even when only some tracks are downloaded. This does not require prefetching the track list of every playlist.
 - **Recently Played:** Persist the last known history. Record qualifying local plays using the same eligibility rule used online. Offline plays appear immediately and survive restart. Merge subsequent server history without erasing unmatched local plays within the normal history retention window. Do not deduplicate distinct plays merely because they use the same track ID. Uploading offline play history is not required by this spec.
 - Store caches durably and scope them to the active account. Missing artwork must not block a view. Cached metadata is not evidence that audio is available offline. A cached playlist name without saved details is **not saved on this device**, not an empty playlist.
 
@@ -38,7 +38,7 @@ Offline Mode v2 replaces the previous client offline mode. Backward compatibilit
 
 - A track is **Downloaded** only once its audio has been fully written, verified against the download contract, and durably recorded as playable by the client. Publish completion only after the file can be opened for playback. Partial transfers and temporary streaming buffers do not count. Downloads survive normal restarts and ordinary metadata or streaming-cache eviction.
 - Prefer a valid download whenever playback belongs to the local client, even online. If the file is missing or unreadable, correct the recorded availability. A saved index entry alone does not make a track playable.
-- When streaming stops because the service is lost or manual mode is enabled, continue at the current position from a valid local copy if possible. Otherwise, play the remaining buffer for the current track without fetching more audio. Pause with a brief reason if the track cannot continue.
+- When streaming stops because the service is lost or manual mode is enabled, continue at the current position from a valid local copy if possible. Otherwise, drain the existing buffer of that occurrence without fetching more audio. Readmit the source for each new occurrence, including Repeat One. Pause with a brief reason if the track cannot continue.
 - When the user explicitly selects an unavailable track, show why it cannot play. Do not substitute a different track. During automatic queue advance, skip unavailable entries in queue order and stop if none can play. Repeat must not spin through an unavailable queue indefinitely.
 - Keep Downloads easy to reach. Indicate unavailable tracks in saved views without obscuring their metadata.
 

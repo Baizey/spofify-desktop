@@ -66,10 +66,6 @@ const MAGIC: &[u8; 8] = b"SPOFDL01";
 const PREFIX_BYTES: usize = 12;
 const LOCK: &str = ".download-lock";
 const STAGE: &str = ".partial";
-// Earlier development builds also used the v1 directory for their cache metadata.
-// These are not audio records. This app never opens or deletes them.
-const LEGACY_CACHE_INDEX: &str = ".playback-cache-v1";
-const LEGACY_CACHE_STAGE: &str = ".playback-cache-partial";
 const ROOT_DIR: &str = "spofify-downloads-v2";
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 const FILE_FLAGS: OFlags = OFlags::NOFOLLOW
@@ -911,10 +907,7 @@ impl OfflineStore {
         while let Some(next) = iterator.next() {
             let next = storage(next)?;
             let name = next.file_name().to_str().map_err(|_| Error::Damaged)?;
-            if matches!(
-                name,
-                "." | ".." | LOCK | STAGE | LEGACY_CACHE_INDEX | LEGACY_CACHE_STAGE
-            ) {
+            if matches!(name, "." | ".." | LOCK | STAGE) {
                 continue;
             }
             if !valid_key(name) {
@@ -1553,7 +1546,7 @@ mod tests {
         data: &[u8],
     ) -> Result<Download, Error> {
         let _guard = store.admit(&scope.name(id)?)?;
-        // Some legacy fixtures deliberately contain non-audio payloads.
+        // Some fixtures deliberately contain non-audio payloads.
         let mut stage = store.stage(fixture_header(scope, id, data))?;
         stage.write(data, || Ok(()))?;
         stage.file.sync_all().map_err(write_error)?;
@@ -2101,7 +2094,7 @@ mod tests {
     }
 
     #[test]
-    fn large_v1_store_lists_reads_removes_and_admits_new_downloads() {
+    fn large_store_lists_reads_removes_and_admits_new_downloads() {
         const SAVED_COUNT: usize = 1089;
         let fixture = Fixture::new();
         let api = api("https://one.invalid");
@@ -2111,9 +2104,6 @@ mod tests {
         let hash = hex(digest(&SHA256, &[0]).as_ref());
         for index in 0..SAVED_COUNT {
             write_sparse_entry(&fixture.root(), &scope, &format!("track-{index}"), 1, &hash);
-        }
-        for name in [LEGACY_CACHE_INDEX, LEGACY_CACHE_STAGE] {
-            stdfs::write(fixture.root().join(name), b"opaque legacy data").unwrap();
         }
         // Exceeds the old count bound alone.
         assert_eq!(store.list(&api, &session).unwrap().len(), SAVED_COUNT);
@@ -2128,12 +2118,6 @@ mod tests {
         install(&store, &scope, "new", b"new audio").unwrap();
         assert!(store.remove(&api, &session, "track-1088").unwrap());
         assert_eq!(store.list(&api, &session).unwrap().len(), SAVED_COUNT);
-        for name in [LEGACY_CACHE_INDEX, LEGACY_CACHE_STAGE] {
-            assert_eq!(
-                stdfs::read(fixture.root().join(name)).unwrap(),
-                b"opaque legacy data"
-            );
-        }
 
         // A large store still checks the candidate and validates layout on list.
         symlink("new", fixture.root().join(scope.name("unsafe").unwrap())).unwrap();
@@ -2145,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_store_over_old_byte_quota_lists_by_header_without_loading_audio() {
+    fn large_store_lists_by_header_without_loading_audio() {
         let fixture = Fixture::new();
         let api = api("https://one.invalid");
         let session = api.test_session();
@@ -2239,7 +2223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_large_v1_wav_and_reads_same_descriptor_after_unlink() {
+    async fn streams_large_saved_wav_and_reads_same_descriptor_after_unlink() {
         const CHUNKS: usize = 33 * 1024 * 1024 / IO_CHUNK;
         let fixture = Fixture::new();
         let api = api("https://one.invalid");
@@ -2280,7 +2264,7 @@ mod tests {
         assert_eq!(store.list(&api, &session).unwrap(), [saved]);
         assert!(!fixture.root().join(STAGE).exists());
 
-        // Match the original v1 keys, order, and prefix exactly, not just a new round trip.
+        // Match the stored record keys, order, and prefix, not just a round trip.
         let expected = format!(
             concat!(
                 "{{\"scope\":\"{}\",\"track\":{{\"id\":\"large\",\"name\":\"Fixture track\",",

@@ -18,8 +18,6 @@ use std::{
     },
 };
 use tokio::{sync::watch, time::Instant};
-#[cfg(test)]
-use crate::playlist_observations::Writer;
 
 #[derive(Clone, Debug)]
 pub struct Mutation {
@@ -153,10 +151,6 @@ struct State {
     replica: Replica,
     quick: QuickAdd,
     observations: VecDeque<Observation>,
-    #[cfg(test)]
-    observation_writer: Option<Writer>,
-    #[cfg(test)]
-    observation_mode: Option<u64>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -179,10 +173,6 @@ impl Default for State {
             replica: Replica::default(),
             quick: QuickAdd::default(),
             observations: VecDeque::new(),
-            #[cfg(test)]
-            observation_writer: None,
-            #[cfg(test)]
-            observation_mode: None,
         }
     }
 }
@@ -336,13 +326,6 @@ impl Default for PersonalAccess {
     }
 }
 impl PersonalAccess {
-    #[cfg(test)]
-    pub(crate) fn playlist_observations(&self, access: &Access) -> Option<Writer> {
-        let state = self.state.lock().expect("personal state");
-        let writer = state.observation_writer.as_ref()?;
-        (state.status.epoch == access.epoch && writer.matches(access)).then(|| writer.clone())
-    }
-
     pub(crate) fn account_fence(&self, epoch: u64) -> Option<(Arc<AtomicU64>, u64)> {
         let state = self.state.lock().expect("personal state");
         let binding = state.cache_binding.as_ref()?;
@@ -964,53 +947,6 @@ impl PersonalHub {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn bind_observations(
-        &self,
-        access: Option<&Access>,
-        current_epoch: &Arc<AtomicU64>,
-    ) {
-        if let Some(access) = access {
-            self.reset(access.epoch);
-        }
-        let mut state = self.0.state.lock().expect("personal state");
-        if let Some(access) = access.filter(|a| a.epoch == state.status.epoch) {
-            if !state
-                .observation_writer
-                .as_ref()
-                .is_some_and(|w| w.matches(access))
-            {
-                state.observation_mode = None;
-                state.observation_writer = Writer::start(access, current_epoch.clone()).ok();
-            }
-        } else if access.is_none() {
-            state.observation_mode = None;
-            state.observation_writer = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn flush_observations(&self) {
-        let writer = self
-            .0
-            .state
-            .lock()
-            .expect("personal state")
-            .observation_writer
-            .clone();
-        if let Some(writer) = writer
-            && let Err(err) = writer.flush().await
-        {
-            eprintln!("{err}");
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_observation_writer(&self, epoch: u64, writer: Writer) {
-        self.reset(epoch);
-        self.0.state.lock().unwrap().observation_writer = Some(writer);
-    }
-
     pub fn reset(&self, epoch: u64) {
         let _publication = PUBLICATION_GATE.lock().unwrap();
         let mut state = self.0.state.lock().expect("personal state");
@@ -1036,10 +972,6 @@ impl PersonalHub {
         state.account_attempt = None;
         if let Some(binding) = state.cache_binding.as_mut() {
             binding.mode = Some(*binding.session.network_changes().borrow());
-        }
-        #[cfg(test)]
-        {
-            state.observation_mode = state.observation_writer.as_ref().and_then(Writer::online_mode);
         }
         state.interrupt();
         self.0.signal();
@@ -1138,8 +1070,6 @@ impl PersonalHub {
         } else {
             None
         };
-        #[cfg(test)]
-        let writer = state.observation_writer.clone().zip(state.observation_mode);
         if state.cache_binding.is_some() && let PersonalUpdate::Change(change) = &update
             && let Some(detail) = change.playlist.as_ref().and_then(|p| state.cache.details.get(&p.id))
         {
@@ -1161,10 +1091,6 @@ impl PersonalHub {
         let received = replica.receive_observed(update, |event| {
             cache.accept(event, part.then_some(at));
             cache_changed = true;
-            #[cfg(test)]
-            if let Some((writer, mode)) = &writer {
-                writer.observe(*mode, event);
-            }
             quick.observe(event);
             if part && let AcceptedPlaylist::Complete(playlist) = event {
                 quick.validated_read(&playlist.summary.id);

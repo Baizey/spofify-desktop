@@ -24,8 +24,6 @@ mod personal_cache;
 mod playback_sync;
 mod player;
 mod playlist_browser;
-#[cfg(test)]
-mod playlist_observations;
 mod playlist_pin_store;
 mod playlist_pins;
 mod playlist_view;

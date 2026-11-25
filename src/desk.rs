@@ -3162,13 +3162,6 @@ impl Browser {
             known.push((route.clone(), page.clone()));
         }
         self.task = Some(tokio::spawn(async move {
-            if save && let Route::Playlist(id) = &route
-                && !a.personal.save_playlist_details(a.epoch, id).await
-            {
-                let result = Update::Changed(Err(unavailable("Playlist details could not be saved on this device.")));
-                let _ = tx.send(Delivery { serial, result }).await;
-                return;
-            }
             let result = if local_action {
                 Update::Local(
                     row.as_ref().map_or_else(String::new, |row| row.id.clone()),
@@ -3183,9 +3176,8 @@ impl Browser {
                     && row.is_none()
                 {
                     Update::Changed(
-                        // This confirmation was for a legacy snapshot. A modern
-                        // pin is never removed through this fallback path.
-                        playlist_browser::remove_legacy(&a, id)
+                        // A catalog collection confirmation cannot remove a pin.
+                        playlist_browser::remove_collection(&a, id)
                             .await
                             .map(|_| Some(Route::Offline)),
                     )
@@ -4505,9 +4497,9 @@ mod tests {
             playable: true,
             ..Default::default()
         });
-        let legacy = playlist_detail_actions(&route, &saved, false, false);
-        assert!(legacy.play && legacy.queue);
-        assert_eq!(legacy.remove_action, "remove");
+        let collection = playlist_detail_actions(&route, &saved, false, false);
+        assert!(collection.play && collection.queue);
+        assert_eq!(collection.remove_action, "remove");
         assert!(
             playlist_detail_actions(&route, &Page::default(), false, false)
                 .remove_action

@@ -1,5 +1,5 @@
 //! Private playlist intent and its last successfully published membership.
-//! Neither a pin nor its tombstone owns audio or modifies legacy collections.
+//! Neither a pin nor its tombstone owns audio or modifies the catalog collection index.
 
 use std::{
     collections::HashSet,
@@ -78,9 +78,8 @@ fn serialize_kind<S: Serializer>(kind: &PlaylistKind, serializer: S) -> Result<S
 pub(crate) struct Membership {
     pub(crate) title: String,
     pub(crate) tracks: Vec<String>,
-    /// Absent in older pins. Never infer identities from track IDs or positions.
+    /// Required in stored memberships. Never infer identities from track IDs or positions.
     #[serde(
-        default,
         deserialize_with = "deserialize_provenance",
         skip_serializing_if = "Option::is_none"
     )]
@@ -175,8 +174,7 @@ impl Store {
         Ok(records)
     }
 
-    /// Return valid records and the exact keys of unreadable records. Those
-    /// keys must not fall back to legacy data: a damaged record may be a tombstone.
+    /// Return valid records and the exact keys of unreadable records.
     /// Each record is independently atomic, without taking the mutation lock.
     pub(crate) fn scan(&self, access: &Access) -> Result<(Vec<Record>, Vec<String>), ApiError> {
         self.check_scope(access)?;
@@ -215,7 +213,7 @@ impl Store {
         Ok((records, unreadable))
     }
 
-    /// Look up one legacy-compatible key without scanning other memberships.
+    /// Look up one exact pin key without scanning other memberships.
     pub(crate) fn get(&self, access: &Access, key: &str) -> Result<Option<Record>, ApiError> {
         self.check_scope(access)?;
         // A malformed Saved route key cannot name a local record.
@@ -261,8 +259,8 @@ impl Store {
                 return Ok(current);
             }
         }
-        // Even when there was no previous v1 pin, an unpin must suppress a
-        // matching legacy snapshot. A later repin gets a new publication token.
+        // An unpin fences older workers even if they have not published any
+        // membership yet. A later repin gets a new publication token.
         let record = Record {
             target,
             key,
@@ -310,7 +308,7 @@ impl Store {
         }) else {
             return Ok(None);
         };
-        if membership.provenance.is_none() || !valid_membership(&membership, current.target.kind) {
+        if !valid_membership(&membership, current.target.kind) {
             return Err(INVALID);
         }
         // Advance the CAS even if the refreshed membership has identical content.
@@ -605,7 +603,7 @@ fn valid_membership(membership: &Membership, kind: PlaylistKind) -> bool {
                 && !matches!(id.as_str(), "." | "..")
                 && !id.chars().any(char::is_control)
         })
-        && membership.provenance.as_ref().is_none_or(|provenance| {
+        && membership.provenance.as_ref().is_some_and(|provenance| {
             let max_id_bytes = match kind {
                 PlaylistKind::Manual => 512,
                 PlaylistKind::Derived => 4096,
@@ -693,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn old_pin_is_read_without_rewrite_and_refresh_retains_exact_duplicate_rows() {
+    fn missing_provenance_is_damaged_and_refresh_retains_exact_duplicate_rows() {
         let fixture = Fixture::new();
         let access = account("https://fixture.invalid");
         let store = fixture.open(&access);
@@ -721,23 +719,20 @@ mod tests {
         let bytes = serde_json::to_vec(&old).unwrap();
         stdfs::write(&path, &bytes).unwrap();
         let store = fixture.open(&access);
-        let record = store.get(&access, &pin.key).unwrap().unwrap();
-        let old_members = record.committed.as_ref().unwrap();
-        assert_eq!(old_members.tracks, ["same", "same"]);
-        assert_eq!(old_members.provenance, None);
-        assert_eq!(store.list(&access).unwrap(), [record.clone()]);
+        assert_eq!(store.get(&access, &pin.key), Err(DAMAGED));
         assert_eq!(stdfs::read(&path).unwrap(), bytes);
-        let basis = Some(fingerprint(old_members));
-        assert_eq!(
-            store.publish(&access, &record, basis, old_members.clone(), || Ok(())),
-            Err(INVALID)
-        );
+        stdfs::remove_file(&path).unwrap();
+        let record = store.set(&access, pin.target, true, || Ok(())).unwrap();
+        let first = membership(&["same", "same"]);
+        store.publish(&access, &record, None, first.clone(), || Ok(())).unwrap().unwrap();
+        let record = store.get(&access, &pin.key).unwrap().unwrap();
+        let basis = Some(fingerprint(&first));
         let refreshed = Membership {
             provenance: Some(Provenance {
                 revision: 12,
                 occurrence_ids: vec!["o1_first".into(), "o1_second".into()],
             }),
-            ..old_members.clone()
+            ..first
         };
         assert_ne!(Some(fingerprint(&refreshed)), basis);
         let token = store
@@ -754,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_provenance_cannot_publish_or_read_as_legacy() {
+    fn malformed_provenance_cannot_publish_or_read() {
         let fixture = Fixture::new();
         let access = account("https://fixture.invalid");
         let store = fixture.open(&access);

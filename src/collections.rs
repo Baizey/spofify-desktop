@@ -76,16 +76,14 @@ const NOT_FOUND: ApiError = ApiError {
     status: 404,
 };
 
-pub async fn list(access: &Access, include_playlists: bool) -> Result<Vec<Row>, ApiError> {
+pub async fn list(access: &Access) -> Result<Vec<Row>, ApiError> {
     let disk_access = access.clone();
     let entries = blocking(move || {
         let scope = scope(&disk_access)?;
         let index = IndexDir::read_existing()?;
         let mut entries: Vec<_> = index
             .in_scope(&scope)
-            .filter(|entry| {
-                include_playlists || !matches!(entry.kind, Kind::Manual | Kind::Derived)
-            })
+            .filter(|entry| entry.kind.is_catalog_collection())
             .collect();
         entries.sort_unstable_by(|a, b| a.title.cmp(&b.title).then_with(|| a.key.cmp(&b.key)));
         Ok(entries)
@@ -113,55 +111,13 @@ pub async fn detail(access: &Access, id: &str) -> Result<Page, ApiError> {
         let scope = scope(&disk_access)?;
         IndexDir::read_existing()?
             .in_scope(&scope)
-            .find(|e| e.key == id)
+            .find(|e| e.key == id && e.kind.is_catalog_collection())
             .ok_or(NOT_FOUND)
     })
     .await?;
     let available = browse_tracks(access, entry.tracks.iter().cloned().collect()).await?;
     check_live(access)?;
     Ok(entry.detail_page(&available))
-}
-
-/// Legacy v1 collections omit the source ID. Only callers with a known source
-/// may recover its membership, using its exact account-scoped playlist key.
-#[cfg(test)]
-pub(crate) struct LegacyPlaylist {
-    pub(crate) title: String,
-    pub(crate) kind: PlaylistKind,
-    pub(crate) tracks: Vec<String>,
-}
-
-#[cfg(test)]
-pub(crate) fn legacy_playlist(
-    access: &Access,
-    playlist_key: &str,
-) -> Result<Option<LegacyPlaylist>, ApiError> {
-    let principal = scope(access)?;
-    let playlist = IndexDir::read_existing()?.playlist(&principal, playlist_key);
-    check_live(access)?;
-    Ok(playlist)
-}
-
-/// Load the legacy snapshots of already identified source playlists in one
-/// index read. Keys are exact account-scoped hashes, not lookup labels.
-#[cfg(test)]
-pub(crate) fn legacy_playlists(
-    access: &Access,
-    source_by_key: &HashMap<String, String>,
-) -> Result<HashMap<String, LegacyPlaylist>, ApiError> {
-    let principal = scope(access)?;
-    if source_by_key.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let playlists = IndexDir::read_existing()?
-        .in_scope(&principal)
-        .filter_map(|entry| {
-            let source = source_by_key.get(&entry.key)?;
-            Some((source.clone(), entry.into_playlist()?))
-        })
-        .collect();
-    check_live(access)?;
-    Ok(playlists)
 }
 
 fn available_tracks(
@@ -358,6 +314,9 @@ impl SaveSummary {
 }
 
 pub async fn save(access: &Access, route: &Route, page: &Page) -> Result<SaveSummary, ApiError> {
+    if !matches!(route, Route::Album(_) | Route::Artist(_)) {
+        return Err(UNSUPPORTED);
+    }
     if access.offline {
         return Err(OFFLINE);
     }
@@ -585,17 +544,18 @@ enum Kind {
     Artist,
     Manual,
     Derived,
-    // Read legacy offline downloads without invalidating the rest of the index.
-    Likes,
 }
 impl Kind {
+    fn is_catalog_collection(self) -> bool {
+        matches!(self, Self::Album | Self::Artist)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Album => "Album",
             Self::Artist => "Artist",
             Self::Manual => "Playlist",
             Self::Derived => "Rule playlist",
-            Self::Likes => "Liked songs",
         }
     }
 }
@@ -1486,20 +1446,6 @@ struct StoredCollection {
     tracks: Vec<String>,
 }
 impl StoredCollection {
-    #[cfg(test)]
-    fn into_playlist(self) -> Option<LegacyPlaylist> {
-        let kind = match self.kind {
-            Kind::Manual => PlaylistKind::Manual,
-            Kind::Derived => PlaylistKind::Derived,
-            _ => return None,
-        };
-        Some(LegacyPlaylist {
-            title: self.title,
-            kind,
-            tracks: self.tracks,
-        })
-    }
-
     fn summary(&self, available: &HashMap<String, Download>) -> SaveSummary {
         SaveSummary::from_tracks(&self.tracks, available)
     }
@@ -1521,13 +1467,6 @@ impl Index {
             .into_iter()
             .filter(move |entry| entry.scope == scope)
     }
-    #[cfg(test)]
-    fn playlist(self, scope: &str, playlist_key: &str) -> Option<LegacyPlaylist> {
-        self.in_scope(scope)
-            .find(|entry| entry.key == playlist_key)?
-            .into_playlist()
-    }
-
     fn empty() -> Self {
         Self {
             version: 1,
@@ -1551,8 +1490,7 @@ impl Index {
                 !hex_digest(&e.scope)
                     || !hex_digest(&e.key)
                     || !valid_title(&e.title)
-                    // Older v1 writers could retain snapshot metadata for an empty playlist.
-                    || (e.tracks.is_empty() && !matches!(e.kind, Kind::Manual | Kind::Derived))
+                    || e.tracks.is_empty()
                     || e.tracks.iter().any(|id| !valid_id(id))
                     || !seen.insert((&e.scope, &e.key))
             })
@@ -2489,7 +2427,7 @@ mod tests {
         assert_eq!(downloads[0].item.id, "repeat");
     }
 
-    fn create_v1_fixture(path: &std::path::Path, fixture: &Value) {
+    fn write_index_fixture(path: &std::path::Path, fixture: &Value) {
         let file = stdfs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -2500,52 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_empty_playlists_survive_other_writes_and_removals() {
-        let scratch = Scratch::new();
-        let path = scratch.0.join(ROOT);
-        let disk = IndexDir::open(&path).unwrap();
-        let _admission = disk.admit().unwrap();
-        let scope = "a".repeat(64);
-        let manual = "b".repeat(64);
-        let derived = "c".repeat(64);
-        let added = "d".repeat(64);
-        create_v1_fixture(
-            &path,
-            &json!({"version": 1, "entries": [
-                {"scope": scope, "key": manual, "kind": "manual", "title": "Manual", "tracks": []},
-                {"scope": scope, "key": derived, "kind": "derived", "title": "Derived", "tracks": []},
-            ]}),
-        );
-
-        let mut index = disk.read().unwrap();
-        index.replace_entry(StoredCollection {
-            scope: scope.clone(),
-            key: added.clone(),
-            kind: Kind::Album,
-            title: "New collection".into(),
-            tracks: vec!["track".into()],
-        });
-        disk.commit(&index, || Ok(())).unwrap();
-        let mut index = disk.read().unwrap();
-        assert_eq!(index.entries.len(), 3);
-        assert!(index.remove_entry(&scope, &added));
-        disk.commit(&index, || Ok(())).unwrap();
-
-        let entries: Vec<_> = disk.read().unwrap().in_scope(&scope).collect();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].key, manual);
-        assert!(matches!(entries[0].kind, Kind::Manual));
-        assert_eq!(entries[1].key, derived);
-        assert!(matches!(entries[1].kind, Kind::Derived));
-        for entry in entries {
-            let page = entry.detail_page(&HashMap::new());
-            assert_eq!(page.total, Some(0));
-            assert!(page.rows.is_empty());
-        }
-    }
-
-    #[test]
-    fn large_v1_membership_reopens_projects_updates_and_removes() {
+    fn large_catalog_collection_reopens_projects_updates_and_removes() {
         const TOTAL: usize = 1161;
         let scratch = Scratch::new();
         let path = scratch.0.join(ROOT);
@@ -2553,46 +2446,33 @@ mod tests {
         let _admission = disk.admit().unwrap();
         let principal = "a".repeat(64);
         let foreign = "b".repeat(64);
-        let key = collection_key(&principal, "playlists", "known-source");
+        let key = collection_key(&principal, "artists", "known-source");
         let sibling_key = collection_key(&principal, "albums", "known-source");
         let ids: Vec<_> = ["saved", "missing", "saved", "another-missing"]
             .into_iter()
             .cycle()
             .take(TOTAL)
             .collect();
-        // Write the legacy format without using the current serializer.
+        // Exercise the exact on-disk format without using the serializer.
         let fixture = json!({"version": 1, "entries": [
             {"scope": principal, "key": sibling_key, "kind": "album", "title": "Album",
                 "tracks": ["saved", "missing", "saved"]},
-            {"scope": foreign, "key": key, "kind": "derived", "title": "Other account",
+            {"scope": foreign, "key": key, "kind": "artist", "title": "Other account",
                 "tracks": vec!["foreign"; 40]},
-            {"scope": principal, "key": key, "kind": "manual", "title": "Legacy playlist",
+            {"scope": principal, "key": key, "kind": "artist", "title": "Saved artist",
                 "tracks": ids},
         ]});
-        create_v1_fixture(&path, &fixture);
-
+        write_index_fixture(&path, &fixture);
         let untouched = stdfs::read(path.join(INDEX)).unwrap();
-        let exact = disk.read().unwrap().playlist(&principal, &key).unwrap();
-        assert_eq!(exact.title, "Legacy playlist");
-        assert_eq!(
-            exact.tracks.iter().map(String::as_str).collect::<Vec<_>>(),
-            ids
-        );
-        for key in [
-            sibling_key.clone(),
-            collection_key(&principal, "playlists", "other-source"),
-            collection_key(&foreign, "playlists", "known-source"),
-        ] {
-            assert!(disk.read().unwrap().playlist(&principal, &key).is_none());
-        }
-        assert_eq!(stdfs::read(path.join(INDEX)).unwrap(), untouched);
-
         let entry = disk
             .read()
             .unwrap()
             .in_scope(&principal)
             .find(|e| e.key == key)
             .unwrap();
+        assert_eq!(entry.title, "Saved artist");
+        assert_eq!(entry.tracks.iter().map(String::as_str).collect::<Vec<_>>(), ids);
+        assert_eq!(stdfs::read(path.join(INDEX)).unwrap(), untouched);
         let saved = serde_json::from_value::<WireTrack>(track("saved"))
             .unwrap()
             .project()
@@ -2625,8 +2505,8 @@ mod tests {
         index.replace_entry(StoredCollection {
             scope: principal.clone(),
             key: key.clone(),
-            kind: Kind::Manual,
-            title: "Updated playlist".into(),
+            kind: Kind::Artist,
+            title: "Updated artist".into(),
             tracks: vec!["saved".into(); TOTAL + 1],
         });
         disk.commit(&index, || Ok(())).unwrap();
@@ -2637,7 +2517,7 @@ mod tests {
             .iter()
             .find(|e| e.scope == principal && e.key == key)
             .unwrap();
-        assert_eq!(updated.title, "Updated playlist");
+        assert_eq!(updated.title, "Updated artist");
         assert_eq!(updated.tracks.len(), TOTAL + 1);
         assert!(index.remove_entry(&principal, &key));
         disk.commit(&index, || Ok(())).unwrap();
@@ -2668,8 +2548,8 @@ mod tests {
             index.entries.push(StoredCollection {
                 scope: scope.clone(),
                 key: format!("{i:064x}"),
-                kind: Kind::Manual,
-                title: format!("Playlist {i}"),
+                kind: Kind::Album,
+                title: format!("Album {i}"),
                 tracks: vec!["x".repeat(512); 128],
             });
         }
@@ -2685,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_index_rejects_malformed_data_without_discarding_it() {
+    fn index_rejects_malformed_data_without_discarding_it() {
         let scratch = Scratch::new();
         let path = scratch.0.join(ROOT);
         let disk = IndexDir::open(&path).unwrap();
