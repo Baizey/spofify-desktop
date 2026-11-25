@@ -53,9 +53,6 @@ mod playback_sync;
 mod player;
 #[path = "../src/playlist_browser.rs"]
 mod playlist_browser;
-#[cfg(test)]
-#[path = "../src/playlist_observations.rs"]
-mod playlist_observations;
 #[path = "../src/playlist_pin_store.rs"]
 mod playlist_pin_store;
 #[path = "../src/playlist_pins.rs"]
